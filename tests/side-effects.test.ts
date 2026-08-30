@@ -88,10 +88,11 @@ describe('side-effect counting', () => {
   });
 
   it('feeds the tool result back to the model on the non-streaming path', async () => {
-    // Regression: the middleware used to re-execute via `context.backend`,
-    // which the Bridge never populates (ai.matey#64). The tool ran, the
-    // follow-up turn never happened, and stripping the tool syntax left the
-    // user with an empty reply.
+    // Regression: the follow-up turn used to not happen at all. The middleware
+    // re-executes via `context.backend`, which the Bridge did not populate
+    // before ai.matey#64 — so the tool ran, the follow-up never did, and
+    // stripping the tool syntax left the user with an empty reply. Core 0.3.0
+    // populates it; this asserts the follow-up actually lands.
     toolRegistry.register({
       id: 'c3', name: 'c3', summary: 's', description: 'd',
       parameters: { type: 'object' }, execute: async () => ({ output: '42' }),
@@ -110,6 +111,67 @@ describe('side-effect counting', () => {
     });
 
     expect(res.message.content).toBe('The answer is 42.');
+  });
+
+  it('serves both turns of a tool conversation from the same backend', async () => {
+    /*
+     * The tool middleware used to pass `resolveBackend: () => this.router`,
+     * routing the follow-up afresh. That override is gone, so the follow-up now
+     * goes to `context.backend` — the concrete adapter ai.matey#64 narrows to
+     * once a response exists.
+     *
+     * Note what this does and does not prove. I revert-checked it: restoring
+     * the router override leaves this test green. Under
+     * `routingStrategy: 'explicit'` the follow-up carries the same backend
+     * selection, so the router resolves to the same adapter — the two
+     * implementations are genuinely indistinguishable here, which is why
+     * dropping the override was safe rather than a trade.
+     *
+     * So this pins the *behaviour* — one backend serves both turns of a tool
+     * conversation — and not the mechanism. It would catch a real regression
+     * (a follow-up landing on a different model than the one that asked for
+     * the tool) under a routing strategy where that could happen, such as
+     * round-robin. It would not catch a silent switch back to router-routing
+     * today, and nothing can, because there is nothing to catch.
+     */
+    toolRegistry.register({
+      id: 'c5', name: 'c5', summary: 's', description: 'd',
+      parameters: { type: 'object' }, execute: async () => ({ output: '7' }),
+    });
+
+    const served: string[] = [];
+    const tagged = (name: string, turns: string[]): BackendAdapter => {
+      let turn = 0;
+      return new FunctionBackendAdapter({
+        execute: async (req: IRChatRequest): Promise<IRChatResponse> => {
+          served.push(name);
+          return {
+            message: { role: 'assistant', content: turns[Math.min(turn++, turns.length - 1)] ?? '' },
+            finishReason: 'stop',
+            metadata: req.metadata,
+          };
+        },
+      });
+    };
+
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register('chosen', tagged('chosen', [
+      '<tool_call>{"name":"c5","arguments":{}}</tool_call>',
+      'It is 7.',
+    ]));
+    // Registered but never selected. If the follow-up went through the router
+    // rather than the serving adapter, this could take the second turn.
+    engine.router.register('other', tagged('other', ['wrong backend']));
+
+    const res = await engine.complete({
+      messages: [{ role: 'user', content: 'go' }],
+      target: targetFor('llama-cpp', manifest.id, manifest.name, 'chosen'),
+      toolIds: ['c5'],
+    });
+
+    expect(res.message.content).toBe('It is 7.');
+    // Both turns served by the same backend.
+    expect(served).toEqual(['chosen', 'chosen']);
   });
 
   it('never returns an empty answer when the reply was only a tool call', async () => {

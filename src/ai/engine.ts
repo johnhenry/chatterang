@@ -209,21 +209,6 @@ export class ChatterangEngine {
         registry: toolRegistry,
         maxIterations: TOOL_ITERATIONS,
         onToolExecuted: (tool) => this.#pendingTools.push(tool),
-        // The Router implements `BackendAdapter`, so the follow-up turn is
-        // routed exactly like the first one.
-        //
-        // This used to be a workaround for ai.matey#64, where `context.backend`
-        // was never populated. That is fixed as of core 0.3.0 — but the
-        // override stays, because #64's fix populates the field *adaptively*:
-        // the router before dispatch, narrowed to the backend that actually
-        // served once a response exists. The tool loop's follow-up runs after a
-        // response, so falling through to `context.backend` would pin every
-        // subsequent turn to whichever backend answered the first one.
-        //
-        // That is a real trade, not a tidy-up: pinning keeps a conversation on
-        // one model, routing again keeps fallback working when that model
-        // starts failing mid-conversation. This app chooses routing.
-        resolveBackend: () => this.router,
       }),
     );
 

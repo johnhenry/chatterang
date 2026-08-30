@@ -13,7 +13,6 @@
  */
 
 import type {
-  BackendAdapter,
   IRChatRequest,
   IRChatResponse,
   IRMessage,
@@ -42,16 +41,6 @@ export interface ToolMiddlewareOptions {
   maxIterations?: number;
   /** Notified as each tool finishes, so the UI can render it live. */
   onToolExecuted?: (tool: ExecutedTool) => void;
-  /**
-   * Backend to run the follow-up turn on, after tools have produced results.
-   *
-   * Required, because `MiddlewareContext.backend` is documented as "available
-   * after routing decision" and is in fact never populated by the Bridge
-   * (johnhenry/ai.matey#64). Depending on it silently truncated the loop: the
-   * tool ran, the model never saw the result, and the visible answer came back
-   * empty once the tool syntax was stripped.
-   */
-  resolveBackend?: () => BackendAdapter | undefined;
 }
 
 /**
@@ -269,7 +258,21 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
       ];
 
       const followUp: IRChatRequest = { ...context.request, messages, stream: false };
-      const backend = options.resolveBackend?.() ?? context.backend;
+
+      // The backend that served the turn the tool call came from.
+      //
+      // ai.matey#64 populates this adaptively: the router before dispatch,
+      // narrowed to the concrete adapter once a response exists. The follow-up
+      // runs after a response, so this is the specific backend — which is what
+      // we want. The model that asked for the tool is the one that should read
+      // its result.
+      //
+      // This used to route back through the Router instead. With
+      // `routingStrategy: 'explicit'` the follow-up carries the same backend
+      // selection, so it resolved to the same adapter anyway; the only
+      // difference was an extra hop and a chance for circuit-breaker state to
+      // change mid-loop and strand the tool work.
+      const backend = context.backend;
       if (!backend) {
         // Nothing to re-execute against. Return what the model said rather
         // than an empty string — the tool results are still reported in
