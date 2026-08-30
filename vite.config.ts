@@ -12,6 +12,10 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
+      // Resolved to source, not a build artefact: the contracts package is
+      // types-only, so there is nothing to compile and a build step here would
+      // only add a way for the two to drift.
+      '@chatterang/contracts': fileURLToPath(new URL('./packages/contracts/src', import.meta.url)),
     },
   },
   server: {

@@ -1,0 +1,12 @@
+{
+  "name": "@chatterang/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Platform-agnostic plugin contracts. Implemented by the Capacitor web shim, the iOS/Android native bridges, and the Node inference package.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./llama-cpp": "./src/llama-cpp.ts",
+    "./onnx-runtime": "./src/onnx-runtime.ts"
+  }
+}

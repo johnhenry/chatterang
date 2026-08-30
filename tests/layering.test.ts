@@ -141,3 +141,58 @@ describe('import layering', () => {
     expect(cycles).toEqual([]);
   });
 });
+
+/**
+ * The contracts package is the one thing three implementations agree on, so it
+ * must depend on none of them.
+ *
+ * It was extracted from `src/plugins/<name>/definitions.ts`, where it sat
+ * inside the web shim's own directory and imported `PluginListenerHandle` from
+ * `@capacitor/core` — a mobile framework, in a contract a Node backend has to
+ * satisfy. These assertions stop it drifting back.
+ */
+describe('contracts package', () => {
+  const CONTRACTS = resolve(process.cwd(), 'packages/contracts/src');
+  const contractFiles = sourceFiles(CONTRACTS);
+
+  it('finds the contract sources', () => {
+    expect(contractFiles.length).toBeGreaterThan(2);
+  });
+
+  it('imports nothing from the app', () => {
+    // A `@/` import would make the contract depend on the app that consumes it.
+    const offenders = contractFiles.flatMap((file) =>
+      importsOf(file).map((specifier) => `${relative(CONTRACTS, file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('imports no platform framework', () => {
+    // Capacitor, Node builtins, and DOM libs are all implementation detail of
+    // one implementation. A Node backend should not install a mobile framework
+    // to describe an event subscription.
+    // Match import specifiers, not raw text — listener.ts names
+    // `@capacitor/core` in a comment explaining why it does not import it, and
+    // a text search flags that as a violation.
+    const banned = /^(@capacitor\/|node:|electron$)/;
+    const offenders = contractFiles
+      .filter((file) =>
+        [...readFileSync(file, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)].some((m) =>
+          banned.test(m[1] ?? ''),
+        ),
+      )
+      .map((file) => relative(CONTRACTS, file));
+    expect(offenders).toEqual([]);
+  });
+
+  it('is types-only, so there is nothing to build and nothing to drift', () => {
+    // Every export is a type. If a runtime value appears here it needs a build
+    // step, and the vite/tsconfig aliases point at source on the assumption
+    // there isn't one.
+    const runtime = contractFiles.filter((file) => {
+      const source = readFileSync(file, 'utf8');
+      return /^export (?!type)(const|function|class|let|var|default)/m.test(source);
+    });
+    expect(runtime.map((f) => relative(CONTRACTS, f))).toEqual([]);
+  });
+});

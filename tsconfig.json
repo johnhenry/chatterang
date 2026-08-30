@@ -29,8 +29,10 @@
 
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@chatterang/contracts": ["packages/contracts/src/index.ts"],
+      "@chatterang/contracts/*": ["packages/contracts/src/*.ts"]
     }
   },
-  "include": ["src", "tests", "vite.config.ts", "capacitor.config.ts"]
+  "include": ["src", "tests", "packages/*/src", "vite.config.ts", "capacitor.config.ts"]
 }
