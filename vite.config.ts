@@ -16,6 +16,12 @@ export default defineConfig({
       // types-only, so there is nothing to compile and a build step here would
       // only add a way for the two to drift.
       '@chatterang/contracts': fileURLToPath(new URL('./packages/contracts/src', import.meta.url)),
+      // Node-only, so it is never part of a web build — but the tests import
+      // it, and resolving through the workspace symlink instead would make the
+      // suite depend on `npm install` having linked it.
+      '@chatterang/inference-node': fileURLToPath(
+        new URL('./packages/inference-node/src', import.meta.url),
+      ),
     },
   },
   server: {

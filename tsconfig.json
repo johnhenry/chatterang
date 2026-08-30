@@ -31,7 +31,8 @@
     "paths": {
       "@/*": ["src/*"],
       "@chatterang/contracts": ["packages/contracts/src/index.ts"],
-      "@chatterang/contracts/*": ["packages/contracts/src/*.ts"]
+      "@chatterang/contracts/*": ["packages/contracts/src/*.ts"],
+      "@chatterang/inference-node": ["packages/inference-node/src/index.ts"]
     }
   },
   "include": ["src", "tests", "packages/*/src", "vite.config.ts", "capacitor.config.ts"]
