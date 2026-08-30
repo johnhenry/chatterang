@@ -1,4 +1,5 @@
 import { Suspense, lazy, useState, type ReactNode } from 'react';
+import { AttachmentImage } from '@/features/chat/AttachmentImage';
 
 import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
@@ -39,10 +40,7 @@ export function MessageView({
             {message.attachments.map((attachment) =>
               attachment.kind === 'image' ? (
                 <div className="attachment" key={attachment.id}>
-                  <img
-                    src={`data:${attachment.mediaType};base64,${attachment.data}`}
-                    alt="Attached image"
-                  />
+                  <AttachmentImage id={attachment.id} alt="Attachment" />
                 </div>
               ) : null,
             )}

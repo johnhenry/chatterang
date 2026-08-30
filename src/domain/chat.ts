@@ -15,8 +15,12 @@ export interface ImageAttachment {
   readonly kind: 'image';
   readonly id: string;
   readonly mediaType: string;
-  /** Base64 payload, without the data-URI prefix. */
-  readonly data: string;
+  /**
+   * Size of the payload, for labelling. The bytes themselves live in the
+   * `blobs` table keyed by this attachment's id — see src/lib/blobs.ts for why
+   * they are not inline any more.
+   */
+  readonly bytes?: number;
   readonly width?: number;
   readonly height?: number;
 }
@@ -25,7 +29,8 @@ export interface AudioAttachment {
   readonly kind: 'audio';
   readonly id: string;
   readonly mediaType: string;
-  readonly data: string;
+  /** See ImageAttachment.bytes — the payload lives in the `blobs` table. */
+  readonly bytes?: number;
   readonly durationMs?: number;
   readonly transcript?: string;
 }

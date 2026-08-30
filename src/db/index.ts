@@ -83,6 +83,15 @@ export interface MarketplaceEntitlement {
   transactionId: string;
 }
 
+/** An attachment payload. See src/lib/blobs.ts for why these are not inline. */
+export interface StoredBlob {
+  readonly id: string;
+  readonly mediaType: string;
+  readonly data: Blob;
+  readonly bytes: number;
+  readonly createdAt: number;
+}
+
 export interface AppSetting {
   key: string;
   value: unknown;
@@ -99,6 +108,7 @@ class ChatterangDatabase extends Dexie {
   entitlements!: EntityTable<MarketplaceEntitlement, 'id'>;
   settings!: EntityTable<AppSetting, 'key'>;
   mcpServers!: EntityTable<McpServerConfig, 'id'>;
+  blobs!: EntityTable<StoredBlob, 'id'>;
 
   constructor() {
     super('chatterang');
@@ -118,6 +128,49 @@ class ChatterangDatabase extends Dexie {
     this.version(2).stores({
       mcpServers: 'id, name, enabled, createdAt',
     });
+    /*
+     * v3 moves attachment payloads out of the message row.
+     *
+     * They were stored inline as base64, so opening a conversation
+     * deserialised every image in it before rendering a character. The upgrade
+     * rewrites existing messages: each attachment's base64 becomes a Blob in
+     * `blobs` keyed by the attachment id, and the attachment keeps only its
+     * metadata.
+     *
+     * Done inside the Dexie upgrade transaction so it is atomic — a partial
+     * migration would leave attachments with neither inline data nor a blob
+     * row, which renders as a permanently broken image with no way back.
+     */
+    this.version(3)
+      .stores({ blobs: 'id, createdAt' })
+      .upgrade(async (tx) => {
+        const messages = await tx.table('messages').toArray();
+        for (const message of messages) {
+          const attachments = message.attachments as
+            | { id: string; mediaType: string; data?: string }[]
+            | undefined;
+          if (!attachments?.some((a) => typeof a.data === 'string')) continue;
+
+          const stripped = [];
+          for (const attachment of attachments) {
+            if (typeof attachment.data !== 'string') {
+              stripped.push(attachment);
+              continue;
+            }
+            const blob = base64ToBlobSync(attachment.data, attachment.mediaType);
+            await tx.table('blobs').put({
+              id: attachment.id,
+              mediaType: attachment.mediaType,
+              data: blob,
+              bytes: blob.size,
+              createdAt: message.createdAt ?? Date.now(),
+            });
+            const { data: _dropped, ...rest } = attachment;
+            stripped.push({ ...rest, bytes: blob.size });
+          }
+          await tx.table('messages').update(message.id, { attachments: stripped });
+        }
+      });
   }
 }
 
@@ -137,16 +190,27 @@ export async function writeSetting(key: string, value: unknown): Promise<void> {
 /* ── Cascading deletes ──────────────────────────────────────────────── */
 
 export async function deleteChat(chatId: string): Promise<void> {
-  await db.transaction('rw', db.chats, db.messages, async () => {
+  await db.transaction('rw', db.chats, db.messages, db.blobs, async () => {
+    const messages = await db.messages.where('chatId').equals(chatId).toArray();
+    // Attachment payloads live in their own table now, so deleting the
+    // conversation has to delete them too. Without this they orphan: rows no
+    // message references, which nothing ever cleans up and which no UI can
+    // show you. That is the growth problem this move was meant to fix,
+    // reappearing one table over.
+    const attachmentIds = messages.flatMap((m) => (m.attachments ?? []).map((a) => a.id));
+    if (attachmentIds.length > 0) await db.blobs.bulkDelete(attachmentIds);
     await db.messages.where('chatId').equals(chatId).delete();
     await db.chats.delete(chatId);
   });
 }
 
 export async function clearAllConversations(): Promise<void> {
-  await db.transaction('rw', db.chats, db.messages, async () => {
+  await db.transaction('rw', db.chats, db.messages, db.blobs, async () => {
     await db.messages.clear();
     await db.chats.clear();
+    // Every payload belonged to a conversation, so clearing them all clears
+    // these too.
+    await db.blobs.clear();
   });
 }
 
@@ -157,4 +221,19 @@ export async function clearAllConversations(): Promise<void> {
 export async function eraseEverything(): Promise<void> {
   await db.delete();
   await db.open();
+}
+
+/**
+ * Base64 -> Blob, duplicated from lib/blobs.ts on purpose.
+ *
+ * The Dexie upgrade runs during database open, before the module graph has
+ * necessarily settled, and importing from lib/blobs.ts would create a cycle:
+ * blobs.ts imports `db` from here. Twelve lines of duplication is the cheaper
+ * of the two problems.
+ */
+function base64ToBlobSync(data: string, mediaType: string): Blob {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mediaType });
 }

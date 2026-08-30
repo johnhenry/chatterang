@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { AttachmentImage } from '@/features/chat/AttachmentImage';
 
 import { Icon } from '@/ui/Icon';
+import { putBlob } from '@/lib/blobs';
 import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
@@ -60,12 +62,12 @@ export function Composer({
           toast(`${file.name} is too large — images must be under 12 MB.`, 'warn');
           continue;
         }
-        added.push({
-          kind: 'image',
-          id: newId('att'),
-          mediaType: file.type,
-          data: await toBase64(file),
-        });
+        // The payload goes to the blob table; the attachment keeps only what
+        // is needed to lay it out and label it. A File is already a Blob, so
+        // nothing is re-encoded here.
+        const id = newId('att');
+        await putBlob(id, file);
+        added.push({ kind: 'image', id, mediaType: file.type, bytes: file.size });
       }
 
       if (added.length > 0) setAttachments((current) => [...current, ...added]);
@@ -117,10 +119,7 @@ export function Composer({
           {attachments.map((attachment) =>
             attachment.kind === 'image' ? (
               <div className="attachment" key={attachment.id}>
-                <img
-                  src={`data:${attachment.mediaType};base64,${attachment.data}`}
-                  alt="Attachment preview"
-                />
+                <AttachmentImage id={attachment.id} alt="Attachment preview" />
                 <button
                   type="button"
                   className="attachment__remove"
@@ -231,12 +230,3 @@ export function Composer({
   );
 }
 
-async function toBase64(file: File): Promise<string> {
-  const buffer = new Uint8Array(await file.arrayBuffer());
-  let binary = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < buffer.length; i += CHUNK) {
-    binary += String.fromCharCode(...buffer.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}

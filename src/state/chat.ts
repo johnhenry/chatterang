@@ -8,6 +8,7 @@
 
 import { create } from 'zustand';
 
+import { blobToBase64 } from '@/lib/blobs';
 import { db, deleteChat } from '@/db';
 import {
   deriveTitle,
@@ -106,7 +107,7 @@ export const useChats = create<ChatState>((set, get) => ({
    * Re-estimate what the next prompt will cost. Cheap enough to run on every
    * thread change, and it is what drives the context readout in the rail.
    */
-  refreshContext() {
+  async refreshContext() {
     const chatId = get().activeChatId;
     const chat = chatId ? get().chats.find((entry) => entry.id === chatId) : undefined;
     if (!chat) {
@@ -122,7 +123,7 @@ export const useChats = create<ChatState>((set, get) => ({
       return;
     }
 
-    const built = buildMessages(chat, get().messages, 0, modelId as string);
+    const built = await buildMessages(chat, get().messages, 0, modelId as string);
     set({
       context: {
         used: built.fit.estimatedTokens,
@@ -370,7 +371,7 @@ async function runGeneration(
     });
   };
 
-  const built = buildMessages(
+  const built = await buildMessages(
     chat,
     get().messages,
     options.previousVariants ? 1 : 0,
@@ -587,12 +588,12 @@ export interface BuiltPrompt {
  * persona with it. `fitToContext` drops old turns instead and reports how
  * many, so the thread can say so.
  */
-function buildMessages(
+async function buildMessages(
   chat: Chat,
   messages: Message[],
   dropTail: number,
   modelId: string,
-): BuiltPrompt {
+): Promise<BuiltPrompt> {
   const personas = usePersonas.getState();
   const models = useModels.getState();
   const persona = chat.personaId ? personas.byId[chat.personaId] : undefined;
@@ -637,14 +638,25 @@ function buildMessages(
       continue;
     }
 
+    // Base64 is produced here, for the turns actually being sent — not held in
+    // every message row. An attachment whose payload has been deleted is
+    // dropped rather than sent as a dangling reference.
+    const encoded = await Promise.all(
+      images.map(async (image) => ({ image, data: await blobToBase64(image.id) })),
+    );
+
     const content: MessageContent[] = [
       { type: 'text', text: message.content },
-      ...images.map(
-        (image): MessageContent => ({
-          type: 'image',
-          source: { type: 'base64', mediaType: image.mediaType, data: image.data },
-        }),
-      ),
+      ...encoded
+        .filter((entry): entry is { image: (typeof images)[number]; data: string } =>
+          typeof entry.data === 'string',
+        )
+        .map(
+          ({ image, data }): MessageContent => ({
+            type: 'image',
+            source: { type: 'base64', mediaType: image.mediaType, data },
+          }),
+        ),
     ];
     result.push({ role: 'user', content });
   }
