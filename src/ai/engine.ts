@@ -542,7 +542,14 @@ function hasPromptApi(): boolean {
   return typeof (globalThis as { LanguageModel?: unknown }).LanguageModel !== 'undefined';
 }
 
-function readStats(custom: Record<string, unknown> | undefined): GenerationStatsSnapshot {
+/**
+ * The boundary where native metrics become UI state.
+ *
+ * Exported for tests. A metric the plugin reports but this function forgets is
+ * invisible everywhere downstream, which is exactly how `draftAcceptance`
+ * reached the UI layer plumbed but unread for so long.
+ */
+export function readStats(custom: Record<string, unknown> | undefined): GenerationStatsSnapshot {
   if (!custom) return {};
   const pick = (key: string): number | undefined =>
     typeof custom[key] === 'number' ? (custom[key] as number) : undefined;

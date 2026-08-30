@@ -109,6 +109,21 @@ export function MessageView({
             {Math.round((message.stats.cachedTokens / message.stats.promptTokens) * 100)}% cached
           </span>
         ) : null}
+
+        {/* Speculative decoding: how many tokens the small draft model
+            proposed that the large one accepted. The native layer has reported
+            this since the llama.cpp plugin landed and nothing has ever shown
+            it. It is the one number that says whether speculation is paying
+            for itself — a low rate means the draft model is being run for
+            nothing, and the fix is to turn it off or pick a closer draft. */}
+        {typeof message.stats?.draftAcceptance === 'number' ? (
+          <span
+            className="readout"
+            title={`${Math.round(message.stats.draftAcceptance * 100)}% of tokens proposed by the draft model were accepted. Below roughly 60% speculative decoding usually costs more than it saves.`}
+          >
+            {Math.round(message.stats.draftAcceptance * 100)}% draft
+          </span>
+        ) : null}
       </div>
 
       {message.provenance?.fallbackFrom ? (
