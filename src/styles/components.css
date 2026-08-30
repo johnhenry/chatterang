@@ -598,6 +598,12 @@
   line-height: var(--lh-snug);
 }
 
+.field__error {
+  font-size: var(--t-xs);
+  color: var(--crit);
+  line-height: var(--lh-snug);
+}
+
 .input,
 .textarea,
 .select {

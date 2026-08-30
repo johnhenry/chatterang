@@ -7,6 +7,7 @@ import { useChats } from '@/state/chat';
 import { usePersonas } from '@/state/personas';
 import { useBench } from '@/state/bench';
 import { useImages } from '@/state/images';
+import { useMcp } from '@/state/mcp';
 
 import { ChatScreen } from '@/features/chat/ChatScreen';
 import { ModelsScreen } from '@/features/models/ModelsScreen';
@@ -42,6 +43,10 @@ export function App(): ReactNode {
         useChats.getState().load(),
         useBench.getState().load(),
         useImages.getState().load(),
+        // Connects any enabled MCP servers and registers their tools. Failures
+        // are contained in the store's own state — an unreachable server must
+        // not stop the app booting.
+        useMcp.getState().load(),
       ]);
     })();
   }, [initialize]);

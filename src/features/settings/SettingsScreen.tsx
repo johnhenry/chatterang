@@ -10,6 +10,8 @@ import { osVoicesReady, speak, type VoiceOption } from '@/lib/voice';
 import { useApp, type ThemeChoice, type VoiceMode } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
 import { ProvidersPanel } from '@/features/settings/ProvidersPanel';
+import { McpPanel } from '@/features/settings/McpPanel';
+import { useMcp } from '@/state/mcp';
 import { ShellSheet } from '@/features/shell/ShellSheet';
 
 export function SettingsScreen(): ReactNode {
@@ -21,6 +23,12 @@ export function SettingsScreen(): ReactNode {
   const neuralVoices = useModels(useShallow((state) => modelsWith(state, 'audio-out')));
 
   const [providers, setProviders] = useState(false);
+  const [mcp, setMcp] = useState(false);
+  // Tools currently offered by connected MCP servers, for the section chip.
+  const mcpToolCount = Object.values(useMcp((state) => state.states)).reduce(
+    (n, entry) => n + entry.toolCount,
+    0,
+  );
   const [shell, setShell] = useState(false);
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [confirmClearChats, setConfirmClearChats] = useState(false);
@@ -239,6 +247,30 @@ export function SettingsScreen(): ReactNode {
               </button>
             </div>
 
+            {/* ── MCP servers ────────────────────────────────────────── */}
+            <div className="section">
+              <div className="section__head">
+                <h2 className="grow">MCP servers</h2>
+                {mcpToolCount > 0 ? (
+                  <span className="chip chip--remote">
+                    <Icon name="cloud" size={11} />
+                    {mcpToolCount} tools
+                  </span>
+                ) : null}
+              </div>
+              <p className="section__hint">
+                Optional. Adds tools the model can call on servers you choose — their arguments
+                leave this device when called, and every one has to be enabled per chat.
+              </p>
+              <button
+                type="button"
+                className="btn btn--secondary btn--block"
+                onClick={() => setMcp(true)}
+              >
+                Manage servers
+              </button>
+            </div>
+
             {/* ── Downloads ──────────────────────────────────────────── */}
             <div className="section">
               <div className="section__head">
@@ -367,6 +399,10 @@ export function SettingsScreen(): ReactNode {
 
       <Sheet open={providers} title="Remote providers" onClose={() => setProviders(false)}>
         <ProvidersPanel />
+      </Sheet>
+
+      <Sheet open={mcp} title="MCP servers" onClose={() => setMcp(false)}>
+        <McpPanel />
       </Sheet>
 
       <AboutSheet open={about} onClose={() => setAbout(false)} />
