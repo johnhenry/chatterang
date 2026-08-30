@@ -8,6 +8,8 @@
  * phase is purely additive here.
  */
 
+import type { ComputeBackendId } from '@chatterang/contracts';
+
 /** Engine ids map 1:1 onto aimatey backend-adapter registration names. */
 export const ENGINE_IDS = [
   'llama-cpp', // Phase 1 — core LLM/VLM (GGUF)
@@ -85,7 +87,15 @@ export type Capability =
   | 'draft'; // usable as a speculative-decoding draft model
 
 /** Compute backends, ordered worst-to-best; the loader walks this downward. */
-export type ComputeBackend = 'cpu' | 'gpu-metal' | 'gpu-opencl' | 'gpu-vulkan' | 'npu-hexagon';
+/**
+ * Re-exported from the plugin contract rather than redeclared.
+ *
+ * This was an independent copy with identical members, which meant widening one
+ * silently diverged it from the other — and this is the copy that gets
+ * persisted (`db.models.lastBackend`) while the contract's is what a plugin
+ * reports. One declaration, one source of truth.
+ */
+export type ComputeBackend = ComputeBackendId;
 
 export interface ModelSource {
   /** Hugging Face repo id, e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF". */

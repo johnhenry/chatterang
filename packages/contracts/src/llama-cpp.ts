@@ -11,7 +11,23 @@
 
 import type { ListenerHandle } from './listener.js';
 
-export type ComputeBackendId = 'cpu' | 'gpu-metal' | 'gpu-opencl' | 'gpu-vulkan' | 'npu-hexagon';
+/**
+ * Compute backends any implementation may report.
+ *
+ * Widening only: every member that has ever been persisted stays valid, so
+ * adding one needs no migration. Removing or renaming one would.
+ *
+ * `gpu-cuda` is the desktop addition — node-llama-cpp builds for cuda, metal
+ * and vulkan, and the latter two were already here for mobile. There is no
+ * `gpu-rocm` because node-llama-cpp does not build for it.
+ */
+export type ComputeBackendId =
+  | 'cpu'
+  | 'gpu-metal'
+  | 'gpu-opencl'
+  | 'gpu-vulkan'
+  | 'gpu-cuda'
+  | 'npu-hexagon';
 
 export interface DeviceCapabilities {
   /** Total physical RAM in bytes. */

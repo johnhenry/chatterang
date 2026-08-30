@@ -1,0 +1,12 @@
+{
+  "name": "@chatterang/inference-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node implementations of the Chatterang plugin contracts, over node-llama-cpp and onnxruntime-node.",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@chatterang/contracts": "*",
+    "node-llama-cpp": "3.20.0"
+  }
+}
