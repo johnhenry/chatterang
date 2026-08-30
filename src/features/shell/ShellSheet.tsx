@@ -42,6 +42,9 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
   const history = useRef<string[]>([]);
   const historyAt = useRef(-1);
   const nextId = useRef(0);
+  // `run` is useCallback([]) so it cannot read `busy` from state. This is the
+  // re-entrancy guard that `disabled` used to provide.
+  const busyRef = useRef(false);
 
   // The shell — and the ~355 kB of `just-bash` behind it — is built on first
   // open, never at startup.
@@ -58,10 +61,17 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
     void shell.current
       .ready()
       .catch(() => undefined)
-      .finally(() => {
-        setBooting(false);
-        field.current?.focus();
-      });
+      .finally(() => setBooting(false));
+  }, [open]);
+
+  // Opening the terminal puts the caret in the prompt — every time, not only
+  // the first. The boot effect above early-returns on reopen, so this cannot
+  // live there. `Sheet` is a child, and React runs child effects first, so its
+  // focus-the-first-button fallback lands and this overrides it in the same
+  // commit. A readOnly field is still focusable, so `booting` does not block.
+  useEffect(() => {
+    if (!open) return;
+    field.current?.focus();
   }, [open]);
 
   useEffect(() => {
@@ -70,7 +80,7 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
 
   const run = useCallback(async (commandLine: string) => {
     const trimmed = commandLine.trim();
-    if (!trimmed || !shell.current) return;
+    if (!trimmed || !shell.current || busyRef.current) return;
 
     if (trimmed === 'clear') {
       setEntries([]);
@@ -84,6 +94,7 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
     const id = nextId.current++;
     setEntries((current) => [...current, { id, command: trimmed, result: null }]);
     setInput('');
+    busyRef.current = true;
     setBusy(true);
 
     // Re-project app state before each command, so the filesystem reflects
@@ -94,13 +105,8 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
     setEntries((current) =>
       current.map((entry) => (entry.id === id ? { ...entry, result } : entry)),
     );
+    busyRef.current = false;
     setBusy(false);
-
-    // A terminal never takes focus away from you. The field is `disabled` while
-    // a command runs, and a disabled element cannot hold focus — so the browser
-    // drops it to <body> on every submit and the next keystroke goes nowhere.
-    // Restoring it after the re-enable is what makes type-run-type work.
-    requestAnimationFrame(() => field.current?.focus());
   }, []);
 
   return (
@@ -116,6 +122,10 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
           className="term"
           ref={scroller}
           onMouseUp={() => {
+            // Desktop convention only. On touch it inverts: tapping the
+            // transcript is how you dismiss the keyboard, and WebKit
+            // synthesises mouseup on tap, so this would re-summon it.
+            if (!window.matchMedia('(pointer: fine)').matches) return;
             // Do not steal focus mid-selection: a user dragging to copy output
             // is not asking to type.
             if ((window.getSelection()?.toString().length ?? 0) > 0) return;
@@ -187,7 +197,8 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
             ref={field}
             className="term__field"
             value={input}
-            disabled={busy || booting}
+            readOnly={busy || booting}
+            aria-disabled={busy || booting}
             spellCheck={false}
             autoCapitalize="none"
             autoCorrect="off"
@@ -219,6 +230,8 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
           <button
             type="submit"
             className="icon-btn"
+            // Keep the caret in the prompt when Run is clicked with a mouse.
+            onMouseDown={(event) => event.preventDefault()}
             disabled={busy || booting || !input.trim()}
             aria-label="Run"
           >

@@ -65,7 +65,12 @@ interface BashInstance {
 }
 
 interface JustBashModule {
-  Bash: new (options: { fs?: unknown; customCommands?: unknown[] }) => BashInstance;
+  Bash: new (options: {
+    fs?: unknown;
+    customCommands?: unknown[];
+    /** Starting directory. Defaults to /home/user, which this VFS does not mount. */
+    cwd?: string;
+  }) => BashInstance;
   InMemoryFs: new () => unknown;
   defineCommand: (
     name: string,
@@ -123,7 +128,14 @@ export class ChatterangShell {
       }),
     );
 
-    const bash = new Bash({ fs: new InMemoryFs(), customCommands });
+    // `cwd: '/'` is not cosmetic. just-bash defaults to /home/user, which this
+    // VFS never mounts — so a bare `ls` returned empty with exit 0, which the
+    // renderer prints as a green "ok", and `cat README.md` failed although
+    // /README.md exists. The first thing anyone types in a shell is `ls`, and
+    // it reported success while showing nothing. The mounts are all at root
+    // and the help text advertises /chats, /models and /personas, so root is
+    // where the prompt belongs.
+    const bash = new Bash({ fs: new InMemoryFs(), customCommands, cwd: '/' });
 
     this.#bash = bash;
     await this.mount();

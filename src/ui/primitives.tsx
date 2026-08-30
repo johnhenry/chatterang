@@ -30,13 +30,30 @@ export function Sheet({ open, title, onClose, children, footer }: SheetProps): R
   const panel = useRef<HTMLDivElement>(null);
   const titleId = useId();
 
+  /*
+   * The effect below does open/close-only work — attach a key handler, focus
+   * the first control, restore focus on unmount. Keeping `onClose` in its deps
+   * made it re-run whenever the *parent* re-rendered with a new inline arrow,
+   * which tore down and re-ran the whole thing: focus jumped back to the first
+   * button. SettingsScreen passes inline arrows and subscribes to `storage`,
+   * so a background model download ticking progress moved the caret out of
+   * whatever the user was typing in — and on iOS collapsed the keyboard.
+   *
+   * Latest-ref, assigned in an effect rather than during render, so the
+   * handler always calls the current onClose without being a dependency.
+   */
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+
   useEffect(() => {
     if (!open) return undefined;
 
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== 'Tab' || !panel.current) return;
@@ -65,7 +82,7 @@ export function Sheet({ open, title, onClose, children, footer }: SheetProps): R
       document.removeEventListener('keydown', onKeyDown);
       previous?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
