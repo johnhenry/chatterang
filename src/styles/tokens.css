@@ -65,6 +65,25 @@
   --hairline: 1px;
   --tap: 44px; /* minimum comfortable touch target */
 
+  /* ---- Size layer -------------------------------------------------------
+   * Everything above is size-agnostic. These four change per tier, and are the
+   * only things that do — so a breakpoint adds a block here rather than a rule
+   * in the component sheet.
+   *
+   * --measure is the width of the TEXT, not of its container. Each container
+   * adds its own padding on top, so the thread and the composer align to the
+   * same text edge rather than the same box edge.
+   *
+   * `ch` is the advance of "0", not the average glyph. Archivo's digit is
+   * ~0.57em, so 66ch is roughly 64 rendered characters at --t-base.
+   */
+  --measure: 66ch;
+  --content-wide: 100%;
+  --rail-w: 232px;
+  --nav-h: 76px;
+  --pad-screen: var(--s-4);
+  --icon-btn: 36px;
+
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
   --dur-fast: 120ms;
@@ -113,6 +132,25 @@
   --shadow-lg: 0 24px 48px -16px rgb(35 26 21 / 0.24), 0 2px 8px rgb(35 26 21 / 0.08);
   --glow-ember: 0 0 0 1px rgb(194 75 24 / 0.28), 0 4px 20px -6px rgb(194 75 24 / 0.36);
 }
+
+/* Medium: the phone stops being a phone. Content gets a cap, padding opens up. */
+@media (min-width: 600px) {
+  :root {
+    --content-wide: 680px;
+    --pad-screen: var(--s-5);
+  }
+}
+
+/* Wide: the rail appears (components.css). 920 rather than 860 is arithmetic,
+ * not taste — see the invariant in tests/layout.test.ts. With a 232px rail and
+ * a 680px medium cap, anything below 912 makes the reading column narrower as
+ * it crosses, which is what 860 did. */
+@media (min-width: 920px) {
+  :root {
+    --content-wide: 900px;
+  }
+}
+
 
 /* Dark is the design's home: a local-inference workbench is a dark-room tool.
    Applied for `prefers-color-scheme: dark` unless the viewer explicitly chose

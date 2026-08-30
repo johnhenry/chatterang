@@ -20,6 +20,27 @@ function block(selector: string): string {
 }
 
 /**
+ * Every `@media (min-width: Npx)` threshold in the sheet, ascending.
+ *
+ * The wide-screen test used to slice from the literal string
+ * `@media (min-width: 860px)`, which made retuning the ladder fail a test whose
+ * subject is not the threshold. Parse instead, so the assertion is about what
+ * the widest tier *does*, not where it starts.
+ */
+function thresholds(): number[] {
+  return [...css.matchAll(/@media \(min-width:\s*(\d+)px\)/g)]
+    .map((m) => Number(m[1]))
+    .sort((a, b) => a - b);
+}
+
+/** The body of the widest `min-width` block. */
+function widestBlock(): string {
+  const widest = thresholds().at(-1);
+  if (widest === undefined) throw new Error('No min-width media query found');
+  return css.slice(css.indexOf(`@media (min-width: ${widest}px)`));
+}
+
+/**
  * Guards the app shell's grid.
  *
  * The shell had a real bug: rows were assigned by auto-placement, so when the
@@ -66,7 +87,17 @@ describe('app shell grid', () => {
 
 describe('wide-screen shell', () => {
   it('re-lays the same named areas rather than reordering children', () => {
-    const wide = css.slice(css.indexOf('@media (min-width: 860px)'));
-    expect(wide).toMatch(/'nav banner'\s*'nav rail'\s*'nav body'/);
+    expect(widestBlock()).toMatch(/'nav banner'\s*'nav rail'\s*'nav body'/);
+  });
+
+  it('opens the rail wide enough that the reading column never narrows', () => {
+    // The ladder's one arithmetic constraint. When the rail appears at
+    // breakpoint B and takes --rail-w, the body column becomes B - rail. If
+    // that is less than the medium tier's content cap, crossing the breakpoint
+    // makes the reading column *narrower* — which is what the 860px rail did
+    // against a 760px cap that only existed above it.
+    const rail = 232;
+    const mediumCap = 680;
+    expect(thresholds().at(-1)).toBeGreaterThanOrEqual(rail + mediumCap);
   });
 });

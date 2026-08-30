@@ -10,7 +10,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b --noEmit false && vite build",
+    "build": "tsc -b && vite build",
     "build:web": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty",

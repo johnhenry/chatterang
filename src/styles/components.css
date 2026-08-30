@@ -266,10 +266,13 @@
 }
 
 .screen__pad {
-  padding: var(--s-4);
+  padding: var(--pad-screen);
   display: flex;
   flex-direction: column;
   gap: var(--s-4);
+  width: 100%;
+  max-width: var(--content-wide);
+  margin-inline: auto;
 }
 
 .section {
@@ -725,12 +728,28 @@
 
 /* ══ Chat ════════════════════════════════════════════════════════════ */
 
+/*
+ * The measure lives here, not inside a breakpoint.
+ *
+ * It used to sit inside `@media (min-width: 860px)`, which meant text was
+ * uncapped below the breakpoint (a ~95-character line on a landscape phone)
+ * and capped above it. Worse, crossing 860 also introduced the 232px rail, so
+ * the reading column went from 859px to 629px — it got *narrower* as the
+ * screen got wider. Capping at the base layer and letting the rail arrive
+ * later (920px, see tokens.css) makes the column grow monotonically.
+ *
+ * --measure is the text width; the padding is added on top so .thread and
+ * .composer__row align to the same text edge.
+ */
 .thread {
   display: flex;
   flex-direction: column;
   gap: var(--s-5);
-  padding: var(--s-4) var(--s-4) var(--s-6);
+  padding: var(--s-4) var(--pad-screen) var(--s-6);
   min-width: 0;
+  width: 100%;
+  max-width: calc(var(--measure) + 2 * var(--pad-screen));
+  margin-inline: auto;
 }
 
 .msg {
@@ -859,6 +878,11 @@
   display: flex;
   align-items: flex-end;
   gap: var(--s-2);
+  width: 100%;
+  /* Same expression as .thread: the composer's text edge has to line up with
+     the messages above it, so it follows --measure rather than --content-wide. */
+  max-width: calc(var(--measure) + 2 * var(--pad-screen));
+  margin-inline: auto;
 }
 
 .composer__input {
@@ -907,6 +931,9 @@
   display: flex;
   gap: var(--s-2);
   flex-wrap: wrap;
+  width: 100%;
+  max-width: calc(var(--measure) + 2 * var(--pad-screen));
+  margin-inline: auto;
 }
 
 .attachment {
@@ -1459,7 +1486,7 @@
   position: fixed;
   left: var(--s-4);
   right: var(--s-4);
-  bottom: calc(env(safe-area-inset-bottom) + 76px);
+  bottom: calc(env(safe-area-inset-bottom) + var(--nav-h));
   z-index: var(--z-toast);
   display: flex;
   flex-direction: column;
@@ -1560,14 +1587,14 @@
 /* Capacitor targets phones first; on tablets and desktop the tab bar becomes
    a side rail and the content column stops stretching. */
 
-@media (min-width: 860px) {
+@media (min-width: 920px) {
   .app {
     grid-template-areas:
       'nav banner'
       'nav rail'
       'nav body';
     grid-template-rows: auto auto 1fr;
-    grid-template-columns: 232px minmax(0, 1fr);
+    grid-template-columns: var(--rail-w) minmax(0, 1fr);
   }
 
   .tabbar {
@@ -1604,15 +1631,6 @@
   .tabbar__label {
     font-size: var(--t-sm);
     font-variation-settings: 'wdth' var(--wdth-normal);
-  }
-
-  .thread,
-  .screen__pad,
-  .composer__row,
-  .composer__attachments {
-    max-width: 760px;
-    margin-inline: auto;
-    width: 100%;
   }
 
   .sheet {

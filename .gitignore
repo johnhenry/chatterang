@@ -12,3 +12,12 @@ models/
 *.gguf
 *.onnx
 *.litertlm
+
+# tsc emit that lands beside sources when --noEmit is overridden. Vite resolves
+# .js before .tsx for extensionless imports, so a stale sibling silently shadows
+# the real source in dev. `npm run build` no longer emits these; this is a guard.
+src/**/*.js
+src/**/*.js.map
+tests/**/*.js
+tests/**/*.js.map
+/capacitor.config.js
