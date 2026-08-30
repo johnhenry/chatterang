@@ -28,6 +28,11 @@
   --t-sm: 0.8125rem; /* 13 — secondary */
   --t-base: 0.9375rem; /* 15 — body */
   --t-md: 1.0625rem; /* 17 — lead */
+  /* 16 — the floor for text-entry controls. iOS Safari zooms the viewport when
+     a focused control computes below 16px, which is the only real reason to
+     reach for `user-scalable=no`. Setting the floor instead keeps pinch-zoom
+     working (WCAG 1.4.4) without the focus jump. */
+  --t-control: 1rem;
   --t-lg: 1.3125rem; /* 21 — section head */
   --t-xl: 1.625rem; /* 26 — screen title */
   --t-2xl: 2.125rem; /* 34 — display */

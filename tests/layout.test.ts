@@ -101,3 +101,46 @@ describe('wide-screen shell', () => {
     expect(thresholds().at(-1)).toBeGreaterThanOrEqual(rail + mediumCap);
   });
 });
+
+/**
+ * Pinch-zoom, and the reason it was disabled.
+ *
+ * The viewport carried `maximum-scale=1.0, user-scalable=no`, which fails
+ * WCAG 1.4.4 (Resize Text) outright — and iOS Safari has ignored it since 10
+ * anyway, so it bought nothing on the platform it was presumably added for.
+ *
+ * The real motivation for that flag is always the same: iOS zooms the viewport
+ * when a focused form control computes below 16px. The fix is the floor, not
+ * the lock. These two assertions are a pair — remove the floor and someone will
+ * reintroduce the lock to stop the zooming.
+ */
+describe('viewport and text-entry controls', () => {
+  const html = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
+  const tokens = readFileSync(resolve(process.cwd(), 'src/styles/tokens.css'), 'utf8');
+
+  it('does not disable pinch-zoom', () => {
+    const viewport = html.match(/name="viewport"[\s\S]*?content="([^"]*)"/)?.[1] ?? '';
+    expect(viewport).not.toMatch(/user-scalable\s*=\s*no/);
+    expect(viewport).not.toMatch(/maximum-scale/);
+  });
+
+  it('keeps viewport-fit=cover, which the safe-area insets depend on', () => {
+    const viewport = html.match(/name="viewport"[\s\S]*?content="([^"]*)"/)?.[1] ?? '';
+    expect(viewport).toContain('viewport-fit=cover');
+  });
+
+  it('floors text-entry controls at 16px so iOS does not zoom on focus', () => {
+    expect(tokens).toMatch(/--t-control:\s*1rem/);
+    // Every control that takes text must use it. A control left on the body
+    // scale (15px) reintroduces the focus zoom this pair exists to prevent.
+    for (const rule of ['.composer__input', '.term__field']) {
+      const start = css.indexOf(`\n${rule} {`);
+      expect(start, `${rule} not found`).toBeGreaterThan(-1);
+      expect(css.slice(start, css.indexOf('}', start))).toContain('font-size: var(--t-control)');
+    }
+    // The shared .input/.textarea/.select rule.
+    const shared = css.indexOf('\n.input,\n.textarea,\n.select {');
+    expect(shared).toBeGreaterThan(-1);
+    expect(css.slice(shared, css.indexOf('}', shared))).toContain('font-size: var(--t-control)');
+  });
+});

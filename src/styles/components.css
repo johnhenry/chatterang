@@ -606,7 +606,7 @@
   border: var(--hairline) solid var(--line);
   border-radius: var(--r-sm);
   padding: var(--s-2) var(--s-3);
-  font-size: var(--t-base);
+  font-size: var(--t-control);
   color: var(--ink);
   min-height: 38px;
   transition: border-color var(--dur-fast) var(--ease-out);
@@ -894,7 +894,7 @@
   border: var(--hairline) solid var(--line);
   border-radius: var(--r-md);
   padding: var(--s-2) var(--s-3);
-  font-size: var(--t-base);
+  font-size: var(--t-control);
   line-height: var(--lh-snug);
 }
 
@@ -1257,7 +1257,12 @@
   flex: 1;
   min-width: 0;
   font-family: var(--font-mono);
-  font-size: var(--t-sm);
+  /* 16px, not the 13px of .term__out. A terminal wants density, but iOS
+     zooms the viewport on any focused control below 16px, and this is a
+     field you type in repeatedly. The input line reads slightly larger than
+     the transcript as a result -- a deliberate trade for not fighting the
+     viewport on every keystroke. */
+  font-size: var(--t-control);
   color: var(--ink);
 }
 
