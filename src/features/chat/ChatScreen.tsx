@@ -14,6 +14,7 @@ import type { Attachment, Chat, Message } from '@/domain/chat';
 import { Composer } from '@/features/chat/Composer';
 import { MessageView } from '@/features/chat/MessageView';
 import { SamplerPanel } from '@/features/chat/SamplerPanel';
+import { exportConversation } from '@/lib/export';
 
 export function ChatScreen(): ReactNode {
   const chats = useChats((state) => state.chats);
@@ -363,6 +364,24 @@ function ChatSettingsSheet({
   const models = useModels(useShallow(installedModels));
   const connections = useApp((state) => state.connections);
   const update = useChats((state) => state.updateChat);
+  const toast = useApp((state) => state.toast);
+  const [exporting, setExporting] = useState(false);
+
+  // Declared before the early return so the hook order is stable; `chat` is
+  // re-checked inside.
+  const runExport = useCallback(async () => {
+    if (!chat) return;
+    setExporting(true);
+    try {
+      const outcome = await exportConversation(chat);
+      // A dismissed share sheet is not a failure — the user changed their mind.
+      if (outcome === 'downloaded') toast('Conversation exported.');
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Export failed.', 'warn');
+    } finally {
+      setExporting(false);
+    }
+  }, [chat, toast]);
 
   if (!chat) return null;
 
@@ -476,6 +495,25 @@ function ChatSettingsSheet({
       </div>
 
       <SamplerPanel chat={chat} />
+
+      <div className="section">
+        <div className="section__head">
+          <h2>Export</h2>
+        </div>
+        <p className="section__hint">
+          Markdown, including which turns ran on this device and which went to a provider — a
+          transcript that hid that would undo the point of marking it.
+        </p>
+        <button
+          type="button"
+          className="btn btn--secondary btn--block"
+          disabled={exporting}
+          onClick={() => void runExport()}
+        >
+          <Icon name="download" size={16} />
+          {exporting ? 'Preparing…' : 'Export conversation'}
+        </button>
+      </div>
     </Sheet>
   );
 }
