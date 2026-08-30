@@ -1,0 +1,198 @@
+/*
+ * Chatterang design tokens
+ * ────────────────────
+ * Direction: "instrument panel, warmly lit."
+ *
+ * The subject is a device doing real thermodynamic work in your hand. The
+ * neutrals are therefore iron-and-clay warm (red-biased), never the default
+ * blue-black of developer tooling. Two accents carry real information rather
+ * than decoration:
+ *
+ *   ember  → work happening ON THIS DEVICE (local engines, on-device models)
+ *   slate  → work leaving the device (remote providers, uploads, sync)
+ *
+ * That distinction is load-bearing for a privacy-first app: a glance at the
+ * colour of a message tells you whether it left your phone.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* ── Type ─────────────────────────────────────────────────────────── */
+  --font-ui: 'Archivo', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'Menlo', monospace;
+
+  /* Scale — minor third (1.2), anchored at 15px for dense mobile reading. */
+  --t-2xs: 0.6875rem; /* 11 — instrument labels */
+  --t-xs: 0.75rem; /* 12 — captions, chips */
+  --t-sm: 0.8125rem; /* 13 — secondary */
+  --t-base: 0.9375rem; /* 15 — body */
+  --t-md: 1.0625rem; /* 17 — lead */
+  --t-lg: 1.3125rem; /* 21 — section head */
+  --t-xl: 1.625rem; /* 26 — screen title */
+  --t-2xl: 2.125rem; /* 34 — display */
+  --t-3xl: 2.875rem; /* 46 — hero numeral */
+
+  --lh-tight: 1.15;
+  --lh-snug: 1.35;
+  --lh-body: 1.6;
+
+  /* Archivo is a variable font with a width axis; expanded headings and
+     condensed data labels are the signature, not extra families. */
+  --wdth-condensed: 88;
+  --wdth-normal: 100;
+  --wdth-expanded: 112;
+
+  /* ── Space ────────────────────────────────────────────────────────── */
+  --s-1: 0.25rem;
+  --s-2: 0.5rem;
+  --s-3: 0.75rem;
+  --s-4: 1rem;
+  --s-5: 1.5rem;
+  --s-6: 2rem;
+  --s-7: 3rem;
+  --s-8: 4rem;
+
+  /* ── Form ─────────────────────────────────────────────────────────── */
+  /* Machined, not pillowy: small consistent radii, one large for sheets. */
+  --r-xs: 3px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 16px;
+  --r-sheet: 22px;
+  --r-full: 999px;
+
+  --hairline: 1px;
+  --tap: 44px; /* minimum comfortable touch target */
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 120ms;
+  --dur: 220ms;
+  --dur-slow: 420ms;
+
+  --z-rail: 10;
+  --z-sheet: 40;
+  --z-toast: 60;
+
+  /* ── Light palette (the un-stamped default is resolved below) ──────── */
+  --ground: #f7f2ed;
+  --surface: #fffdfb;
+  --surface-2: #f1e9e1;
+  --surface-3: #e7dcd2;
+  --overlay: rgb(35 26 21 / 0.42);
+
+  --line: #ded1c5;
+  --line-strong: #c9b8a9;
+
+  --ink: #231a15;
+  --ink-2: #574840;
+  --ink-3: #877468;
+  --ink-inverse: #fbf7f4;
+
+  --ember: #c24b18;
+  --ember-hot: #a83e11;
+  --ember-soft: #f6e2d4;
+  --ember-line: #eaba97;
+  --on-ember: #fff6f0;
+
+  --slate: #3d7a8c;
+  --slate-soft: #e0edf1;
+  --slate-line: #a9cdd8;
+  --on-slate: #f3fbfd;
+
+  --good: #4b7c3a;
+  --good-soft: #e5f0df;
+  --warn: #9a6d12;
+  --warn-soft: #f8ecd2;
+  --crit: #b02d43;
+  --crit-soft: #fadfe3;
+
+  --shadow-sm: 0 1px 2px rgb(35 26 21 / 0.07), 0 1px 1px rgb(35 26 21 / 0.04);
+  --shadow-md: 0 4px 16px -4px rgb(35 26 21 / 0.14), 0 1px 3px rgb(35 26 21 / 0.06);
+  --shadow-lg: 0 24px 48px -16px rgb(35 26 21 / 0.24), 0 2px 8px rgb(35 26 21 / 0.08);
+  --glow-ember: 0 0 0 1px rgb(194 75 24 / 0.28), 0 4px 20px -6px rgb(194 75 24 / 0.36);
+}
+
+/* Dark is the design's home: a local-inference workbench is a dark-room tool.
+   Applied for `prefers-color-scheme: dark` unless the viewer explicitly chose
+   light, and again for an explicit dark choice, so both directions win. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --ground: #17120f;
+    --surface: #211a16;
+    --surface-2: #2c2320;
+    --surface-3: #392e29;
+    --overlay: rgb(10 7 5 / 0.66);
+
+    --line: #392e29;
+    --line-strong: #52423a;
+
+    --ink: #f2e9e2;
+    --ink-2: #c2b1a6;
+    --ink-3: #94806f;
+    --ink-inverse: #1a1411;
+
+    --ember: #e8622c;
+    --ember-hot: #f59e5b;
+    --ember-soft: #3a2018;
+    --ember-line: #7a3c1f;
+    --on-ember: #1a0d06;
+
+    --slate: #6fa8b8;
+    --slate-soft: #16292f;
+    --slate-line: #2f5560;
+    --on-slate: #08181d;
+
+    --good: #7fb069;
+    --good-soft: #1c2a17;
+    --warn: #e3b23c;
+    --warn-soft: #2e2410;
+    --crit: #d6455d;
+    --crit-soft: #2f141a;
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
+    --shadow-md: 0 6px 20px -6px rgb(0 0 0 / 0.6), 0 1px 3px rgb(0 0 0 / 0.4);
+    --shadow-lg: 0 28px 56px -20px rgb(0 0 0 / 0.72), 0 2px 10px rgb(0 0 0 / 0.5);
+    --glow-ember: 0 0 0 1px rgb(232 98 44 / 0.4), 0 6px 28px -8px rgb(232 98 44 / 0.45);
+  }
+}
+
+:root[data-theme='dark'] {
+  --ground: #17120f;
+  --surface: #211a16;
+  --surface-2: #2c2320;
+  --surface-3: #392e29;
+  --overlay: rgb(10 7 5 / 0.66);
+
+  --line: #392e29;
+  --line-strong: #52423a;
+
+  --ink: #f2e9e2;
+  --ink-2: #c2b1a6;
+  --ink-3: #94806f;
+  --ink-inverse: #1a1411;
+
+  --ember: #e8622c;
+  --ember-hot: #f59e5b;
+  --ember-soft: #3a2018;
+  --ember-line: #7a3c1f;
+  --on-ember: #1a0d06;
+
+  --slate: #6fa8b8;
+  --slate-soft: #16292f;
+  --slate-line: #2f5560;
+  --on-slate: #08181d;
+
+  --good: #7fb069;
+  --good-soft: #1c2a17;
+  --warn: #e3b23c;
+  --warn-soft: #2e2410;
+  --crit: #d6455d;
+  --crit-soft: #2f141a;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow-md: 0 6px 20px -6px rgb(0 0 0 / 0.6), 0 1px 3px rgb(0 0 0 / 0.4);
+  --shadow-lg: 0 28px 56px -20px rgb(0 0 0 / 0.72), 0 2px 10px rgb(0 0 0 / 0.5);
+  --glow-ember: 0 0 0 1px rgb(232 98 44 / 0.4), 0 6px 28px -8px rgb(232 98 44 / 0.45);
+}

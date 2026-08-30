@@ -1,0 +1,47 @@
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import { fileURLToPath, URL } from 'node:url';
+
+import pkg from './package.json' with { type: 'json' };
+
+export default defineConfig({
+  plugins: [react()],
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
+  resolve: {
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
+    },
+  },
+  server: {
+    port: 5273,
+    host: true,
+    headers: {
+      // Required for threaded WASM runtimes (LiteRT-LM, ONNX Runtime Web,
+      // wllama) that rely on SharedArrayBuffer.
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+    },
+  },
+  build: {
+    target: 'es2022',
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        // Keep the inference stack in its own chunk so the shell paints before
+        // any adapter code is parsed.
+        manualChunks(id: string) {
+          if (id.includes('@johnhenry/aimatey')) return 'aimatey';
+          return undefined;
+        },
+      },
+    },
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./tests/setup.ts'],
+    include: ['tests/**/*.test.{ts,tsx}'],
+  },
+});

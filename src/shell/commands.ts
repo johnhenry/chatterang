@@ -1,0 +1,508 @@
+/**
+ * Chatterang's own commands.
+ *
+ * These are app verbs, not POSIX ones — `model install`, `bench run`,
+ * `provider disable`. They are registered into the same shell instance as the
+ * bundled Unix commands, so `chatterang model list | grep vision` composes, and so
+ * the model and the person driving the app share one audited surface.
+ *
+ * Two rules hold this together:
+ *
+ *  1. **Nothing here reaches the network.** Commands read and write local
+ *     state. Downloading a model is the one exception and it is explicitly
+ *     marked, because a shell that can quietly fetch is a shell that can
+ *     quietly exfiltrate.
+ *  2. **Anything that changes state is `mutating`.** The model may not run a
+ *     mutating command without the user confirming it — see `ShellContext`.
+ */
+
+import { formatBytes, type Capability } from '@/domain/manifest';
+import { deriveTitle } from '@/domain/chat';
+
+export interface ShellOutput {
+  readonly stdout: string;
+  readonly stderr?: string;
+  readonly exitCode: number;
+}
+
+export interface ShellContext {
+  /**
+   * Ask the user to approve an action. Returns false when they declined.
+   *
+   * `network` is declared per *action*, not per command, because a single
+   * command spans both: `model use` only touches local state, while `model
+   * install` downloads. Gating at command granularity would either prompt for
+   * harmless things or wave through egress.
+   */
+  confirm(action: string, options?: { network?: boolean }): Promise<boolean>;
+  /** Who is driving: the person at the keyboard, or the model. */
+  readonly actor: 'user' | 'model';
+  readonly signal?: AbortSignal;
+}
+
+export interface ShellCommand {
+  readonly name: string;
+  readonly summary: string;
+  readonly usage: string;
+  /** Changes app state. Requires confirmation when the actor is the model. */
+  readonly mutating?: boolean;
+  /** Some subcommand can leave the device. Documentation; the gate is per-action. */
+  readonly network?: boolean;
+  run(args: readonly string[], context: ShellContext): Promise<ShellOutput>;
+}
+
+export const ok = (stdout: string): ShellOutput => ({ stdout, exitCode: 0 });
+export const fail = (stderr: string, exitCode = 1): ShellOutput => ({
+  stdout: '',
+  stderr,
+  exitCode,
+});
+
+/* ── Store access, injected so commands stay testable ────────────────── */
+
+export interface ShellStores {
+  models: () => {
+    installed: Record<string, ModelRow>;
+    activeModelId: string | null;
+    install(id: string): Promise<void>;
+    remove(id: string): Promise<void>;
+    setActive(id: string | null): Promise<void>;
+  };
+  catalog: () => readonly CatalogRow[];
+  chats: () => {
+    list: readonly ChatRow[];
+    activeChatId: string | null;
+    messagesFor(chatId: string): Promise<readonly MessageRow[]>;
+    open(chatId: string): Promise<void>;
+    create(): Promise<string>;
+  };
+  personas: () => readonly PersonaRow[];
+  providers: () => {
+    list: readonly ProviderRow[];
+    toggle(id: string, enabled: boolean): Promise<void>;
+  };
+  device: () => DeviceRow | null;
+  benchmarks: () => readonly BenchRow[];
+  runBenchmark(modelId: string): Promise<void>;
+}
+
+interface ModelRow {
+  id: string;
+  state: string;
+  downloadedBytes: number;
+  useCount: number;
+  manifest: {
+    name: string;
+    quantization: string;
+    capabilities: readonly Capability[];
+    contextLength: number;
+    sizeBytes: number;
+    engine: string;
+    license: string;
+  };
+}
+interface CatalogRow {
+  id: string;
+  name: string;
+  sizeBytes: number;
+  capabilities: readonly Capability[];
+  bestFor?: string;
+}
+interface ChatRow {
+  id: string;
+  title: string;
+  messageCount: number;
+  updatedAt: number;
+  mode: string;
+}
+interface MessageRow {
+  role: string;
+  content: string;
+  createdAt: number;
+  provenance?: { modelName: string; local: boolean };
+}
+interface PersonaRow {
+  id: string;
+  name: string;
+  kind: string;
+  tagline: string;
+  builtin?: boolean;
+}
+interface ProviderRow {
+  id: string;
+  label: string;
+  enabled: boolean;
+  defaultModel: string;
+}
+interface DeviceRow {
+  chipset: string;
+  totalMemory: number;
+  cpuCores: number;
+  backends: readonly string[];
+  simulated: boolean;
+  engineVersion: string;
+}
+interface BenchRow {
+  modelName: string;
+  generateTokensPerSecond: number;
+  backend: string;
+  createdAt: number;
+}
+
+/* ── Formatting helpers ──────────────────────────────────────────────── */
+
+/** Fixed-width columns, so shell output stays greppable and scannable. */
+export function table(rows: readonly (readonly string[])[]): string {
+  if (rows.length === 0) return '';
+  const widths = rows[0]!.map((_, column) =>
+    Math.max(...rows.map((row) => (row[column] ?? '').length)),
+  );
+  return rows
+    .map((row) =>
+      row
+        .map((cell, column) => (column === row.length - 1 ? cell : cell.padEnd(widths[column]!)))
+        .join('  ')
+        .trimEnd(),
+    )
+    .join('\n');
+}
+
+/* ── The commands ────────────────────────────────────────────────────── */
+
+export function chatterangCommands(stores: ShellStores): ShellCommand[] {
+  const model: ShellCommand = {
+    name: 'model',
+    summary: 'List, install, remove, and select models',
+    usage: 'model list [--all] | model info <id> | model use <id> | model install <id> | model remove <id>',
+    mutating: true,
+    network: true,
+    async run(args, context) {
+      const [sub, id] = args;
+      const store = stores.models();
+
+      switch (sub ?? 'list') {
+        case 'list': {
+          const showAll = args.includes('--all');
+          const installed = Object.values(store.installed).filter((m) => m.state === 'installed');
+
+          if (!showAll) {
+            if (installed.length === 0) return ok('No models installed. `model list --all` to browse.');
+            return ok(
+              table([
+                ['ID', 'NAME', 'SIZE', 'CTX', 'USES', ''],
+                ...installed.map((m) => [
+                  m.id,
+                  m.manifest.name,
+                  formatBytes(m.downloadedBytes),
+                  String(m.manifest.contextLength),
+                  String(m.useCount),
+                  m.id === store.activeModelId ? '← active' : '',
+                ]),
+              ]),
+            );
+          }
+
+          return ok(
+            table([
+              ['ID', 'NAME', 'SIZE', 'STATE', 'FOR'],
+              ...stores.catalog().map((c) => [
+                c.id,
+                c.name,
+                formatBytes(c.sizeBytes),
+                store.installed[c.id]?.state ?? 'available',
+                c.bestFor ?? '',
+              ]),
+            ]),
+          );
+        }
+
+        case 'info': {
+          if (!id) return fail('usage: model info <id>');
+          const found = store.installed[id];
+          if (!found) return fail(`no installed model "${id}"`);
+          const m = found.manifest;
+          return ok(
+            table([
+              ['name', m.name],
+              ['engine', m.engine],
+              ['quantization', m.quantization],
+              ['capabilities', m.capabilities.join(', ')],
+              ['context', String(m.contextLength)],
+              ['on disk', formatBytes(found.downloadedBytes)],
+              ['licence', m.license],
+              ['uses', String(found.useCount)],
+            ]),
+          );
+        }
+
+        case 'use': {
+          if (!id) return fail('usage: model use <id>');
+          if (store.installed[id]?.state !== 'installed') return fail(`"${id}" is not installed`);
+          if (!(await context.confirm(`switch the active model to ${id}`))) {
+            return fail('cancelled', 130);
+          }
+          await store.setActive(id);
+          return ok(`active model is now ${id}`);
+        }
+
+        case 'install': {
+          if (!id) return fail('usage: model install <id>');
+          if (!stores.catalog().some((c) => c.id === id)) return fail(`no catalog model "${id}"`);
+          // Downloading is the one thing here that touches the network, so
+          // this action is gated for everyone, including a person who typed it.
+          if (
+            !(await context.confirm(`download ${id} from Hugging Face`, { network: true }))
+          ) {
+            return fail('cancelled', 130);
+          }
+          await store.install(id);
+          return ok(`installing ${id} — watch progress in Models`);
+        }
+
+        case 'remove': {
+          if (!id) return fail('usage: model remove <id>');
+          if (!store.installed[id]) return fail(`no installed model "${id}"`);
+          if (!(await context.confirm(`delete ${id} from this device`))) {
+            return fail('cancelled', 130);
+          }
+          await store.remove(id);
+          return ok(`removed ${id}`);
+        }
+
+        default:
+          return fail(`model: unknown subcommand "${sub}"\nusage: ${this.usage}`);
+      }
+    },
+  };
+
+  const chat: ShellCommand = {
+    name: 'chat',
+    summary: 'List, open, and export conversations',
+    usage: 'chat list | chat open <id> | chat new | chat export <id>',
+    mutating: true,
+    async run(args, context) {
+      const [sub, id] = args;
+      const store = stores.chats();
+
+      switch (sub ?? 'list') {
+        case 'list':
+          if (store.list.length === 0) return ok('No conversations yet.');
+          return ok(
+            table([
+              ['ID', 'MESSAGES', 'UPDATED', 'TITLE', ''],
+              ...store.list.map((c) => [
+                c.id,
+                String(c.messageCount),
+                new Date(c.updatedAt).toISOString().slice(0, 10),
+                c.title,
+                c.id === store.activeChatId ? '← open' : '',
+              ]),
+            ]),
+          );
+
+        case 'open': {
+          if (!id) return fail('usage: chat open <id>');
+          if (!store.list.some((c) => c.id === id)) return fail(`no chat "${id}"`);
+          await store.open(id);
+          return ok(`opened ${id}`);
+        }
+
+        case 'new': {
+          if (!(await context.confirm('start a new conversation'))) return fail('cancelled', 130);
+          return ok(`created ${await store.create()}`);
+        }
+
+        case 'export': {
+          if (!id) return fail('usage: chat export <id>');
+          const found = store.list.find((c) => c.id === id);
+          if (!found) return fail(`no chat "${id}"`);
+          return ok(renderTranscript(found, await store.messagesFor(id)));
+        }
+
+        default:
+          return fail(`chat: unknown subcommand "${sub}"\nusage: ${this.usage}`);
+      }
+    },
+  };
+
+  const persona: ShellCommand = {
+    name: 'persona',
+    summary: 'List personas',
+    usage: 'persona list',
+    async run() {
+      const all = stores.personas();
+      if (all.length === 0) return ok('No personas.');
+      return ok(
+        table([
+          ['ID', 'KIND', 'NAME', 'TAGLINE'],
+          ...all.map((p) => [p.id, p.kind, p.name, p.tagline]),
+        ]),
+      );
+    },
+  };
+
+  const provider: ShellCommand = {
+    name: 'provider',
+    summary: 'Inspect and toggle remote providers',
+    usage: 'provider list | provider enable <id> | provider disable <id>',
+    mutating: true,
+    async run(args, context) {
+      const [sub, id] = args;
+      const store = stores.providers();
+
+      switch (sub ?? 'list') {
+        case 'list':
+          if (store.list.length === 0) {
+            return ok('No remote providers connected. Everything runs on this device.');
+          }
+          return ok(
+            table([
+              ['ID', 'LABEL', 'MODEL', 'STATE'],
+              ...store.list.map((p) => [p.id, p.label, p.defaultModel, p.enabled ? 'on' : 'off']),
+            ]),
+          );
+
+        case 'enable':
+        case 'disable': {
+          if (!id) return fail(`usage: provider ${sub} <id>`);
+          if (!store.list.some((p) => p.id === id)) return fail(`no provider "${id}"`);
+          const enabling = sub === 'enable';
+          // Enabling a provider means conversations can leave the device.
+          if (
+            !(await context.confirm(
+              enabling
+                ? `enable ${id} — messages sent to it will leave this device`
+                : `disable ${id}`,
+              // Turning egress on is a decision worth interrupting anyone for;
+              // turning it off is not.
+              { network: enabling },
+            ))
+          ) {
+            return fail('cancelled', 130);
+          }
+          await store.toggle(id, enabling);
+          return ok(`${id} ${enabling ? 'enabled' : 'disabled'}`);
+        }
+
+        default:
+          return fail(`provider: unknown subcommand "${sub}"\nusage: ${this.usage}`);
+      }
+    },
+  };
+
+  const bench: ShellCommand = {
+    name: 'bench',
+    summary: 'Run and read on-device benchmarks',
+    usage: 'bench list | bench run <model-id>',
+    mutating: true,
+    async run(args, context) {
+      const [sub, id] = args;
+
+      switch (sub ?? 'list') {
+        case 'list': {
+          const runs = stores.benchmarks();
+          if (runs.length === 0) return ok('No benchmark runs yet.');
+          return ok(
+            table([
+              ['MODEL', 'TOK/S', 'BACKEND', 'WHEN'],
+              ...runs.map((r) => [
+                r.modelName,
+                r.generateTokensPerSecond.toFixed(1),
+                r.backend,
+                new Date(r.createdAt).toISOString().slice(0, 10),
+              ]),
+            ]),
+          );
+        }
+
+        case 'run': {
+          if (!id) return fail('usage: bench run <model-id>');
+          if (stores.models().installed[id]?.state !== 'installed') {
+            return fail(`"${id}" is not installed`);
+          }
+          if (!(await context.confirm(`benchmark ${id} — this will warm the device`))) {
+            return fail('cancelled', 130);
+          }
+          await stores.runBenchmark(id);
+          return ok(`benchmarked ${id} — see Models › Benchmarks`);
+        }
+
+        default:
+          return fail(`bench: unknown subcommand "${sub}"\nusage: ${this.usage}`);
+      }
+    },
+  };
+
+  const device: ShellCommand = {
+    name: 'device',
+    summary: 'What this device can run',
+    usage: 'device',
+    async run() {
+      const info = stores.device();
+      if (!info) return fail('device capabilities are not available yet');
+      return ok(
+        table([
+          ['chipset', info.chipset],
+          ['memory', formatBytes(info.totalMemory, 0)],
+          ['cores', String(info.cpuCores)],
+          ['backends', info.backends.join(', ')],
+          ['engine', info.engineVersion],
+          ['simulated', info.simulated ? 'yes — responses are synthesised' : 'no'],
+        ]),
+      );
+    },
+  };
+
+  const privacy: ShellCommand = {
+    name: 'privacy',
+    summary: 'What leaves this device',
+    usage: 'privacy',
+    async run() {
+      const enabled = stores.providers().list.filter((p) => p.enabled);
+      return ok(
+        [
+          'Leaves this device:',
+          '  - model downloads from Hugging Face, when you ask for one',
+          enabled.length > 0
+            ? `  - messages you send to: ${enabled.map((p) => p.label).join(', ')}`
+            : '  - nothing else: no remote providers are enabled',
+          '',
+          'Stays on this device:',
+          '  - conversations, personas, generated images, settings, benchmark runs',
+        ].join('\n'),
+      );
+    },
+  };
+
+  return [model, chat, persona, provider, bench, device, privacy];
+}
+
+/** Render a conversation as Markdown — used by `chat export` and the VFS. */
+export function renderTranscript(
+  chat: { title: string; updatedAt: number },
+  messages: readonly MessageRow[],
+): string {
+  const lines = [
+    `# ${chat.title || deriveTitle('')}`,
+    '',
+    `_${messages.length} messages · last updated ${new Date(chat.updatedAt).toISOString().slice(0, 10)}_`,
+    '',
+  ];
+
+  for (const message of messages) {
+    const who =
+      message.role === 'user'
+        ? 'You'
+        : (message.provenance?.modelName ?? (message.role === 'assistant' ? 'Assistant' : message.role));
+    // Provenance is preserved in the export: a transcript that hides which
+    // turns left the device would undo the point of marking them.
+    const where = message.provenance
+      ? message.provenance.local
+        ? ' (on device)'
+        : ' (remote)'
+      : '';
+    lines.push(`## ${who}${where}`, '', message.content.trim(), '');
+  }
+
+  return lines.join('\n');
+}
