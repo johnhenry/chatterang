@@ -95,6 +95,12 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
       current.map((entry) => (entry.id === id ? { ...entry, result } : entry)),
     );
     setBusy(false);
+
+    // A terminal never takes focus away from you. The field is `disabled` while
+    // a command runs, and a disabled element cannot hold focus — so the browser
+    // drops it to <body> on every submit and the next keystroke goes nowhere.
+    // Restoring it after the re-enable is what makes type-run-type work.
+    requestAnimationFrame(() => field.current?.focus());
   }, []);
 
   return (
@@ -105,7 +111,17 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
           model reaches the same commands through its <code>bash</code> tool.
         </p>
 
-        <div className="term" ref={scroller}>
+        {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
+        <div
+          className="term"
+          ref={scroller}
+          onMouseUp={() => {
+            // Do not steal focus mid-selection: a user dragging to copy output
+            // is not asking to type.
+            if ((window.getSelection()?.toString().length ?? 0) > 0) return;
+            field.current?.focus();
+          }}
+        >
           {entries.length === 0 && !booting ? (
             <div className="term__hint">
               <span className="label">Try</span>
@@ -175,6 +191,11 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
             spellCheck={false}
             autoCapitalize="none"
             autoCorrect="off"
+            // A terminal is not a form field: stop the browser offering saved
+            // values, and label the on-screen return key "go" rather than
+            // "return" so the phone keyboard reads like a prompt.
+            autoComplete="off"
+            enterKeyHint="go"
             placeholder={booting ? 'starting…' : 'chatterang'}
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {

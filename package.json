@@ -2,7 +2,7 @@
   "name": "chatterang",
   "version": "1.0.0",
   "private": true,
-  "description": "Chatterang \u2014 a privacy-first, on-device AI super app. Local LLMs, VLMs, speech, and image generation, routed through @johnhenry/aimatey.",
+  "description": "Chatterang — a privacy-first, on-device AI super app. Local LLMs, VLMs, speech, and image generation, routed through @johnhenry/aimatey.",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -40,6 +40,7 @@
     "@johnhenry/aimatey-middleware": "0.1.1",
     "@johnhenry/aimatey-types": "0.2.0",
     "@johnhenry/aimatey-utils": "0.1.1",
+    "@johnhenry/mcp-query": "^0.0.0",
     "dexie": "^4.4.5",
     "just-bash": "^3.4.2",
     "react": "^19.2.8",
