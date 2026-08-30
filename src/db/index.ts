@@ -6,6 +6,7 @@
  * anywhere, and there is no server-side counterpart to any of these tables.
  */
 
+import type { McpServerConfig } from '@/domain/mcp';
 import Dexie, { type EntityTable } from 'dexie';
 
 import type { Chat, Message } from '@/domain/chat';
@@ -97,6 +98,7 @@ class ChatterangDatabase extends Dexie {
   connections!: EntityTable<ProviderConnection, 'id'>;
   entitlements!: EntityTable<MarketplaceEntitlement, 'id'>;
   settings!: EntityTable<AppSetting, 'key'>;
+  mcpServers!: EntityTable<McpServerConfig, 'id'>;
 
   constructor() {
     super('chatterang');
@@ -110,6 +112,11 @@ class ChatterangDatabase extends Dexie {
       connections: 'id, providerId, enabled',
       entitlements: 'id, personaId',
       settings: 'key',
+    });
+    // v2 adds remote MCP servers. Additive only — Dexie carries v1 data
+    // forward, so an existing install keeps its chats.
+    this.version(2).stores({
+      mcpServers: 'id, name, enabled, createdAt',
     });
   }
 }
