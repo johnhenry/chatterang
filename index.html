@@ -6,6 +6,18 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!--
+      iOS ignores the manifest's display mode; these are how a home-screen
+      launch gets a standalone window and a dark status bar. `default` would
+      draw black text over the dark ground.
+    -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Chatterang" />
     <meta name="theme-color" content="#17120F" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#F7F2ED" media="(prefers-color-scheme: light)" />
     <meta name="color-scheme" content="dark light" />

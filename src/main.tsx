@@ -7,6 +7,7 @@ import '@/styles/components.css';
 
 import { App } from '@/App';
 import { registerShellTool } from '@/shell/register';
+import { captureInstallPrompt, registerServiceWorker } from '@/lib/pwa';
 import { useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { useChats } from '@/state/chat';
@@ -27,6 +28,11 @@ if (import.meta.env.DEV) {
 // store, and a store importing it back would close an import cycle that only
 // fails at runtime. The entry point runs after all modules are initialised.
 registerShellTool();
+
+// Offline shell + install prompt. Both no-op inside a Capacitor webview and in
+// dev; see src/lib/pwa.ts for why.
+registerServiceWorker();
+captureInstallPrompt();
 
 const container = document.getElementById('root');
 if (!container) throw new Error('Missing #root element.');
