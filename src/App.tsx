@@ -8,6 +8,7 @@ import { usePersonas } from '@/state/personas';
 import { useBench } from '@/state/bench';
 import { useImages } from '@/state/images';
 import { useMcp } from '@/state/mcp';
+import { Onboarding } from '@/features/onboarding/Onboarding';
 
 import { ChatScreen } from '@/features/chat/ChatScreen';
 import { ModelsScreen } from '@/features/models/ModelsScreen';
@@ -33,6 +34,9 @@ export function App(): ReactNode {
   const ready = useApp((state) => state.ready);
   const initialize = useApp((state) => state.initialize);
   const refreshThermal = useApp((state) => state.refreshThermal);
+  const settings = useApp((state) => state.settings);
+  const updateSettings = useApp((state) => state.updateSettings);
+  const installedModels = useModels((state) => state.installed);
 
   useEffect(() => {
     void (async () => {
@@ -58,11 +62,23 @@ export function App(): ReactNode {
     return () => clearInterval(timer);
   }, [ready, refreshThermal]);
 
+  const showOnboarding =
+    ready && !settings.onboardingSeen && Object.keys(installedModels).length === 0;
+
   if (!ready) return <Splash />;
 
   return (
     <div className="app">
       <ShimNotice />
+      {/*
+        Shown once, and only to someone who has nothing installed — a user who
+        already has a model does not need to be told how to get one. Dismissing
+        it any way sets the flag, so it never reappears and never blocks.
+      */}
+      <Onboarding
+        open={showOnboarding}
+        onClose={() => void updateSettings({ onboardingSeen: true })}
+      />
       {tab === 'chat' ? <ChatScreen /> : null}
       {tab === 'models' ? <ModelsScreen /> : null}
       {tab === 'personas' ? <PersonasScreen onOpenChat={() => setTab('chat')} /> : null}

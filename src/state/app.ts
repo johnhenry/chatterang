@@ -41,6 +41,8 @@ export interface Settings {
   haptics: boolean;
   /** Show the development-shim banner when running in a browser. */
   dismissedShimNotice: boolean;
+  /** Set once the first-run sheet has been shown, whichever way it was dismissed. */
+  onboardingSeen: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -57,6 +59,7 @@ export const DEFAULT_SETTINGS: Settings = {
   renderMarkdown: true,
   haptics: true,
   dismissedShimNotice: false,
+  onboardingSeen: false,
 };
 
 /** A confirmation the model has asked for and the user has not answered yet. */
