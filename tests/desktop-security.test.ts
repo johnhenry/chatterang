@@ -554,6 +554,46 @@ describe('main.ts wiring', () => {
     expect(source).not.toContain('resolveBundleRequest(');
   });
 
+  it('[5] gates the IPC trust check on the parsed-origin predicate', () => {
+    // The predicate is tested directly; this asserts the file that RUNS uses
+    // it. A correct predicate nothing calls is the shape defect [3] already
+    // took once — right code in src/, dead in the shipping process.
+    expect(source).toContain('isTrustedOrigin(');
+    expect(source).not.toMatch(/startsWith\(\s*APP_ORIGIN/);
+  });
+
+  it('[9] sets the CSP the resolver chose as a response header', () => {
+    // The constant lives in security.ts and reaches main.ts as `target.csp`,
+    // so this pins the assignment rather than the constant's name.
+    expect(source).toMatch(/headers\['content-security-policy'\]\s*=/);
+    expect(source).toContain('target.csp');
+  });
+
+  it('[11] passes an owner to notifyListeners rather than broadcasting', () => {
+    // Without the third argument every window receives every llamaToken and
+    // every llamaEnd — including terminal events for turns it never started.
+    const calls = [...source.matchAll(/notifyListeners\s*\(/g)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      const tail = source.slice(call.index ?? 0, (call.index ?? 0) + 220);
+      expect(tail).toMatch(/ownerId|senderId/);
+    }
+  });
+
+  it('[13] does not re-swallow a throwing notify', () => {
+    // The reordered settle only helps while main.ts lets the throw reach the
+    // Supervisor. Wrapping the notify in a bare try/catch restores the silent
+    // drop the reorder was written to prevent.
+    // Look BEFORE the call, not after it: a wrapping `try {` sits ahead of
+    // `notifyListeners`, so slicing forward from the call could never see it.
+    // The first version of this test did exactly that and passed against the
+    // very mutation it was written to catch.
+    const at = source.indexOf('pluginHost.notifyListeners');
+    expect(at).toBeGreaterThan(0);
+    const before = source.slice(Math.max(0, at - 300), at);
+    expect(before).not.toMatch(/try\s*\{[^}]*$/);
+  });
+
   it('keeps the security defaults on the window it opens', () => {
     // Not a decision that can be extracted — it is an object literal Electron
     // reads — so it is pinned here.
@@ -642,3 +682,38 @@ describe('confineModelPath', () => {
     expect(confineModelPath(ROOT, 'my models/a model.gguf')).toBe(`${ROOT}/my models/a model.gguf`);
   });
 });
+
+describe('the files no test can import still carry their guards', () => {
+  // preload.ts and host/entry.ts run in processes the suite cannot enter, and
+  // both are load-bearing: the preload is where defect [3]'s error codes were
+  // being stripped, and the host entry is the process boundary [8]'s path
+  // confinement sits behind. Static assertions are weaker than execution, and
+  // are here because the alternative is nothing at all.
+  const read = (rel: string) => readFileSync(resolve(process.cwd(), rel), 'utf8');
+
+  it('[3] the preload hands the wire result across without unwrapping it', () => {
+    const preload = read('apps/desktop/src/preload.ts');
+    expect(preload.length).toBeGreaterThan(200);
+    // contextBridge strips custom own properties from Errors, so unwrapping on
+    // this side loses the code. The raw {ok,error} must cross intact.
+    expect(preload).not.toContain('fromWireError');
+  });
+
+  it('the preload exposes exactly one bridge object', () => {
+    const preload = read('apps/desktop/src/preload.ts');
+    expect([...preload.matchAll(/exposeInMainWorld\s*\(/g)].length).toBe(1);
+  });
+
+  it('[8] the host confines model paths, and the entry point applies it', () => {
+    const paths = read('apps/desktop/src/host/model-paths.ts');
+    expect(paths).toContain('PATH_FIELDS');
+    // The confinement is worth nothing if the process boundary skips it.
+    // Pin the import and the call, not a loose alternation: the first version
+    // accepted the word "confinement" from a nearby comment, so breaking the
+    // real import left the test green.
+    const entry = read('apps/desktop/src/host/entry.ts');
+    expect(entry).toMatch(/import\s*\{[^}]*modelPathGuard[^}]*\}\s*from\s*'\.\/model-paths\.js'/);
+    expect(entry).toContain('modelPathGuard(');
+  });
+});
+
