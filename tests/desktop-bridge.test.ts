@@ -3013,6 +3013,36 @@ describe('two engines in flight at once', () => {
     expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
   });
 
+  it('one engine\u2019s cancel does not reach the other engine\u2019s turn', async () => {
+    // The CANCEL direction, which the sibling test above does not pin. A test
+    // in this file is named "one engine's abort does not settle or cancel the
+    // other's turn" and catches only the settle half; making #cancelTurn fall
+    // back to scanning every engine's table for the requestId left the whole
+    // 592-test suite green. A name that promises more than it pins is the
+    // failure mode this project keeps meeting, so this pins the other half.
+    //
+    // Same window owns both turns, so ownership cannot be what refuses the
+    // cancel — only the per-engine table lookup can.
+    const w = twoEngines();
+    beginOn(w, 1, LLAMA_PLUGIN.name, 'shared');
+    beginOn(w, 1, TRANSCRIBER.name, 'shared');
+    await settle();
+    expect(w.supervisor.inflightCount).toBe(2);
+
+    // `void`, not `await`: an honoured cancel posts to the wire and waits for a
+    // `ret` this fake host never sends. The refused-cancel tests can await
+    // because a no-op resolves immediately.
+    void w.call(1, TRANSCRIBER.name, 'cancel', [{ requestId: 'shared' }]);
+    await settle();
+
+    // Exactly one cancel went to the wire, addressed to the transcriber.
+    const cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(TRANSCRIBER.name);
+    // And llama.cpp's turn under the same id is untouched.
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+  });
+
   it('refuses a cross-engine cancel from a window that owns neither turn', async () => {
     // Ownership is checked in the turn's OWN engine. Window 2 cancelling
     // window 1's transcription must be the same no-op it is for a generation.
@@ -3413,3 +3443,46 @@ describe('the inference host serves plugins by name', () => {
     );
   });
 });
+
+describe('an engine cannot name a stream its definition does not declare', () => {
+  // A terminal event the definition does not declare is dropped on delivery, so
+  // every turn on that engine completes and then waits forever for an end that
+  // was discarded. Nothing checked this, and ONNX is the first engine whose
+  // names nobody has typed twice.
+  const build = (spec: EngineSpec) => () =>
+    new Supervisor({
+      spawn: () => {
+        throw new Error('not reached: the constructor must refuse first');
+      },
+      notify: () => true,
+      engines: [spec],
+    });
+
+  // The real spec, so "accepts a valid one" is a control on the shipped shape
+  // rather than on a shape invented here.
+  const base = TRANSCRIBER_ENGINE;
+
+  it('accepts a spec whose names all exist', () => {
+    expect(build(base)).not.toThrow();
+  });
+
+  it('refuses an undeclared terminal event', () => {
+    const spec = { ...base, stream: { ...base.stream!, terminal: 'nope' } } as EngineSpec;
+    expect(build(spec)).toThrow(/terminal/);
+  });
+
+  it('refuses an undeclared progress event', () => {
+    const spec = { ...base, stream: { ...base.stream!, progress: ['nope'] } } as EngineSpec;
+    expect(build(spec)).toThrow(/progress/);
+  });
+
+  it('refuses an undeclared start or cancel method', () => {
+    expect(build({ ...base, stream: { ...base.stream!, start: 'nope' } } as EngineSpec)).toThrow(
+      /stream start/,
+    );
+    expect(build({ ...base, stream: { ...base.stream!, cancel: 'nope' } } as EngineSpec)).toThrow(
+      /stream cancel/,
+    );
+  });
+});
+

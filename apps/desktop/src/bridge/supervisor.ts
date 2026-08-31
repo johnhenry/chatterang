@@ -385,6 +385,38 @@ export class Supervisor {
             'in both directions.',
         );
       }
+      /*
+       * An engine's stream names must exist in the definition it points at.
+       *
+       * Nothing checked this, and the failure is silent in the worst way: a
+       * terminal event the definition does not declare is dropped on delivery,
+       * so every turn on that engine runs to completion and then hangs waiting
+       * for an end that was discarded — the exact unrecoverable wait the
+       * terminal-event rule exists to prevent, reintroduced by a typo.
+       *
+       * ONNX is the first engine whose names nobody has typed twice, so this
+       * lands before it rather than after.
+       */
+      const stream = spec.stream;
+      if (stream !== undefined) {
+        const events = new Set(spec.definition.events);
+        const methods = new Set(spec.definition.methods);
+        const missing: string[] = [];
+        if (!events.has(stream.terminal)) missing.push(`event "${stream.terminal}" (terminal)`);
+        for (const name of stream.progress) {
+          if (!events.has(name)) missing.push(`event "${name}" (progress)`);
+        }
+        if (!methods.has(stream.start)) missing.push(`method "${stream.start}" (stream start)`);
+        if (!methods.has(stream.cancel)) missing.push(`method "${stream.cancel}" (stream cancel)`);
+        if (missing.length > 0) {
+          throw new Error(
+            `desktop bridge: engine "${spec.definition.name}" names ${missing.join(', ')}, ` +
+              'which its plugin definition does not declare. A terminal event that is not ' +
+              'declared is dropped on delivery, so every turn would hang rather than fail.',
+          );
+        }
+      }
+
       this.#engines.set(spec.definition.name, { spec, inflight: new Map() });
     }
 
