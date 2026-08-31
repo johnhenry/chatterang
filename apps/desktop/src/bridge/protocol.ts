@@ -138,6 +138,18 @@ export interface WireError {
  */
 export const HANDLE_LOST = 'HANDLE_LOST';
 
+/**
+ * The code carried by a call that outlived its deadline.
+ *
+ * Distinct from {@link HANDLE_LOST} on purpose. `HANDLE_LOST` says "the
+ * process that held your handle is gone, load again"; `HOST_TIMEOUT` says "the
+ * process is still there and stopped answering THIS call". The adapter treats
+ * neither as a reason to keep waiting, which is the only property that
+ * matters, but a log that cannot tell a crash from a wedge is a log that
+ * cannot tell you which one you have.
+ */
+export const HOST_TIMEOUT = 'HOST_TIMEOUT';
+
 /** Flatten anything throwable into the wire shape. */
 export function toWireError(error: unknown): WireError {
   if (error instanceof Error) {
@@ -182,7 +194,28 @@ export interface HostBoot {
   readonly status: DshStatus;
 }
 
-export type HostMessage = HostCall | HostReturn | HostEvent | HostBoot;
+/**
+ * A liveness probe, and its answer.
+ *
+ * Deliberately NOT a plugin method call. A host that is alive but wedged emits
+ * no `exit`, so the link's own close path never fires and every settlement
+ * path in the supervisor misses it. The ping is the only thing that can tell
+ * "still working" from "stopped existing as far as we are concerned", and it
+ * has to be answerable without touching the plugin — a probe routed through
+ * `LlamaCppNode` would be blocked by exactly the state it exists to detect.
+ */
+export interface HostPing {
+  readonly k: 'ping';
+  readonly id: number;
+}
+
+/** The answer to one {@link HostPing}, echoing its id. */
+export interface HostPong {
+  readonly k: 'pong';
+  readonly id: number;
+}
+
+export type HostMessage = HostCall | HostReturn | HostEvent | HostBoot | HostPing | HostPong;
 
 /**
  * The narrowest port this code can work against.
@@ -196,4 +229,22 @@ export interface MessageLink {
   onMessage(listener: (message: unknown) => void): void;
   /** Called once when the far side goes away for good. */
   onClose(listener: (reason: string) => void): void;
+}
+
+/**
+ * One inference host process, as the supervisor sees it.
+ *
+ * A bare {@link MessageLink} was enough while the host was forked once and
+ * never replaced. It is not enough now, for one reason: the supervisor can
+ * decide a host is gone while its PROCESS is still running — a wedged decode
+ * answers no ping and emits no `exit`. Forking a replacement without a way to
+ * terminate the original would leave two hosts holding the same GPU, the old
+ * one invisible and unreachable. `kill` is that way.
+ *
+ * `kill` MUST be safe to call on a host that has already exited, and safe to
+ * call twice; the supervisor calls it on every retirement, orderly or not.
+ */
+export interface HostHandle {
+  readonly link: MessageLink;
+  kill(): void;
 }

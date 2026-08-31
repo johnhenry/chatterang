@@ -34,7 +34,7 @@ import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
 
 import { BrowserWindow, app, ipcMain, protocol, shell, utilityProcess } from 'electron';
-import type { UtilityProcess, WebContents } from 'electron';
+import type { WebContents } from 'electron';
 
 import {
   BOOTSTRAP_CHANNEL,
@@ -49,8 +49,8 @@ import {
 import type {
   BootManifest,
   DshStatus,
+  HostHandle,
   InvokeResult,
-  MessageLink,
   PluginImplementation,
 } from './bridge/index.js';
 import {
@@ -95,25 +95,49 @@ async function serveBundle(request: Request): Promise<Response> {
 
 /* ── The inference host ───────────────────────────────────────────────── */
 
-function utilityProcessLink(child: UtilityProcess): MessageLink {
-  return {
-    postMessage: (message) => child.postMessage(message),
-    onMessage: (listener) => {
-      child.on('message', (message: unknown) => listener(message));
-    },
-    onClose: (listener) => {
-      child.once('exit', (code: number) => listener(`exit code ${code}`));
-    },
-  };
-}
-
-function forkInferenceHost(): UtilityProcess {
-  return utilityProcess.fork(join(app.getAppPath(), 'build', 'host.mjs'), [], {
+/**
+ * Start one inference host, as a handle the supervisor can replace.
+ *
+ * Called once at boot and again on every loss — this is the whole of the
+ * respawn story on Electron's side, and it is deliberately the only thing in
+ * this file that knows what a utility process is. The POLICY (when to give up,
+ * how long to wait, how to notice a host that is alive but wedged) lives in
+ * `Supervisor`, where tests can reach it.
+ */
+function spawnInferenceHost(): HostHandle {
+  const child = utilityProcess.fork(join(app.getAppPath(), 'build', 'host.mjs'), [], {
     serviceName: 'chatterang-inference',
     // Piped, not inherited: the host's stdout must not reach a terminal or a
     // log the user did not ask for.
     stdio: 'pipe',
   });
+  child.stdout?.on('data', (chunk: Buffer) => process.stdout.write(`[inference] ${chunk}`));
+  child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`[inference] ${chunk}`));
+
+  let exited = false;
+  child.once('exit', () => {
+    exited = true;
+  });
+
+  return {
+    link: {
+      postMessage: (message) => child.postMessage(message),
+      onMessage: (listener) => {
+        child.on('message', (message: unknown) => listener(message));
+      },
+      onClose: (listener) => {
+        child.once('exit', (code: number) => listener(`exit code ${code}`));
+      },
+    },
+    // Idempotent and safe after exit, as `HostHandle` requires. The call that
+    // matters is the one for a host declared lost while its process is still
+    // running: an unanswered ping means wedged, not dead, and a wedged host
+    // still holds the GPU its replacement is about to ask for.
+    kill: () => {
+      if (exited) return;
+      child.kill();
+    },
+  };
 }
 
 /* ── Sender trust ─────────────────────────────────────────────────────── */
@@ -137,19 +161,8 @@ function start(): void {
     return true;
   });
 
-  const child = forkInferenceHost();
-  child.stdout?.on('data', (chunk: Buffer) => process.stdout.write(`[inference] ${chunk}`));
-  child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`[inference] ${chunk}`));
-
-  let dshStatus: DshStatus = {
-    mounted: false,
-    services: [],
-    routes: [],
-    treeAssertion: 'not reported: the inference host has not finished booting',
-  };
-
   const supervisor = new Supervisor({
-    link: utilityProcessLink(child),
+    spawn: spawnInferenceHost,
     notify: (eventName, data) => {
       try {
         pluginHost.notifyListeners(LLAMA_PLUGIN.name, eventName, data);
@@ -160,7 +173,6 @@ function start(): void {
       }
     },
     onBoot: (status) => {
-      dshStatus = status;
       console.log(
         status.mounted
           ? `[main] DSH tree mounted: services ${status.services.join(', ')}; routes ${status.routes.join(', ')}`
@@ -172,11 +184,14 @@ function start(): void {
 
   pluginHost.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation);
   pluginHost.register(DSH_PLUGIN, {
-    getStatus: async (): Promise<DshStatus> => dshStatus,
-    // The route set is a boot snapshot on purpose: cordis-aimatey captures it
-    // once at mount, because aimatey emits no event when a backend appears.
+    // Asked of the supervisor on every call rather than served from a variable
+    // captured at boot. The route set within one host's life is still a
+    // snapshot — cordis-aimatey captures it once at mount, because aimatey
+    // emits no event when a backend appears — but which HOST it describes is
+    // now the one that is running, not the one that was running at startup.
+    getStatus: async (): Promise<DshStatus> => supervisor.hostStatus(),
     listProviders: async (): Promise<{ providers: readonly string[] }> => ({
-      providers: dshStatus.routes,
+      providers: supervisor.hostStatus().routes,
     }),
   });
 
@@ -202,6 +217,9 @@ function start(): void {
       return router.handle(event.sender.id, channel, payload);
     });
   }
+
+  // A quitting app must not fork a replacement host on its way out.
+  app.once('will-quit', () => supervisor.dispose());
 
   createWindow(pluginHost, supervisor, senders);
   app.on('activate', () => {

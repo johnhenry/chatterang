@@ -35,9 +35,24 @@
  * `ReferenceError` in the main world at startup. `CAPACITOR_SHIM_SOURCE` is
  * built from `.toString()` so the source that is evaluated is the source that
  * is tested, and the test evaluates the STRING for exactly this reason.
+ *
+ * WHY THE ERROR IS REBUILT HERE, AND NOWHERE EARLIER. This is the first code
+ * that runs on the PAGE side of `contextBridge`, and `contextBridge` reduces
+ * an `Error` to its message and stack — custom own properties do not survive.
+ * An `Error` carrying `code: 'HANDLE_LOST'` built in the preload therefore
+ * arrives in the page with no code at all, and the recovery in
+ * `src/ai/backends/llama-cpp.ts` never fires: the adapter keeps a handle whose
+ * host no longer exists and every retry fails the same way. So the preload
+ * resolves plain `{ok,error}` data and the throw is reconstructed below, in
+ * the world that has to see it.
+ *
+ * `unwrap` is a verbatim inline of `fromWireError` plus a shape check, and it
+ * is inline for the self-containment reason above — a call to the imported one
+ * would be a `ReferenceError` in the main world. `tests/desktop-bridge.test.ts`
+ * asserts the two agree, so the copy cannot drift unnoticed.
  */
 
-import type { DesktopBridge } from './renderer.js';
+import type { PreloadBridge } from './renderer.js';
 
 /** The window properties this shim reads and writes. */
 export interface ShimTarget {
@@ -60,9 +75,27 @@ export interface ShimTarget {
  */
 export function installCapacitorShim(
   target: ShimTarget,
-  bridge: DesktopBridge,
+  bridge: PreloadBridge,
   platform = 'electron',
 ): void {
+  /** `{ok,error}` back into a value or a throw — `code` and all. */
+  const unwrap = (answer: unknown): unknown => {
+    const result = answer as
+      | { ok?: unknown; data?: unknown; error?: { message?: unknown; code?: unknown } }
+      | null
+      | undefined;
+    if (result === null || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+      throw new Error('desktop bridge: the preload answered with a value that is not a result.');
+    }
+    if (result.ok) return result.data;
+    const wire = result.error;
+    const error = new Error(
+      typeof wire?.message === 'string' ? wire.message : 'desktop bridge: an unnamed failure.',
+    );
+    if (typeof wire?.code === 'string') Object.assign(error, { code: wire.code });
+    throw error;
+  };
+
   const manifest = bridge.getBootstrap();
   const capacitor: Record<string, unknown> = target.Capacitor ?? {};
 
@@ -81,16 +114,20 @@ export function installCapacitorShim(
     ],
   }));
 
-  capacitor['nativePromise'] = (
+  capacitor['nativePromise'] = async (
     pluginName: string,
     methodName: string,
     options?: unknown,
   ): Promise<unknown> => {
-    if (methodName === 'removeAllListeners') return bridge.removeAllListeners(pluginName);
-    return bridge.invoke(pluginName, methodName, options === undefined ? [] : [options]);
+    if (methodName === 'removeAllListeners') {
+      return unwrap(await bridge.removeAllListeners(pluginName));
+    }
+    return unwrap(
+      await bridge.invoke(pluginName, methodName, options === undefined ? [] : [options]),
+    );
   };
 
-  capacitor['nativeCallback'] = (
+  capacitor['nativeCallback'] = async (
     pluginName: string,
     methodName: string,
     options: Record<string, unknown> | undefined,
@@ -100,14 +137,12 @@ export function installCapacitorShim(
       // `addListenerNative` awaits this and uses the value as the callback id
       // it later hands back to `removeListener`. Our subscription id IS that
       // value, so the two stay in step with no extra bookkeeping.
-      return bridge.addListener(pluginName, String(options?.['eventName']), callback);
+      return unwrap(await bridge.addListener(pluginName, String(options?.['eventName']), callback));
     }
     if (methodName === 'removeListener') {
-      return bridge.removeListener(Number(options?.['callbackId']));
+      return unwrap(await bridge.removeListener(Number(options?.['callbackId'])));
     }
-    return Promise.reject(
-      new Error(`desktop bridge: no callback-style method "${pluginName}.${methodName}".`),
-    );
+    throw new Error(`desktop bridge: no callback-style method "${pluginName}.${methodName}".`);
   };
 
   target.Capacitor = capacitor;

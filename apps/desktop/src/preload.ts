@@ -25,7 +25,7 @@ import { contextBridge, ipcRenderer, webFrame } from 'electron';
 
 import { capacitorShimSource } from './bridge/capacitor-shim.js';
 import { BRIDGE_GLOBAL, BRIDGE_KEYS, createRendererBridge } from './bridge/renderer.js';
-import type { DesktopBridge, RendererIpc } from './bridge/renderer.js';
+import type { PreloadBridge, RendererIpc } from './bridge/renderer.js';
 
 const ipc: RendererIpc = {
   invoke: (channel, payload) => ipcRenderer.invoke(channel, payload),
@@ -44,7 +44,7 @@ const bridge = createRendererBridge(ipc);
 // sixth property added to the bridge object later does not silently ship.
 const exposed = Object.fromEntries(
   BRIDGE_KEYS.map((key) => [key, (bridge as unknown as Record<string, unknown>)[key]]),
-) as unknown as DesktopBridge;
+) as unknown as PreloadBridge;
 
 contextBridge.exposeInMainWorld(BRIDGE_GLOBAL, exposed);
 

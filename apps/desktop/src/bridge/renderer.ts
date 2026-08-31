@@ -20,6 +20,23 @@
  * Neither layer imports Electron. `RendererIpc` is the three-method slice of
  * `ipcRenderer` this needs, which is what makes the whole thing testable
  * against a fake port instead of a launched window.
+ *
+ * WHY NOTHING HERE THROWS, AND WHY NOTHING HERE UNWRAPS.
+ *
+ * There is a THIRD boundary, and it is the one that is easy to forget because
+ * it has no port and no channel: `contextBridge`. Everything these functions
+ * return is copied into the main world by Electron's own serializer, and that
+ * serializer reduces an `Error` to its message and stack. Custom own
+ * properties — `code` — are DROPPED.
+ *
+ * So this layer never rebuilds an `Error`. It resolves the `{ok,error}` result
+ * as PLAIN DATA and lets `capacitor-shim.ts`, which runs in the main world on
+ * the far side of that copy, rebuild the `Error` there. `HANDLE_LOST` is the
+ * whole reason: `src/ai/backends/llama-cpp.ts` drops its cached model handle
+ * when it sees that code and reloads. Rebuild the error here and the page gets
+ * a bare `Error` with the right message and no code, the adapter keeps sending
+ * a handle no host has any more, and every retry fails identically until the
+ * app is relaunched. That recovery path was unreachable in the shipped build.
  */
 
 import {
@@ -33,7 +50,7 @@ import {
 import { assertCloneable } from './clone.js';
 import type { EventPayload } from './plugin-host.js';
 import type { BootManifest, WireError } from './protocol.js';
-import { fromWireError } from './protocol.js';
+import { toWireError } from './protocol.js';
 
 /** The slice of `ipcRenderer` the preload actually uses. */
 export interface RendererIpc {
@@ -60,17 +77,23 @@ export type InvokeResult =
  *
  * Five functions. The page's entire reachable surface. `BRIDGE_KEYS` below is
  * the same list as data so the preload and the test assert one thing.
+ *
+ * Four of the five resolve an {@link InvokeResult} and NEVER reject — see the
+ * note at the top of this file. The page-facing ergonomics (a value, or a
+ * throw carrying `code`) are restored in the main world by
+ * `installCapacitorShim`, on the near side of nothing.
  */
-export interface DesktopBridge {
+export interface PreloadBridge {
   getBootstrap(): BootManifest;
-  invoke(pluginName: string, method: string, args: readonly unknown[]): Promise<unknown>;
+  invoke(pluginName: string, method: string, args: readonly unknown[]): Promise<InvokeResult>;
+  /** On success, `data` is the subscription id. */
   addListener(
     pluginName: string,
     eventName: string,
     callback: (data: unknown) => void,
-  ): Promise<number>;
-  removeListener(subscriptionId: number): Promise<void>;
-  removeAllListeners(pluginName: string): Promise<void>;
+  ): Promise<InvokeResult>;
+  removeListener(subscriptionId: number): Promise<InvokeResult>;
+  removeAllListeners(pluginName: string): Promise<InvokeResult>;
 }
 
 /** The exact allowlist, as data. Nothing else is exposed to the page. */
@@ -91,15 +114,6 @@ interface CallbackRecord {
   readonly callback: (data: unknown) => void;
 }
 
-function unwrap(answer: unknown): unknown {
-  const result = answer as InvokeResult | undefined;
-  if (result === undefined || typeof result !== 'object') {
-    throw new Error('desktop bridge: main answered with a value that is not an invoke result.');
-  }
-  if (result.ok) return result.data;
-  throw fromWireError(result.error);
-}
-
 /**
  * Build the preload bridge.
  *
@@ -110,7 +124,7 @@ function unwrap(answer: unknown): unknown {
  * @param ipc - the `ipcRenderer` slice.
  * @returns the five functions, and nothing else.
  */
-export function createRendererBridge(ipc: RendererIpc): DesktopBridge {
+export function createRendererBridge(ipc: RendererIpc): PreloadBridge {
   const manifest = ipc.sendSync(BOOTSTRAP_CHANNEL) as BootManifest;
   const callbacks = new Map<number, CallbackRecord>();
   let nextSubscriptionId = 1;
@@ -137,59 +151,81 @@ export function createRendererBridge(ipc: RendererIpc): DesktopBridge {
     record.callback(payload.data);
   });
 
-  const bridge: DesktopBridge = {
+  /** A local refusal, in the same shape as a refusal from main. */
+  const refuse = (error: unknown): InvokeResult => ({ ok: false, error: toWireError(error) });
+
+  const bridge: PreloadBridge = {
     getBootstrap: () => manifest,
 
-    async invoke(pluginName: string, method: string, args: readonly unknown[]): Promise<unknown> {
-      const definition = plugin(pluginName);
-      // Refused HERE, before a channel string exists. This is the property the
-      // whole design rests on: a page-supplied name cannot become a channel.
-      if (!definition.methods.includes(method)) {
-        throw new Error(
-          `desktop bridge: "${pluginName}" has no method "${method}". ` +
-            `It has: ${definition.methods.join(', ')}.`,
-        );
+    async invoke(
+      pluginName: string,
+      method: string,
+      args: readonly unknown[],
+    ): Promise<InvokeResult> {
+      try {
+        const definition = plugin(pluginName);
+        // Refused HERE, before a channel string exists. This is the property
+        // the whole design rests on: a page-supplied name cannot become a
+        // channel.
+        if (!definition.methods.includes(method)) {
+          throw new Error(
+            `desktop bridge: "${pluginName}" has no method "${method}". ` +
+              `It has: ${definition.methods.join(', ')}.`,
+          );
+        }
+        assertCloneable(args, `${pluginName}.${method}(arguments)`);
+      } catch (error) {
+        return refuse(error);
       }
-      assertCloneable(args, `${pluginName}.${method}(arguments)`);
-      return unwrap(await ipc.invoke(methodChannel(pluginName, method), args));
+      return (await ipc.invoke(methodChannel(pluginName, method), args)) as InvokeResult;
     },
 
     async addListener(
       pluginName: string,
       eventName: string,
       callback: (data: unknown) => void,
-    ): Promise<number> {
-      const definition = plugin(pluginName);
-      if (!definition.events.includes(eventName)) {
-        throw new Error(
-          `desktop bridge: "${pluginName}" emits no event "${eventName}". ` +
-            `It emits: ${definition.events.join(', ') || '(none)'}.`,
-        );
-      }
-      const subscriptionId = nextSubscriptionId++;
-      callbacks.set(subscriptionId, { pluginName, eventName, callback });
+    ): Promise<InvokeResult> {
+      let subscriptionId: number;
       try {
-        unwrap(await ipc.invoke(LISTENER_ADD_CHANNEL, { pluginName, eventName, subscriptionId }));
+        const definition = plugin(pluginName);
+        if (!definition.events.includes(eventName)) {
+          throw new Error(
+            `desktop bridge: "${pluginName}" emits no event "${eventName}". ` +
+              `It emits: ${definition.events.join(', ') || '(none)'}.`,
+          );
+        }
+        subscriptionId = nextSubscriptionId++;
+        callbacks.set(subscriptionId, { pluginName, eventName, callback });
       } catch (error) {
-        callbacks.delete(subscriptionId);
-        throw error;
+        return refuse(error);
       }
-      return subscriptionId;
+      const answer = (await ipc.invoke(LISTENER_ADD_CHANNEL, {
+        pluginName,
+        eventName,
+        subscriptionId,
+      })) as InvokeResult;
+      if (!answer.ok) {
+        callbacks.delete(subscriptionId);
+        return answer;
+      }
+      // The subscription id, not whatever main answered with — Capacitor uses
+      // this value as the callback id it later hands to `removeListener`.
+      return { ok: true, data: subscriptionId };
     },
 
-    async removeListener(subscriptionId: number): Promise<void> {
+    async removeListener(subscriptionId: number): Promise<InvokeResult> {
       // Dropped locally FIRST. If the round trip fails the page must still
       // stop hearing the event; a listener that survives its own `remove()` is
       // how a torn-down component keeps writing into dead state.
       callbacks.delete(subscriptionId);
-      unwrap(await ipc.invoke(LISTENER_REMOVE_CHANNEL, { subscriptionId }));
+      return (await ipc.invoke(LISTENER_REMOVE_CHANNEL, { subscriptionId })) as InvokeResult;
     },
 
-    async removeAllListeners(pluginName: string): Promise<void> {
+    async removeAllListeners(pluginName: string): Promise<InvokeResult> {
       for (const [id, record] of callbacks) {
         if (record.pluginName === pluginName) callbacks.delete(id);
       }
-      unwrap(await ipc.invoke(LISTENER_REMOVE_ALL_CHANNEL, { pluginName }));
+      return (await ipc.invoke(LISTENER_REMOVE_ALL_CHANNEL, { pluginName })) as InvokeResult;
     },
   };
 

@@ -15,7 +15,7 @@
 import type { LlamaCppPlugin } from '@chatterang/contracts';
 
 import { assertCloneable } from './clone.js';
-import type { HostCall, LlamaEventName, MessageLink } from './protocol.js';
+import type { HostCall, HostPing, LlamaEventName, MessageLink } from './protocol.js';
 import { LLAMA_EVENTS, LLAMA_METHODS, toWireError } from './protocol.js';
 
 export interface HostRuntimeOptions {
@@ -65,8 +65,17 @@ export function serveLlamaCpp(options: HostRuntimeOptions): () => Promise<void> 
   );
 
   link.onMessage((raw) => {
-    const message = raw as HostCall;
-    if (message === null || typeof message !== 'object' || message.k !== 'call') return;
+    const message = raw as HostCall | HostPing;
+    if (message === null || typeof message !== 'object') return;
+    // Answered HERE, ahead of the method allowlist and without touching the
+    // plugin. A probe that had to go through `LlamaCppNode` would be blocked by
+    // precisely the state it exists to detect, and would answer "wedged" for a
+    // host that is merely busy loading a 6 GB model.
+    if (message.k === 'ping') {
+      send({ k: 'pong', id: message.id });
+      return;
+    }
+    if (message.k !== 'call') return;
     void dispatch(message);
   });
 

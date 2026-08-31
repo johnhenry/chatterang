@@ -19,9 +19,11 @@ import { LlamaCppNode } from '@chatterang/inference-node';
 
 import {
   BRIDGE_KEYS,
+  DEFAULT_POLICY,
   DSH_PLUGIN,
   EVENT_CHANNEL,
   HANDLE_LOST,
+  HOST_TIMEOUT,
   LLAMA_EVENTS,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
@@ -33,15 +35,22 @@ import {
   channelCollisions,
   createMainRouter,
   createRendererBridge,
+  fromWireError,
   installCapacitorShim,
   methodChannel,
   serveLlamaCpp,
 } from '@chatterang/desktop/bridge';
 import type {
-  DesktopBridge,
+  BootManifest,
+  HostMessage,
   MessageLink,
+  NotifyListeners,
   PluginImplementation,
+  PreloadBridge,
   RendererIpc,
+  ShimTarget,
+  SupervisorPolicy,
+  SupervisorTimers,
 } from '@chatterang/desktop/bridge';
 
 /**
@@ -76,6 +85,10 @@ interface LinkPair {
   readonly host: MessageLink;
   /** Kill the inference host, as a native-addon abort would. */
   kill(reason: string): void;
+  /** True once this host has been terminated, by either side. */
+  readonly dead: boolean;
+  /** Set when the SUPERVISOR terminated it, rather than it dying on its own. */
+  killedBySupervisor: boolean;
 }
 
 /**
@@ -114,31 +127,230 @@ function createLinkPair(): LinkPair {
     };
   };
 
-  return {
+  const pair = {
     main: side('main'),
     host: side('host'),
-    kill(reason) {
+    killedBySupervisor: false,
+    get dead(): boolean {
+      return !open;
+    },
+    kill(reason: string): void {
       if (!open) return;
       open = false;
       for (const close of closers) close(reason);
     },
   };
+  return pair;
+}
+
+/* ── The clock, held still ────────────────────────────────────────────── */
+
+interface ManualClock extends SupervisorTimers {
+  /** Move the wall clock forward and run whatever that makes due. */
+  advance(ms: number): Promise<void>;
+}
+
+/**
+ * A clock a test owns.
+ *
+ * The watchdog's whole job is measured in minutes, and a suite that waited
+ * them out would either take minutes or assert against shortened deadlines
+ * that are not the ones shipped. Holding the clock still also means the
+ * DEFAULT policy is what every test below exercises: nothing fires unless a
+ * test moves time, and when it does, it moves it by an exact amount.
+ */
+function manualClock(): ManualClock {
+  let now = 0;
+  const ticks = new Set<() => void>();
+  const pending = new Set<{ at: number; fn: () => void }>();
+  return {
+    now: () => now,
+    every: (_ms, fn) => {
+      ticks.add(fn);
+      return () => ticks.delete(fn);
+    },
+    after: (ms, fn) => {
+      const entry = { at: now + ms, fn };
+      pending.add(entry);
+      return () => pending.delete(entry);
+    },
+    async advance(ms: number): Promise<void> {
+      now += ms;
+      for (const entry of [...pending]) {
+        if (entry.at > now) continue;
+        pending.delete(entry);
+        entry.fn();
+      }
+      // The tick is deadline-driven, not count-driven, so running it once
+      // after a jump is equivalent to running it every `tickMs` across it.
+      for (const fn of [...ticks]) fn();
+      await new Promise((done) => setTimeout(done, 0));
+    },
+  };
+}
+
+/* ── The contextBridge hop, modelled ──────────────────────────────────── */
+
+/**
+ * What `contextBridge.exposeInMainWorld` does to a value, as a function.
+ *
+ * THIS IS NOT `structuredClone`, AND THE DIFFERENCE IS DEFECT [3]. The ports
+ * above are modelled with structured clone because that is the algorithm
+ * Electron's IPC actually uses. `contextBridge` is a THIRD boundary with its
+ * own rules, and the two disagree in both directions:
+ *
+ *   - structured clone THROWS on a function; contextBridge passes one through
+ *     as a proxy, which is the only reason an event callback works at all;
+ *   - structured clone carries an `Error`'s own properties across; **
+ *     contextBridge reduces an `Error` to its message and stack and DROPS
+ *     custom own properties** — including `code`.
+ *
+ * So a test that modelled the preload-to-page hop with `structuredClone`
+ * would have shown `HANDLE_LOST` arriving intact when in the shipped app it
+ * did not. This double reproduces the one documented behaviour the defect
+ * turns on, and `the contextBridge double is not a no-op` below proves it is
+ * not vacuous by showing the old arrangement failing through it.
+ *
+ * WHAT THIS DOUBLE IS NOT: real Electron. It models Electron's documented
+ * behaviour for the value shapes this bridge actually passes — plain objects,
+ * arrays, primitives, functions and Errors. It does not model the frozen
+ * result objects, the proxy identity rules, or anything else.
+ */
+function crossContextBridge<T>(value: T): T {
+  return cross(value) as T;
+}
+
+function cross(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'function') {
+      const fn = value as (...args: unknown[]) => unknown;
+      return (...args: unknown[]): unknown => {
+        let result: unknown;
+        try {
+          result = fn(...args.map((arg) => cross(arg)));
+        } catch (error) {
+          // A SYNCHRONOUS throw crosses too, and loses the same properties.
+          // Missed on the first draft of this double, and caught by the test
+          // below that asserts the double is not a no-op — which is exactly
+          // what that test is for.
+          throw cross(error);
+        }
+        if (result instanceof Promise) {
+          return result.then(
+            (settled) => cross(settled),
+            (error: unknown) => {
+              throw cross(error);
+            },
+          );
+        }
+        return cross(result);
+      };
+    }
+    return value;
+  }
+  if (value instanceof Error) {
+    // THE DEFECT, in one line. `code` does not survive; message and stack do.
+    const copy = new Error(value.message);
+    copy.stack = value.stack;
+    return copy;
+  }
+  if (Array.isArray(value)) return value.map((entry) => cross(entry));
+  const prototype = Object.getPrototypeOf(value) as object | null;
+  if (prototype !== Object.prototype && prototype !== null) {
+    // Anything that is not a plain object crosses as ITSELF. contextBridge
+    // proxies such a value rather than flattening it, and the distinction
+    // matters here: an `AbortSignal` flattened to `{}` on the way in would
+    // sail past `assertCloneable`, and the test that proves the bridge refuses
+    // one would be passing for a reason that does not exist in the app.
+    // Caught by exactly that test while this double was being written.
+    return value;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) out[key] = cross(entry);
+  return out;
+}
+
+/* ── The page's view of the bridge ────────────────────────────────────── */
+
+/**
+ * What a page script sees after the shim has run: values, and throws that
+ * carry `code`.
+ *
+ * Built by DRIVING THE REAL SHIM rather than by re-implementing it. Every
+ * `h.bridge.invoke` below therefore crosses the modelled contextBridge and
+ * comes back through `installCapacitorShim`'s own `unwrap` — which is where
+ * the error is now rebuilt, and the only place a test can prove that it is.
+ */
+interface PageBridge {
+  getBootstrap(): BootManifest;
+  invoke(pluginName: string, method: string, args: readonly unknown[]): Promise<unknown>;
+  addListener(
+    pluginName: string,
+    eventName: string,
+    callback: (data: unknown) => void,
+  ): Promise<number>;
+  removeListener(subscriptionId: number): Promise<void>;
+  removeAllListeners(pluginName: string): Promise<void>;
+}
+
+function pageBridge(exposed: PreloadBridge): PageBridge {
+  const target: ShimTarget = {};
+  installCapacitorShim(target, exposed);
+  const capacitor = target.Capacitor as {
+    nativePromise(plugin: string, method: string, options?: unknown): Promise<unknown>;
+    nativeCallback(
+      plugin: string,
+      method: string,
+      options: Record<string, unknown> | undefined,
+      callback?: (data: unknown) => void,
+    ): Promise<unknown>;
+  };
+  return {
+    getBootstrap: () => exposed.getBootstrap(),
+    // Capacitor's proxy passes at most one options object per call, which is
+    // exactly the shape every method in `LLAMA_METHODS` takes.
+    invoke: (pluginName, method, args) => capacitor.nativePromise(pluginName, method, args[0]),
+    addListener: async (pluginName, eventName, callback) =>
+      (await capacitor.nativeCallback(pluginName, 'addListener', { eventName }, callback)) as number,
+    removeListener: async (subscriptionId) => {
+      await capacitor.nativeCallback('LlamaCpp', 'removeListener', { callbackId: subscriptionId });
+    },
+    removeAllListeners: async (pluginName) => {
+      await capacitor.nativePromise(pluginName, 'removeAllListeners');
+    },
+  };
 }
 
 interface Harness {
-  readonly bridge: DesktopBridge;
+  /** The page's view: through contextBridge, through the real shim. */
+  readonly bridge: PageBridge;
+  /** What `contextBridge.exposeInMainWorld` published, as the page sees it. */
+  readonly exposed: PreloadBridge;
+  /** The preload object itself, before it crosses anything. */
+  readonly preload: PreloadBridge;
   readonly host: PluginHost;
   readonly supervisor: Supervisor;
+  readonly clock: ManualClock;
   /** Every channel the renderer named, in order. */
   readonly channels: string[];
+  /** Every host the supervisor has spawned, oldest first. */
+  readonly hosts: LinkPair[];
   killHost(reason?: string): void;
   destroyRenderer(): void;
 }
 
+interface HarnessOptions {
+  readonly dsh?: PluginImplementation;
+  readonly policy?: Partial<SupervisorPolicy>;
+}
+
 /** Renderer -> preload -> main -> inference host, all real, twice serialized. */
-function harness(plugin: LlamaCppPlugin, dsh?: PluginImplementation): Harness {
-  const pair = createLinkPair();
-  serveLlamaCpp({ link: pair.host, plugin });
+function harness(
+  plugin: LlamaCppPlugin | (() => LlamaCppPlugin),
+  options: HarnessOptions = {},
+): Harness {
+  const make = typeof plugin === 'function' ? plugin : (): LlamaCppPlugin => plugin;
+  const hosts: LinkPair[] = [];
 
   let eventListener: ((payload: unknown) => void) | null = null;
   let rendererAlive = true;
@@ -151,13 +363,29 @@ function harness(plugin: LlamaCppPlugin, dsh?: PluginImplementation): Harness {
     return true;
   });
 
+  const clock = manualClock();
   const supervisor = new Supervisor({
-    link: pair.main,
+    // A FACTORY, exactly as `main.ts` supplies one: each call is a new host
+    // process with a new port, which is what makes a respawn observable.
+    spawn: () => {
+      const pair = createLinkPair();
+      serveLlamaCpp({ link: pair.host, plugin: make() });
+      hosts.push(pair);
+      return {
+        link: pair.main,
+        kill: () => {
+          pair.killedBySupervisor = true;
+          pair.kill('terminated by the supervisor');
+        },
+      };
+    },
     notify: (eventName, data) => host.notifyListeners(LLAMA_PLUGIN.name, eventName, data),
+    timers: clock,
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
   });
 
   host.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation);
-  if (dsh !== undefined) host.register(DSH_PLUGIN, dsh);
+  if (options.dsh !== undefined) host.register(DSH_PLUGIN, options.dsh);
 
   const router = createMainRouter(host);
   const channels: string[] = [];
@@ -177,12 +405,19 @@ function harness(plugin: LlamaCppPlugin, dsh?: PluginImplementation): Harness {
     },
   };
 
+  const preload = createRendererBridge(ipc);
+  const exposed = crossContextBridge(preload);
+
   return {
-    bridge: createRendererBridge(ipc),
+    bridge: pageBridge(exposed),
+    exposed,
+    preload,
     host,
     supervisor,
+    clock,
     channels,
-    killHost: (reason = 'SIGKILL') => pair.kill(reason),
+    hosts,
+    killHost: (reason = 'SIGKILL') => hosts[hosts.length - 1]?.kill(reason),
     destroyRenderer: () => {
       rendererAlive = false;
       host.releaseSender(1);
@@ -378,7 +613,7 @@ function endEvent(requestId: string, stopReason: GenerateResult['stopReason']): 
 }
 
 /** Subscribe through the real preload bridge and collect what arrives. */
-async function collect<T>(bridge: DesktopBridge, eventName: string): Promise<T[]> {
+async function collect<T>(bridge: PageBridge, eventName: string): Promise<T[]> {
   const received: T[] = [];
   await bridge.addListener(LLAMA_PLUGIN.name, eventName, (data) => received.push(data as T));
   return received;
@@ -388,7 +623,7 @@ const settle = async (): Promise<void> => {
   await new Promise((done) => setTimeout(done, 10));
 };
 
-async function loadOne(bridge: DesktopBridge): Promise<string> {
+async function loadOne(bridge: PageBridge): Promise<string> {
   const result = (await bridge.invoke(LLAMA_PLUGIN.name, 'load', [
     { modelPath: '/models/test.gguf' },
   ])) as { handle: string };
@@ -709,16 +944,19 @@ describe('values that cannot cross are refused, not silently mangled', () => {
 describe('the renderer can only ever name a channel from the manifest', () => {
   it('exposes exactly the five allowlisted functions', () => {
     const h = harness(scripted(async (o) => endEvent(o.requestId, 'stop')));
+    // Asserted against the PRELOAD object, which is the one `contextBridge`
+    // actually publishes — the page's view is built from it by the shim and
+    // would hide a sixth property rather than reveal one.
     const exposed = Object.fromEntries(
-      BRIDGE_KEYS.map((key) => [key, (h.bridge as unknown as Record<string, unknown>)[key]]),
+      BRIDGE_KEYS.map((key) => [key, (h.preload as unknown as Record<string, unknown>)[key]]),
     );
     // Both directions: nothing missing, and nothing extra. The preload builds
     // the exposed object from this same list, so the allowlist is one list.
     expect(Object.keys(exposed).sort()).toEqual([...BRIDGE_KEYS].sort());
-    expect(Object.keys(h.bridge).sort()).toEqual([...BRIDGE_KEYS].sort());
+    expect(Object.keys(h.preload).sort()).toEqual([...BRIDGE_KEYS].sort());
     for (const key of BRIDGE_KEYS) expect(typeof exposed[key]).toBe('function');
-    expect((h.bridge as unknown as Record<string, unknown>)['ipcRenderer']).toBeUndefined();
-    expect((h.bridge as unknown as Record<string, unknown>)['require']).toBeUndefined();
+    expect((h.preload as unknown as Record<string, unknown>)['ipcRenderer']).toBeUndefined();
+    expect((h.preload as unknown as Record<string, unknown>)['require']).toBeUndefined();
   });
 
   it('touches no channel outside the allowlist during a whole session', async () => {
@@ -798,7 +1036,11 @@ describe('the renderer can only ever name a channel from the manifest', () => {
     // passes for the object we actually ship.
     const pair = createLinkPair();
     const host = new PluginHost(() => true);
-    const supervisor = new Supervisor({ link: pair.main, notify: () => undefined });
+    const supervisor = new Supervisor({
+      spawn: () => ({ link: pair.main, kill: () => pair.kill('terminated') }),
+      notify: () => undefined,
+      timers: manualClock(),
+    });
     expect(() =>
       host.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation),
     ).not.toThrow();
@@ -822,7 +1064,7 @@ describe('registerPlugin in src/ resolves to the desktop bridge', () => {
 
   beforeAll(async () => {
     shared = harness(realPlugin('p q r').plugin);
-    installCapacitorShim(globalThis as never, shared.bridge);
+    installCapacitorShim(globalThis as never, shared.exposed);
     const core = await import('@capacitor/core');
     LlamaCpp = core.registerPlugin<LlamaCppPlugin>('LlamaCpp', {
       web: async () => new (await import('@/plugins/llama-cpp/web')).LlamaCppWeb(),
@@ -982,5 +1224,515 @@ describe('a lost handle is dropped rather than cached forever', () => {
     expect(response.message.content).toBe('recovered');
     expect(calls.load).toBe(2);
     vi.doUnmock('@/plugins/llama-cpp');
+  });
+});
+
+/* ══ The host comes back ════════════════════════════════════════════════ */
+
+/**
+ * A supervisor over hand-built links, for the cases the fake port cannot show.
+ *
+ * `createLinkPair` models a host honestly and therefore stops delivering when
+ * it dies — which is exactly wrong for testing what happens when a host we
+ * have given up on speaks anyway, or when a host is alive enough to answer
+ * calls and not alive enough to answer a ping. These links are dumber and
+ * fully controlled.
+ */
+interface WiredHost {
+  readonly posted: unknown[];
+  /** Deliver a message to main as if this host had sent it. */
+  send(message: unknown): void;
+  /** Signal `exit` to main. */
+  close(reason: string): void;
+  killed: boolean;
+}
+
+function wiredSupervisor(options: {
+  policy?: Partial<SupervisorPolicy>;
+  answer?: (host: WiredHost, message: HostMessage) => void;
+  notify?: NotifyListeners;
+}): { supervisor: Supervisor; hosts: WiredHost[]; clock: ManualClock; warnings: string[] } {
+  const hosts: WiredHost[] = [];
+  const warnings: string[] = [];
+  const clock = manualClock();
+  const supervisor = new Supervisor({
+    spawn: () => {
+      const listeners: ((m: unknown) => void)[] = [];
+      const closers: ((r: string) => void)[] = [];
+      const host: WiredHost = {
+        posted: [],
+        killed: false,
+        send: (message) => {
+          for (const listener of listeners) listener(message);
+        },
+        close: (reason) => {
+          for (const closer of closers) closer(reason);
+        },
+      };
+      hosts.push(host);
+      return {
+        link: {
+          postMessage: (message) => {
+            host.posted.push(message);
+            options.answer?.(host, message as HostMessage);
+          },
+          onMessage: (listener) => listeners.push(listener),
+          onClose: (listener) => closers.push(listener),
+        },
+        kill: () => {
+          host.killed = true;
+        },
+      };
+    },
+    notify: options.notify ?? ((): void => undefined),
+    warn: (message) => warnings.push(message),
+    timers: clock,
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
+  });
+  return { supervisor, hosts, clock, warnings };
+}
+
+describe('a dead inference host is replaced, not mourned', () => {
+  it('a call that arrives after the host died succeeds against its replacement', async () => {
+    // DEFECT [2]. The shipped build forked once and latched `#closed` forever:
+    // kill the child and every later call failed with HANDLE_LOST until the
+    // app was relaunched. FAULT INJECTED to confirm this test sees it —
+    // deleting the `this.#scheduleRestart()` call from `#onClose` gave
+    // `expected 1 to be 2` on spawnCount and left the second call rejecting
+    // with "The inference process stopped unexpectedly (SIGKILL)."
+    const h = harness(() => scripted(async (o) => endEvent(o.requestId, 'stop')));
+    expect(await h.bridge.invoke(LLAMA_PLUGIN.name, 'getCapabilities', [])).toMatchObject({
+      simulated: true,
+    });
+
+    h.killHost('SIGKILL');
+    await settle();
+
+    // The gap between one host dying and the next existing is not a hang: a
+    // call made in it fails immediately, with the code the adapter recovers on.
+    await expect(
+      h.bridge.invoke(LLAMA_PLUGIN.name, 'getCapabilities', []),
+    ).rejects.toMatchObject({ code: HANDLE_LOST });
+
+    await h.clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+
+    expect(h.supervisor.spawnCount).toBe(2);
+    expect(h.hosts).toHaveLength(2);
+    expect(await h.bridge.invoke(LLAMA_PLUGIN.name, 'getCapabilities', [])).toMatchObject({
+      simulated: true,
+    });
+    // And a whole generation runs on the replacement, with its one llamaEnd.
+    const ends = await collect<GenerationEndEvent>(h.bridge, 'llamaEnd');
+    await h.bridge.invoke(LLAMA_PLUGIN.name, 'generate', [
+      { handle: 'h', prompt: 'p', requestId: 'after-restart' },
+    ]);
+    await settle();
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.requestId).toBe('after-restart');
+  });
+
+  it('ignores a message from a host it has already given up on', async () => {
+    // `MessageLink` has no unsubscribe, so a retired host's listener still
+    // points at the supervisor. Call ids come from one counter and a restarted
+    // host answers ids it never saw, so without the epoch check a late message
+    // from a dead host settles a live call with a dead host's answer.
+    // FAULT INJECTED: removing `if (epoch !== this.#generation) return;` from
+    // the `onMessage` wiring in `#attach` resolved the second call with
+    // `{ from: 'the host that died' }`.
+    const { supervisor, hosts, clock } = wiredSupervisor({});
+    hosts[0]?.close('exit code 9');
+    await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    expect(hosts).toHaveLength(2);
+
+    const second = supervisor.getCapabilities();
+    const call = hosts[1]?.posted.at(-1) as { k: string; id: number };
+    expect(call.k).toBe('call');
+
+    hosts[0]?.send({ k: 'ret', id: call.id, ok: true, data: { from: 'the host that died' } });
+    await settle();
+    hosts[1]?.send({ k: 'ret', id: call.id, ok: true, data: { from: 'the host that lives' } });
+
+    expect(await second).toEqual({ from: 'the host that lives' });
+  });
+
+  it('reports the status of the host that is running, not the one that booted', async () => {
+    // DEFECT [2], second half. `main.ts` held the first boot report in a
+    // variable and served it forever, so after a respawn `DshHost.getStatus()`
+    // answered `mounted: true` about a process that no longer existed —
+    // and "mounted" is exactly what a caller checks before deciding the
+    // inference stack is usable.
+    const { supervisor, hosts, clock } = wiredSupervisor({});
+    expect(supervisor.hostStatus().mounted).toBe(false);
+    expect(supervisor.hostStatus().treeAssertion).toMatch(/has not finished booting/);
+
+    hosts[0]?.send({
+      k: 'boot',
+      status: { mounted: true, services: ['llm'], routes: ['llama'], treeAssertion: 'walked' },
+    });
+    expect(supervisor.hostStatus()).toMatchObject({ mounted: true, routes: ['llama'] });
+
+    hosts[0]?.close('exit code 9');
+    // FAULT INJECTED: dropping `this.#boot = null;` from `#onClose` kept
+    // `mounted: true` here — the stale answer the defect is about.
+    expect(supervisor.hostStatus().mounted).toBe(false);
+    expect(supervisor.hostStatus().error).toMatch(/stopped unexpectedly/);
+
+    await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    hosts[1]?.send({
+      k: 'boot',
+      status: { mounted: true, services: ['llm'], routes: ['llama-2'], treeAssertion: 'walked' },
+    });
+    expect(supervisor.hostStatus().routes).toEqual(['llama-2']);
+  });
+
+  it('stops restarting a host that will not stay up, and says so', async () => {
+    // A host that dies on startup — a missing model directory, a native addon
+    // that aborts on load — would otherwise be respawned forever, one process
+    // per attempt. FAULT INJECTED: removing the `maxRestarts` check spun to
+    // 200 spawns before the test's own loop stopped it.
+    const { supervisor, hosts, clock } = wiredSupervisor({ policy: { maxRestarts: 3 } });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      hosts.at(-1)?.close('exit code 1');
+      await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    }
+    expect(supervisor.spawnCount).toBe(4);
+    await expect(supervisor.getCapabilities()).rejects.toThrow(/is not being restarted again/);
+  });
+
+  it('terminates a host it replaces, so two are never decoding at once', async () => {
+    const { hosts, clock } = wiredSupervisor({});
+    hosts[0]?.close('exit code 9');
+    await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    // FAULT INJECTED: removing the `#retire()` call from `#onClose` left this
+    // false — and in the app that is a wedged host still holding the GPU its
+    // replacement is about to ask for.
+    expect(hosts[0]?.killed).toBe(true);
+    expect(hosts[1]?.killed).toBe(false);
+  });
+});
+
+/* ══ A host that is alive and useless ═══════════════════════════════════ */
+
+describe('a WEDGED host terminates too, though it never exits', () => {
+  it('a generation that produces nothing is settled by its deadline, exactly once', async () => {
+    // THE HANG THE TERMINAL-EVENT RULE EXISTS TO PREVENT, and the one path
+    // that still produced it. A host that is alive but wedged — a spinning
+    // decode, a hung Metal call — emits no `exit`, so `#onClose` never fires;
+    // `ipcRenderer.invoke` has no timeout, so the renderer waits forever.
+    // FAULT INJECTED: deleting the deadline sweep from `#tick` made this test
+    // hang until vitest's own timeout killed it, which is precisely the
+    // failure being fixed.
+    const h = harness(
+      scripted(
+        () =>
+          new Promise<GenerateResult>(() => {
+            /* a wedged host: alive, answering pings, producing nothing */
+          }),
+      ),
+    );
+    const ends = await collect<GenerationEndEvent>(h.bridge, 'llamaEnd');
+
+    const generation = h.bridge.invoke(LLAMA_PLUGIN.name, 'generate', [
+      { handle: 'h', prompt: 'p', requestId: 'wedged' },
+    ]);
+    // The rejection is asserted below, but it HAPPENS inside `advance`, so it
+    // needs a handler before then or Node reports an unhandled rejection and
+    // vitest fails the file for a reason that is not the test's.
+    void generation.catch(() => undefined);
+    await settle();
+
+    await h.clock.advance(DEFAULT_POLICY.generateIdleTimeoutMs + 1);
+
+    await expect(generation).rejects.toMatchObject({ code: HOST_TIMEOUT });
+    await expect(generation).rejects.toThrow(/stopped answering/);
+    await settle();
+
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.stopReason).toBe('error');
+    expect(h.supervisor.inflightCount).toBe(0);
+
+    // And the host was NOT replaced: it is still answering pings, so as far as
+    // the supervisor knows it is a host that produced a bad turn, not a dead
+    // one. The deadline settles the turn; only the ping condemns the process.
+    expect(h.supervisor.spawnCount).toBe(1);
+  });
+
+  it('a token buys its generation more time, so a long answer is not cut off', async () => {
+    // A fixed cap on generation time would break exactly the workloads this
+    // app exists for, and a timeout that breaks working generations gets
+    // raised until it is useless. FAULT INJECTED: removing the `llamaToken`
+    // branch from `#receive` timed the generation out at the first advance.
+    let emitToken: ((data: unknown) => void) | null = null;
+    const h = harness(
+      scripted(
+        (options, emit) =>
+          new Promise<GenerateResult>(() => {
+            emitToken = (data) => emit('llamaToken', data);
+            void options;
+          }),
+      ),
+    );
+    const ends = await collect<GenerationEndEvent>(h.bridge, 'llamaEnd');
+    const generation = h.bridge.invoke(LLAMA_PLUGIN.name, 'generate', [
+      { handle: 'h', prompt: 'p', requestId: 'slow' },
+    ]);
+    void generation.catch(() => undefined);
+    await settle();
+
+    const idle = DEFAULT_POLICY.generateIdleTimeoutMs;
+    await h.clock.advance(idle - 1_000);
+    (emitToken as unknown as (data: unknown) => void)({
+      requestId: 'slow',
+      token: 'still here',
+      index: 0,
+    });
+    await settle();
+
+    // Past the ORIGINAL deadline, and still running because of that one token.
+    await h.clock.advance(2_000);
+    expect(ends).toHaveLength(0);
+    expect(h.supervisor.inflightCount).toBe(1);
+
+    await h.clock.advance(idle + 1);
+    await expect(generation).rejects.toMatchObject({ code: HOST_TIMEOUT });
+    await settle();
+    expect(ends).toHaveLength(1);
+  });
+
+  it('a host that stops answering pings is condemned while its process still runs', async () => {
+    // The other half of [4], and the one no `exit` can ever report. This host
+    // answers calls it feels like answering and ignores pings entirely; its
+    // process is alive throughout. FAULT INJECTED: removing the `#pingTick`
+    // call from `#tick` left spawnCount at 1 forever — the wedged host is
+    // never replaced and the app never works again.
+    const { supervisor, hosts, clock } = wiredSupervisor({
+      answer: (host, message) => {
+        // Calls are answered; pings are not. Alive, and useless.
+        if (message.k === 'call') host.send({ k: 'ret', id: message.id, ok: true, data: 'fine' });
+      },
+    });
+    expect(await supervisor.getCapabilities()).toBe('fine');
+
+    await clock.advance(DEFAULT_POLICY.pingIntervalMs + 1);
+    expect((hosts[0]?.posted.at(-1) as { k: string }).k).toBe('ping');
+    expect(supervisor.spawnCount).toBe(1);
+
+    await clock.advance(DEFAULT_POLICY.pingTimeoutMs + 1);
+    // Condemned, and terminated — the process was never going to exit on its
+    // own, and leaving it running would double the GPU its replacement wants.
+    expect(hosts[0]?.killed).toBe(true);
+
+    await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    expect(supervisor.spawnCount).toBe(2);
+    expect(await supervisor.getCapabilities()).toBe('fine');
+  });
+
+  it('a host that answers pings is never condemned, however long it takes', async () => {
+    // The counterpart, and the reason the ping is a separate mechanism from
+    // the deadline: loading a 6 GB GGUF takes seconds during which no call
+    // returns, and a liveness check that could not tell that from a wedge
+    // would kill the host mid-load, every time.
+    const { supervisor, hosts, clock } = wiredSupervisor({
+      answer: (host, message) => {
+        if (message.k === 'ping') host.send({ k: 'pong', id: message.id });
+      },
+    });
+    const slow = supervisor.load({ modelPath: '/models/big.gguf' });
+    void slow.catch(() => undefined);
+    for (let minute = 0; minute < 5; minute += 1) {
+      await clock.advance(60_000);
+    }
+    expect(supervisor.spawnCount).toBe(1);
+    expect(hosts[0]?.killed).toBe(false);
+    // The CALL still has a deadline — nothing hangs — but the process lives.
+    await expect(slow).rejects.toMatchObject({ code: HOST_TIMEOUT });
+  });
+
+  it('the real host runtime answers a ping without touching the plugin', async () => {
+    // The probe must not be routed through `LlamaCppNode`: it would then be
+    // blocked by precisely the state it exists to detect. This drives the real
+    // `serveLlamaCpp` against a plugin whose every method hangs.
+    const pair = createLinkPair();
+    const hanging = {
+      addListener: async () => ({ remove: async () => undefined }),
+      generate: () => new Promise(() => undefined),
+      getCapabilities: () => new Promise(() => undefined),
+    } as unknown as LlamaCppPlugin;
+    serveLlamaCpp({ link: pair.host, plugin: hanging });
+
+    const seen: unknown[] = [];
+    pair.main.onMessage((message) => seen.push(message));
+    pair.main.postMessage({ k: 'call', id: 1, method: 'getCapabilities', args: [] });
+    pair.main.postMessage({ k: 'ping', id: 77 });
+    await settle();
+
+    expect(seen).toContainEqual({ k: 'pong', id: 77 });
+    expect(seen.filter((m) => (m as { k: string }).k === 'ret')).toHaveLength(0);
+  });
+});
+
+/* ══ The third boundary: contextBridge ══════════════════════════════════ */
+
+describe('an error code survives the contextBridge hop', () => {
+  it('the double is not a no-op: it drops custom own properties from an Error', () => {
+    // THE MODEL THIS SECTION RESTS ON, asserted rather than assumed. If this
+    // is wrong in the permissive direction every test below passes for free,
+    // so it is checked in both: `code` is gone, `message` is not.
+    const thrower = crossContextBridge({
+      go: (): never => {
+        const error = new Error('the inference process stopped unexpectedly (SIGKILL).');
+        Object.assign(error, { code: HANDLE_LOST });
+        throw error;
+      },
+    });
+    let caught: unknown;
+    try {
+      thrower.go();
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as Error).message).toMatch(/SIGKILL/);
+    expect((caught as { code?: string }).code).toBeUndefined();
+
+    // The same failure as DATA crosses whole. That difference is the fix.
+    const asData = crossContextBridge({
+      go: (): unknown => ({ ok: false, error: { message: 'gone', code: HANDLE_LOST } }),
+    });
+    expect(asData.go()).toEqual({ ok: false, error: { message: 'gone', code: HANDLE_LOST } });
+  });
+
+  it('the SHIPPED arrangement loses HANDLE_LOST, which is why the unwrap moved', async () => {
+    // DEFECT [3], reproduced. This is what `createRendererBridge` used to do:
+    // unwrap in the preload, so an `Error` — not data — crossed. The code is
+    // stripped, `src/ai/backends/llama-cpp.ts` never sees HANDLE_LOST, and the
+    // one change A5 made to `src/` is unreachable in the running app.
+    const preloadThatUnwraps = crossContextBridge({
+      invoke: async (): Promise<unknown> => {
+        const wire = { message: 'The inference process stopped unexpectedly.', code: HANDLE_LOST };
+        throw fromWireError(wire);
+      },
+    });
+    const shipped = await preloadThatUnwraps.invoke().catch((error: unknown) => error);
+    expect((shipped as Error).message).toMatch(/stopped unexpectedly/);
+    expect((shipped as { code?: string }).code).toBeUndefined();
+  });
+
+  it('the page sees HANDLE_LOST when the host dies mid-generation', async () => {
+    // The fix, end to end: supervisor -> main -> IPC -> preload -> **the
+    // contextBridge hop** -> the real `installCapacitorShim` -> the page. Every
+    // `h.bridge` call in this file takes that route, so the whole suite now
+    // exercises it; this one names the property.
+    const h = harness(
+      scripted(
+        () =>
+          new Promise<GenerateResult>(() => {
+            /* never settles: the host dies first */
+          }),
+      ),
+    );
+    const generation = h.bridge.invoke(LLAMA_PLUGIN.name, 'generate', [
+      { handle: 'h', prompt: 'p', requestId: 'lost' },
+    ]);
+    await settle();
+    h.killHost('SIGKILL');
+    await expect(generation).rejects.toMatchObject({ code: HANDLE_LOST });
+  });
+
+  it('a deadline reaches the page as HOST_TIMEOUT, not as an anonymous Error', async () => {
+    const h = harness(
+      scripted(
+        () =>
+          new Promise<GenerateResult>(() => {
+            /* wedged */
+          }),
+      ),
+    );
+    const generation = h.bridge.invoke(LLAMA_PLUGIN.name, 'generate', [
+      { handle: 'h', prompt: 'p', requestId: 'wedged-code' },
+    ]);
+    void generation.catch(() => undefined);
+    await settle();
+    await h.clock.advance(DEFAULT_POLICY.generateIdleTimeoutMs + 1);
+    await expect(generation).rejects.toMatchObject({ code: HOST_TIMEOUT });
+  });
+
+  it('a NOT_CLONEABLE refusal keeps its code across the hop too', async () => {
+    // The preload no longer throws at all — it answers `{ok:false}` — so this
+    // is the check that its LOCAL refusals still arrive as throws with their
+    // code, and not as a resolved result object the page would treat as data.
+    const h = harness(scripted(async (o) => endEvent(o.requestId, 'stop')));
+    const refused = await h.bridge
+      .invoke(LLAMA_PLUGIN.name, 'generate', [{ onToken: (): void => undefined }])
+      .catch((error: unknown) => error);
+    expect((refused as Error).message).toMatch(/functions are not cloneable/);
+    expect((refused as { code?: string }).code).toBe('NOT_CLONEABLE');
+  });
+
+  it("the shim's inlined unwrap agrees with fromWireError, so the copy cannot drift", () => {
+    // `installCapacitorShim` cannot CALL `fromWireError`: its source is
+    // stringified and evaluated in the main world, where nothing from this
+    // module is in scope. The duplication is required; this is what keeps it
+    // honest. FAULT INJECTED: dropping the `Object.assign(error, {code})` line
+    // from the shim's unwrap failed on the code comparison.
+    const cases = [
+      { message: 'plain' },
+      { message: 'coded', code: HANDLE_LOST },
+      { message: 'timed out', code: HOST_TIMEOUT },
+    ];
+    for (const wire of cases) {
+      const target: ShimTarget = {};
+      installCapacitorShim(target, {
+        getBootstrap: () => ({ platform: 'electron', plugins: [LLAMA_PLUGIN] }),
+        invoke: async () => ({ ok: false, error: wire }),
+      } as unknown as PreloadBridge);
+      const capacitor = target.Capacitor as {
+        nativePromise(p: string, m: string, o?: unknown): Promise<unknown>;
+      };
+      const expected = fromWireError(wire);
+      void expect(capacitor.nativePromise('LlamaCpp', 'load', {})).rejects.toMatchObject({
+        message: expected.message,
+        ...(wire.code === undefined ? {} : { code: wire.code }),
+      });
+    }
+  });
+
+  it('the code survives the shim source that is actually EVALUATED, not just imported', async () => {
+    // The preload runs `capacitorShimSource(...)` through
+    // `webFrame.executeJavaScript`; the imported function is not what ships.
+    // This drives the STRING, with `window` as its only free variable, and
+    // pushes a coded failure all the way through it.
+    const manifest = { platform: 'electron', plugins: [LLAMA_PLUGIN] };
+    const fakeWindow: Record<string, unknown> = {
+      __chatterangDesktop: {
+        getBootstrap: () => manifest,
+        invoke: async () => ({
+          ok: false,
+          error: { message: 'The inference process stopped unexpectedly.', code: HANDLE_LOST },
+        }),
+      },
+    };
+    new Function('window', capacitorShimSource('__chatterangDesktop'))(fakeWindow);
+    const capacitor = fakeWindow['Capacitor'] as {
+      nativePromise(p: string, m: string, o?: unknown): Promise<unknown>;
+    };
+    const caught = await capacitor
+      .nativePromise('LlamaCpp', 'generate', { requestId: 'x' })
+      .catch((error: unknown) => error);
+    expect((caught as Error) instanceof Error).toBe(true);
+    expect((caught as { code?: string }).code).toBe(HANDLE_LOST);
+  });
+
+  it('refuses an answer that is not a result, rather than handing the page undefined', async () => {
+    const target: ShimTarget = {};
+    installCapacitorShim(target, {
+      getBootstrap: () => ({ platform: 'electron', plugins: [LLAMA_PLUGIN] }),
+      invoke: async () => 'not a result',
+    } as unknown as PreloadBridge);
+    const capacitor = target.Capacitor as {
+      nativePromise(p: string, m: string, o?: unknown): Promise<unknown>;
+    };
+    await expect(capacitor.nativePromise('LlamaCpp', 'load', {})).rejects.toThrow(
+      /not a result/,
+    );
   });
 });

@@ -28,17 +28,23 @@ export { createMainRouter } from './main-router.js';
 export type { MainRouter } from './main-router.js';
 export type { EventDelivery, EventPayload, PluginImplementation, PluginMethod } from './plugin-host.js';
 export { BRIDGE_GLOBAL, BRIDGE_KEYS, createRendererBridge } from './renderer.js';
-export type { DesktopBridge, InvokeResult, RendererIpc } from './renderer.js';
+export type { InvokeResult, PreloadBridge, RendererIpc } from './renderer.js';
 export { capacitorShimSource, installCapacitorShim } from './capacitor-shim.js';
 export type { ShimTarget } from './capacitor-shim.js';
-export { Supervisor } from './supervisor.js';
-export type { NotifyListeners, SupervisorOptions } from './supervisor.js';
+export { DEFAULT_POLICY, Supervisor, systemTimers } from './supervisor.js';
+export type {
+  NotifyListeners,
+  SupervisorOptions,
+  SupervisorPolicy,
+  SupervisorTimers,
+} from './supervisor.js';
 export { serveLlamaCpp } from './host-runtime.js';
 export type { HostRuntimeOptions } from './host-runtime.js';
 export {
   DSH_METHODS,
   DSH_PLUGIN,
   HANDLE_LOST,
+  HOST_TIMEOUT,
   LLAMA_EVENTS,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
@@ -51,6 +57,9 @@ export type {
   HostBoot,
   HostCall,
   HostEvent,
+  HostHandle,
+  HostPing,
+  HostPong,
   HostMessage,
   HostReturn,
   LlamaEventMap,
