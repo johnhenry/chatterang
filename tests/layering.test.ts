@@ -17,6 +17,18 @@ import { describe, expect, it } from 'vitest';
 const SRC = resolve(process.cwd(), 'src');
 
 /**
+ * The one ban the src/ desktop-layer guard enforces.
+ *
+ * Shared, not copied. The form tests below previously asserted against a
+ * byte-identical second copy, so weakening the ban that is actually applied to
+ * real files left every one of them green — a revert-check that verified a
+ * duplicate of the thing under test. Exactly the failure this file keeps
+ * re-learning, committed inside the guard against it.
+ */
+const DESKTOP_LAYER_BAN =
+  /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
+
+/**
  * Every module specifier a file names, by any of the four doors.
  *
  *   `import x from 'y'` / `export … from 'y'`   — the `from` form
@@ -280,8 +292,7 @@ describe('the app never reaches the desktop-only layer', () => {
     // with no darwin/x64 build at all — one import away from the web and
     // mobile bundles. `node-llama-cpp` had the identical hole and is closed
     // here too; it was never a new category, only an unnoticed one.
-    const banned =
-      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
+    const banned = DESKTOP_LAYER_BAN;
     const offenders = files
       .filter((file) =>
         [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
@@ -351,8 +362,7 @@ describe('the app never reaches the desktop-only layer', () => {
     // The same five doors, spelled with A3's specifiers, and asserted against
     // the BAN as well as the matcher — a specifier the matcher sees and the
     // regex then waves through is the failure this file keeps re-learning.
-    const onnxBan =
-      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
+    const onnxBan = DESKTOP_LAYER_BAN;
     const onnxForms: [string, string][] = [
       ["import * as ort from 'onnxruntime-node';", 'onnxruntime-node'],
       ["import { Tensor } from 'onnxruntime-common';", 'onnxruntime-common'],
