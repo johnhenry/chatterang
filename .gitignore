@@ -8,7 +8,12 @@ dist/
 /android/
 
 # Downloaded model weights never belong in the repository.
-models/
+#
+# Anchored. An unanchored `models/` also matched `src/features/models/`, so four
+# UI source files were silently untracked: a fresh clone could not build, and
+# every green test run was measured against a working tree git did not have.
+/models/
+/apps/desktop/models/
 *.gguf
 *.onnx
 *.litertlm

@@ -13,6 +13,7 @@
  */
 
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -69,5 +70,45 @@ describe('the web bundle cannot ship an unresolved optional peer', () => {
       .filter((file) => /Could not resolve "[^"]+"/.test(readFileSync(join(assets, file), 'utf8')))
       .sort();
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('every source file on disk is a source file in git', () => {
+  it('tracks all of src, packages and apps/desktop/src', () => {
+    /*
+     * `.gitignore` carried an unanchored `models/` rule for downloaded weights.
+     * It also matched `src/features/models/`, so four UI source files were
+     * silently untracked: a fresh clone could not build them, and every green
+     * test run in this repo was measured against a working tree that git did
+     * not have. Nothing noticed, because the local tree was always complete.
+     *
+     * This compares the two sources of truth directly, which is the only check
+     * that could have caught it.
+     */
+    const roots = ['src', 'packages', 'apps/desktop/src'];
+    const onDisk = new Set<string>();
+    const walk = (dir: string): void => {
+      if (!existsSync(dir)) return;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = `${dir}/${entry.name}`;
+        if (entry.isDirectory()) {
+          if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+          walk(full);
+        } else if (/\.(ts|tsx|css)$/.test(entry.name)) {
+          onDisk.add(full);
+        }
+      }
+    };
+    for (const root of roots) walk(root);
+    expect(onDisk.size).toBeGreaterThan(60);
+
+    const tracked = new Set(
+      execFileSync('git', ['ls-files', ...roots], { encoding: 'utf8' })
+        .split('\n')
+        .filter((line) => /\.(ts|tsx|css)$/.test(line)),
+    );
+
+    const untracked = [...onDisk].filter((file) => !tracked.has(file)).sort();
+    expect(untracked).toEqual([]);
   });
 });
