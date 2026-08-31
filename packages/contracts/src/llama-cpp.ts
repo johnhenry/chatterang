@@ -72,6 +72,17 @@ export interface LoadOptions {
   useMmap?: boolean;
   /** Chat template override when the GGUF metadata has none. */
   chatTemplate?: string;
+
+  /**
+   * The template's own control markers, for a match check at load time.
+   *
+   * A chat template is chosen by model id, which is a guess. When the guess is
+   * wrong the markers are not in the model's vocabulary, so they tokenize as
+   * ordinary text and the model answers noise — the failure looks like a broken
+   * model rather than a wrong template. Passing the markers lets the engine,
+   * which is the only layer that can tokenize, say so instead.
+   */
+  templateMarkers?: readonly string[];
 }
 
 export interface LoadResult {

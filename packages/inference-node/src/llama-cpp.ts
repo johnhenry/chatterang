@@ -359,6 +359,35 @@ export class LlamaCppNode implements LlamaCppPlugin {
       const handle = `node_${++this.#counter}`;
       const chatTemplate = model.chatTemplateName ?? options.chatTemplate ?? 'unknown';
 
+      /*
+       * Does the chosen template's vocabulary actually exist in this model?
+       *
+       * A control marker the model knows tokenizes to exactly one token. If NOT
+       * ONE of the template's markers does, the template is for a different
+       * model family and every turn will be rendered in a language this model
+       * cannot read. Observed: a Gemma 2/3 template on a Gemma 4 model, where
+       * `<end_of_turn>` tokenized to SEVEN tokens and the model replied with
+       * `<start_of_turn>model` repeated and digit noise.
+       *
+       * A warning, not a refusal: some templates legitimately use plain-text
+       * markers, and one wrong guess should not make a model unloadable.
+       */
+      const markers = options.templateMarkers ?? [];
+      if (markers.length > 0) {
+        const recognised = markers.filter((marker) => model.tokenize(marker, true).length === 1);
+        if (recognised.length === 0) {
+          warnings.push(
+            // Name the template the CALLER chose, not the one the model
+            // declares: the caller's guess is the thing that is wrong, and
+            // `chatTemplate` above prefers the model's own name when it has one.
+            `The "${options.chatTemplate ?? chatTemplate}" chat template does not match this ` +
+              'model: none of its ' +
+              `markers (${markers.join(', ')}) exist in its vocabulary, so they will ` +
+              'be sent as ordinary text. Expect incoherent output until the template is changed.',
+          );
+        }
+      }
+
       this.#handles.set(handle, { model, context, sequence, draft, backend });
 
       return {

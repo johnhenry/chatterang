@@ -198,6 +198,12 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
       gpuLayers: -1,
       useMmap: true,
       chatTemplate: manifest.promptTemplate,
+      // The template is chosen by model id, which is a guess. Hand the engine
+      // its markers so a wrong guess is reported at load rather than showing up
+      // later as an incoherent model.
+      templateMarkers: templateStopSequences(
+        manifest.promptTemplate ?? inferTemplate(manifest.id),
+      ),
     });
 
     for (const warning of result.warnings) this.#config.onWarning?.(warning);

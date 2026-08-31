@@ -580,6 +580,50 @@ describe('load', () => {
     expect(result.warnings.join(' ')).toMatch(/Requested gpu-cuda/);
   });
 
+  it('warns when none of the template markers exist in the model vocabulary', async () => {
+    // The real case this was written for: a Gemma 2/3 template on a Gemma 4
+    // model, where `<end_of_turn>` tokenized to SEVEN tokens because Gemma 4
+    // does not use that marker at all. The model then answered with
+    // `<start_of_turn>model` repeated and digit noise, which reads as a broken
+    // model rather than a wrong template. The fake's tokenizer splits on
+    // whitespace, so a marker containing a space is its version of "not a real
+    // control token".
+    const { plugin } = fakePlugin();
+    const result = await plugin.load({
+      modelPath: '/m.gguf',
+      chatTemplate: 'gemma',
+      templateMarkers: ['<end of turn>'],
+    });
+
+    expect(result.warnings.join(' ')).toMatch(/does not match this model/);
+    expect(result.warnings.join(' ')).toMatch(/gemma/);
+  });
+
+  it('stays quiet when a marker is a real control token', async () => {
+    const { plugin } = fakePlugin();
+    const result = await plugin.load({
+      modelPath: '/m.gguf',
+      chatTemplate: 'gemma',
+      templateMarkers: ['<end_of_turn>'],
+    });
+
+    expect(result.warnings.join(' ')).not.toMatch(/does not match this model/);
+  });
+
+  it('accepts a template where only some markers are control tokens', async () => {
+    // Some templates legitimately mix control tokens with plain-text markers —
+    // Mistral's `[INST]` is ordinary text in several vocabularies. One
+    // recognised marker is enough to say the template belongs to this model.
+    const { plugin } = fakePlugin();
+    const result = await plugin.load({
+      modelPath: '/m.gguf',
+      chatTemplate: 'mistral',
+      templateMarkers: ['</s>', '[INST] with spaces'],
+    });
+
+    expect(result.warnings.join(' ')).not.toMatch(/does not match this model/);
+  });
+
   it('degrades a mobile-only backend request to whatever the engine picks', async () => {
     const { plugin, engine } = fakePlugin({ gpu: false });
     const result = await plugin.load({ modelPath: '/m.gguf', backend: 'npu-hexagon' });
