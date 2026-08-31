@@ -46,6 +46,7 @@
  */
 
 import { join } from 'node:path';
+import { mkdirSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
 import { BrowserWindow, app, ipcMain, protocol, shell, utilityProcess } from 'electron';
@@ -55,6 +56,7 @@ import {
   BOOTSTRAP_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
+  FILESYSTEM_PLUGIN,
   HostFleet,
   LLAMA_ENGINE,
   LLAMA_PLUGIN,
@@ -79,6 +81,7 @@ import {
   isTrustedOrigin,
   resolveBundleUrl,
 } from './security.js';
+import { createFilesystemPlugin } from './fs/filesystem.js';
 
 /** Set only in development; a packaged build must never carry one. */
 const DEV_SERVER_URL = process.env['CHATTERANG_DEV_SERVER_URL'] ?? '';
@@ -97,19 +100,133 @@ function appRoot(): string {
   return join(app.getAppPath(), 'app');
 }
 
+/* ── The filesystem the renderer is allowed to see ────────────────────── */
+
+/** The subdirectory of the DATA root that `src/lib/download.ts` writes into. */
+const MODEL_DIR = 'models';
+
 /**
- * The only directory a model may be loaded from.
+ * The app's own files, under `userData` and NOWHERE ELSE IN IT.
  *
- * Under `userData`, which is per-user, app-private and outside the bundle. This
- * is the directory the desktop download manager will have to write into: today
- * `src/lib/download.ts` takes its native branch through `@capacitor/filesystem`,
- * which has no desktop implementation, so no model reaches disk through the app
- * on this platform at all. Naming the directory here is what a working
- * downloader will target, and confining `load` to it is what stops the page
- * naming anything else in the meantime.
+ * `userData` ITSELF MUST NOT BE A MAPPED ROOT. Verified on this machine, the
+ * real `userData` is `~/Library/Application Support/@chatterang/desktop` —
+ * Electron derives it from the scoped package name — and it holds Chromium's
+ * profile: `Cookies`, `Local Storage`, `Session Storage`, `IndexedDB`,
+ * `Preferences`, `Local State`, `Network Persistent State`, `Trust Tokens`,
+ * `blob_storage`. Mapping `Directory.Data` there would make every one of those
+ * writable through `writeFile` and removable through a recursive `rmdir`. So
+ * the two roots live in a subtree of our own, and Chromium's names are outside
+ * it.
+ *
+ * `files/data` and `files/cache` rather than `data` and `cache`: macOS is
+ * case-insensitive by default and `userData/Cache` is Chromium's HTTP cache.
+ */
+function filesRoot(): string {
+  return join(app.getPath('userData'), 'files');
+}
+
+/** `Directory.Data` — persistent app storage. CONTAINS the model directory. */
+function dataRoot(): string {
+  return join(filesRoot(), 'data');
+}
+
+/**
+ * `Directory.Cache` — reclaimable app storage.
+ *
+ * Deliberately NOT `app.getPath('cache')`, which resolves to
+ * `~/Library/Caches` on this machine — the whole shared user cache root, not an
+ * app directory — and deliberately not Chromium's `userData/Cache`, which is
+ * the HTTP cache and would collide with it.
+ */
+function cacheRoot(): string {
+  return join(filesRoot(), 'cache');
+}
+
+/**
+ * Every root, as the FILESYSTEM spells it — symlinks already resolved.
+ *
+ * NOT COSMETIC, and the reason is the join this milestone exists to make.
+ * `getUri` answers with a `realpath`ed path (it must: `confineRealPath`
+ * resolves), the app stores that as the model's path, and `LlamaCpp.load` then
+ * puts it through `confineModelPath`, which is purely LEXICAL and compares
+ * against whatever root string it was handed. Hand it an unresolved root and
+ * the two spellings disagree: measured directly, a root under
+ * `/var/folders/…` (macOS's tmpdir, a symlink to `/private/var`) makes
+ * `realpath(root).startsWith(root + sep)` FALSE, so every path `getUri`
+ * returned would be refused at load. Today `~/Library/Application
+ * Support/@chatterang/desktop` happens to contain no symlink and the bug is
+ * invisible; resolving once here means it cannot appear.
+ *
+ * Falls back to the unresolved path rather than throwing: the roots are created
+ * immediately before this runs, and a boot that dies over a `realpath` is worse
+ * than one that carries on with the string it already had.
+ */
+function realDirectory(directory: string): string {
+  try {
+    return realpathSync(directory);
+  } catch {
+    return directory;
+  }
+}
+
+/**
+ * Create every root, before anything can ask for one.
+ *
+ * `confineRealPath` begins with `realpathSync(root)` and returns null when that
+ * throws, so a root that does not exist refuses EVERY path under it —
+ * including the `mkdir` that would have created it. Nothing else creates them:
+ * `src/lib/export.ts` writes into the cache root with no `mkdir` at all, and
+ * the model root was previously created lazily by a downloader that was writing
+ * somewhere else entirely, so it never appeared on disk at all.
+ *
+ * Creating them here is not guessing them. This is the one place that knows
+ * where `userData` is, which is exactly why the roots are decided here and
+ * injected everywhere else.
+ */
+function createRoots(): void {
+  for (const directory of [dataRoot(), cacheRoot(), join(dataRoot(), MODEL_DIR)]) {
+    mkdirSync(directory, { recursive: true });
+  }
+}
+
+/**
+ * The only directory a model may be loaded from, INSIDE the DATA root.
+ *
+ * That containment is the whole join. `src/lib/download.ts` writes to
+ * `models/<engine>/<id>` under `Directory.Data` and stores what `getUri`
+ * answers as the model's path; the inference host is handed this directory and
+ * confines `LlamaCpp.load` to it. The two only meet if the app's DATA root is
+ * the parent of the host's model root — before this, `Directory.Data` had no
+ * desktop implementation at all and the downloader's bytes went to IndexedDB
+ * while the host looked at a directory that had never been created.
+ *
+ * Nothing is migrated because there is nothing to migrate: `userData/models`
+ * has never existed on this machine, and no download has ever completed on
+ * desktop.
  */
 function modelRoot(): string {
-  return join(app.getPath('userData'), 'models');
+  return realDirectory(join(dataRoot(), MODEL_DIR));
+}
+
+/**
+ * The `Directory` values this platform maps, and what they map to.
+ *
+ * The seven others — `DOCUMENTS`, `LIBRARY`, `EXTERNAL`, `EXTERNAL_STORAGE`,
+ * `EXTERNAL_CACHE`, `LIBRARY_NO_CLOUD`, `TEMPORARY` — are absent on purpose and
+ * are refused by name. `app.getPath('documents')` is the user's own Documents
+ * folder; the rest name iOS/Android storage classes with no desktop analogue,
+ * and inventing one is the same class of mistake as guessing a model root.
+ *
+ * Built HERE and passed in, because `fs/filesystem.ts` must call no
+ * `app.getPath()` of its own — same reason the inference host is handed its
+ * model root as `argv[2]`, and what lets a headless server (A9) supply its own
+ * roots without touching that file.
+ */
+function filesystemRoots(): ReadonlyMap<string, string> {
+  return new Map([
+    ['DATA', realDirectory(dataRoot())],
+    ['CACHE', realDirectory(cacheRoot())],
+  ]);
 }
 
 async function serveBundle(request: Request): Promise<Response> {
@@ -209,6 +326,13 @@ function isTrusted(event: { senderFrame: unknown; sender: WebContents }): boolea
 function start(): void {
   const senders = new Map<number, WebContents>();
 
+  // Created BEFORE they are resolved, and resolved before anything is handed
+  // one: `realDirectory` of a directory that does not exist yet would silently
+  // answer with the unresolved string, which is the disagreement it exists to
+  // prevent.
+  createRoots();
+  const roots = filesystemRoots();
+
   const pluginHost = new PluginHost((senderId, payload) => {
     const sender = senders.get(senderId);
     if (sender === undefined || sender.isDestroyed()) return false;
@@ -274,6 +398,22 @@ function start(): void {
   // here at boot rather than failing every call at runtime.
   pluginHost.register(LLAMA_PLUGIN, fleet.plugin(LLAMA_PLUGIN.name));
   pluginHost.register(ONNX_PLUGIN, fleet.plugin(ONNX_PLUGIN.name));
+  /*
+   * The filesystem, served from MAIN rather than through the supervisor.
+   *
+   * `DSH_PLUGIN` below is already registered with an inline implementation, so
+   * a main-resident plugin is the established pattern here — but for this one
+   * it is also a size decision. A 4 MiB slice of a model becomes a ~5.33 MB
+   * base64 string per `appendFile`, and routing it through a utility process
+   * would make that string cross a SECOND process boundary for no benefit; the
+   * inference host's job is inference. (That figure is arithmetic from
+   * `download.ts`'s chunk size, not a measurement.)
+   *
+   * Ten of the fifteen declared methods exist only to REFUSE — see
+   * `FILESYSTEM_METHODS` for why declaring fewer would reopen the bug rather
+   * than shrink the surface. They are not dead code to be tidied away.
+   */
+  pluginHost.register(FILESYSTEM_PLUGIN, createFilesystemPlugin({ roots }));
   pluginHost.register(DSH_PLUGIN, {
     // THE LLAMA HOST, deliberately and by name. The Cordis tree mounts only
     // where the Router and the llama backend are (`host/llama-engine.ts`);

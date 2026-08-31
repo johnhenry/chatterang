@@ -178,6 +178,69 @@ export const ONNX_PLUGIN: PluginDefinition = Object.freeze({
 });
 
 /**
+ * EVERY invocable method of `@capacitor/filesystem`'s `FilesystemPlugin` — all
+ * fifteen, of which the shell implements five.
+ *
+ * THE FULL LIST IS THE POINT, and declaring only the five we serve would be the
+ * bug rather than a smaller surface. `@capacitor/core`'s `createPluginMethod`
+ * (`node_modules/@capacitor/core/dist/index.js:88-107`) routes a call by
+ * looking the method up in the plugin HEADER; for a method the header does not
+ * list it falls to `else if (impl) return impl[prop].bind(impl)`, and `impl` is
+ * the package's WEB implementation — `loadPluginImplementation` picks `'web'`
+ * whenever a custom platform is set, which ours always is. So an undeclared
+ * `readdir` does not fail: it reaches IndexedDB and succeeds there, which is
+ * exactly the defect this plugin exists to close. Declaring all fifteen routes
+ * all fifteen to us, and `fs/filesystem.ts` throws by name for the ten it
+ * cannot honour.
+ *
+ * `addListener` and `removeAllListeners` are the other two members of the
+ * interface and are NOT here, for the reason recorded above `LLAMA_METHODS`:
+ * the bridge serves them itself, and `PluginHost.register` refuses a plugin
+ * that declares one.
+ *
+ * The order is the declaration order in
+ * `node_modules/@capacitor/filesystem/dist/esm/definitions.d.ts:525-647`, so
+ * the two can be diffed by eye. `tests/desktop-filesystem.test.ts` diffs them
+ * by machine, against that file, so a package upgrade that adds a method fails
+ * a test rather than quietly reopening one door.
+ */
+export const FILESYSTEM_METHODS = Object.freeze([
+  'checkPermissions',
+  'requestPermissions',
+  'readFile',
+  'readFileInChunks',
+  'writeFile',
+  'appendFile',
+  'deleteFile',
+  'mkdir',
+  'rmdir',
+  'readdir',
+  'getUri',
+  'stat',
+  'rename',
+  'copy',
+  'downloadFile',
+] as const);
+
+/**
+ * The desktop filesystem, under the name `@capacitor/filesystem` registers.
+ *
+ * `events: []` is a decision, not an omission. The plugin's only event is the
+ * deprecated `progress` and nothing in `src/` subscribes — but registering a
+ * PluginHeader flips the renderer proxy's `addListener` onto the bridge's
+ * native path (see `capacitor-shim.ts`), so `addListener('progress')` now
+ * reaches `PluginHost.addListener` and is refused with `UNKNOWN_EVENT` naming
+ * the empty set. That is a refusal instead of a silently dead subscription,
+ * and it IS a behaviour change from the web shim, which would have accepted
+ * the listener.
+ */
+export const FILESYSTEM_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'Filesystem',
+  methods: FILESYSTEM_METHODS,
+  events: Object.freeze([] as string[]),
+});
+
+/**
  * The DSH status plugin — the thing that gives milestone A4 a caller.
  *
  * A mount nobody can observe is indistinguishable from no mount, which is the
