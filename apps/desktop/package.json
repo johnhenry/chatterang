@@ -1,0 +1,25 @@
+{
+  "name": "@chatterang/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Electron desktop shell (milestone A5): the first platform on which Chatterang inference actually runs.",
+  "main": "build/main.cjs",
+  "exports": {
+    "./bridge": "./src/bridge/index.ts"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "sync": "node scripts/sync.mjs",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@chatterang/contracts": "*",
+    "@chatterang/cordis-aimatey": "*",
+    "@chatterang/inference-node": "*"
+  },
+  "devDependencies": {
+    "electron": "44.0.0",
+    "esbuild": "^0.25.0"
+  }
+}

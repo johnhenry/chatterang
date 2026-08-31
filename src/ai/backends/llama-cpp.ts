@@ -211,6 +211,27 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     };
   }
 
+  /**
+   * Drop the cached handle when the engine that owned it went away.
+   *
+   * The desktop shell runs inference in a separate process so a native-addon
+   * abort is recoverable; the process restarts and every handle it held dies
+   * with it. Without this, `#ensureLoaded` short-circuits on the cached
+   * `modelId` forever and every retry sends a handle that no longer exists —
+   * a permanent, silent wedge until the app is relaunched, which is worse than
+   * a hang because it reads as a broken model.
+   *
+   * `HANDLE_LOST` is the wire code `apps/desktop` attaches to exactly this
+   * failure. It is a string literal here rather than an import because `src/`
+   * may not import the desktop layer at all — `tests/layering.test.ts`
+   * enforces that in three import forms. `tests/desktop-bridge.test.ts` binds
+   * the two ends by driving this adapter with the constant the bridge exports.
+   */
+  #forgetHandleOnLoss(error: unknown): void {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === 'HANDLE_LOST') this.#loaded = null;
+  }
+
   async unload(): Promise<void> {
     if (!this.#loaded) return;
     await LlamaCpp.unload({ handle: this.#loaded.handle }).catch(() => undefined);
@@ -246,6 +267,9 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
         requestId,
       });
       return this.toIR(result, request, Math.round(performance.now() - started));
+    } catch (error) {
+      this.#forgetHandleOnLoss(error);
+      throw error;
     } finally {
       signal?.removeEventListener('abort', abort);
     }
@@ -311,6 +335,7 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
         finished = result;
       })
       .catch((error: unknown) => {
+        this.#forgetHandleOnLoss(error);
         failure = error instanceof Error ? error : new Error(String(error));
       })
       .finally(wake);

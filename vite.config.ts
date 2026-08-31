@@ -27,6 +27,11 @@ export default defineConfig({
       '@chatterang/cordis-aimatey': fileURLToPath(
         new URL('./packages/cordis-aimatey/src', import.meta.url),
       ),
+      // The Electron shell. Desktop-only and never part of a web build —
+      // nothing under `src/` imports it, and `tests/layering.test.ts` makes
+      // that a rule rather than a habit. The alias exists so the bridge tests
+      // can drive the real shell code without launching a window.
+      '@chatterang/desktop': fileURLToPath(new URL('./apps/desktop/src', import.meta.url)),
     },
   },
   server: {

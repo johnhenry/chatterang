@@ -21,3 +21,9 @@ src/**/*.js.map
 tests/**/*.js
 tests/**/*.js.map
 /capacitor.config.js
+
+# Desktop build artefacts. `apps/desktop/build` is esbuild output and
+# `apps/desktop/app` is a verbatim copy of `dist/`; both are reproducible from
+# `npm run desktop:build` and `npm run desktop:sync`.
+/apps/desktop/build/
+/apps/desktop/app/

@@ -225,4 +225,60 @@ describe('the app never reaches the desktop-only layer', () => {
       .map((file) => relative(SRC, file));
     expect(offenders).toEqual([]);
   });
+
+  it('src/ never imports the Electron shell either', () => {
+    // A5 added `apps/desktop`, and it is the same seam as the two above with
+    // the same three doors. The shell imports Electron, `node:fs`,
+    // `utilityProcess` and `@deepseek-ai/*`; one import from `src/` would put
+    // all of that in the mobile bundle, where none of it exists.
+    //
+    // The direction is one-way ON PURPOSE and only in this direction:
+    // `apps/desktop` DOES import `src/ai/prompt.ts`, so the inference host
+    // renders chat templates with the same code the renderer does rather than
+    // a copy that drifts. That is why this guard names the desktop layer
+    // rather than banning the pair from knowing about each other.
+    //
+    // Three doors, checked as three: the bare specifier, a subpath
+    // (`@chatterang/desktop/bridge` — which is how the tests import it, so it
+    // is not hypothetical), and a relative path into the directory.
+    const banned = /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)/;
+    const offenders = files
+      .filter((file) =>
+        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
+          banned.test(m[1] ?? ''),
+        ),
+      )
+      .map((file) => relative(SRC, file));
+    expect(offenders).toEqual([]);
+  });
+});
+
+/**
+ * The desktop bridge is testable because it is not Electron.
+ *
+ * `tests/desktop-bridge.test.ts` drives `apps/desktop/src/bridge` end to end
+ * through a pair of fake ports — which is only possible while that directory
+ * imports no Electron and no Node builtins. One `import { app } from
+ * 'electron'` there would not fail typecheck and would not fail any bridge
+ * test; it would fail the whole suite at import time, days later, with an
+ * error pointing at vitest rather than at the import.
+ */
+describe('the desktop bridge stays platform-free', () => {
+  const BRIDGE = resolve(process.cwd(), 'apps/desktop/src/bridge');
+  const bridgeFiles = sourceFiles(BRIDGE);
+
+  it('finds the bridge sources', () => {
+    expect(bridgeFiles.length).toBeGreaterThan(5);
+  });
+
+  it('imports neither Electron nor a Node builtin', () => {
+    const banned = /^(electron$|electron\/|node:)/;
+    const offenders = bridgeFiles.flatMap((file) =>
+      [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)]
+        .map((m) => m[1] ?? '')
+        .filter((specifier) => banned.test(specifier))
+        .map((specifier) => `${relative(BRIDGE, file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
 });

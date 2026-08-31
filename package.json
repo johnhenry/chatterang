@@ -19,6 +19,10 @@
     "sync": "npm run build:web && cap sync",
     "ios": "npm run sync && cap open ios",
     "android": "npm run sync && cap open android",
+    "desktop:build": "npm --workspace @chatterang/desktop run build",
+    "desktop:sync": "npm run build:web && npm --workspace @chatterang/desktop run sync && npm run desktop:build",
+    "desktop:start": "npm --workspace @chatterang/desktop run start",
+    "desktop:dev": "npm run desktop:build && CHATTERANG_DEV_SERVER_URL=http://localhost:5273 npm --workspace @chatterang/desktop run start",
     "verify": "npm run typecheck && npm run test && npm run build:web"
   },
   "dependencies": {
@@ -62,6 +66,7 @@
     "vitest": "^4.1.11"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ]
 }
