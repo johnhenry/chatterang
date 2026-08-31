@@ -389,6 +389,126 @@ describe('the app never reaches the desktop-only layer', () => {
 });
 
 /**
+ * The platform seam: one file may name a platform, and it is not the four that
+ * used to.
+ *
+ * Every platform decision in `src/` was a BOOLEAN — `Capacitor
+ * .isNativePlatform()`, which is `getPlatform() !== 'web'` — at four sites
+ * written when there were two platforms. The desktop shell reports
+ * `'electron'`, so the boolean answered TRUE and all four took the NATIVE path
+ * on a platform that implements only part of what native means. One of them
+ * (`download.ts`) wrote every model into IndexedDB, where the inference host
+ * could never read it.
+ *
+ * The fix is a capability table in `src/lib/platform.ts`. This guard is what
+ * keeps it the only one: the FIFTH site fails here the day it is written,
+ * rather than the day someone runs the desktop build and notices a feature
+ * silently doing nothing.
+ */
+describe('only the platform seam names a platform', () => {
+  const SEAM = 'lib/platform.ts';
+
+  /** A CALL to Capacitor's platform accessors, in either spelling. */
+  const NAMES_A_PLATFORM = /\bCapacitor\s*\.\s*(isNativePlatform|getPlatform)\b/;
+
+  /**
+   * Source with comments removed, and with strings left intact.
+   *
+   * A raw text search is what the guards above deliberately avoid, for a
+   * reason this rule runs straight into: the four sites that USED to name a
+   * platform now carry comments explaining what they used to do and why it was
+   * wrong. Those comments are the documentation this milestone is made of, and
+   * a guard that forbids writing them down is a guard that pushes the
+   * explanation out of the code.
+   *
+   * Strings are kept rather than stripped, so `getPlatform()` smuggled into an
+   * `eval`-shaped string still counts.
+   */
+  function codeOf(source: string): string {
+    let out = '';
+    let i = 0;
+    while (i < source.length) {
+      const two = source.slice(i, i + 2);
+      if (two === '//') {
+        const end = source.indexOf('\n', i);
+        i = end === -1 ? source.length : end;
+        continue;
+      }
+      if (two === '/*') {
+        const end = source.indexOf('*/', i + 2);
+        i = end === -1 ? source.length : end + 2;
+        continue;
+      }
+      const ch = source[i]!;
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const quote = ch;
+        out += ch;
+        i += 1;
+        while (i < source.length) {
+          const c = source[i]!;
+          out += c;
+          i += 1;
+          if (c === '\\') {
+            out += source[i] ?? '';
+            i += 1;
+            continue;
+          }
+          if (c === quote) break;
+        }
+        continue;
+      }
+      out += ch;
+      i += 1;
+    }
+    return out;
+  }
+
+  it('finds the seam itself, so this guard is not vacuous', () => {
+    // A guard that would pass on a repo where nobody calls Capacitor at all is
+    // a guard that proves nothing. The seam MUST name the platform — that is
+    // its job — and every other file must not.
+    const seam = files.find((file) => rel(file) === SEAM);
+    expect(seam, 'src/lib/platform.ts is missing').toBeDefined();
+    expect(NAMES_A_PLATFORM.test(codeOf(readFileSync(seam!, 'utf8')))).toBe(true);
+  });
+
+  it('no other file in src/ asks Capacitor which platform this is', () => {
+    const offenders = files
+      .filter((file) => rel(file) !== SEAM)
+      .filter((file) => NAMES_A_PLATFORM.test(codeOf(readFileSync(file, 'utf8'))))
+      .map((file) => rel(file));
+    expect(offenders).toEqual([]);
+  });
+
+  it('the matcher sees a call and ignores a comment about one', () => {
+    // The recurring failure in this file is a matcher revert-checked only
+    // against the form it already caught, so both halves are asserted: what it
+    // must see, and what it must not fire on.
+    for (const form of [
+      'if (Capacitor.isNativePlatform()) return;',
+      'const id = Capacitor.getPlatform();',
+      'return Capacitor\n  .isNativePlatform();',
+      "const f = eval('Capacitor.getPlatform()');",
+    ]) {
+      expect(NAMES_A_PLATFORM.test(codeOf(form)), form).toBe(true);
+    }
+    for (const allowed of [
+      '// the guard used to be Capacitor.isNativePlatform()',
+      '/* Capacitor.getPlatform() answers "electron" here */',
+      "capabilities().modelStore === 'filesystem'",
+      'const platform = capabilities().id;',
+    ]) {
+      expect(NAMES_A_PLATFORM.test(codeOf(allowed)), allowed).toBe(false);
+    }
+
+    // And the stripper does not eat code: a URL inside a string is not a
+    // comment, and what follows it on that line still counts.
+    const tricky = "const u = 'https://example.com'; Capacitor.getPlatform();";
+    expect(NAMES_A_PLATFORM.test(codeOf(tricky))).toBe(true);
+  });
+});
+
+/**
  * The desktop bridge is testable because it is not Electron.
  *
  * `tests/desktop-bridge.test.ts` drives `apps/desktop/src/bridge` end to end

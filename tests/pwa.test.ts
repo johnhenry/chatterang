@@ -66,11 +66,27 @@ describe('service worker refuses everything that is not the app shell', () => {
 });
 
 describe('service worker registration', () => {
-  it('does not register inside a Capacitor webview', () => {
-    expect(pwa).toContain('Capacitor.isNativePlatform()');
+  it('registers only where an offline cache is wanted, and checks before registering', () => {
+    /*
+     * SAME PROPERTY, NEW TOKEN. This used to assert on
+     * `Capacitor.isNativePlatform()`, which was the right guard reached by the
+     * wrong question: it answers TRUE on the desktop shell, so the shell got
+     * the correct behaviour by accident. A6 replaced it with the capability
+     * the guard is actually about. The ordering assertion — the guard comes
+     * BEFORE `.register(`, not after — is unchanged and is the half that
+     * matters, because a check that runs after the call guards nothing.
+     */
+    expect(pwa).toContain('capabilities().offlineCache');
     const body = pwa.slice(pwa.indexOf('export function registerServiceWorker'));
-    // The native guard must come before the register call, not after it.
-    expect(body.indexOf('isNativePlatform')).toBeLessThan(body.indexOf('.register('));
+    expect(body.indexOf('offlineCache')).toBeLessThan(body.indexOf('.register('));
+  });
+
+  it('asks the platform seam rather than naming a platform itself', () => {
+    // `tests/layering.test.ts` enforces this for all of `src/`; asserted here
+    // too because this file is where the boolean-shaped guard lived, and the
+    // temptation to add "…and not on desktop" as a second clause lands here.
+    expect(pwa).not.toContain('isNativePlatform');
+    expect(pwa).toContain("from '@/lib/platform'");
   });
 
   it('does not register in development', () => {

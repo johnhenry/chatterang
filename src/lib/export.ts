@@ -11,12 +11,12 @@
  * itself about what a conversation contained.
  */
 
-import { Capacitor } from '@capacitor/core';
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 
 import { db } from '@/db';
 import type { Chat } from '@/domain/chat';
+import { capabilities } from '@/lib/platform';
 import { renderTranscript } from '@/shell/commands';
 
 /** A filename that is safe on every platform and still recognisable. */
@@ -42,20 +42,44 @@ export type ExportOutcome = 'shared' | 'downloaded' | 'cancelled';
 /**
  * Hand the transcript to the platform.
  *
- * Native gets the share sheet, which is the only route to "save to Files",
- * "send to someone", or "open in an editor" on iOS — a bare filesystem write
- * would land somewhere the user cannot reach. Web gets a download.
+ * THREE ANSWERS, NOT TWO — and the third is why this was broken. The old test
+ * was `Capacitor.isNativePlatform()`, which the desktop shell answers TRUE, so
+ * export took the share-sheet branch on a platform that registers no Share
+ * plugin. `@capacitor/core` then fell through to the package's WEB shim, whose
+ * `share()` throws unless `navigator.share` exists — and in Electron on macOS
+ * it does not. The bare `catch` below turned that throw into `'cancelled'`,
+ * which `ChatScreen` does not toast. So export did NOTHING, said NOTHING, and
+ * left one orphan `.md` in the cache root per attempt, because the file it
+ * wrote for the share sheet was never consumed. Confirmed end to end against
+ * the real shim in a hidden Electron window before it was changed.
  *
- * The file is written to `Directory.Cache` rather than `Documents`: it exists
- * only to be handed to the share sheet, and the OS is free to reclaim it
- * afterwards. Writing to Documents would accumulate a copy per export with
- * nothing ever deleting them.
+ * Now each platform is asked what it can do with a file:
+ *
+ *   share-sheet       iOS and Android. The only route to "save to Files",
+ *                     "send to someone", or "open in an editor" — a bare
+ *                     filesystem write would land somewhere unreachable. The
+ *                     file goes to `Directory.Cache` rather than `Documents`
+ *                     because it exists only to be handed over, and the OS is
+ *                     free to reclaim it; Documents would accumulate a copy
+ *                     per export with nothing deleting them.
+ *   browser-download  Web AND the desktop shell. An `<a download>` on a blob
+ *                     URL: the download shelf in a browser, and in Electron
+ *                     the OS save dialog, because the shell registers no
+ *                     `will-download` handler so the default applies. No new
+ *                     plugin, no new native code, and it is the branch this
+ *                     function already had.
+ *
+ * `Share.canShare()` is consulted as well as the table, because "a share sheet
+ * exists on this platform" and "the sheet will accept this right now" are two
+ * questions. When it says no there is nothing to hand the file to, so the
+ * cache copy is deleted rather than left behind and the caller is told — an
+ * export that silently does nothing is the defect this replaces.
  */
 export async function exportConversation(chat: Chat): Promise<ExportOutcome> {
   const markdown = await buildTranscript(chat);
   const filename = exportFilename(chat);
 
-  if (Capacitor.isNativePlatform()) {
+  if (capabilities().fileHandoff === 'share-sheet') {
     await Filesystem.writeFile({
       path: filename,
       data: markdown,
@@ -63,13 +87,26 @@ export async function exportConversation(chat: Chat): Promise<ExportOutcome> {
       encoding: Encoding.UTF8,
     });
     const { uri } = await Filesystem.getUri({ path: filename, directory: Directory.Cache });
+
+    const shareable = await Share.canShare()
+      .then((result) => result.value)
+      .catch(() => false);
+    if (!shareable) {
+      // Nothing will consume the file, so it does not stay on disk.
+      await Filesystem.deleteFile({ path: filename, directory: Directory.Cache }).catch(
+        () => undefined,
+      );
+      throw new Error('Sharing is not available on this device, so the chat was not exported.');
+    }
+
     try {
       await Share.share({ title: chat.title || 'Conversation', url: uri });
       return 'shared';
     } catch {
       // The share sheet throws on dismissal, which is not an error — the user
       // simply changed their mind, and telling them something failed would be
-      // wrong.
+      // wrong. This is reached only after `canShare()` said yes, so it is a
+      // dismissal rather than an absent implementation.
       return 'cancelled';
     }
   }

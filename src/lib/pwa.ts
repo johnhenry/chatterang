@@ -4,22 +4,33 @@
  * Deliberately narrow. Three conditions have to hold before this app registers
  * a worker at all, and each one is a real failure mode rather than caution:
  *
- * 1. **Not inside a Capacitor webview.** The native builds serve the same
- *    bundle from a custom scheme, and the plugins — model downloads, file
- *    access, billing — go through the bridge, not through `fetch`. A worker
- *    there intercepts nothing useful and adds a second cache layer with its
- *    own lifecycle in front of an app that already has a native one. On iOS
- *    the WKWebView scheme is not a normal http origin, so registration is
- *    unreliable in the first place.
+ * 1. **This platform wants an offline cache.** Only a browser tab does. The
+ *    packaged builds — iOS, Android, and the Electron shell — already own
+ *    their bundle on disk, and the plugins they route through (model
+ *    downloads, file access, billing) go over the bridge, not through `fetch`.
+ *    A worker there intercepts nothing useful and adds a second cache layer
+ *    with its own lifecycle in front of an app that already has one.
+ *
+ *    It would also not work. `apps/desktop/app` is a verbatim copy of the
+ *    production `dist/`, so `import.meta.env.PROD` is TRUE in the shell and
+ *    registration WOULD be attempted without this guard — and MEASURED in a
+ *    hidden Electron 44 window over the shell's real scheme, `register('/sw.js')`
+ *    rejects: "The URL protocol of the current origin
+ *    ('chatterang-desktop://app') is not supported." On iOS the WKWebView
+ *    scheme is not a normal http origin either.
+ *
+ *    This asks `capabilities().offlineCache` rather than "am I native?"
+ *    because that boolean answered TRUE on desktop for the wrong reason —
+ *    right answer, wrong question. See `lib/platform.ts`.
  * 2. **Production only.** In dev, Vite serves modules it expects to control;
  *    a worker caching them is a debugging trap that outlives a hard reload.
  * 3. **Feature present.** Not every embedded browser has one.
  */
 
-import { Capacitor } from '@capacitor/core';
+import { capabilities } from '@/lib/platform';
 
 export function registerServiceWorker(): void {
-  if (Capacitor.isNativePlatform()) return;
+  if (!capabilities().offlineCache) return;
   if (!import.meta.env.PROD) return;
   if (!('serviceWorker' in navigator)) return;
 

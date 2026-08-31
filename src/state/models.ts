@@ -120,12 +120,32 @@ export const useModels = create<ModelState>((set, get) => ({
       }
     } catch (error) {
       if (error instanceof DownloadCancelled) {
+        /*
+         * CANCEL CLEANS UP, IN THIS ORDER.
+         *
+         * The partial file first, the record second. `remove()` returns early
+         * on `if (!record) return`, so a record deleted before its files
+         * makes the directory unreachable from the UI forever — and a
+         * cancelled multi-file model can already have a completed companion
+         * on disk: every vision model in the catalogue has one, and the
+         * cancel can land during the second file.
+         *
+         * This path did not run at all until the abort handling in
+         * `lib/download.ts` was fixed. An aborted fetch REJECTS the pending
+         * `reader.read()`; it does not return `{done:true}`, so the post-read
+         * `signal.aborted` check the downloader used to rely on was
+         * unreachable. Cancelling therefore fell into the `else` arm below:
+         * the record was persisted `state:'failed'` and the user got a red
+         * toast reading "BodyStreamBuffer was aborted".
+         */
+        await deleteModelFiles(manifest);
         await db.models.delete(manifest.id);
         set((state) => {
           const installed = { ...state.installed };
           delete installed[manifest.id];
           return { installed };
         });
+        toast(`${manifest.name} download cancelled.`, 'info');
       } else {
         const message = error instanceof Error ? error.message : 'Download failed.';
         await persist({ ...record, state: 'failed', error: message }, set, get);
@@ -142,6 +162,14 @@ export const useModels = create<ModelState>((set, get) => ({
     }
   },
 
+  /**
+   * Abort the transfer. The cleanup happens where the download unwinds.
+   *
+   * Deliberately not `async`: the caller is a click handler, and the work
+   * that follows — deleting the partial file, dropping the record — belongs to
+   * `install()`'s own unwinding, where the manifest and the record are already
+   * in hand. Aborting a controller that has already been retired is a no-op.
+   */
   cancelInstall(modelId) {
     controllers.get(modelId)?.abort();
   },

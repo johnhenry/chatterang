@@ -145,13 +145,22 @@ export function Marketplace(): ReactNode {
         })}
       </div>
 
-      <button
-        type="button"
-        className="btn btn--ghost btn--block"
-        onClick={() => void usePersonas.getState().restore()}
-      >
-        Restore purchases
-      </button>
+      {/*
+        Only where a store exists. On the web and in the desktop shell this
+        button reached the Billing web stub, got an empty list back, and toasted
+        "No previous purchases found for this account." — implying a store
+        account the user does not have on this platform. `billingAvailable()`
+        already answers the question; the button now honours it.
+      */}
+      {storeReady ? (
+        <button
+          type="button"
+          className="btn btn--ghost btn--block"
+          onClick={() => void usePersonas.getState().restore()}
+        >
+          Restore purchases
+        </button>
+      ) : null}
 
       <ListingSheet
         listing={detail}
