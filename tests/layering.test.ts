@@ -205,7 +205,14 @@ describe('the app never reaches the desktop-only layer', () => {
     // import from src/ would put them in the mobile bundle, where they cannot
     // load at all. The seam is one-way by construction: cordis-aimatey imports
     // aimatey, never the reverse.
-    const banned = /^(@deepseek-ai\/|@chatterang\/cordis-aimatey$)/;
+    // Three doors, not one. A bare specifier is the obvious route; a subpath
+    // (`@chatterang/cordis-aimatey/src/adapter`) and a relative path into the
+    // package (`../packages/cordis-aimatey/...`) reach exactly the same code.
+    // An earlier version anchored the scoped name with `$` and had no relative
+    // rule, and was revert-checked only against bare specifiers — the one form
+    // it already caught. Both other doors were open.
+    const banned =
+      /^(@deepseek-ai\/|@chatterang\/cordis-aimatey(\/|$))|(^|\/)packages\/cordis-aimatey(\/|$)/;
     const offenders = files
       .filter((file) =>
         [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
