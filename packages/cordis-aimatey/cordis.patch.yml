@@ -1,0 +1,25 @@
+# The chatterang desktop/server profile: the narrowed DSH tree that hosts
+# aimatey's Router as an LLM provider.
+#
+# GENERATED from packages/cordis-aimatey/src/profile.ts (PROFILE_ROWS).
+# Edit that file, not this one; tests/cordis-aimatey.test.ts asserts they match.
+#
+# This is a complete tree, not a layer over dsh-base: every DeepSeek-specific
+# row is deliberately absent. See EXCLUDED_ROWS in profile.ts for which, and why.
+#
+# Row order carries no load semantics — activation is service-availability
+# driven — so the order below is for readers.
+
+- insert:
+
+    - id: llm
+      name: '@deepseek-ai/dsh-llm'
+
+    - id: invariants
+      name: '@deepseek-ai/dsh-invariants'
+
+    - id: llm-invariant
+      name: '@deepseek-ai/dsh-llm/invariant'
+
+    - id: aimatey-router
+      name: '@chatterang/cordis-aimatey'

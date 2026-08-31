@@ -22,6 +22,11 @@ export default defineConfig({
       '@chatterang/inference-node': fileURLToPath(
         new URL('./packages/inference-node/src', import.meta.url),
       ),
+      // Same reasoning as inference-node: desktop-only, never in a web build,
+      // and resolved to source so the suite does not depend on a workspace link.
+      '@chatterang/cordis-aimatey': fileURLToPath(
+        new URL('./packages/cordis-aimatey/src', import.meta.url),
+      ),
     },
   },
   server: {
