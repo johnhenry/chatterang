@@ -16,8 +16,31 @@ import type {
   LlamaTokenId,
 } from '@chatterang/inference-node';
 import { LlamaCppNode } from '@chatterang/inference-node';
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { modelPathGuard } from '@chatterang/desktop/host/model-paths';
 import { onnxPathGuard } from '@chatterang/desktop/host/onnx-paths';
+
+/*
+ * A REAL model directory for the path-guard tests.
+ *
+ * The guard resolves symlinks now (apps/desktop/src/host/real-path.ts), so it
+ * asks the filesystem what a path actually opens rather than only inspecting
+ * the string. A fictional root refuses everything, which would make the
+ * assertions below pass for the wrong reason. Nothing about what they assert
+ * has changed; only the fixture became real.
+ */
+const REAL_MODEL_ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'guard-root-')));
+const REAL_ONNX_ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'onnx-root-')));
+mkdirSync(join(REAL_ONNX_ROOT, 'whisper-base'), { recursive: true });
+for (const name of ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json']) {
+  writeFileSync(join(REAL_ONNX_ROOT, 'whisper-base', name), 'x');
+}
+mkdirSync(join(REAL_MODEL_ROOT, 'gemma'), { recursive: true });
+for (const name of ['model.gguf', 'mmproj.gguf', 'draft.gguf']) {
+  writeFileSync(join(REAL_MODEL_ROOT, 'gemma', name), 'x');
+}
 
 import {
   BRIDGE_KEYS,
@@ -2640,7 +2663,15 @@ describe('argument shape at the inference-host boundary', () => {
 
 describe('load is not a filesystem oracle', () => {
   /** The guard `host/entry.ts` installs, with a root a test can name. */
-  const ROOT = '/app-data/models';
+  /*
+   * A REAL directory, not a fictional one.
+   *
+   * The guard now resolves symlinks (host/real-path.ts), so it asks the
+   * filesystem what a path actually opens. A root that does not exist refuses
+   * everything, which would make every assertion below pass for the wrong
+   * reason. Every assertion is unchanged; only the fixture became real.
+   */
+  const ROOT = REAL_MODEL_ROOT;
 
   it('[8] refuses a path outside the model directory, before the engine runs', async () => {
     const h = hostBoundary({ guard: modelPathGuard(ROOT) });
@@ -3557,7 +3588,7 @@ describe('the inference host serves plugins by name', () => {
     // FAULT INJECTED: folding every registration's guard over the arguments
     // (`reduce`) refused the transcriber's `/etc/hosts` too, and this test
     // failed with `expected false to be true`.
-    const h = twoServed({ guard: modelPathGuard('/app-data/models') });
+    const h = twoServed({ guard: modelPathGuard(REAL_MODEL_ROOT) });
     const refused = await h.call(LLAMA_PLUGIN.name, 'load', [{ modelPath: '/etc/hosts' }]);
     const allowed = await h.call(TRANSCRIBER.name, 'load', [{ modelPath: '/etc/hosts' }]);
 
@@ -4411,14 +4442,17 @@ describe('the ONNX argument table', () => {
 });
 
 describe('the ONNX path guard', () => {
-  const ROOT = '/app/models';
+  // Real, for the same reason as the llama guard's root above: the guard now
+  // resolves symlinks, so a fictional directory refuses everything and every
+  // assertion here would pass for the wrong reason.
+  const ROOT = REAL_ONNX_ROOT;
 
   it('confines modelPath, and passes the resolved path on', () => {
     const guard = onnxPathGuard(ROOT);
     const [options] = guard('createSession', [
       { task: 'stt', modelPath: 'whisper-base' },
     ]) as [Record<string, unknown>];
-    expect(options['modelPath']).toBe('/app/models/whisper-base');
+    expect(options['modelPath']).toBe(`${ROOT}/whisper-base`);
   });
 
   it('confines EVERY companion, whatever the role is called', () => {
@@ -4434,8 +4468,8 @@ describe('the ONNX path guard', () => {
       },
     ]) as [Record<string, unknown>];
     expect(options['companions']).toEqual({
-      encoder: '/app/models/whisper-base/onnx/encoder_model.onnx',
-      somethingNew: '/app/models/x.json',
+      encoder: `${ROOT}/whisper-base/onnx/encoder_model.onnx`,
+      somethingNew: `${ROOT}/x.json`,
     });
   });
 
@@ -4480,7 +4514,7 @@ describe('the ONNX path guard', () => {
     const allowed = await h.call('createSession', [{ task: 'stt', modelPath: 'whisper-base' }]);
     expect(allowed.ok).toBe(true);
     expect(h.reached).toEqual([
-      { method: 'createSession', args: [{ task: 'stt', modelPath: '/app/models/whisper-base' }] },
+      { method: 'createSession', args: [{ task: 'stt', modelPath: `${ROOT}/whisper-base` }] },
     ]);
   });
 });

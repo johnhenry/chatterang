@@ -1,4 +1,13 @@
-import { readFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -14,6 +23,9 @@ import {
   resolveBundleUrl,
   resolveWithinRoot,
 } from '@chatterang/desktop/security';
+import { confineRealPath } from '@chatterang/desktop/host/real-path';
+import { modelPathGuard } from '@chatterang/desktop/host/model-paths';
+import { onnxPathGuard } from '@chatterang/desktop/host/onnx-paths';
 import { RENDERER_TEARDOWN_EVENTS } from '@chatterang/desktop/bridge';
 
 /**
@@ -810,3 +822,119 @@ describe('the files no test can import still carry their guards', () => {
   });
 });
 
+/* ── Symlinks ─────────────────────────────────────────────────────────── */
+
+describe('confineRealPath', () => {
+  /*
+   * `confineModelPath` is lexical by design and says so: it resolves `..` and
+   * refuses absolute paths, and its own doc notes that symlink resolution
+   * "belongs in the host". The host half was never written, so a symlink INSIDE
+   * the model folder passed the guard and the engine followed it wherever it
+   * pointed. Reproduced before the fix: with
+   * `<root>/escape.onnx -> <tmp>/outside.txt`, the guard returned
+   * `<root>/escape.onnx` — a path that opens a file outside the root.
+   *
+   * `confineModelPath`'s own tests above are untouched; it still does exactly
+   * what it did. This covers the half that now runs after it.
+   */
+  const raw = mkdtempSync(join(tmpdir(), 'confine-'));
+  // macOS hands out /var/folders/…, a symlink to /private/var. Keeping BOTH
+  // spellings is what makes the unresolved-root case below meaningful.
+  const real = realpathSync(raw);
+  const root = join(real, 'models');
+  const rawRoot = join(raw, 'models');
+
+  mkdirSync(join(root, 'nested'), { recursive: true });
+  mkdirSync(join(real, 'elsewhere'), { recursive: true });
+  writeFileSync(join(real, 'outside.txt'), 'not a model');
+  writeFileSync(join(root, 'real.gguf'), 'x');
+  symlinkSync(join(real, 'outside.txt'), join(root, 'escape.onnx'));
+  symlinkSync(join(real, 'elsewhere'), join(root, 'evildir'));
+  symlinkSync(join(root, 'real.gguf'), join(root, 'inside-link'));
+
+  it('refuses a symlink pointing out of the model folder', () => {
+    expect(confineRealPath(root, join(root, 'escape.onnx'))).toBeNull();
+  });
+
+  it('refuses a path under a symlinked parent, even when the file is absent', () => {
+    // The case a downloader creates: the target does not exist yet, so only
+    // resolving the deepest EXISTING ancestor catches the escape.
+    expect(confineRealPath(root, join(root, 'evildir', 'new.onnx'))).toBeNull();
+  });
+
+  it('accepts a real file inside the folder', () => {
+    expect(confineRealPath(root, join(root, 'real.gguf'))).toBe(join(root, 'real.gguf'));
+  });
+
+  it('accepts a download target that does not exist yet', () => {
+    const target = join(root, 'nested', 'download.gguf');
+    expect(confineRealPath(root, target)).toBe(target);
+  });
+
+  it('accepts a symlink that stays inside the folder', () => {
+    // Refusing this would be a false positive: the file it opens IS in the root.
+    expect(confineRealPath(root, join(root, 'inside-link'))).toBe(join(root, 'real.gguf'));
+  });
+
+  it('refuses the root itself, which is a directory and not a model', () => {
+    expect(confineRealPath(root, root)).toBeNull();
+  });
+
+  it('accepts a legitimate file under an UNRESOLVED root', () => {
+    // If only the candidate were resolved, every path under a symlinked root —
+    // which is what macOS hands out — would look like an escape.
+    expect(confineRealPath(rawRoot, join(root, 'real.gguf'))).toBe(join(root, 'real.gguf'));
+  });
+
+  it('still refuses an escape when the root is unresolved', () => {
+    expect(confineRealPath(rawRoot, join(root, 'escape.onnx'))).toBeNull();
+  });
+
+  it('refuses when the model folder does not exist at all', () => {
+    expect(confineRealPath(join(real, 'no-such-root'), join(real, 'no-such-root', 'm.gguf'))).toBeNull();
+  });
+});
+
+describe('the guards actually apply the symlink check', () => {
+  /*
+   * `confineRealPath` is pinned thoroughly above — but every one of those tests
+   * passed while the guards did not call it at all. Deleting the call from
+   * either guard left the whole suite green, which is the same shape as a
+   * correct function nobody invokes. These two go through the guards.
+   */
+  const real = realpathSync(mkdtempSync(join(tmpdir(), 'guard-sym-')));
+  const root = join(real, 'models');
+  mkdirSync(join(root, 'whisper'), { recursive: true });
+  writeFileSync(join(real, 'outside.txt'), 'not a model');
+  writeFileSync(join(root, 'ok.gguf'), 'x');
+  writeFileSync(join(root, 'whisper', 'encoder_model.onnx'), 'x');
+  symlinkSync(join(real, 'outside.txt'), join(root, 'escape.gguf'));
+  symlinkSync(join(real, 'outside.txt'), join(root, 'whisper', 'escape.onnx'));
+
+  it('modelPathGuard refuses a symlink out of the model folder', () => {
+    const guard = modelPathGuard(root);
+    expect(() => guard('load', [{ modelPath: 'escape.gguf' }])).toThrow(/model folder/);
+    // And still passes a real one, so the refusal is about the symlink.
+    const [ok] = guard('load', [{ modelPath: 'ok.gguf' }]) as [Record<string, unknown>];
+    expect(ok['modelPath']).toBe(join(root, 'ok.gguf'));
+  });
+
+  it('modelPathGuard refuses a symlinked companion too', () => {
+    const guard = modelPathGuard(root);
+    expect(() =>
+      guard('load', [{ modelPath: 'ok.gguf', mmprojPath: 'escape.gguf' }]),
+    ).toThrow(/model folder/);
+  });
+
+  it('onnxPathGuard refuses a symlinked model and a symlinked companion', () => {
+    const guard = onnxPathGuard(root);
+    expect(() => guard('createSession', [{ task: 'stt', modelPath: 'escape.gguf' }])).toThrow(
+      /model folder/,
+    );
+    expect(() =>
+      guard('createSession', [
+        { task: 'stt', modelPath: 'whisper', companions: { encoder: 'whisper/escape.onnx' } },
+      ]),
+    ).toThrow(/model folder/);
+  });
+});

@@ -13,6 +13,7 @@
 
 import type { CallGuard } from '../bridge/host-runtime.js';
 import { confineModelPath } from '../security.js';
+import { confineRealPath } from './real-path.js';
 
 /** Every `LoadOptions` field that names a file on disk. */
 const PATH_FIELDS = ['modelPath', 'mmprojPath', 'draftModelPath'] as const;
@@ -45,7 +46,11 @@ export function modelPathGuard(modelRoot: string): CallGuard {
       // Only `modelPath` is required; the other two are absent far more often
       // than they are present, and absent is not a violation.
       if (value === undefined) continue;
-      const resolved = typeof value === 'string' ? confineModelPath(modelRoot, value) : null;
+      const lexical = typeof value === 'string' ? confineModelPath(modelRoot, value) : null;
+      // Then the filesystem's answer, not just the string's: a symlink inside
+      // the model folder passes the lexical gate and opens whatever it points
+      // at. See host/real-path.ts.
+      const resolved = lexical === null ? null : confineRealPath(modelRoot, lexical);
       if (resolved === null) {
         throw new Error(
           `inference host: "${field}" must name a file inside the application's model folder. ` +

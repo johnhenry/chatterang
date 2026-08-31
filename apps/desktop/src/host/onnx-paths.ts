@@ -23,6 +23,18 @@
 
 import type { CallGuard } from '../bridge/host-runtime.js';
 import { confineModelPath } from '../security.js';
+import { confineRealPath } from './real-path.js';
+
+/**
+ * The lexical gate, then the filesystem's answer.
+ *
+ * `createSession` takes a modelPath AND a bag of companions, so the two-step
+ * check lives in one helper rather than being repeated per field and drifting.
+ */
+function confineBothWays(modelRoot: string, candidate: string): string | null {
+  const lexical = confineModelPath(modelRoot, candidate);
+  return lexical === null ? null : confineRealPath(modelRoot, lexical);
+}
 
 /**
  * Confine `modelPath` and every companion to the app's model directory.
@@ -43,7 +55,7 @@ export function onnxPathGuard(modelRoot: string): CallGuard {
 
     const modelPath = options['modelPath'];
     const resolved =
-      typeof modelPath === 'string' ? confineModelPath(modelRoot, modelPath) : null;
+      typeof modelPath === 'string' ? confineBothWays(modelRoot, modelPath) : null;
     if (resolved === null) {
       throw new Error(
         'inference host: "modelPath" must name a file or folder inside the application\'s ' +
@@ -62,7 +74,7 @@ export function onnxPathGuard(modelRoot: string): CallGuard {
       }
       const safe: Record<string, string> = {};
       for (const [role, value] of Object.entries(companions as Record<string, unknown>)) {
-        const path = typeof value === 'string' ? confineModelPath(modelRoot, value) : null;
+        const path = typeof value === 'string' ? confineBothWays(modelRoot, value) : null;
         if (path === null) {
           throw new Error(
             `inference host: the "${role}" companion must name a file inside the application's ` +
