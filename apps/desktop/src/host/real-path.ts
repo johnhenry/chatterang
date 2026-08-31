@@ -27,7 +27,7 @@
  * than left to be assumed.
  */
 
-import { realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 
 /**
@@ -69,6 +69,27 @@ export function confineRealPath(modelRoot: string, resolvedCandidate: string): s
       existing = realpathSync(existing);
       break;
     } catch {
+      /*
+       * `realpath` failed. Either the entry does not exist — the ordinary
+       * download-target case — or it EXISTS as a dangling symlink, which is a
+       * very different thing.
+       *
+       * Treating a dangling link as "absent" and re-attaching its name made
+       * this function hand back a path inside the root that `open` would
+       * follow OUT of it. With a write primitive on the other side (the
+       * desktop Filesystem plugin) that is an arbitrary-write: verified by
+       * creating `<root>/innocent.gguf -> <tmp>/ARBITRARY-WRITE-TARGET.txt`
+       * with the target absent, and watching a write land outside the root.
+       *
+       * `lstat` does not follow the link, so it succeeds exactly when the
+       * entry is really there. A symlink whose target resolves INSIDE the root
+       * is unaffected — `realpath` succeeds for those and never reaches here.
+       */
+      try {
+        if (lstatSync(existing).isSymbolicLink()) return null;
+      } catch {
+        // Genuinely absent. Fall through and treat it as a missing component.
+      }
       const parent = dirname(existing);
       // `dirname` is a fixed point at the filesystem root; without this a
       // candidate on a non-existent volume would spin forever.

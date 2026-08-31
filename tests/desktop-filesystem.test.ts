@@ -65,6 +65,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -661,6 +662,87 @@ describe('confinement refuses every escape, on every method', () => {
 });
 
 /* ── Two roots ───────────────────────────────────────────────────────── */
+
+describe('a dangling symlink is not an absent file', () => {
+  /*
+   * The hole this plugin turned from theory into a write primitive.
+   *
+   * `confineRealPath` walks up to the deepest EXISTING ancestor so a download
+   * target that does not exist yet is still allowed. A symlink whose target is
+   * absent makes `realpath` throw, so it looked absent — and the walk handed
+   * back a path inside the root that `open` follows OUT of it. Verified before
+   * the fix: `<root>/innocent.gguf -> <tmp>/ARBITRARY-WRITE-TARGET.txt` with
+   * the target missing, then a write that created that file outside the root.
+   */
+  it('writeFile refuses a dangling symlink at the leaf', async () => {
+    const outside = join(fixture.outside, 'ARBITRARY-WRITE-TARGET.txt');
+    symlinkSync(outside, join(fixture.data, 'innocent.gguf'));
+
+    await expect(
+      call(fixture.plugin, 'writeFile', {
+        path: 'innocent.gguf',
+        directory: 'DATA',
+        data: b64('PWNED'),
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(outside)).toBe(false);
+  });
+
+  it('appendFile refuses one too', async () => {
+    const outside = join(fixture.outside, 'APPEND-TARGET.txt');
+    symlinkSync(outside, join(fixture.data, 'append-me.bin'));
+
+    await expect(
+      call(fixture.plugin, 'appendFile', {
+        path: 'append-me.bin',
+        directory: 'DATA',
+        data: b64('PWNED'),
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(outside)).toBe(false);
+  });
+
+  it('still accepts a symlink whose target is inside the root', async () => {
+    // The fix must not refuse every symlink: one that resolves inside is fine,
+    // and refusing it would be a false positive that breaks legitimate layouts.
+    writeFileSync(join(fixture.data, 'real.bin'), 'x');
+    symlinkSync(join(fixture.data, 'real.bin'), join(fixture.data, 'alias.bin'));
+
+    const { uri } = (await call(fixture.plugin, 'getUri', {
+      path: 'alias.bin',
+      directory: 'DATA',
+    })) as { uri: string };
+    expect(uri).toBe(join(fixture.data, 'real.bin'));
+  });
+});
+
+describe('a real download slice, at the size download.ts actually sends', () => {
+  it('appendFile accepts a 4 MiB slice without blowing the stack', async () => {
+    /*
+     * `download.ts` slices a model into 4 MiB blobs, which is a 5,592,408
+     * character base64 string. The first validator here was
+     * /^(?:[A-Za-z0-9+\/]{4})*.../ — catastrophic on an input that long:
+     * testing one threw `RangeError: Maximum call stack size exceeded`, so no
+     * model in the catalogue could finish downloading. Every unit test passed,
+     * because every unit test used a short string.
+     */
+    const slice = Buffer.alloc(4 * 1024 * 1024).toString('base64');
+    expect(slice.length).toBe(5_592_408);
+
+    await call(fixture.plugin, 'writeFile', {
+      path: 'models/big.gguf',
+      directory: 'DATA',
+      data: '',
+    });
+    await call(fixture.plugin, 'appendFile', {
+      path: 'models/big.gguf',
+      directory: 'DATA',
+      data: slice,
+    });
+
+    expect(statSync(join(fixture.data, 'models', 'big.gguf')).size).toBe(4 * 1024 * 1024);
+  });
+});
 
 describe('Directory.Data and Directory.Cache are different roots', () => {
   it('writes the same path into two different places', async () => {

@@ -131,7 +131,21 @@ export interface FilesystemPluginOptions {
  * a bad write. The empty string matches, and must: `download.ts:206` writes
  * `data: ''` to create-and-truncate before it appends.
  */
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/*
+ * Linear, not backtracking.
+ *
+ * The grouped form — /^(?:[A-Za-z0-9+/]{4})*.../ — is catastrophic on a long
+ * input: `download.ts` slices a model into 4 MiB blobs, which is a 5,592,408
+ * character base64 string, and testing one threw
+ * `RangeError: Maximum call stack size exceeded`. Every model in the catalogue
+ * is larger than one slice, so no download could complete.
+ */
+const NON_BASE64 = /[^A-Za-z0-9+/]/;
+
+function isBase64(data: string): boolean {
+  if (data.length % 4 !== 0) return false;
+  return !NON_BASE64.test(data.replace(/={0,2}$/, ''));
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
@@ -242,7 +256,7 @@ function decode(method: string, data: unknown, encoding: unknown): Buffer {
     );
   }
   if (encoding === undefined || encoding === null) {
-    if (!BASE64.test(data)) {
+    if (!isBase64(data)) {
       throw new Error(
         `desktop filesystem: "${method}" was given data that is not valid base64. With no ` +
           '"encoding" the data is the file\'s bytes as standard padded base64. Node\'s ' +
