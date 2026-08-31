@@ -22,6 +22,13 @@ export default defineConfig({
       '@chatterang/inference-node': fileURLToPath(
         new URL('./packages/inference-node/src', import.meta.url),
       ),
+      // The ONNX backend. Node-only for a sharper reason than its sibling:
+      // onnxruntime-node ships 283 MB of prebuilt native binaries, and there is
+      // no darwin/x64 build at all. Aliased to source so the suite does not
+      // depend on the workspace link, and banned from `src/` outright.
+      '@chatterang/onnx-node': fileURLToPath(
+        new URL('./packages/onnx-node/src', import.meta.url),
+      ),
       // Same reasoning as inference-node: desktop-only, never in a web build,
       // and resolved to source so the suite does not depend on a workspace link.
       '@chatterang/cordis-aimatey': fileURLToPath(

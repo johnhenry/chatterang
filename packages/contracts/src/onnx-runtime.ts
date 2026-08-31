@@ -119,6 +119,32 @@ export interface PartialTranscriptEvent {
   text: string;
 }
 
+/**
+ * The one event that ends a transcription, whatever happened to it.
+ *
+ * ADDED FOR A3, AND IT WAS A GAP RATHER THAN AN ADDITION. This contract
+ * declared `onnxProgress` and `onnxPartial` and nothing terminal, so a
+ * transcription that streamed partials had no event that said "and that is
+ * all". The desktop supervisor guarantees exactly one terminal event per turn
+ * and refuses at construction to run a stream whose terminal is not declared
+ * here — an undeclared terminal is dropped on delivery, so every turn would
+ * complete and then wait forever.
+ *
+ * It carries `TranscribeResult`'s fields so a listener that missed the return
+ * value still has the whole answer, plus `error` for the ends the engine never
+ * got to report itself: a host that died, a deadline that expired, a
+ * cancellation.
+ */
+export interface TranscriptionEndEvent {
+  requestId: string;
+  text: string;
+  language: string;
+  durationMs: number;
+  segments: { start: number; end: number; text: string }[];
+  /** Present only when the transcription did not finish normally. */
+  error?: string;
+}
+
 export interface OnnxRuntimePlugin {
   /** Execution providers this build supports on this device. */
   getExecutionProviders(): Promise<{
@@ -144,6 +170,10 @@ export interface OnnxRuntimePlugin {
   addListener(
     eventName: 'onnxPartial',
     listener: (event: PartialTranscriptEvent) => void,
+  ): Promise<ListenerHandle>;
+  addListener(
+    eventName: 'onnxEnd',
+    listener: (event: TranscriptionEndEvent) => void,
   ): Promise<ListenerHandle>;
   removeAllListeners(): Promise<void>;
 }

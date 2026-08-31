@@ -100,19 +100,39 @@ export class OnnxRuntimeWeb extends WebPlugin implements OnnxRuntimePlugin {
     }
   }
 
+  /**
+   * Ends with exactly one `onnxEnd`, on every path.
+   *
+   * The event was added to the contract for the Node backend, whose desktop
+   * supervisor needs a terminal event to end a turn on. A contract event the
+   * SHIM never fires would be the same hazard one layer down — a listener
+   * written against the contract would work on desktop and wait forever on the
+   * web — so it is emitted here too, including on the no-recogniser path.
+   */
   async transcribe(options: TranscribeOptions): Promise<TranscribeResult> {
     const Recognition = getSpeechRecognition();
     const started = performance.now();
+    let settled = false;
+    const finish = (result: TranscribeResult, error?: string): TranscribeResult => {
+      if (!settled) {
+        settled = true;
+        this.notifyListeners('onnxEnd', error === undefined ? result : { ...result, error });
+      }
+      return result;
+    };
 
     if (!Recognition) {
       const text = '[No on-device speech recognition available in this browser.]';
-      return {
-        requestId: options.requestId,
-        text,
-        language: options.language ?? 'en',
-        durationMs: Math.round(performance.now() - started),
-        segments: [{ start: 0, end: 0, text }],
-      };
+      return finish(
+        {
+          requestId: options.requestId,
+          text,
+          language: options.language ?? 'en',
+          durationMs: Math.round(performance.now() - started),
+          segments: [{ start: 0, end: 0, text }],
+        },
+        'No on-device speech recognition is available in this browser.',
+      );
     }
 
     // The browser API listens to the live microphone rather than a buffer, so
@@ -138,13 +158,16 @@ export class OnnxRuntimeWeb extends WebPlugin implements OnnxRuntimePlugin {
       recognition.start();
     });
 
-    return {
+    return finish({
       requestId: options.requestId,
       text,
       language: options.language ?? 'en',
       durationMs: Math.round(performance.now() - started),
+      // Still {0, 0}: the browser recogniser reports no timings at all, and
+      // inventing them would make the shim look like the Node backend, which
+      // measures them. See `packages/onnx-node` for real segment boundaries.
       segments: [{ start: 0, end: 0, text }],
-    };
+    });
   }
 
   async synthesize(options: SynthesizeOptions): Promise<SynthesizeResult> {

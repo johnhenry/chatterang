@@ -271,8 +271,17 @@ describe('the app never reaches the desktop-only layer', () => {
     // An earlier version anchored the scoped name with `$` and had no relative
     // rule, and was revert-checked only against bare specifiers — the one form
     // it already caught. Both other doors were open.
+    //
+    // A3 ADDED `@chatterang/onnx-node`, AND THE npm PACKAGE NAMES WITH IT.
+    // The workspace package is the obvious entry, but it is not the only one:
+    // npm hoists `onnxruntime-node` to the ROOT `node_modules`, so
+    // `import * as ort from 'onnxruntime-node'` in `src/` resolved and passed
+    // every guard in this file. That is 283 MB of prebuilt native binaries —
+    // with no darwin/x64 build at all — one import away from the web and
+    // mobile bundles. `node-llama-cpp` had the identical hole and is closed
+    // here too; it was never a new category, only an unnoticed one.
     const banned =
-      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node)(\/|$))|(^|\/)packages\/(cordis-aimatey|inference-node)(\/|$)/;
+      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
     const offenders = files
       .filter((file) =>
         [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
@@ -337,6 +346,34 @@ describe('the app never reaches the desktop-only layer', () => {
     for (const form of forms) {
       const found = [...form.matchAll(new RegExp(SPECIFIER.source, 'g'))].map((m) => m[1]);
       expect(found, form).toContain(form.includes('/main') ? 'electron/main' : 'electron');
+    }
+
+    // The same five doors, spelled with A3's specifiers, and asserted against
+    // the BAN as well as the matcher — a specifier the matcher sees and the
+    // regex then waves through is the failure this file keeps re-learning.
+    const onnxBan =
+      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
+    const onnxForms: [string, string][] = [
+      ["import * as ort from 'onnxruntime-node';", 'onnxruntime-node'],
+      ["import { Tensor } from 'onnxruntime-common';", 'onnxruntime-common'],
+      ["export { OnnxRuntimeNode } from '@chatterang/onnx-node';", '@chatterang/onnx-node'],
+      ["import 'onnxruntime-node/dist/backend';", 'onnxruntime-node/dist/backend'],
+      ["const m = await import('../../packages/onnx-node/src/index');", '../../packages/onnx-node/src/index'],
+      ["const ort = require('../node_modules/onnxruntime-node');", '../node_modules/onnxruntime-node'],
+      ["const ort = require(`onnxruntime-node`);", 'onnxruntime-node'],
+      ["const ort = require /* sneaky */ ('onnxruntime-node');", 'onnxruntime-node'],
+      ["import { getLlama } from 'node-llama-cpp';", 'node-llama-cpp'],
+    ];
+    for (const [form, specifier] of onnxForms) {
+      const found = [...form.matchAll(new RegExp(SPECIFIER.source, 'g'))].map((m) => m[1]);
+      expect(found, form).toContain(specifier);
+      expect(onnxBan.test(specifier), `${form} -> ${specifier}`).toBe(true);
+    }
+
+    // And the control: a name that merely LOOKS like one of them is not banned,
+    // so the rule is a rule and not a substring search.
+    for (const allowed of ['onnxruntime-web', '@chatterang/contracts', 'node-llama-cpp-web']) {
+      expect(onnxBan.test(allowed), allowed).toBe(false);
     }
   });
 });

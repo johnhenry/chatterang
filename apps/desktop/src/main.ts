@@ -40,7 +40,10 @@ import {
   BOOTSTRAP_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
+  LLAMA_ENGINE,
   LLAMA_PLUGIN,
+  ONNX_ENGINE,
+  ONNX_PLUGIN,
   PluginHost,
   Supervisor,
   createMainRouter,
@@ -187,6 +190,11 @@ function start(): void {
 
   const supervisor = new Supervisor({
     spawn: spawnInferenceHost,
+    // BOTH engines, named explicitly. The option defaults to `[LLAMA_ENGINE]`,
+    // so passing it at all means passing the whole list: an engine served by
+    // the host but missing from here is refused on arrival by `#receive`
+    // rather than dispatched to the wrong place.
+    engines: [LLAMA_ENGINE, ONNX_ENGINE],
     // No try/catch here on purpose. The swallow used to live at this call site,
     // which meant a delivery that threw never reached the supervisor and it
     // marked the turn ended anyway — the page got no `llamaEnd` at all while
@@ -215,6 +223,7 @@ function start(): void {
   // thing; with two, an object carrying every engine's methods at once has no
   // way to say which `generate` a call meant.
   pluginHost.register(LLAMA_PLUGIN, supervisor.plugin(LLAMA_PLUGIN.name));
+  pluginHost.register(ONNX_PLUGIN, supervisor.plugin(ONNX_PLUGIN.name));
   pluginHost.register(DSH_PLUGIN, {
     // Asked of the supervisor on every call rather than served from a variable
     // captured at boot. The route set within one host's life is still a

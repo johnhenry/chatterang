@@ -16,7 +16,14 @@
  * fake ports instead of launching a window.
  */
 
-import type { GenerationEndEvent, ThermalState, TokenEvent } from '@chatterang/contracts';
+import type {
+  DiffusionProgressEvent,
+  GenerationEndEvent,
+  PartialTranscriptEvent,
+  ThermalState,
+  TokenEvent,
+  TranscriptionEndEvent,
+} from '@chatterang/contracts';
 
 /* ── Boundary 1: what a plugin declares ───────────────────────────────── */
 
@@ -113,6 +120,61 @@ export const LLAMA_PLUGIN: PluginDefinition = Object.freeze({
   name: 'LlamaCpp',
   methods: LLAMA_METHODS,
   events: LLAMA_EVENTS,
+});
+
+/**
+ * The eight invocable methods of `OnnxRuntimePlugin`.
+ *
+ * `addListener` and `removeAllListeners` are NOT here, for the same reason
+ * they are absent from `LLAMA_METHODS`: they are served by the bridge, which
+ * owns the subscription table, and declaring them would collide in
+ * `channels.ts`.
+ *
+ * This is what makes the plugin dimension real. Note `cancel`, which BOTH
+ * engines declare: before `HostCall` carried a plugin name, an ONNX
+ * cancellation and a llama.cpp one were the same wire message, and the wrong
+ * engine would have answered.
+ */
+export const ONNX_METHODS = Object.freeze([
+  'getExecutionProviders',
+  'createSession',
+  'releaseSession',
+  'releaseTask',
+  'transcribe',
+  'synthesize',
+  'diffuse',
+  'cancel',
+] as const);
+
+/**
+ * The three event names `OnnxRuntimePlugin` emits.
+ *
+ * `onnxEnd` was ADDED TO THE CONTRACT for A3. Without it the plugin declared
+ * two progress events and nothing terminal, and `EngineSpec` cannot describe a
+ * stream whose end has no name — `Supervisor` refuses at construction, because
+ * an undeclared terminal event is dropped on delivery and every turn would
+ * hang rather than fail.
+ */
+export const ONNX_EVENTS = Object.freeze(['onnxProgress', 'onnxPartial', 'onnxEnd'] as const);
+
+/** Payload type per event name, so the forwarding code cannot swap two. */
+export interface OnnxEventMap {
+  onnxProgress: DiffusionProgressEvent;
+  onnxPartial: PartialTranscriptEvent;
+  onnxEnd: TranscriptionEndEvent;
+}
+
+/**
+ * ONNX Runtime, the desktop shell's second engine.
+ *
+ * The name must match `registerPlugin('OnnxRuntime', …)` in
+ * `src/plugins/onnx-runtime/index.ts`; it is the wire address in both
+ * directions and the key `PluginHost` registers under.
+ */
+export const ONNX_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'OnnxRuntime',
+  methods: ONNX_METHODS,
+  events: ONNX_EVENTS,
 });
 
 /**

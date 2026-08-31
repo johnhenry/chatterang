@@ -19,13 +19,16 @@
 import { Router } from '@johnhenry/aimatey-core';
 
 import { LlamaCppNode } from '@chatterang/inference-node';
+import { OnnxRuntimeNode } from '@chatterang/onnx-node';
 
 import { LLAMA_HOST_POLICY } from '../bridge/call-shape.js';
+import { ONNX_HOST_POLICY } from '../bridge/onnx-call-shape.js';
 import { createHostRuntime } from '../bridge/host-runtime.js';
 import type { MessageLink } from '../bridge/protocol.js';
-import { LLAMA_PLUGIN } from '../bridge/protocol.js';
+import { LLAMA_PLUGIN, ONNX_PLUGIN } from '../bridge/protocol.js';
 import { mountDsh } from './dsh.js';
 import { modelPathGuard } from './model-paths.js';
+import { onnxPathGuard } from './onnx-paths.js';
 import { DesktopLlamaBackend } from './llama-backend.js';
 
 /**
@@ -75,21 +78,38 @@ async function main(): Promise<void> {
   const link = parentPortLink(port);
   const plugin = new LlamaCppNode();
 
-  // ONE runtime, any number of plugins on it. Milestone A3's ONNX engine is a
-  // second `runtime.serve(...)` line here with its own definition, its own
-  // argument table and its own path guard — and nothing else, which is the
-  // point of the generalisation.
+  // ONE runtime, any number of plugins on it. A3's ONNX engine is the second
+  // `runtime.serve(...)` line below: its own definition, its own argument
+  // table, its own path guard — and nothing else, which is the point of the
+  // generalisation.
   const runtime = createHostRuntime({
     link,
     warn: (message: string) => console.warn(`[inference-host] ${message}`),
   });
 
-  // Serve the plugin FIRST. Inference must work even if the DSH mount below
-  // fails; the tree is an additional consumer of this engine, not a
-  // prerequisite for it.
+  const root = modelRoot();
+
+  // Serve the plugins FIRST. Inference must work even if the DSH mount below
+  // fails; the tree is an additional consumer of these engines, not a
+  // prerequisite for them.
   runtime.serve(LLAMA_PLUGIN, plugin, {
     ...LLAMA_HOST_POLICY,
-    guard: modelPathGuard(modelRoot()),
+    guard: modelPathGuard(root),
+  });
+
+  // ONNX Runtime, in the SAME process as llama.cpp, and that is a decision
+  // with a measured cost. `InferenceSession.run` is a synchronous native call
+  // behind a `setImmediate`: it blocks this process's event loop for its whole
+  // duration — 0 timer ticks across a 134 ms whisper-base encoder pass, and
+  // four concurrent runs serialise at 4x. So an ONNX run freezes llama.cpp's
+  // decode, the DSH tree AND the supervisor's ping traffic while it lasts,
+  // which is exactly the "alive but WEDGED" state the supervisor's tick exists
+  // to notice. Whisper-base's encoder is ~130 ms per 30-second window, well
+  // inside the 10 s ping timeout; a larger model, or diffusion, is not
+  // obviously so, and would need its own host or a worker thread.
+  runtime.serve(ONNX_PLUGIN, new OnnxRuntimeNode(), {
+    ...ONNX_HOST_POLICY,
+    guard: onnxPathGuard(root),
   });
 
   const router = new Router({ routingStrategy: 'explicit', fallbackStrategy: 'none' });

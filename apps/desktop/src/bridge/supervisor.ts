@@ -66,7 +66,11 @@
  * be a choice to be fragile.
  */
 
-import type { GenerateOptions, GenerationEndEvent } from '@chatterang/contracts';
+import type {
+  GenerateOptions,
+  GenerationEndEvent,
+  TranscriptionEndEvent,
+} from '@chatterang/contracts';
 
 import type { PluginImplementation } from './plugin-host.js';
 import type {
@@ -76,7 +80,14 @@ import type {
   PluginDefinition,
   WireError,
 } from './protocol.js';
-import { HANDLE_LOST, HOST_TIMEOUT, LLAMA_PLUGIN, SENDER_SCOPED, fromWireError } from './protocol.js';
+import {
+  HANDLE_LOST,
+  HOST_TIMEOUT,
+  LLAMA_PLUGIN,
+  ONNX_PLUGIN,
+  SENDER_SCOPED,
+  fromWireError,
+} from './protocol.js';
 
 /**
  * How the supervisor reaches the renderer. Supplied by `PluginHost`.
@@ -183,6 +194,56 @@ export const LLAMA_ENGINE: EngineSpec = Object.freeze({
     terminal: 'llamaEnd',
     progress: Object.freeze(['llamaToken']),
     synthesise: synthesiseEnd,
+  }),
+});
+
+/** A zeroed transcript, for the ends the ONNX host never got to report. */
+function synthesiseTranscriptionEnd(requestId: string, error: string): TranscriptionEndEvent {
+  return { requestId, text: '', language: '', durationMs: 0, segments: [], error };
+}
+
+/**
+ * ONNX Runtime's engine spec — the shell's second engine, and the first real
+ * user of the plugin dimension.
+ *
+ * ONE STREAM PER ENGINE, AND `transcribe` IS IT. `StreamSpec` has exactly one
+ * `start`, one `cancel` and one `terminal`, so `transcribe`, `synthesize` and
+ * `diffuse` cannot all be streams of a single plugin. Whisper is the milestone,
+ * so `transcribe` takes the slot and the other two go through the plain call
+ * path. That has consequences, and they are consequences rather than design:
+ *
+ *   - `synthesize` and `diffuse` get the flat `callTimeoutMs` with no
+ *     progress-based reset, no per-window cancel ownership, and no synthesised
+ *     terminal if the host dies mid-call — the call promise simply rejects.
+ *     Both refuse in this build, so nothing is currently affected; a 20-step
+ *     diffusion on the CPU would blow the 120 s deadline and that has to be
+ *     revisited when diffusion ships.
+ *   - `onnxProgress` is NOT in `progress`, so diffusion progress is BROADCAST
+ *     to every window rather than delivered to the turn's owner, and it resets
+ *     no deadline. Correct today (nothing emits it) and WRONG the day
+ *     diffusion ships — it is here for the reader who would otherwise take the
+ *     broadcast for a decision.
+ *
+ * `idleTimeoutMs` is raised above the 120 s default because a long recording
+ * decoded on the CPU legitimately produces nothing for a while between
+ * windows: the encoder pass for a 30-second window is a single blocking native
+ * call. What is never legitimate is silence for five minutes.
+ *
+ * `senderScoped` is omitted deliberately: the default is
+ * `[stream.start, stream.cancel]` = `['transcribe', 'cancel']`, which is
+ * exactly right. A transcription belongs to the window that started it, and
+ * naming anything else would claim that e.g. `createSession`'s answer differs
+ * per window.
+ */
+export const ONNX_ENGINE: EngineSpec = Object.freeze({
+  definition: ONNX_PLUGIN,
+  stream: Object.freeze({
+    start: 'transcribe',
+    cancel: 'cancel',
+    terminal: 'onnxEnd',
+    progress: Object.freeze(['onnxPartial']),
+    idleTimeoutMs: 300_000,
+    synthesise: synthesiseTranscriptionEnd,
   }),
 });
 

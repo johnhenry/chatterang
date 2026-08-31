@@ -33,7 +33,7 @@ export { BRIDGE_GLOBAL, BRIDGE_KEYS, createRendererBridge } from './renderer.js'
 export type { InvokeResult, PreloadBridge, RendererIpc } from './renderer.js';
 export { capacitorShimSource, installCapacitorShim } from './capacitor-shim.js';
 export type { ShimTarget } from './capacitor-shim.js';
-export { DEFAULT_POLICY, LLAMA_ENGINE, Supervisor, systemTimers } from './supervisor.js';
+export { DEFAULT_POLICY, LLAMA_ENGINE, ONNX_ENGINE, Supervisor, systemTimers } from './supervisor.js';
 export type {
   EngineSpec,
   NotifyListeners,
@@ -57,6 +57,12 @@ export {
   assertCallShape,
 } from './call-shape.js';
 export {
+  ONNX_HOST_POLICY,
+  ONNX_OPAQUE_FAILURES,
+  ONNX_REQUIRED_ARGUMENTS,
+  assertOnnxCallShape,
+} from './onnx-call-shape.js';
+export {
   DSH_METHODS,
   DSH_PLUGIN,
   HANDLE_LOST,
@@ -64,6 +70,9 @@ export {
   LLAMA_EVENTS,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
+  ONNX_EVENTS,
+  ONNX_METHODS,
+  ONNX_PLUGIN,
   SENDER_SCOPED,
   fromWireError,
   toWireError,
@@ -82,6 +91,7 @@ export type {
   LlamaEventMap,
   LlamaEventName,
   MessageLink,
+  OnnxEventMap,
   PluginDefinition,
   WireError,
 } from './protocol.js';

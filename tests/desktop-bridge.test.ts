@@ -17,6 +17,7 @@ import type {
 } from '@chatterang/inference-node';
 import { LlamaCppNode } from '@chatterang/inference-node';
 import { modelPathGuard } from '@chatterang/desktop/host/model-paths';
+import { onnxPathGuard } from '@chatterang/desktop/host/onnx-paths';
 
 import {
   BRIDGE_KEYS,
@@ -31,7 +32,14 @@ import {
   LLAMA_OPAQUE_FAILURES,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
+  ONNX_ENGINE,
+  ONNX_HOST_POLICY,
+  ONNX_METHODS,
+  ONNX_OPAQUE_FAILURES,
+  ONNX_PLUGIN,
+  ONNX_REQUIRED_ARGUMENTS,
   PluginHost,
+  assertOnnxCallShape,
   RENDERER_TEARDOWN_EVENTS,
   SENDER_SCOPED,
   Supervisor,
@@ -3486,3 +3494,458 @@ describe('an engine cannot name a stream its definition does not declare', () =>
   });
 });
 
+
+/* ── Milestone A3: ONNX Runtime as the shell's second engine ──────────── */
+
+/**
+ * THE PLUGIN DIMENSION, WITH A REAL SECOND ENGINE IN IT.
+ *
+ * `TRANSCRIBER` above is a fake, and its header says why: adding ONNX there
+ * would have been adding the feature rather than proving the seam. The seam is
+ * proven; this is the feature. Everything below uses the SHIPPED
+ * `ONNX_PLUGIN`, `ONNX_ENGINE`, `ONNX_HOST_POLICY` and `onnxPathGuard` — the
+ * exact values `host/entry.ts` and `main.ts` register — so a mistake in one of
+ * them is a red test rather than a fake that agrees with itself.
+ */
+
+/** Both shipped engines, one supervisor, one host, two renderers. */
+function shippedEngines(): {
+  readonly supervisor: Supervisor;
+  readonly hosts: WiredHost[];
+  readonly inbox: Map<number, EventPayload[]>;
+  call(
+    senderId: number,
+    pluginName: string,
+    method: string,
+    args: readonly unknown[],
+  ): Promise<InvokeResult>;
+  emit(pluginName: string, name: string, data: unknown): void;
+  posted(): PostedCall[];
+} {
+  const inbox = new Map<number, EventPayload[]>([
+    [1, []],
+    [2, []],
+  ]);
+  const host = new PluginHost((senderId, payload) => {
+    const box = inbox.get(senderId);
+    if (box === undefined) return false;
+    box.push(structuredClone(payload));
+    return true;
+  });
+  const wired = wiredSupervisor({
+    engines: [LLAMA_ENGINE, ONNX_ENGINE],
+    notify: (pluginName, eventName, data, ownerId) =>
+      host.notifyListeners(pluginName, eventName, data, ownerId),
+  });
+  host.register(LLAMA_PLUGIN, wired.supervisor.plugin(LLAMA_PLUGIN.name));
+  host.register(ONNX_PLUGIN, wired.supervisor.plugin(ONNX_PLUGIN.name));
+  const router = createMainRouter(host);
+
+  let subscriptionId = 1;
+  for (const senderId of inbox.keys()) {
+    for (const definition of [LLAMA_PLUGIN, ONNX_PLUGIN]) {
+      for (const eventName of definition.events) {
+        host.addListener(senderId, definition.name, eventName, subscriptionId++);
+      }
+    }
+  }
+
+  return {
+    supervisor: wired.supervisor,
+    hosts: wired.hosts,
+    inbox,
+    call: (senderId, pluginName, method, args) =>
+      router.handle(senderId, methodChannel(pluginName, method), args),
+    emit: (pluginName, name, data) =>
+      wired.hosts[0]?.send({ k: 'ev', plugin: pluginName, name, data }),
+    posted: () =>
+      (wired.hosts[0]?.posted ?? []).filter((m) => (m as PostedCall).k === 'call') as PostedCall[],
+  };
+}
+
+describe('the ONNX engine spec', () => {
+  it('is accepted by the Supervisor, which refuses a stream it cannot deliver', () => {
+    // The CONTROL for the four refusals below. `ONNX_ENGINE` names `onnxEnd`
+    // as its terminal, and `onnxEnd` had to be added to the contract for that
+    // to be true — this is the assertion that says the two agree.
+    expect(
+      () =>
+        new Supervisor({
+          spawn: () => {
+            throw new Error('not reached: construction must succeed without spawning');
+          },
+          notify: () => true,
+          engines: [LLAMA_ENGINE, ONNX_ENGINE],
+        }),
+    ).not.toThrow();
+  });
+
+  it('names a terminal, progress, start and cancel that the definition declares', () => {
+    const stream = ONNX_ENGINE.stream!;
+    expect(ONNX_PLUGIN.events).toContain(stream.terminal);
+    for (const name of stream.progress) expect(ONNX_PLUGIN.events).toContain(name);
+    expect(ONNX_PLUGIN.methods).toContain(stream.start);
+    expect(ONNX_PLUGIN.methods).toContain(stream.cancel);
+    // `transcribe` takes the one stream slot; synthesize and diffuse do not.
+    expect(stream.start).toBe('transcribe');
+    expect(stream.terminal).toBe('onnxEnd');
+    // onnxProgress is deliberately NOT progress: it is diffusion's step event,
+    // it has no owner while transcribe owns the stream, and it must not extend
+    // anybody's deadline.
+    expect(stream.progress).not.toContain('onnxProgress');
+  });
+
+  it('declares neither addListener nor removeAllListeners as invocable', () => {
+    // They are served by the bridge, which owns the subscription table.
+    // Declaring them would collide with the listener channels.
+    expect(ONNX_METHODS).not.toContain('addListener');
+    expect(ONNX_METHODS).not.toContain('removeAllListeners');
+    expect(ONNX_METHODS).toHaveLength(8);
+  });
+
+  it('shares no channel with llama.cpp even though both declare `cancel`', () => {
+    expect(ONNX_METHODS).toContain('cancel');
+    expect(LLAMA_METHODS).toContain('cancel');
+    expect(channelCollisions([LLAMA_PLUGIN, ONNX_PLUGIN])).toEqual([]);
+    expect(methodChannel(ONNX_PLUGIN.name, 'cancel')).not.toBe(
+      methodChannel(LLAMA_PLUGIN.name, 'cancel'),
+    );
+  });
+});
+
+describe('llama.cpp and ONNX in flight at once', () => {
+  it("one engine's abort does not settle or cancel the other's turn", async () => {
+    // The isolation claim, with the two REAL engines and ONE requestId. The
+    // ids are minted per caller and nothing coordinates them across engines,
+    // so the collision is the normal case rather than a contrived one.
+    const w = shippedEngines();
+
+    const generation = watch(
+      w.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'r1' }]),
+    );
+    const transcription = watch(
+      w.call(1, ONNX_PLUGIN.name, 'transcribe', [
+        { handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'r1' },
+      ]),
+    );
+    await settle();
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(w.supervisor.inflightCountFor(ONNX_PLUGIN.name)).toBe(1);
+
+    // Both went out addressed to their own plugin. `cancel` is the name they
+    // SHARE, and the reason the wire needed a plugin dimension at all.
+    void w.call(1, ONNX_PLUGIN.name, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+
+    // THE CANCEL HALF: exactly one cancel went out, at ONNX. A supervisor
+    // keyed by requestId alone would have posted llama.cpp's too.
+    const cancels = w.posted().filter((call) => call.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(ONNX_PLUGIN.name);
+
+    // The transcription ends on its OWN terminal event and its own call settles.
+    const start = w
+      .posted()
+      .find((call) => call.plugin === ONNX_PLUGIN.name && call.method === 'transcribe');
+    w.emit(ONNX_PLUGIN.name, 'onnxEnd', {
+      requestId: 'r1',
+      text: 'hello',
+      language: 'en',
+      durationMs: 12,
+      segments: [],
+      error: 'The transcription was cancelled.',
+    });
+    w.hosts[0]?.send({ k: 'ret', id: start?.id ?? 0, ok: true, data: { requestId: 'r1' } });
+    await settle();
+
+    expect(sawFrom(w.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd')).toHaveLength(1);
+    expect(w.supervisor.inflightCountFor(ONNX_PLUGIN.name)).toBe(0);
+    expect(transcription()).toBeDefined();
+
+    // THE SETTLE HALF: llama.cpp's turn is untouched — no terminal event,
+    // still in flight, still unsettled.
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(generation()).toBeUndefined();
+  });
+
+  it("a partial on one engine does not become the other's progress", async () => {
+    const w = shippedEngines();
+    watch(
+      w.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'r2' }]),
+    );
+    watch(
+      w.call(2, ONNX_PLUGIN.name, 'transcribe', [
+        { handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'r2' },
+      ]),
+    );
+    await settle();
+
+    w.emit(ONNX_PLUGIN.name, 'onnxPartial', { requestId: 'r2', text: 'the desk' });
+    await settle();
+
+    // Delivered to the window that started the transcription, and to no other.
+    expect(sawFrom(w.inbox, 2, ONNX_PLUGIN.name, 'onnxPartial')).toEqual([
+      { requestId: 'r2', text: 'the desk' },
+    ]);
+    expect(sawFrom(w.inbox, 1, ONNX_PLUGIN.name, 'onnxPartial')).toEqual([]);
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaToken')).toEqual([]);
+  });
+
+  it('a host that dies ends BOTH turns, each with its own engine’s terminal', async () => {
+    const w = shippedEngines();
+    const generation = watch(
+      w.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'r3' }]),
+    );
+    const transcription = watch(
+      w.call(1, ONNX_PLUGIN.name, 'transcribe', [
+        { handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'r3' },
+      ]),
+    );
+    await settle();
+
+    w.hosts[0]?.close('exit code 5');
+    await settle();
+
+    expect(w.supervisor.inflightCount).toBe(0);
+    const ends = sawFrom(w.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd') as {
+      requestId: string;
+      error?: string;
+      segments: unknown[];
+    }[];
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.error).toBeTruthy();
+    // The ONNX shape, not llama.cpp's: `synthesise` is per engine, and a
+    // GenerationEndEvent delivered as an onnxEnd would typecheck nowhere and
+    // arrive with the wrong fields.
+    expect(ends[0]?.segments).toEqual([]);
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toHaveLength(1);
+    expect(generation()).toBeDefined();
+    expect(transcription()).toBeDefined();
+  });
+});
+
+/** The ONNX half of the host boundary, driven through the real HostRuntime. */
+function onnxHostBoundary(options: {
+  plugin?: Record<string, (...args: readonly unknown[]) => unknown>;
+  guard?: CallGuard;
+}): {
+  call(method: string, args: readonly unknown[]): Promise<{ ok: boolean; message: string }>;
+  readonly warnings: string[];
+  readonly reached: { method: string; args: readonly unknown[] }[];
+} {
+  const pair = createLinkPair();
+  const warnings: string[] = [];
+  const reached: { method: string; args: readonly unknown[] }[] = [];
+
+  const base = Object.fromEntries(
+    ONNX_METHODS.map((method) => [
+      method,
+      (...args: readonly unknown[]) => {
+        reached.push({ method, args });
+        return Promise.resolve({ ok: true });
+      },
+    ]),
+  );
+  const plugin = {
+    ...base,
+    ...options.plugin,
+    addListener: async () => ({ remove: async (): Promise<void> => undefined }),
+  } as unknown as HostPluginImplementation;
+
+  createHostRuntime({ link: pair.host, warn: (message: string) => warnings.push(message) }).serve(
+    ONNX_PLUGIN,
+    plugin,
+    { ...ONNX_HOST_POLICY, ...(options.guard === undefined ? {} : { guard: options.guard }) },
+  );
+
+  let nextId = 1;
+  return {
+    warnings,
+    reached,
+    call: (method, args) =>
+      new Promise((resolveCall) => {
+        const id = nextId++;
+        pair.main.onMessage((message) => {
+          const answer = message as {
+            k: string;
+            id: number;
+            ok: boolean;
+            error?: { message: string };
+          };
+          if (answer.k !== 'ret' || answer.id !== id) return;
+          resolveCall({ ok: answer.ok, message: answer.error?.message ?? '' });
+        });
+        pair.main.postMessage({ k: 'call', id, plugin: ONNX_PLUGIN.name, method, args });
+      }),
+  };
+}
+
+describe('the ONNX argument table', () => {
+  it('covers every method the host serves, with no gaps', () => {
+    expect(Object.keys(ONNX_REQUIRED_ARGUMENTS).sort()).toEqual([...ONNX_METHODS].sort());
+  });
+
+  it('is a SEPARATE table from llama.cpp’s, not a shared one', () => {
+    // Both engines declare `cancel` and both happen to require only
+    // `requestId`. That agreement must be two statements, not one: a shared
+    // table would apply llama's `generate` fields to an ONNX method of the
+    // same name the moment either engine's contract moved.
+    expect(ONNX_REQUIRED_ARGUMENTS).not.toBe(REQUIRED_ARGUMENTS);
+    expect(Object.keys(ONNX_REQUIRED_ARGUMENTS)).not.toEqual(Object.keys(REQUIRED_ARGUMENTS));
+    expect(assertOnnxCallShape).not.toBe(assertCallShape);
+  });
+
+  it('names the method and the field rather than failing deep inside the engine', async () => {
+    const answer = await onnxHostBoundary({}).call('createSession', [{ task: 'stt' }]);
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toContain('createSession');
+    expect(answer.message).toContain('modelPath');
+  });
+
+  it('refuses an EMPTY audio payload, which is what the web caller sends today', async () => {
+    // `src/lib/voice.ts` calls transcribe with `audio: ''` because the web shim
+    // listens to the microphone and ignores the field. There is no microphone
+    // in the inference host, so the empty string has to be refused here rather
+    // than become a transcript of nothing.
+    const h = onnxHostBoundary({});
+    const answer = await h.call('transcribe', [
+      { handle: 's', audio: '', mediaType: 'audio/wav', requestId: 'r' },
+    ]);
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toContain('audio');
+    expect(h.reached).toEqual([]);
+  });
+
+  it('never echoes the value back, because one of the fields is a recording', async () => {
+    const answer = await onnxHostBoundary({}).call('transcribe', [
+      { handle: 's', audio: { secret: 'the user said this' }, mediaType: 'audio/wav', requestId: 'r' },
+    ]);
+    expect(answer.ok).toBe(false);
+    expect(answer.message).not.toContain('the user said this');
+    expect(answer.message).toContain('a object');
+  });
+
+  it('is callable as a pure function, which is how it is checked', () => {
+    expect(() =>
+      assertOnnxCallShape('createSession', [{ task: 'stt', modelPath: '/models/whisper' }]),
+    ).not.toThrow();
+    expect(() => assertOnnxCallShape('createSession', [{ task: 'stt' }])).toThrow(/modelPath/);
+    // An unknown method is the allowlist's business, not this check's.
+    expect(() => assertOnnxCallShape('somethingElse', [])).not.toThrow();
+  });
+
+  it('replaces an onnxruntime load failure instead of forwarding it to the page', async () => {
+    // DEFECT [8], second half, under a new method name. onnxruntime's own
+    // message is `Load model from <path> failed:Protobuf parsing failed.` —
+    // forwarded to the page that named the path, that is a read primitive.
+    const h = onnxHostBoundary({
+      plugin: {
+        createSession: () => {
+          throw new Error(
+            'Load model from /Users/someone/.ssh/id_rsa failed:Protobuf parsing failed.',
+          );
+        },
+      },
+    });
+    const answer = await h.call('createSession', [{ task: 'stt', modelPath: '/models/whisper' }]);
+
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toBe(ONNX_OPAQUE_FAILURES['createSession']);
+    expect(answer.message).not.toContain('Protobuf');
+    expect(answer.message).not.toContain('id_rsa');
+    // The real words stay inside the utility process, one `warn` away.
+    expect(h.warnings.join(' ')).toContain('Protobuf parsing failed');
+  });
+
+  it('leaves other methods’ failures legible', async () => {
+    // Blanketing every method would cost every diagnostic in the app for
+    // nothing. Only `createSession` opens a caller-named file.
+    const h = onnxHostBoundary({
+      plugin: {
+        transcribe: () => {
+          throw new Error('No ONNX session is loaded for handle "onnx_stt_9".');
+        },
+      },
+    });
+    const answer = await h.call('transcribe', [
+      { handle: 'onnx_stt_9', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'r' },
+    ]);
+    expect(answer.message).toContain('No ONNX session is loaded');
+  });
+});
+
+describe('the ONNX path guard', () => {
+  const ROOT = '/app/models';
+
+  it('confines modelPath, and passes the resolved path on', () => {
+    const guard = onnxPathGuard(ROOT);
+    const [options] = guard('createSession', [
+      { task: 'stt', modelPath: 'whisper-base' },
+    ]) as [Record<string, unknown>];
+    expect(options['modelPath']).toBe('/app/models/whisper-base');
+  });
+
+  it('confines EVERY companion, whatever the role is called', () => {
+    // The reason this is not a copy of `modelPathGuard`: `companions` is a
+    // record of role -> path with no fixed key set, and every value is a path
+    // the loader opens. A fixed-field guard would have waved them through.
+    const guard = onnxPathGuard(ROOT);
+    const [options] = guard('createSession', [
+      {
+        task: 'stt',
+        modelPath: 'whisper-base',
+        companions: { encoder: 'whisper-base/onnx/encoder_model.onnx', somethingNew: 'x.json' },
+      },
+    ]) as [Record<string, unknown>];
+    expect(options['companions']).toEqual({
+      encoder: '/app/models/whisper-base/onnx/encoder_model.onnx',
+      somethingNew: '/app/models/x.json',
+    });
+  });
+
+  it('refuses a companion that escapes the model folder', () => {
+    const guard = onnxPathGuard(ROOT);
+    expect(() =>
+      guard('createSession', [
+        { task: 'stt', modelPath: 'whisper-base', companions: { tokenizer: '../../etc/passwd' } },
+      ]),
+    ).toThrow(/"tokenizer" companion must name a file inside/);
+  });
+
+  it('refuses an escaping modelPath without echoing it back', () => {
+    const guard = onnxPathGuard(ROOT);
+    try {
+      guard('createSession', [{ task: 'stt', modelPath: '/etc/hosts' }]);
+      throw new Error('the guard did not refuse');
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toMatch(/"modelPath" must name a file or folder inside/);
+      // Reflecting the path back would confirm one more piece of the
+      // filesystem to the page that asked.
+      expect(message).not.toContain('/etc/hosts');
+    }
+  });
+
+  it('leaves every other method’s arguments exactly as they were', () => {
+    const guard = onnxPathGuard(ROOT);
+    const args = [{ handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'r' }];
+    expect(guard('transcribe', args)).toBe(args);
+    expect(guard('cancel', [{ requestId: 'r' }])).toEqual([{ requestId: 'r' }]);
+  });
+
+  it('runs INSIDE the host boundary, after the shape check and before the engine', async () => {
+    // The order is the point: the shape check says which field is missing, the
+    // guard says which path is refused, and only then does anything native run.
+    const h = onnxHostBoundary({ guard: onnxPathGuard(ROOT) });
+    const refused = await h.call('createSession', [{ task: 'stt', modelPath: '/etc/hosts' }]);
+    expect(refused.ok).toBe(false);
+    expect(h.reached).toEqual([]);
+
+    const allowed = await h.call('createSession', [{ task: 'stt', modelPath: 'whisper-base' }]);
+    expect(allowed.ok).toBe(true);
+    expect(h.reached).toEqual([
+      { method: 'createSession', args: [{ task: 'stt', modelPath: '/app/models/whisper-base' }] },
+    ]);
+  });
+});

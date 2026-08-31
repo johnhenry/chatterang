@@ -1,0 +1,12 @@
+{
+  "name": "@chatterang/onnx-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node implementation of the Chatterang OnnxRuntime plugin contract, over onnxruntime-node. Desktop only: the native binding is ~283 MB and cannot load in a webview.",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@chatterang/contracts": "*",
+    "onnxruntime-node": "1.29.0"
+  }
+}

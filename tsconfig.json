@@ -33,6 +33,7 @@
       "@chatterang/contracts": ["packages/contracts/src/index.ts"],
       "@chatterang/contracts/*": ["packages/contracts/src/*.ts"],
       "@chatterang/inference-node": ["packages/inference-node/src/index.ts"],
+      "@chatterang/onnx-node": ["packages/onnx-node/src/index.ts"],
       "@chatterang/cordis-aimatey": ["packages/cordis-aimatey/src/index.ts"],
       "@chatterang/desktop/*": ["apps/desktop/src/*"]
     }

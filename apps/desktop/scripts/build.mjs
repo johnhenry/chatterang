@@ -14,6 +14,12 @@
  *   node-llama-cpp    — must resolve to the real prebuilt package so its
  *                       platform binary is found. Inlining it would break the
  *                       `.node` lookup entirely.
+ *   onnxruntime-node  — same, and more so: its `.node` binding is found by a
+ *                       path built from `__dirname` (`bin/napi-v6/<platform>/
+ *                       <arch>/`), and the binding then loads
+ *                       `@rpath/libonnxruntime.1.dylib` beside itself. Move
+ *                       either and the require fails at run time, not at
+ *                       build time.
  *   @deepseek-ai/*    — `dsh-llm` does `createRequire(import.meta.url)
  *                       ('../package.json')` at runtime. Single-file bundling
  *                       moves the module and that read fails.
@@ -48,6 +54,7 @@ const aliasPlugin = {
       [/^@chatterang\/contracts$/, join(repo, 'packages/contracts/src/index.ts')],
       [/^@chatterang\/contracts\/(.*)$/, join(repo, 'packages/contracts/src/$1.ts')],
       [/^@chatterang\/inference-node$/, join(repo, 'packages/inference-node/src/index.ts')],
+      [/^@chatterang\/onnx-node$/, join(repo, 'packages/onnx-node/src/index.ts')],
       [/^@chatterang\/cordis-aimatey$/, join(repo, 'packages/cordis-aimatey/src/index.ts')],
       [/^@\/(.*)$/, join(repo, 'src/$1')],
     ];
@@ -104,7 +111,7 @@ await esbuild.build({
   entryPoints: [join(desktop, 'src/host/entry.ts')],
   outfile: join(out, 'host.mjs'),
   format: 'esm',
-  external: ['node-llama-cpp', '@deepseek-ai/*', '@johnhenry/*'],
+  external: ['node-llama-cpp', 'onnxruntime-node', '@deepseek-ai/*', '@johnhenry/*'],
 });
 
 console.log('desktop: built main.cjs, preload.cjs, host.mjs');
