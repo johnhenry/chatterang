@@ -48,6 +48,22 @@ export default defineConfig({
     target: 'es2022',
     sourcemap: true,
     rollupOptions: {
+      /*
+       * Optional peer dependencies of the aimatey backends.
+       *
+       * `@johnhenry/aimatey-backend-browser` declares `@litert-lm/core` as an
+       * OPTIONAL peer (`peerDependenciesMeta.optional`) and imports it lazily,
+       * so the package is meant to work without it. The bundler resolved that
+       * lazy import eagerly anyway and, on failing, emitted a stub that throws
+       * during module evaluation — which took down the whole app: React never
+       * mounted and every page was blank, in the browser as well as in the
+       * desktop shell. The build still exited 0, so nothing caught it.
+       *
+       * Marking it external restores the declared contract: the app boots, and
+       * the import fails only if something actually reaches for LiteRT. Install
+       * `@litert-lm/core` to enable that backend.
+       */
+      external: [/^@litert-lm\//, /^@opentelemetry\//],
       output: {
         // Keep the inference stack in its own chunk so the shell paints before
         // any adapter code is parsed.
