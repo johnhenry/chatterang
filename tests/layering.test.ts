@@ -171,13 +171,15 @@ describe('contracts package', () => {
     // Capacitor, Node builtins, and DOM libs are all implementation detail of
     // one implementation. A Node backend should not install a mobile framework
     // to describe an event subscription.
-    // Match import specifiers, not raw text — listener.ts names
+    // Match `from 'x'`, bare `import 'x'` and dynamic `import('x')` alike: a
+    // side-effect import has no `from`, and matching only `from` let one
+    // through. Specifiers, not raw text — listener.ts names
     // `@capacitor/core` in a comment explaining why it does not import it, and
     // a text search flags that as a violation.
     const banned = /^(@capacitor\/|node:|electron$)/;
     const offenders = contractFiles
       .filter((file) =>
-        [...readFileSync(file, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)].some((m) =>
+        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
           banned.test(m[1] ?? ''),
         ),
       )
@@ -194,5 +196,23 @@ describe('contracts package', () => {
       return /^export (?!type)(const|function|class|let|var|default)/m.test(source);
     });
     expect(runtime.map((f) => relative(CONTRACTS, f))).toEqual([]);
+  });
+});
+
+describe('the app never reaches the desktop-only layer', () => {
+  it('src/ imports neither DSH nor the Cordis plugin that hosts it', () => {
+    // DSH is Node-only and pulls native addons (koffi, node-pty). A single
+    // import from src/ would put them in the mobile bundle, where they cannot
+    // load at all. The seam is one-way by construction: cordis-aimatey imports
+    // aimatey, never the reverse.
+    const banned = /^(@deepseek-ai\/|@chatterang\/cordis-aimatey$)/;
+    const offenders = files
+      .filter((file) =>
+        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
+          banned.test(m[1] ?? ''),
+        ),
+      )
+      .map((file) => relative(SRC, file));
+    expect(offenders).toEqual([]);
   });
 });

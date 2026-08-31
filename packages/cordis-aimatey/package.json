@@ -1,0 +1,12 @@
+{
+  "name": "@chatterang/cordis-aimatey",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Registers aimatey's Router as an LLM provider inside a DeepSeek Harness Cordis tree.",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2"
+  }
+}
