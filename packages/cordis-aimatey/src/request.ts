@@ -152,7 +152,15 @@ function toIRMessage(
  */
 export function toIRRequest(
   options: GenerateOptions,
-  provider: string,
+  /**
+   * The aimatey backend to pin, or `undefined` for router-choice.
+   *
+   * Deliberately not the DSH provider string: deriving "is this router-choice?"
+   * here by comparing against {@link ROUTER_SENTINEL} meant a real backend
+   * registered under that reserved name silently lost its pin. The caller is
+   * the only place that knows which it is, so it says so.
+   */
+  pinned: string | undefined,
   hooks: TranslationHooks = {},
 ): IRChatRequest {
   const dropped = { reasoning: 0 };
@@ -185,7 +193,7 @@ export function toIRRequest(
   }));
 
   const custom: Record<string, unknown> = {};
-  if (provider !== ROUTER_SENTINEL) custom['backend'] = provider;
+  if (pinned !== undefined) custom['backend'] = pinned;
   // Carried under namespaced keys purely so a DSH-side log line and an
   // aimatey-side log line can be joined. Nothing in aimatey reads either, and
   // neither influences routing.

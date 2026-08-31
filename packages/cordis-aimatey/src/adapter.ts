@@ -102,8 +102,21 @@ export class AimateyAdapter extends LlmAdapter {
    * and `name` must be non-empty, or `registerAdapter` throws INVALID_ADAPTER
    * and the mount fails loudly.
    */
+  /**
+   * `aimatey` is the router-choose route ONLY while no backend owns that name.
+   *
+   * Comparing against the constant alone made a backend registered under the
+   * reserved name reachable through no pinned route at all: the request took
+   * the sentinel branch and the Router chose freely, which is the opposite of
+   * what `routesFor`'s warning promises. Asking the router each time also keeps
+   * the answer correct when that backend is registered after mount.
+   */
+  #isRouterChoice(provider: string): boolean {
+    return provider === ROUTER_SENTINEL && !this.#router.has(ROUTER_SENTINEL);
+  }
+
   override providerInfo(provider: string): LlmProviderInfo {
-    if (provider === ROUTER_SENTINEL) return { id: provider, name: 'aimatey (router)' };
+    if (this.#isRouterChoice(provider)) return { id: provider, name: 'aimatey (router)' };
     const info = this.#router.getBackendInfo(provider);
     return { id: provider, name: info?.metadata.provider ?? provider };
   }
@@ -117,7 +130,7 @@ export class AimateyAdapter extends LlmAdapter {
    * advisory and never used for routing or request validation.
    */
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    if (provider === ROUTER_SENTINEL) return [];
+    if (this.#isRouterChoice(provider)) return [];
     try {
       const backend = this.#router.get(provider);
       if (typeof backend?.listModels !== 'function') return [];
@@ -192,8 +205,8 @@ export class AimateyAdapter extends LlmAdapter {
    * through a Router that structurally cannot reach any other backend.
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, undefined> {
-    if (options.provider === ROUTER_SENTINEL) {
-      const request = toIRRequest(options, options.provider, this.#hooks);
+    if (this.#isRouterChoice(options.provider)) {
+      const request = toIRRequest(options, undefined, this.#hooks);
       // The signal is threaded positionally; aimatey does not read it from the
       // request object.
       yield* translate(this.#router.executeStream(request, options.signal), options.signal, this.#hooks);

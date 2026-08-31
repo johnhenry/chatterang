@@ -617,7 +617,7 @@ describe('request translation', () => {
 
   it('pins the backend through metadata.custom.backend, and omits it for the sentinel', () => {
     expect(toIRRequest(request(), 'ollama').metadata.custom).toMatchObject({ backend: 'ollama' });
-    expect(toIRRequest(request(), ROUTER_SENTINEL).metadata.custom).not.toHaveProperty('backend');
+    expect(toIRRequest(request(), undefined).metadata.custom).not.toHaveProperty('backend');
   });
 
   it('routes to the named backend and lets the sentinel fall through', async () => {
@@ -635,7 +635,7 @@ describe('request translation', () => {
   it('prepends the system slot as a message and keeps an existing system message', () => {
     const ir = toIRRequest(
       request({ system: 'be brief', messages: [message('system', [{ type: 'text', text: 'be kind' }])] }),
-      ROUTER_SENTINEL,
+      undefined,
     );
     // Both survive, in order. Merging them would be an invention.
     expect(ir.messages).toHaveLength(2);
@@ -644,7 +644,7 @@ describe('request translation', () => {
   });
 
   it('sets streamMode delta and stream true', () => {
-    const ir = toIRRequest(request(), ROUTER_SENTINEL);
+    const ir = toIRRequest(request(), undefined);
     expect(ir.stream).toBe(true);
     // Under 'accumulated' each chunk carries the whole text so far; forwarding
     // that as a delta would repeat the message.
@@ -654,7 +654,7 @@ describe('request translation', () => {
   it('copies only the sampler fields DSH can express', () => {
     const ir = toIRRequest(
       request({ temperature: 0.3, maxTokens: 64, stop: ['END'] }),
-      ROUTER_SENTINEL,
+      undefined,
     );
     expect(ir.parameters).toEqual({
       model: 'test-model',
@@ -704,7 +704,7 @@ describe('request translation', () => {
       request({
         messages: [message('assistant', [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' }])],
       }),
-      ROUTER_SENTINEL,
+      undefined,
     );
     expect(ok.messages[0]).toEqual({
       role: 'assistant',
@@ -716,7 +716,7 @@ describe('request translation', () => {
         request({
           messages: [message('assistant', [{ type: 'tool-call', id: CallId('c2'), name: 'f', arguments: '{"a":' }])],
         }),
-        ROUTER_SENTINEL,
+        undefined,
       ),
     ).toThrow(LlmError);
   });
@@ -733,7 +733,7 @@ describe('request translation', () => {
           ]),
         ],
       }),
-      ROUTER_SENTINEL,
+      undefined,
       { debug: (line) => notes.push(line) },
     );
 
@@ -838,6 +838,38 @@ describe('registration lifecycle', () => {
     expect(routes).toEqual([ROUTER_SENTINEL]);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('reserved name');
+  });
+
+  it('pins a backend that took the reserved name, instead of letting the router choose', async () => {
+    // The warning routesFor emits says the reserved name "now pins that
+    // backend". It did the opposite: `stream` compared the route against the
+    // ROUTER_SENTINEL constant, so the request took the router-choose branch
+    // and the real backend named "aimatey" was reachable through no pinned
+    // route at all. Two other backends are registered so a router-choose would
+    // have something else to pick.
+    const router = new FakeRouter()
+      .register(ROUTER_SENTINEL, echoBackend)
+      .register('alpha', echoBackend)
+      .register('beta', echoBackend);
+    const ctx = await boot(router);
+
+    const terminal = terminalOf(await drain(ctx.llm.stream(request({ provider: ROUTER_SENTINEL }))));
+    expect(terminal.reason).toEqual({ kind: 'stop' });
+
+    // The pin is carried, and it names the backend rather than being absent.
+    expect(router.seen.at(-1)?.metadata?.custom).toMatchObject({ backend: ROUTER_SENTINEL });
+    expect(router.routed.at(-1)).toBe(ROUTER_SENTINEL);
+  });
+
+  it('still lets the router choose when no backend has taken the reserved name', async () => {
+    // The other half: the sentinel must keep working as "let the Router pick"
+    // in the ordinary case, so the fix above cannot have simply deleted it.
+    const router = new FakeRouter().register('alpha', echoBackend);
+    const ctx = await boot(router);
+
+    const terminal = terminalOf(await drain(ctx.llm.stream(request({ provider: ROUTER_SENTINEL }))));
+    expect(terminal.reason).toEqual({ kind: 'stop' });
+    expect(router.seen.at(-1)?.metadata?.custom ?? {}).not.toHaveProperty('backend');
   });
 
   it('registers every route, and after dispose the provider is gone', async () => {

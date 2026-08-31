@@ -90,6 +90,9 @@ export function routesFor(router: AimateyRouter, warn?: (message: string) => voi
     warn?.(
       `cordis-aimatey: a backend is registered under the reserved name "${ROUTER_SENTINEL}", ` +
         'so the router-choose route is not offered; that name now pins that backend.',
+      // True because `stream` asks the router whether the name is taken rather
+      // than comparing against the constant. The dedupe below is unchanged: it
+      // already collapsed the two, and rewriting it changes nothing.
     );
   }
   return [...new Set([ROUTER_SENTINEL, ...backends])];
