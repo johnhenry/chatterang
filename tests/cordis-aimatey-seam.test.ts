@@ -607,6 +607,14 @@ describe('provenance says which backend actually served the request', () => {
     router.register('pinned', fixture('pinned', 'never seen', recorder(), { dieAfterStart: true }));
     router.register('cloud', fixture('cloud', 'hello from cloud', recorder()));
 
+    // LIVE-CHANNEL CONTROL, and the reason it is inside this test rather than
+    // beside it. The assertion below is negative, so it passes for free the
+    // moment the observation channel dies — reword the debug line at
+    // chunks.ts:165 and `[]` is still `[]`. Proving the same helper, on the
+    // same router, still reports a backend is what makes the emptiness mean
+    // "no other backend served" rather than "nothing was observed".
+    expect(await startedOn(router, 'cloud')).toEqual(['cloud']);
+
     // The control above shows this same setup reporting `cloud` without the
     // pin. With it, the pinned attempt is the only attempt — and since aimatey
     // withholds the preamble of an attempt that fails, no `start` chunk
