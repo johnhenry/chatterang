@@ -20,8 +20,10 @@ import { Router } from '@johnhenry/aimatey-core';
 
 import { LlamaCppNode } from '@chatterang/inference-node';
 
-import { serveLlamaCpp } from '../bridge/host-runtime.js';
+import { LLAMA_HOST_POLICY } from '../bridge/call-shape.js';
+import { createHostRuntime } from '../bridge/host-runtime.js';
 import type { MessageLink } from '../bridge/protocol.js';
+import { LLAMA_PLUGIN } from '../bridge/protocol.js';
 import { mountDsh } from './dsh.js';
 import { modelPathGuard } from './model-paths.js';
 import { DesktopLlamaBackend } from './llama-backend.js';
@@ -73,13 +75,20 @@ async function main(): Promise<void> {
   const link = parentPortLink(port);
   const plugin = new LlamaCppNode();
 
+  // ONE runtime, any number of plugins on it. Milestone A3's ONNX engine is a
+  // second `runtime.serve(...)` line here with its own definition, its own
+  // argument table and its own path guard — and nothing else, which is the
+  // point of the generalisation.
+  const runtime = createHostRuntime({
+    link,
+    warn: (message: string) => console.warn(`[inference-host] ${message}`),
+  });
+
   // Serve the plugin FIRST. Inference must work even if the DSH mount below
   // fails; the tree is an additional consumer of this engine, not a
   // prerequisite for it.
-  serveLlamaCpp({
-    link,
-    plugin,
-    warn: (message) => console.warn(`[inference-host] ${message}`),
+  runtime.serve(LLAMA_PLUGIN, plugin, {
+    ...LLAMA_HOST_POLICY,
     guard: modelPathGuard(modelRoot()),
   });
 

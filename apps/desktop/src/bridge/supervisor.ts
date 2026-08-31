@@ -44,6 +44,19 @@
  * window received the first window's answer token by token and either window
  * reloading cancelled both.
  *
+ * AND A TURN BELONGS TO ONE ENGINE. Every plugin registered here gets its own
+ * in-flight table, its own terminal-event name and its own cancel method, and
+ * every call and every event on the wire carries the plugin it belongs to. The
+ * old shape had one `#inflight` map keyed by requestId alone and one hard-coded
+ * `llamaEnd`/`llamaToken`/`cancel` triple. With a second engine that is not a
+ * missing feature but a corruption: two engines may legitimately use the same
+ * requestId and may both call their terminal event `end`, so one engine's abort
+ * would have settled the other engine's turn, its deadline would have posted a
+ * `cancel` the wrong engine answered, and its tokens would have been delivered
+ * against the wrong owner. The plugin dimension is what keeps those apart, and
+ * `tests/desktop-bridge.test.ts` runs two engines in flight at once — sharing a
+ * requestId on purpose — to show it does.
+ *
  * The renderer's authority is (1), not (2). `src/ai/backends/llama-cpp.ts`
  * loops `while (!finished && !failure)`, both set by the `generate` promise;
  * nothing in `src/` consumes `llamaEnd` at all. That is also the RIGHT thing
@@ -53,29 +66,125 @@
  * be a choice to be fragile.
  */
 
-import type { GenerateOptions, GenerateResult, GenerationEndEvent } from '@chatterang/contracts';
+import type { GenerateOptions, GenerationEndEvent } from '@chatterang/contracts';
 
+import type { PluginImplementation } from './plugin-host.js';
 import type {
   DshStatus,
   HostHandle,
   HostMessage,
-  LlamaEventName,
+  PluginDefinition,
   WireError,
 } from './protocol.js';
-import { HANDLE_LOST, HOST_TIMEOUT, SENDER_SCOPED, fromWireError } from './protocol.js';
+import { HANDLE_LOST, HOST_TIMEOUT, LLAMA_PLUGIN, SENDER_SCOPED, fromWireError } from './protocol.js';
 
 /**
  * How the supervisor reaches the renderer. Supplied by `PluginHost`.
+ *
+ * `pluginName` leads, because an event name alone does not identify an event:
+ * `PluginHost` keys its subscription table by (plugin, event), and two engines
+ * may both emit `end`. It used to be absent and `main.ts` supplied
+ * `LLAMA_PLUGIN.name` at the call site, which is the same thing as asserting
+ * that only one plugin will ever emit anything.
  *
  * `ownerId` addresses the event at the one window the generation belongs to.
  * Omitting it broadcasts, which is right for `llamaThermal` — a property of the
  * machine — and was wrong for everything else.
  */
 export type NotifyListeners = (
-  eventName: LlamaEventName,
+  pluginName: string,
+  eventName: string,
   data: unknown,
   ownerId?: number,
 ) => void;
+
+/**
+ * The streaming contract of ONE engine.
+ *
+ * Every name the supervisor used to hard-code — `generate`, `cancel`,
+ * `llamaEnd`, `llamaToken` — lives here instead, per plugin. That is what lets
+ * a second engine keep the same four guarantees without pretending to be
+ * llama.cpp, and it is what stops the guarantees leaking across engines: a
+ * terminal event is matched against the emitting plugin's `terminal`, so
+ * another engine's identically named event cannot end this one's turn.
+ *
+ * A plugin with no `stream` is served too — `DshHost` is one — it simply has no
+ * turns, no owners and no idle deadline.
+ */
+export interface StreamSpec {
+  /** The method that starts a turn, keyed by `requestId`. */
+  readonly start: string;
+  /** The method that stops one. Posted by the deadline and by renderer loss. */
+  readonly cancel: string;
+  /** The event that ends a turn, exactly once. */
+  readonly terminal: string;
+  /**
+   * Events that are proof of progress: delivered to the turn's owner alone,
+   * and each one resets the turn's idle deadline.
+   */
+  readonly progress: readonly string[];
+  /** Idle deadline for a turn. Falls back to `policy.generateIdleTimeoutMs`. */
+  readonly idleTimeoutMs?: number;
+  /**
+   * Build the terminal payload for an end nobody reported.
+   *
+   * Used on the paths the engine never got to speak on: a host that died, a
+   * deadline that expired, a `ret` that arrived with no event before it.
+   */
+  synthesise(requestId: string, error: string): unknown;
+}
+
+/** One plugin the supervisor forwards to, and how its turns behave. */
+export interface EngineSpec {
+  readonly definition: PluginDefinition;
+  /**
+   * Methods called with the calling renderer's id in front.
+   *
+   * Defaults to the stream's `start` and `cancel`, which are exactly the two
+   * that own per-renderer state. Naming anything else here is a claim that a
+   * method's answer differs per window, and `PluginHost.register` refuses a
+   * name the definition does not declare.
+   */
+  readonly senderScoped?: readonly string[];
+  /** Omitted for a plugin with no turns. */
+  readonly stream?: StreamSpec;
+}
+
+/** A zeroed result, for the ends the host never got to report itself. */
+function synthesiseEnd(requestId: string, error: string): GenerationEndEvent {
+  return {
+    requestId,
+    text: '',
+    promptTokens: 0,
+    cachedTokens: 0,
+    completionTokens: 0,
+    ttftMs: 0,
+    totalMs: 0,
+    tokensPerSecond: 0,
+    stopReason: 'error',
+    error,
+  };
+}
+
+/**
+ * llama.cpp's engine spec — the one this app ships.
+ *
+ * `llamaThermal` is deliberately NOT in `progress`: it describes the machine,
+ * not a conversation, so it has no owner, it is broadcast, and it must not
+ * extend anybody's deadline. A thermal reading arriving every second from a
+ * host whose decode has wedged would otherwise keep the turn alive forever,
+ * which is the exact failure the deadline exists to end.
+ */
+export const LLAMA_ENGINE: EngineSpec = Object.freeze({
+  definition: LLAMA_PLUGIN,
+  stream: Object.freeze({
+    start: 'generate',
+    cancel: 'cancel',
+    terminal: 'llamaEnd',
+    progress: Object.freeze(['llamaToken']),
+    synthesise: synthesiseEnd,
+  }),
+});
 
 /**
  * The clock and the timers, injected.
@@ -142,6 +251,14 @@ export interface SupervisorOptions {
   readonly spawn: () => HostHandle;
   /** Emit one plugin event to every subscribed renderer. */
   readonly notify: NotifyListeners;
+  /**
+   * The engines this supervisor forwards to. Defaults to llama.cpp alone.
+   *
+   * A call or an event naming a plugin that is not here is refused rather than
+   * guessed at — see `#receive`. Milestone A3 adds its ONNX spec to this list;
+   * nothing else about this class changes.
+   */
+  readonly engines?: readonly EngineSpec[];
   /** The inference host's DSH boot report, each time one arrives. */
   readonly onBoot?: (status: DshStatus) => void;
   /** Where anomalies go. Never a payload — see the logging rule in main.ts. */
@@ -151,8 +268,10 @@ export interface SupervisorOptions {
 }
 
 interface PendingCall {
+  /** Which engine this call was addressed to. Chooses the cancel to post. */
+  readonly plugin: string;
   readonly method: string;
-  /** Set only for a generation, so a timed-out one can be cancelled in the host. */
+  /** Set only for a turn, so a timed-out one can be cancelled in the host. */
   readonly requestId?: string;
   /** When this call stops being worth waiting for. */
   deadlineAt: number;
@@ -164,8 +283,21 @@ interface InflightGeneration {
   readonly callId: number;
   /** The renderer that started this turn, and the only one it belongs to. */
   readonly senderId: number;
-  /** True once this turn's single `llamaEnd` has been DELIVERED. */
+  /** True once this turn's single terminal event has been DELIVERED. */
   ended: boolean;
+}
+
+/**
+ * One engine's live state.
+ *
+ * The in-flight table is PER ENGINE, and that is the whole of the isolation
+ * guarantee. One shared map keyed by requestId alone made two engines' turns
+ * collide the moment they picked the same id — which they will, because ids are
+ * per-caller and nothing coordinates them across engines.
+ */
+interface EngineState {
+  readonly spec: EngineSpec;
+  readonly inflight: Map<string, InflightGeneration>;
 }
 
 function codedError(message: string, code: string): Error {
@@ -194,20 +326,10 @@ export function systemTimers(): SupervisorTimers {
   };
 }
 
-/** A zeroed result, for the ends the host never got to report itself. */
-function synthesiseEnd(requestId: string, error: string): GenerationEndEvent {
-  return {
-    requestId,
-    text: '',
-    promptTokens: 0,
-    cachedTokens: 0,
-    completionTokens: 0,
-    ttftMs: 0,
-    totalMs: 0,
-    tokensPerSecond: 0,
-    stopReason: 'error',
-    error,
-  };
+/** The requestId a turn-shaped payload names, if it names one. */
+function requestIdOf(data: unknown): string | undefined {
+  const requestId = (data as { requestId?: unknown } | null)?.requestId;
+  return typeof requestId === 'string' ? requestId : undefined;
 }
 
 export class Supervisor {
@@ -218,8 +340,8 @@ export class Supervisor {
   readonly #policy: SupervisorPolicy;
   readonly #timers: SupervisorTimers;
 
+  readonly #engines = new Map<string, EngineState>();
   readonly #calls = new Map<number, PendingCall>();
-  readonly #inflight = new Map<string, InflightGeneration>();
   #nextCallId = 1;
   #nextPingId = 1;
   #closed: string | null = null;
@@ -255,6 +377,17 @@ export class Supervisor {
     this.#policy = { ...DEFAULT_POLICY, ...options.policy };
     this.#timers = options.timers ?? systemTimers();
 
+    for (const spec of options.engines ?? [LLAMA_ENGINE]) {
+      if (this.#engines.has(spec.definition.name)) {
+        throw new Error(
+          `desktop bridge: two engines are registered as "${spec.definition.name}". ` +
+            'The plugin name is the wire address; two engines sharing one is ambiguous ' +
+            'in both directions.',
+        );
+      }
+      this.#engines.set(spec.definition.name, { spec, inflight: new Map() });
+    }
+
     this.#attach();
   }
 
@@ -263,14 +396,31 @@ export class Supervisor {
     return this.#boot;
   }
 
-  /** In-flight generations. Exists so a test can assert the map drains. */
+  /** In-flight turns across every engine. Exists so a test can assert it drains. */
   get inflightCount(): number {
-    return this.#inflight.size;
+    let total = 0;
+    for (const engine of this.#engines.values()) total += engine.inflight.size;
+    return total;
+  }
+
+  /**
+   * In-flight turns for ONE engine.
+   *
+   * The isolation assertion needs this: `inflightCount` staying at 1 after an
+   * abort says a turn survived, but not WHOSE.
+   */
+  inflightCountFor(pluginName: string): number {
+    return this.#engine(pluginName).inflight.size;
   }
 
   /** How many hosts have been spawned. 1 until the first one is replaced. */
   get spawnCount(): number {
     return this.#spawnCount;
+  }
+
+  /** The plugin names this supervisor serves, in registration order. */
+  get engines(): readonly string[] {
+    return [...this.#engines.keys()];
   }
 
   /**
@@ -302,67 +452,75 @@ export class Supervisor {
     };
   }
 
-  /* ── The declared LlamaCpp surface ─────────────────────────────────── */
+  /* ── The plugin surface, per engine ────────────────────────────────── */
 
   /**
-   * The two methods `PluginHost` calls with the renderer's id in front.
+   * The `PluginImplementation` for one engine, built from its definition.
    *
-   * Exactly these two, and the shortness of the list is the point: everything
-   * else here is a question about the machine or the loaded model, with the
-   * same answer for every window. `generate` and `cancel` are the two that own
-   * per-window state.
+   * Every declared method becomes a forwarder tagged with THIS plugin's name,
+   * so a call can only ever reach the engine it was addressed to. The stream's
+   * `start` and `cancel` get the two wrappers that own per-turn state; nothing
+   * else is special-cased, which is what stops a second engine needing a second
+   * copy of this class.
+   *
+   * Built fresh on each call rather than cached, because `PluginHost.register`
+   * takes it once at boot and holds it — there is no benefit to sharing, and a
+   * cache would be one more thing that can go stale across a respawn.
+   *
+   * @throws Error for a plugin this supervisor was not given an engine for.
+   *   Registering a manifest entry the supervisor cannot serve would leave the
+   *   renderer with channels whose every call fails at runtime.
    */
-  readonly [SENDER_SCOPED]: readonly string[] = ['generate', 'cancel'];
+  plugin(pluginName: string): PluginImplementation {
+    const engine = this.#engine(pluginName);
+    const { definition, stream } = engine.spec;
 
-  getCapabilities = (): Promise<unknown> => this.#call('getCapabilities', []);
-  getThermalState = (): Promise<unknown> => this.#call('getThermalState', []);
-  load = (options: unknown): Promise<unknown> => this.#call('load', [options]);
-  unload = (options: unknown): Promise<unknown> => this.#call('unload', [options]);
-  listLoaded = (): Promise<unknown> => this.#call('listLoaded', []);
-  tokenize = (options: unknown): Promise<unknown> => this.#call('tokenize', [options]);
-  countTokens = (options: unknown): Promise<unknown> => this.#call('countTokens', [options]);
-  benchmark = (options: unknown): Promise<unknown> => this.#call('benchmark', [options]);
-
-  /**
-   * Cancel, which is the whole cancellation story.
-   *
-   * An `AbortSignal` never crosses either boundary — it is an `EventTarget`,
-   * so structured clone refuses it outright, and `clone.ts` refuses it earlier
-   * with a better message. It does not need to: the contract already keys
-   * cancellation by `requestId`, and `src/ai/backends/llama-cpp.ts` already
-   * converts the signal at the renderer edge. Across IPC that simply becomes a
-   * second, independent invoke.
-   *
-   * Cancelling a request that is not running is a no-op, per the contract —
-   * including when the host has already died, in which case the crash path has
-   * settled the turn and there is nothing left to cancel.
-   */
-  cancel = async (senderId: number, options: unknown): Promise<void> => {
-    if (this.#handle === null) return;
-    // A window may only cancel its own turn. Cancelling by requestId alone
-    // would let any window stop any other window's generation, which is the
-    // same missing ownership check as defect [11] pointing the other way.
-    const requestId = (options as { requestId?: unknown } | null)?.requestId;
-    if (typeof requestId === 'string') {
-      const entry = this.#inflight.get(requestId);
-      // Not in flight at all is a no-op per the contract; in flight for
-      // SOMEONE ELSE is also a no-op, and deliberately indistinguishable from
-      // it, so a cancel cannot be used to probe what another window is doing.
-      if (entry === undefined || entry.senderId !== senderId) return;
+    const methods: Record<string, (...args: readonly unknown[]) => unknown> = {};
+    for (const method of definition.methods) {
+      if (stream !== undefined && method === stream.start) {
+        methods[method] = (senderId, ...args) => this.#startTurn(engine, senderId as number, args);
+      } else if (stream !== undefined && method === stream.cancel) {
+        methods[method] = (senderId, ...args) => this.#cancelTurn(engine, senderId as number, args);
+      } else {
+        methods[method] = (...args) => this.#call(pluginName, method, args);
+      }
     }
-    await this.#call('cancel', [options]);
-  };
+
+    return {
+      ...methods,
+      [SENDER_SCOPED]:
+        engine.spec.senderScoped ?? (stream === undefined ? [] : [stream.start, stream.cancel]),
+    } as unknown as PluginImplementation;
+  }
+
+  #engine(pluginName: string): EngineState {
+    const engine = this.#engines.get(pluginName);
+    if (engine === undefined) {
+      throw new Error(
+        `desktop bridge: the supervisor serves no engine named "${pluginName}". ` +
+          `It serves: ${[...this.#engines.keys()].join(', ') || '(none)'}.`,
+      );
+    }
+    return engine;
+  }
 
   /**
-   * Generate.
+   * Start a turn.
    *
    * The in-flight record is created BEFORE the call is posted, so a host that
    * dies between the two still has its turn settled by `#onClose`.
    */
-  generate = (senderId: number, options: unknown): Promise<GenerateResult> => {
-    const requestId = (options as GenerateOptions | undefined)?.requestId;
+  #startTurn(engine: EngineState, senderId: number, args: readonly unknown[]): Promise<unknown> {
+    const stream = engine.spec.stream;
+    /* c8 ignore next */
+    if (stream === undefined) return Promise.reject(new Error('unreachable: no stream spec'));
+    const name = engine.spec.definition.name;
+
+    const requestId = (args[0] as GenerateOptions | undefined)?.requestId;
     if (typeof requestId !== 'string' || requestId.length === 0) {
-      return Promise.reject(new Error('desktop bridge: generate requires a requestId.'));
+      return Promise.reject(
+        new Error(`desktop bridge: ${name}.${stream.start} requires a requestId.`),
+      );
     }
     if (this.#closed !== null) {
       return Promise.reject(codedError(this.#closed, HANDLE_LOST));
@@ -379,7 +537,11 @@ export class Supervisor {
     // sharing one is ambiguous all the way down and there is no arrangement of
     // this map that fixes that. Cancelling by that id would be ambiguous, and
     // so would every token it emits.
-    if (this.#inflight.has(requestId)) {
+    //
+    // WITHIN ONE ENGINE. Two DIFFERENT engines using the same requestId is not
+    // ambiguous at all — each host-side plugin keys its own generations — so
+    // this map is per engine and the clash is not refused across them.
+    if (engine.inflight.has(requestId)) {
       return Promise.reject(
         new Error(
           `desktop bridge: a generation with requestId "${requestId}" is already running. ` +
@@ -389,27 +551,68 @@ export class Supervisor {
     }
 
     const callId = this.#nextCallId;
-    this.#inflight.set(requestId, { callId, senderId, ended: false });
-    return this.#call('generate', [options], {
-      timeoutMs: this.#policy.generateIdleTimeoutMs,
+    engine.inflight.set(requestId, { callId, senderId, ended: false });
+    return this.#call(name, stream.start, args, {
+      timeoutMs: stream.idleTimeoutMs ?? this.#policy.generateIdleTimeoutMs,
       requestId,
     }).then(
       (result) => {
         // A host that returned without emitting its own terminal event. Should
         // not happen — `LlamaCppNode` has a `finally` backstop — but a future
         // early return in that file must not be able to hang the UI.
-        this.#settle(requestId, result as GenerationEndEvent);
-        this.#inflight.delete(requestId);
-        return result as GenerateResult;
+        this.#settle(engine, requestId, result);
+        engine.inflight.delete(requestId);
+        return result;
       },
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        this.#settle(requestId, synthesiseEnd(requestId, message));
-        this.#inflight.delete(requestId);
+        this.#settle(engine, requestId, stream.synthesise(requestId, message));
+        engine.inflight.delete(requestId);
         throw error;
       },
     );
-  };
+  }
+
+  /**
+   * Cancel, which is the whole cancellation story.
+   *
+   * An `AbortSignal` never crosses either boundary — it is an `EventTarget`,
+   * so structured clone refuses it outright, and `clone.ts` refuses it earlier
+   * with a better message. It does not need to: the contract already keys
+   * cancellation by `requestId`, and `src/ai/backends/llama-cpp.ts` already
+   * converts the signal at the renderer edge. Across IPC that simply becomes a
+   * second, independent invoke.
+   *
+   * Cancelling a request that is not running is a no-op, per the contract —
+   * including when the host has already died, in which case the crash path has
+   * settled the turn and there is nothing left to cancel.
+   *
+   * SCOPED TO ONE ENGINE as well as one window: the lookup is in THIS engine's
+   * table, so an abort aimed at a transcription cannot find — and cannot stop —
+   * a text generation that happens to share its requestId.
+   */
+  async #cancelTurn(
+    engine: EngineState,
+    senderId: number,
+    args: readonly unknown[],
+  ): Promise<void> {
+    if (this.#handle === null) return;
+    const stream = engine.spec.stream;
+    /* c8 ignore next */
+    if (stream === undefined) return;
+    // A window may only cancel its own turn. Cancelling by requestId alone
+    // would let any window stop any other window's generation, which is the
+    // same missing ownership check as defect [11] pointing the other way.
+    const requestId = requestIdOf(args[0]);
+    if (requestId !== undefined) {
+      const entry = engine.inflight.get(requestId);
+      // Not in flight at all is a no-op per the contract; in flight for
+      // SOMEONE ELSE is also a no-op, and deliberately indistinguishable from
+      // it, so a cancel cannot be used to probe what another window is doing.
+      if (entry === undefined || entry.senderId !== senderId) return;
+    }
+    await this.#call(engine.spec.definition.name, stream.cancel, args);
+  }
 
   /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
@@ -419,8 +622,8 @@ export class Supervisor {
    *
    * Three things happen, and the third is the subtle one: the turns are marked
    * ended WITHOUT emitting, because the page that would have received the
-   * event no longer exists and a synthesised `llamaEnd` broadcast to whatever
-   * page loaded next would be a turn it never started.
+   * event no longer exists and a synthesised terminal event broadcast to
+   * whatever page loaded next would be a turn it never started.
    *
    * SCOPED TO ONE RENDERER, which is defect [11]. This used to cancel EVERY
    * in-flight generation regardless of which window departed, because
@@ -429,16 +632,30 @@ export class Supervisor {
    * the other window's answer mid-sentence — and the second window's `generate`
    * promise rejected with a reason ("the page that started this generation
    * navigated away") that was, for it, simply false.
+   *
+   * ACROSS EVERY ENGINE, because the window really is gone: a departing
+   * renderer's transcription is as abandoned as its generation. Each engine is
+   * cancelled with its OWN cancel method, on its own plugin address.
    */
   releaseRenderer(senderId: number, reason: string): void {
-    for (const [requestId, entry] of this.#inflight) {
-      if (entry.senderId !== senderId) continue;
-      entry.ended = true;
-      this.#post({ k: 'call', id: this.#nextCallId++, method: 'cancel', args: [{ requestId }] });
-      const pending = this.#calls.get(entry.callId);
-      this.#calls.delete(entry.callId);
-      this.#inflight.delete(requestId);
-      pending?.reject(codedError(reason, 'RENDERER_GONE'));
+    for (const engine of this.#engines.values()) {
+      const stream = engine.spec.stream;
+      if (stream === undefined) continue;
+      for (const [requestId, entry] of engine.inflight) {
+        if (entry.senderId !== senderId) continue;
+        entry.ended = true;
+        this.#post({
+          k: 'call',
+          id: this.#nextCallId++,
+          plugin: engine.spec.definition.name,
+          method: stream.cancel,
+          args: [{ requestId }],
+        });
+        const pending = this.#calls.get(entry.callId);
+        this.#calls.delete(entry.callId);
+        engine.inflight.delete(requestId);
+        pending?.reject(codedError(reason, 'RENDERER_GONE'));
+      }
     }
   }
 
@@ -500,6 +717,7 @@ export class Supervisor {
   }
 
   #call(
+    plugin: string,
     method: string,
     args: readonly unknown[],
     options?: { timeoutMs?: number; requestId?: string },
@@ -508,9 +726,12 @@ export class Supervisor {
     const id = this.#nextCallId++;
     const deadlineAt = this.#timers.now() + (options?.timeoutMs ?? this.#policy.callTimeoutMs);
     return new Promise<unknown>((resolve, reject) => {
-      const pending: PendingCall = { method, deadlineAt, resolve, reject };
-      this.#calls.set(id, options?.requestId === undefined ? pending : { ...pending, requestId: options.requestId });
-      this.#post({ k: 'call', id, method, args });
+      const pending: PendingCall = { plugin, method, deadlineAt, resolve, reject };
+      this.#calls.set(
+        id,
+        options?.requestId === undefined ? pending : { ...pending, requestId: options.requestId },
+      );
+      this.#post({ k: 'call', id, plugin, method, args });
     });
   }
 
@@ -542,29 +763,7 @@ export class Supervisor {
         return;
       }
       case 'ev': {
-        if (message.name === 'llamaEnd') {
-          const end = message.data as GenerationEndEvent;
-          this.#settle(end.requestId, end);
-          return;
-        }
-        if (message.name === 'llamaToken') {
-          this.#extendDeadline(message.data);
-          const owner = this.#ownerOf(message.data);
-          // A token for a generation this supervisor is not tracking is
-          // DROPPED, not broadcast. Broadcasting it would put the text of one
-          // window's answer into every other window — which is what the code
-          // did for every token, and is the half of defect [11] that leaks data
-          // rather than merely cancelling the wrong thing.
-          if (owner === undefined) {
-            this.#warn('inference host sent a token for a generation that is not in flight.');
-            return;
-          }
-          this.#emit('llamaToken', message.data, owner);
-          return;
-        }
-        // `llamaThermal` describes the machine, not a conversation. It has no
-        // owner and every window is entitled to it.
-        this.#emit(message.name, message.data);
+        this.#event(message.plugin, message.name, message.data);
         return;
       }
       case 'boot': {
@@ -585,6 +784,57 @@ export class Supervisor {
   }
 
   /**
+   * One event, routed by the plugin that emitted it.
+   *
+   * The two checks at the top are what the plugin dimension buys. An event
+   * naming an engine we do not serve is DROPPED rather than broadcast, and so
+   * is one naming an event the engine's own definition does not declare —
+   * because `PluginHost` would otherwise be asked to deliver something no
+   * renderer could ever have subscribed to, and because a host that has started
+   * emitting names we do not know is a host we should be told about.
+   */
+  #event(plugin: string, name: string, data: unknown): void {
+    const engine = this.#engines.get(plugin);
+    if (engine === undefined) {
+      this.#warn(`inference host sent a "${name}" for unknown plugin "${plugin}".`);
+      return;
+    }
+    if (!engine.spec.definition.events.includes(name)) {
+      this.#warn(`inference host sent "${name}", which "${plugin}" does not declare.`);
+      return;
+    }
+
+    const stream = engine.spec.stream;
+    if (stream !== undefined && name === stream.terminal) {
+      const requestId = requestIdOf(data);
+      if (requestId === undefined) {
+        this.#warn(`inference host ended a ${plugin} generation with no requestId.`);
+        return;
+      }
+      this.#settle(engine, requestId, data);
+      return;
+    }
+    if (stream !== undefined && stream.progress.includes(name)) {
+      this.#extendDeadline(engine, data);
+      const owner = this.#ownerOf(engine, data);
+      // A token for a generation this supervisor is not tracking is
+      // DROPPED, not broadcast. Broadcasting it would put the text of one
+      // window's answer into every other window — which is what the code
+      // did for every token, and is the half of defect [11] that leaks data
+      // rather than merely cancelling the wrong thing.
+      if (owner === undefined) {
+        this.#warn(`inference host sent a token for a generation that is not in flight.`);
+        return;
+      }
+      this.#emit(plugin, name, data, owner);
+      return;
+    }
+    // Everything else describes the machine, not a conversation. It has no
+    // owner and every window subscribed to it is entitled to it.
+    this.#emit(plugin, name, data);
+  }
+
+  /**
    * A token is proof of progress, so it buys its generation more time.
    *
    * Without this, `generateIdleTimeoutMs` would be a cap on TOTAL generation
@@ -592,21 +842,22 @@ export class Supervisor {
    * working generations is worse than no timeout at all, because it is the
    * kind of thing people work around by raising it until it is useless.
    */
-  #extendDeadline(data: unknown): void {
-    const requestId = (data as { requestId?: unknown } | null)?.requestId;
-    if (typeof requestId !== 'string') return;
-    const entry = this.#inflight.get(requestId);
+  #extendDeadline(engine: EngineState, data: unknown): void {
+    const requestId = requestIdOf(data);
+    if (requestId === undefined) return;
+    const entry = engine.inflight.get(requestId);
     if (entry === undefined) return;
     const pending = this.#calls.get(entry.callId);
     if (pending === undefined) return;
-    pending.deadlineAt = this.#timers.now() + this.#policy.generateIdleTimeoutMs;
+    pending.deadlineAt =
+      this.#timers.now() + (engine.spec.stream?.idleTimeoutMs ?? this.#policy.generateIdleTimeoutMs);
   }
 
   /** Which renderer owns the generation this event belongs to, if any. */
-  #ownerOf(data: unknown): number | undefined {
-    const requestId = (data as { requestId?: unknown } | null)?.requestId;
-    if (typeof requestId !== 'string') return undefined;
-    return this.#inflight.get(requestId)?.senderId;
+  #ownerOf(engine: EngineState, data: unknown): number | undefined {
+    const requestId = requestIdOf(data);
+    if (requestId === undefined) return undefined;
+    return engine.inflight.get(requestId)?.senderId;
   }
 
   /**
@@ -623,13 +874,13 @@ export class Supervisor {
    * @returns false when the event did not reach anyone, so the caller can
    *   decline to spend the turn's one terminal event on a delivery that failed.
    */
-  #emit(eventName: LlamaEventName, data: unknown, ownerId?: number): boolean {
+  #emit(pluginName: string, eventName: string, data: unknown, ownerId?: number): boolean {
     try {
-      this.#notify(eventName, data, ownerId);
+      this.#notify(pluginName, eventName, data, ownerId);
       return true;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      this.#warn(`could not deliver ${eventName}: ${detail}`);
+      this.#warn(`could not deliver ${pluginName}.${eventName}: ${detail}`);
       return false;
     }
   }
@@ -652,11 +903,18 @@ export class Supervisor {
       // it — so ask it to stop before the caller is told. A wedged host will
       // not hear this; a merely slow one will, and an abandoned generation
       // left decoding burns the GPU for nobody.
-      if (pending.requestId !== undefined) {
+      //
+      // Addressed at the call's OWN plugin, with that plugin's own cancel
+      // method. Posting a bare `cancel` was fine while one engine existed and
+      // would, with two, ask llama.cpp to stop a transcription's requestId —
+      // which either does nothing or stops a text turn that shares the id.
+      const stream = this.#engines.get(pending.plugin)?.spec.stream;
+      if (pending.requestId !== undefined && stream !== undefined) {
         this.#post({
           k: 'call',
           id: this.#nextCallId++,
-          method: 'cancel',
+          plugin: pending.plugin,
+          method: stream.cancel,
           args: [{ requestId: pending.requestId }],
         });
       }
@@ -689,12 +947,12 @@ export class Supervisor {
   }
 
   /**
-   * The single door every terminal event goes through.
+   * The single door every terminal event goes through, per engine.
    *
    * The main-process mirror of `LlamaCppNode`'s own `settled` flag — the same
    * discipline, applied at the boundary that flag cannot see across. A double
-   * `llamaEnd` is not a hang; it is a conversation turn counted twice, which
-   * is data corruption and harder to notice.
+   * terminal event is not a hang; it is a conversation turn counted twice,
+   * which is data corruption and harder to notice.
    *
    * DEFECT [13] was the ORDER of the two statements below. `entry.ended = true`
    * came first, so a delivery that threw consumed the turn's one terminal event
@@ -705,14 +963,17 @@ export class Supervisor {
    * host's `ret`, or `#onClose`'s synthesised end — to try again, with a
    * payload we built ourselves rather than one the engine handed us.
    */
-  #settle(requestId: string, end: GenerationEndEvent): void {
-    const entry = this.#inflight.get(requestId);
+  #settle(engine: EngineState, requestId: string, end: unknown): void {
+    const stream = engine.spec.stream;
+    /* c8 ignore next */
+    if (stream === undefined) return;
+    const entry = engine.inflight.get(requestId);
     if (entry === undefined) {
       this.#warn(`inference host ended a generation that is not in flight.`);
       return;
     }
     if (entry.ended) return;
-    entry.ended = this.#emit('llamaEnd', end, entry.senderId);
+    entry.ended = this.#emit(engine.spec.definition.name, stream.terminal, end, entry.senderId);
   }
 
   /**
@@ -722,6 +983,10 @@ export class Supervisor {
    * process, and schedules a replacement. `#closed` is set for the gap between
    * the two so a call made in that window fails fast with `HANDLE_LOST` rather
    * than being posted into nothing.
+   *
+   * ONE process holds every engine, so losing it loses all of them: each
+   * engine's turns get their own synthesised terminal event, on their own
+   * event name.
    */
   #onClose(reason: string): void {
     if (this.#closed !== null) return;
@@ -733,12 +998,19 @@ export class Supervisor {
 
     // Terminal events first, so a listener sees the turn end before the
     // promise it is racing rejects.
-    for (const [requestId, entry] of this.#inflight) {
-      if (!entry.ended) {
-        entry.ended = this.#emit('llamaEnd', synthesiseEnd(requestId, message), entry.senderId);
+    for (const engine of this.#engines.values()) {
+      const stream = engine.spec.stream;
+      for (const [requestId, entry] of engine.inflight) {
+        if (entry.ended || stream === undefined) continue;
+        entry.ended = this.#emit(
+          engine.spec.definition.name,
+          stream.terminal,
+          stream.synthesise(requestId, message),
+          entry.senderId,
+        );
       }
+      engine.inflight.clear();
     }
-    this.#inflight.clear();
 
     for (const [, pending] of this.#calls) pending.reject(codedError(message, HANDLE_LOST));
     this.#calls.clear();

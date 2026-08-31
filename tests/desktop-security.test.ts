@@ -580,6 +580,24 @@ describe('main.ts wiring', () => {
     }
   });
 
+  it('routes an event by the plugin name the supervisor gives, not by a constant', () => {
+    // `main.ts` cannot be imported by any test — `protocol.registerSchemes
+    // Privileged` and `app.whenReady()` run at module scope — so the wiring is
+    // pinned as text. Two halves, and both matter: the notify must FORWARD the
+    // supervisor's plugin name, and the registration must use the facade the
+    // supervisor builds per engine rather than the supervisor object itself.
+    //
+    // FAULT INJECTED both ways. Restoring `notifyListeners(LLAMA_PLUGIN.name,
+    // …)` failed the first two assertions; restoring
+    // `pluginHost.register(LLAMA_PLUGIN, supervisor as unknown as
+    // PluginImplementation)` failed the third.
+    const at = source.indexOf('pluginHost.notifyListeners');
+    expect(at).toBeGreaterThan(0);
+    expect(source.slice(at, at + 60)).toMatch(/notifyListeners\(\s*pluginName,/);
+    expect(source).not.toMatch(/notifyListeners\(\s*LLAMA_PLUGIN\.name/);
+    expect(source).toContain('supervisor.plugin(LLAMA_PLUGIN.name)');
+  });
+
   it('[13] does not re-swallow a throwing notify', () => {
     // The reordered settle only helps while main.ts lets the throw reach the
     // Supervisor. Wrapping the notify in a bare try/catch restores the silent

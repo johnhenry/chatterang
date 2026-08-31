@@ -12,7 +12,18 @@
  *     like from main — no `exit`, no answer, a process still in `ps`.
  *   - `hang`: answer nothing for one call, but keep answering pings. A slow
  *     load looks like this, and it must NOT be treated as a wedge.
+ *
+ * IT SERVES TWO PLUGINS, and dispatches on `message.plugin`. A double that
+ * answered every call regardless of which engine it named would pass whatever
+ * the supervisor sent, including a call addressed at an engine that does not
+ * exist — which is exactly the confusion the plugin dimension was added to
+ * make impossible.
  */
+
+const PLUGINS = {
+  LlamaCpp: ['getCapabilities', 'getThermalState', 'load', 'unload', 'listLoaded', 'generate', 'cancel', 'tokenize', 'countTokens', 'benchmark'],
+  Sidecar: ['describe', 'run', 'halt'],
+};
 
 let wedged = false;
 
@@ -29,6 +40,28 @@ process.on('message', (message) => {
 
   if (wedged || message.method === 'benchmark') return;
 
+  const methods = PLUGINS[message.plugin];
+  if (methods === undefined) {
+    process.send({
+      k: 'ret',
+      id: message.id,
+      ok: false,
+      error: { message: `inference host double: no plugin named "${String(message.plugin)}".` },
+    });
+    return;
+  }
+  if (!methods.includes(message.method)) {
+    process.send({
+      k: 'ret',
+      id: message.id,
+      ok: false,
+      error: {
+        message: `inference host double: "${message.plugin}" has no method "${String(message.method)}".`,
+      },
+    });
+    return;
+  }
+
   if (message.method === 'unload') {
     wedged = true;
     process.send({ k: 'ret', id: message.id, ok: true, data: { wedged: true } });
@@ -44,7 +77,7 @@ process.on('message', (message) => {
     k: 'ret',
     id: message.id,
     ok: true,
-    data: { pid: process.pid, method: message.method },
+    data: { pid: process.pid, plugin: message.plugin, method: message.method },
   });
 });
 
@@ -54,6 +87,7 @@ process.send({
     mounted: true,
     services: ['llm'],
     routes: ['llama'],
+    entries: [],
     notChecked: `walked by pid ${process.pid}`,
   },
 });

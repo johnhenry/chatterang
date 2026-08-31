@@ -33,16 +33,29 @@ export { BRIDGE_GLOBAL, BRIDGE_KEYS, createRendererBridge } from './renderer.js'
 export type { InvokeResult, PreloadBridge, RendererIpc } from './renderer.js';
 export { capacitorShimSource, installCapacitorShim } from './capacitor-shim.js';
 export type { ShimTarget } from './capacitor-shim.js';
-export { DEFAULT_POLICY, Supervisor, systemTimers } from './supervisor.js';
+export { DEFAULT_POLICY, LLAMA_ENGINE, Supervisor, systemTimers } from './supervisor.js';
 export type {
+  EngineSpec,
   NotifyListeners,
+  StreamSpec,
   SupervisorOptions,
   SupervisorPolicy,
   SupervisorTimers,
 } from './supervisor.js';
-export { serveLlamaCpp } from './host-runtime.js';
-export type { CallGuard, HostRuntimeOptions } from './host-runtime.js';
-export { REQUIRED_ARGUMENTS, assertCallShape } from './call-shape.js';
+export { HostRuntime, createHostRuntime } from './host-runtime.js';
+export type {
+  CallGuard,
+  CallShape,
+  HostPluginImplementation,
+  HostRuntimeOptions,
+  ServeOptions,
+} from './host-runtime.js';
+export {
+  LLAMA_HOST_POLICY,
+  LLAMA_OPAQUE_FAILURES,
+  REQUIRED_ARGUMENTS,
+  assertCallShape,
+} from './call-shape.js';
 export {
   DSH_METHODS,
   DSH_PLUGIN,

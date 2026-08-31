@@ -51,7 +51,6 @@ import type {
   DshStatus,
   HostHandle,
   InvokeResult,
-  PluginImplementation,
   RendererTeardownEvent,
 } from './bridge/index.js';
 import {
@@ -194,8 +193,13 @@ function start(): void {
     // its `generate` promise resolved successfully (defect [13]). `Supervisor`
     // now catches it, logs through `warn`, and leaves the turn open for the
     // next terminal path.
-    notify: (eventName, data, ownerId) =>
-      pluginHost.notifyListeners(LLAMA_PLUGIN.name, eventName, data, ownerId),
+    //
+    // The plugin name comes from the SUPERVISOR, not from this call site. It
+    // used to be `LLAMA_PLUGIN.name` hard-coded here, which is the same thing
+    // as asserting that only one engine will ever emit an event — and which
+    // would have delivered a second engine's events on llama.cpp's channels.
+    notify: (pluginName, eventName, data, ownerId) =>
+      pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
     onBoot: (status) => {
       console.log(
         status.mounted
@@ -206,7 +210,11 @@ function start(): void {
     warn: (message) => console.warn(`[main] ${message}`),
   });
 
-  pluginHost.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation);
+  // The facade the supervisor builds from the engine's own definition, rather
+  // than the supervisor object itself. With one engine the two were the same
+  // thing; with two, an object carrying every engine's methods at once has no
+  // way to say which `generate` a call meant.
+  pluginHost.register(LLAMA_PLUGIN, supervisor.plugin(LLAMA_PLUGIN.name));
   pluginHost.register(DSH_PLUGIN, {
     // Asked of the supervisor on every call rather than served from a variable
     // captured at boot. The route set within one host's life is still a

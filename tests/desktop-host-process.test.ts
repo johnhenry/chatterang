@@ -5,8 +5,8 @@ import { resolve } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { Supervisor, systemTimers } from '@chatterang/desktop/bridge';
-import type { HostHandle, SupervisorPolicy } from '@chatterang/desktop/bridge';
+import { LLAMA_ENGINE, LLAMA_PLUGIN, Supervisor, systemTimers } from '@chatterang/desktop/bridge';
+import type { EngineSpec, HostHandle, SupervisorPolicy } from '@chatterang/desktop/bridge';
 
 /**
  * THE SUPERVISOR AGAINST REAL PROCESSES.
@@ -47,6 +47,41 @@ const FAST: Partial<SupervisorPolicy> = {
   pingTimeoutMs: 120,
   restartDelayMs: 30,
 };
+
+/**
+ * A SECOND engine on the same host process, so the respawn story is asserted
+ * with the plugin dimension in it.
+ *
+ * Not ONNX — that is milestone A3 — but the same shape a real second engine
+ * has: its own plugin name, its own method names, its own event names, its own
+ * terminal event. The fixture at `tests/fixtures/inference-host-double.mjs`
+ * answers both, keyed by `plugin`.
+ */
+const SIDECAR: EngineSpec = {
+  definition: { name: 'Sidecar', methods: ['describe', 'run', 'halt'], events: ['sideChunk', 'sideDone'] },
+  stream: {
+    start: 'run',
+    cancel: 'halt',
+    terminal: 'sideDone',
+    progress: ['sideChunk'],
+    synthesise: (requestId, error) => ({ requestId, error }),
+  },
+};
+
+interface Facade {
+  getCapabilities(): Promise<unknown>;
+  unload(options: unknown): Promise<unknown>;
+  listLoaded(): Promise<unknown>;
+  describe(): Promise<unknown>;
+}
+
+function llama(supervisor: Supervisor): Facade {
+  return supervisor.plugin(LLAMA_PLUGIN.name) as unknown as Facade;
+}
+
+function sidecar(supervisor: Supervisor): Facade {
+  return supervisor.plugin(SIDECAR.definition.name) as unknown as Facade;
+}
 
 interface Spawned {
   readonly supervisor: Supervisor;
@@ -91,6 +126,7 @@ function spawnSupervised(policy: Partial<SupervisorPolicy> = FAST): Spawned {
       };
     },
     notify: () => undefined,
+    engines: [LLAMA_ENGINE, SIDECAR],
     timers: systemTimers(),
     policy,
   });
@@ -127,7 +163,7 @@ describe('the inference host, killed for real', () => {
       // unexpectedly (SIGKILL)." — the reviewer's finding, reproduced, and
       // then fixed.
       const { supervisor, children } = spawnSupervised();
-      const first = (await supervisor.getCapabilities()) as { pid: number };
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
       expect(typeof first.pid).toBe('number');
       expect(alive(first.pid)).toBe(true);
 
@@ -135,7 +171,7 @@ describe('the inference host, killed for real', () => {
       await until('the OS to reap the killed host', () => !alive(first.pid));
 
       await until('a replacement host', () => supervisor.spawnCount === 2);
-      const second = (await supervisor.getCapabilities()) as { pid: number };
+      const second = (await llama(supervisor).getCapabilities()) as { pid: number };
 
       expect(second.pid).not.toBe(first.pid);
       expect(alive(second.pid)).toBe(true);
@@ -155,9 +191,9 @@ describe('the inference host, killed for real', () => {
       // left spawnCount at 1 and the wedged process alive for the whole
       // timeout — the app permanently broken with a healthy-looking child.
       const { supervisor } = spawnSupervised();
-      const first = (await supervisor.getCapabilities()) as { pid: number };
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
 
-      await supervisor.unload({ handle: 'h' });
+      await llama(supervisor).unload({ handle: 'h' });
       // Still there. This is the state the exit-based paths cannot see.
       expect(alive(first.pid)).toBe(true);
 
@@ -165,7 +201,7 @@ describe('the inference host, killed for real', () => {
       // Terminated by the supervisor — it was never going to exit on its own.
       await until('the wedged host to be terminated', () => !alive(first.pid));
 
-      const second = (await supervisor.getCapabilities()) as { pid: number };
+      const second = (await llama(supervisor).getCapabilities()) as { pid: number };
       expect(second.pid).not.toBe(first.pid);
     },
     15_000,
@@ -179,9 +215,9 @@ describe('the inference host, killed for real', () => {
       // exactly like this, and a liveness check that could not tell the two
       // apart would kill the host mid-load every time.
       const { supervisor } = spawnSupervised({ ...FAST, callTimeoutMs: 400 });
-      const first = (await supervisor.getCapabilities()) as { pid: number };
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
 
-      const stuck = supervisor.listLoaded().catch((error: unknown) => error);
+      const stuck = llama(supervisor).listLoaded().catch((error: unknown) => error);
       const failure = (await stuck) as { code?: string };
 
       expect(failure.code).toBe('HOST_TIMEOUT');
@@ -189,7 +225,7 @@ describe('the inference host, killed for real', () => {
       expect(supervisor.spawnCount).toBe(1);
       // And the host is still usable afterwards: one dead call is not a dead
       // host.
-      expect(((await supervisor.getCapabilities()) as { pid: number }).pid).toBe(first.pid);
+      expect(((await llama(supervisor).getCapabilities()) as { pid: number }).pid).toBe(first.pid);
     },
     15_000,
   );
@@ -198,7 +234,7 @@ describe('the inference host, killed for real', () => {
     'dispose() terminates the host and does not spawn another',
     async () => {
       const { supervisor } = spawnSupervised();
-      const first = (await supervisor.getCapabilities()) as { pid: number };
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
       supervisor.dispose();
       await until('the host to exit', () => !alive(first.pid));
       // FAULT INJECTED, with a caveat worth stating: `#disposed` is checked in
@@ -208,7 +244,43 @@ describe('the inference host, killed for real', () => {
       // outlives the app", and not either individual line.
       await new Promise((done) => setTimeout(done, 200));
       expect(supervisor.spawnCount).toBe(1);
-      await expect(supervisor.getCapabilities()).rejects.toThrow(/shutting down/);
+      await expect(llama(supervisor).getCapabilities()).rejects.toThrow(/shutting down/);
+    },
+    15_000,
+  );
+
+  it(
+    'carries the plugin dimension across a real SIGKILL and respawn',
+    async () => {
+      // The respawn invariant, per plugin, against a real process. Both engines
+      // are served by ONE host, so one signal takes both away and the
+      // replacement has to answer for both. FAULT INJECTED: dropping `plugin`
+      // from the `{k:'call'}` envelope in `Supervisor.#call` made the double
+      // answer `no plugin named "undefined"` for every call in this test,
+      // before and after the kill.
+      const { supervisor } = spawnSupervised();
+      const first = (await sidecar(supervisor).describe()) as {
+        pid: number;
+        plugin: string;
+        method: string;
+      };
+      // The call reached the SIDECAR, under its own method name — not
+      // llama.cpp, which has no `describe` at all.
+      expect(first.plugin).toBe('Sidecar');
+      expect(first.method).toBe('describe');
+
+      process.kill(first.pid, 'SIGKILL');
+      await until('the OS to reap the killed host', () => !alive(first.pid));
+      await until('a replacement host', () => supervisor.spawnCount === 2);
+
+      const second = (await sidecar(supervisor).describe()) as { pid: number; plugin: string };
+      expect(second.pid).not.toBe(first.pid);
+      expect(second.plugin).toBe('Sidecar');
+      // And llama.cpp is served by the same replacement process.
+      expect((await llama(supervisor).getCapabilities()) as { pid: number }).toMatchObject({
+        pid: second.pid,
+        plugin: 'LlamaCpp',
+      });
     },
     15_000,
   );

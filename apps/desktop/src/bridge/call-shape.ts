@@ -19,6 +19,13 @@
  *
  * This file imports nothing. It runs in the utility process next to the native
  * addon, and it is exercised directly by `tests/desktop-bridge.test.ts`.
+ *
+ * IT IS LLAMA.CPP'S POLICY, NOT THE BOUNDARY'S. `host-runtime.ts` knows how to
+ * serve any plugin and holds no method names; the required-field table below
+ * and the opacity table beside it are what makes one of those plugins
+ * llama.cpp. A second engine brings its own pair, under its own names, and a
+ * shared table would silently apply `generate`'s llama fields to an ONNX
+ * method that happens to be spelled the same way.
  */
 
 /** One field a method cannot run without. */
@@ -109,3 +116,35 @@ function describe(value: unknown): string {
   if (Array.isArray(value)) return 'an array';
   return `a ${typeof value}`;
 }
+
+/**
+ * Methods whose ENGINE failure message must not cross the boundary verbatim.
+ *
+ * DEFECT [8], the second half — see `ServeOptions.opaqueFailures` for the
+ * reasoning. `load` is the only llama.cpp method that opens a file the renderer
+ * named, so it is the only entry: blanketing every method would cost every
+ * diagnostic in the app for nothing.
+ *
+ * The cost is real and is accepted rather than hidden: a genuine load failure
+ * (a truncated download, a model too large for memory) now reads the same as a
+ * wrong file. The engine's own words are one `warn` away for anyone debugging,
+ * and a diagnostic that is also an oracle is not a diagnostic worth keeping.
+ */
+export const LLAMA_OPAQUE_FAILURES: Readonly<Record<string, string>> = Object.freeze({
+  load: 'The model could not be loaded. Check that the file is a complete GGUF model in the app’s model folder.',
+});
+
+/**
+ * Everything `host-runtime.ts` needs to serve llama.cpp, as one value.
+ *
+ * Exported as a bundle so `host/entry.ts` and the tests register the plugin
+ * with the SAME policy. Passing the two pieces separately at each call site is
+ * how one of them ends up missing from the process that ships.
+ */
+export const LLAMA_HOST_POLICY: {
+  readonly shape: (method: string, args: readonly unknown[]) => void;
+  readonly opaqueFailures: Readonly<Record<string, string>>;
+} = Object.freeze({
+  shape: assertCallShape,
+  opaqueFailures: LLAMA_OPAQUE_FAILURES,
+});

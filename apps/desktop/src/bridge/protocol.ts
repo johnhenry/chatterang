@@ -92,6 +92,14 @@ export const LLAMA_METHODS = Object.freeze([
 /** The three event names `LlamaCppPlugin` emits. */
 export const LLAMA_EVENTS = Object.freeze(['llamaToken', 'llamaEnd', 'llamaThermal'] as const);
 
+/**
+ * llama.cpp's three event names as a union.
+ *
+ * Narrow, and DELIBERATELY not the type of `HostEvent.name` any more. It once
+ * was, which made the wire unable to carry any other engine's event names at
+ * all. Its remaining job is local: naming llama.cpp's own three, next to the
+ * payload map below.
+ */
 export type LlamaEventName = (typeof LLAMA_EVENTS)[number];
 
 /** Payload type per event name, so the forwarding code cannot swap two. */
@@ -200,10 +208,22 @@ export function fromWireError(wire: WireError): Error {
 
 /* ── Boundary 2: main <-> inference host ──────────────────────────────── */
 
-/** A method call travelling towards the inference host. */
+/**
+ * A method call travelling towards the inference host.
+ *
+ * `plugin` is the dimension milestone A3 could not exist without. Until it was
+ * added a call was `{k:'call', id, method, args}` and the host dispatched every
+ * one of them onto the single `LlamaCppPlugin` it was serving — so a second
+ * engine had no way to be addressed at all, and two engines that both declare
+ * a method called `generate` or `cancel` would have been the same wire message.
+ * Nothing about that was going to be noticed by a type error; it would have
+ * been an ONNX transcription answered by llama.cpp.
+ */
 export interface HostCall {
   readonly k: 'call';
   readonly id: number;
+  /** Which registered plugin this call is addressed to. */
+  readonly plugin: string;
   readonly method: string;
   readonly args: readonly unknown[];
 }
@@ -213,10 +233,24 @@ export type HostReturn =
   | { readonly k: 'ret'; readonly id: number; readonly ok: true; readonly data: unknown }
   | { readonly k: 'ret'; readonly id: number; readonly ok: false; readonly error: WireError };
 
-/** A plugin event travelling towards main. Fire-and-forget; never correlated. */
+/**
+ * A plugin event travelling towards main. Fire-and-forget; never correlated.
+ *
+ * `name` is a plain string and `plugin` says whose it is. It used to be typed
+ * `LlamaEventName`, which read as rigour and was in fact a ceiling: a second
+ * engine's `onnxChunk` could not be given a name the type admitted, and — worse
+ * — an event name is not unique across engines. Two plugins may legitimately
+ * both emit `end`. Without `plugin`, the supervisor's terminal-event rule would
+ * have applied one engine's `end` to the other engine's in-flight turn.
+ *
+ * The pair (plugin, name) is validated against the registered definition before
+ * anything is delivered; see `Supervisor.#receive`.
+ */
 export interface HostEvent {
   readonly k: 'ev';
-  readonly name: LlamaEventName;
+  /** Which registered plugin emitted this. */
+  readonly plugin: string;
+  readonly name: string;
   readonly data: unknown;
 }
 

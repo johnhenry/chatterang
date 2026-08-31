@@ -21,11 +21,14 @@ import { modelPathGuard } from '@chatterang/desktop/host/model-paths';
 import {
   BRIDGE_KEYS,
   DEFAULT_POLICY,
+  DSH_METHODS,
   DSH_PLUGIN,
   EVENT_CHANNEL,
   HANDLE_LOST,
   HOST_TIMEOUT,
+  LLAMA_ENGINE,
   LLAMA_EVENTS,
+  LLAMA_OPAQUE_FAILURES,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
   PluginHost,
@@ -43,14 +46,18 @@ import {
   REQUIRED_ARGUMENTS,
   assertCallShape,
   methodChannel,
+  createHostRuntime,
+  LLAMA_HOST_POLICY,
   releaseRendererOn,
-  serveLlamaCpp,
   teardownReason,
 } from '@chatterang/desktop/bridge';
 import type {
   BootManifest,
+  EngineSpec,
   EventPayload,
   HostMessage,
+  HostPluginImplementation,
+  PluginDefinition,
   InvokeResult,
   MessageLink,
   NotifyListeners,
@@ -79,7 +86,7 @@ import type {
  *
  * Everything between the fake ports is production code: the real
  * `PluginHost`, the real `Supervisor`, the real `createMainRouter`, the real
- * preload bridge, the real `serveLlamaCpp`, the real `LlamaCppNode` from
+ * preload bridge, the real `HostRuntime`, the real `LlamaCppNode` from
  * `packages/inference-node`, and — in the Capacitor section — the real
  * `@capacitor/core` and the app's own `src/plugins/llama-cpp`.
  *
@@ -332,6 +339,29 @@ function pageBridge(exposed: PreloadBridge): PageBridge {
   };
 }
 
+/**
+ * The `LlamaCpp` facade the supervisor builds from the engine's definition.
+ *
+ * The supervisor is no longer itself a plugin implementation: it serves any
+ * number of engines, and an object carrying every engine's methods at once has
+ * no way to say which `generate` a call meant. `main.ts` registers this same
+ * facade; these tests call it directly where the point is the supervisor rather
+ * than the whole bridge.
+ */
+interface LlamaFacade {
+  getCapabilities(): Promise<unknown>;
+  getThermalState(): Promise<unknown>;
+  load(options: unknown): Promise<unknown>;
+  unload(options: unknown): Promise<unknown>;
+  listLoaded(): Promise<unknown>;
+  generate(senderId: number, options: unknown): Promise<unknown>;
+  cancel(senderId: number, options: unknown): Promise<void>;
+}
+
+function llamaOf(supervisor: Supervisor): LlamaFacade {
+  return supervisor.plugin(LLAMA_PLUGIN.name) as unknown as LlamaFacade;
+}
+
 interface Harness {
   /** The page's view: through contextBridge, through the real shim. */
   readonly bridge: PageBridge;
@@ -380,7 +410,10 @@ function harness(
     // process with a new port, which is what makes a respawn observable.
     spawn: () => {
       const pair = createLinkPair();
-      serveLlamaCpp({ link: pair.host, plugin: make() });
+      // Through the GENERIC runtime, with llama.cpp's own policy passed in —
+      // the same two lines `host/entry.ts` runs. A convenience wrapper here
+      // would leave the shipped registration path untested.
+      createHostRuntime({ link: pair.host }).serve(LLAMA_PLUGIN, make(), LLAMA_HOST_POLICY);
       hosts.push(pair);
       return {
         link: pair.main,
@@ -390,12 +423,13 @@ function harness(
         },
       };
     },
-    notify: (eventName, data) => host.notifyListeners(LLAMA_PLUGIN.name, eventName, data),
+    notify: (pluginName, eventName, data, ownerId) =>
+      host.notifyListeners(pluginName, eventName, data, ownerId),
     timers: clock,
     ...(options.policy === undefined ? {} : { policy: options.policy }),
   });
 
-  host.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation);
+  host.register(LLAMA_PLUGIN, supervisor.plugin(LLAMA_PLUGIN.name));
   if (options.dsh !== undefined) host.register(DSH_PLUGIN, options.dsh);
 
   const router = createMainRouter(host);
@@ -1049,9 +1083,12 @@ describe('the renderer can only ever name a channel from the manifest', () => {
     );
   });
 
-  it('registers the real Supervisor without complaint, so the forwarders all exist', () => {
+  it('registers the real Supervisor facade without complaint, so the forwarders all exist', () => {
     // The counterpart to the test above: the check is only worth having if it
-    // passes for the object we actually ship.
+    // passes for the object we actually ship. The facade is BUILT from the
+    // definition, so this also says the two cannot drift — a method added to
+    // `LLAMA_METHODS` gets a forwarder by construction rather than by someone
+    // remembering to write one.
     const pair = createLinkPair();
     const host = new PluginHost(() => true);
     const supervisor = new Supervisor({
@@ -1059,11 +1096,12 @@ describe('the renderer can only ever name a channel from the manifest', () => {
       notify: () => undefined,
       timers: manualClock(),
     });
-    expect(() =>
-      host.register(LLAMA_PLUGIN, supervisor as unknown as PluginImplementation),
-    ).not.toThrow();
+    expect(() => host.register(LLAMA_PLUGIN, supervisor.plugin(LLAMA_PLUGIN.name))).not.toThrow();
     expect(LLAMA_METHODS).toHaveLength(10);
     expect(LLAMA_EVENTS).toEqual(['llamaToken', 'llamaEnd', 'llamaThermal']);
+    // And a name it serves no engine for is refused rather than registered as
+    // a manifest entry whose every call would fail at runtime.
+    expect(() => supervisor.plugin('OnnxRuntime')).toThrow(/serves no engine named "OnnxRuntime"/);
   });
 });
 
@@ -1269,6 +1307,7 @@ function wiredSupervisor(options: {
   policy?: Partial<SupervisorPolicy>;
   answer?: (host: WiredHost, message: HostMessage) => void;
   notify?: NotifyListeners;
+  engines?: readonly EngineSpec[];
 }): { supervisor: Supervisor; hosts: WiredHost[]; clock: ManualClock; warnings: string[] } {
   const hosts: WiredHost[] = [];
   const warnings: string[] = [];
@@ -1305,6 +1344,7 @@ function wiredSupervisor(options: {
     notify: options.notify ?? ((): void => undefined),
     warn: (message) => warnings.push(message),
     timers: clock,
+    ...(options.engines === undefined ? {} : { engines: options.engines }),
     ...(options.policy === undefined ? {} : { policy: options.policy }),
   });
   return { supervisor, hosts, clock, warnings };
@@ -1362,7 +1402,7 @@ describe('a dead inference host is replaced, not mourned', () => {
     await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
     expect(hosts).toHaveLength(2);
 
-    const second = supervisor.getCapabilities();
+    const second = llamaOf(supervisor).getCapabilities();
     const call = hosts[1]?.posted.at(-1) as { k: string; id: number };
     expect(call.k).toBe('call');
 
@@ -1414,7 +1454,7 @@ describe('a dead inference host is replaced, not mourned', () => {
       await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
     }
     expect(supervisor.spawnCount).toBe(4);
-    await expect(supervisor.getCapabilities()).rejects.toThrow(/is not being restarted again/);
+    await expect(llamaOf(supervisor).getCapabilities()).rejects.toThrow(/is not being restarted again/);
   });
 
   it('terminates a host it replaces, so two are never decoding at once', async () => {
@@ -1529,7 +1569,7 @@ describe('a WEDGED host terminates too, though it never exits', () => {
         if (message.k === 'call') host.send({ k: 'ret', id: message.id, ok: true, data: 'fine' });
       },
     });
-    expect(await supervisor.getCapabilities()).toBe('fine');
+    expect(await llamaOf(supervisor).getCapabilities()).toBe('fine');
 
     await clock.advance(DEFAULT_POLICY.pingIntervalMs + 1);
     expect((hosts[0]?.posted.at(-1) as { k: string }).k).toBe('ping');
@@ -1542,7 +1582,7 @@ describe('a WEDGED host terminates too, though it never exits', () => {
 
     await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
     expect(supervisor.spawnCount).toBe(2);
-    expect(await supervisor.getCapabilities()).toBe('fine');
+    expect(await llamaOf(supervisor).getCapabilities()).toBe('fine');
   });
 
   it('a host that answers pings is never condemned, however long it takes', async () => {
@@ -1555,7 +1595,7 @@ describe('a WEDGED host terminates too, though it never exits', () => {
         if (message.k === 'ping') host.send({ k: 'pong', id: message.id });
       },
     });
-    const slow = supervisor.load({ modelPath: '/models/big.gguf' });
+    const slow = llamaOf(supervisor).load({ modelPath: '/models/big.gguf' });
     void slow.catch(() => undefined);
     for (let minute = 0; minute < 5; minute += 1) {
       await clock.advance(60_000);
@@ -1569,18 +1609,27 @@ describe('a WEDGED host terminates too, though it never exits', () => {
   it('the real host runtime answers a ping without touching the plugin', async () => {
     // The probe must not be routed through `LlamaCppNode`: it would then be
     // blocked by precisely the state it exists to detect. This drives the real
-    // `serveLlamaCpp` against a plugin whose every method hangs.
+    // `HostRuntime` against a plugin whose every method hangs. The ping is
+    // answered by the RUNTIME, once, ahead of the plugin registry — which is
+    // also why it must not be per-plugin: two served engines would otherwise
+    // send two pongs for one ping.
     const pair = createLinkPair();
     const hanging = {
       addListener: async () => ({ remove: async () => undefined }),
       generate: () => new Promise(() => undefined),
       getCapabilities: () => new Promise(() => undefined),
     } as unknown as LlamaCppPlugin;
-    serveLlamaCpp({ link: pair.host, plugin: hanging });
+    createHostRuntime({ link: pair.host }).serve(LLAMA_PLUGIN, hanging, LLAMA_HOST_POLICY);
 
     const seen: unknown[] = [];
     pair.main.onMessage((message) => seen.push(message));
-    pair.main.postMessage({ k: 'call', id: 1, method: 'getCapabilities', args: [] });
+    pair.main.postMessage({
+      k: 'call',
+      id: 1,
+      plugin: LLAMA_PLUGIN.name,
+      method: 'getCapabilities',
+      args: [],
+    });
     pair.main.postMessage({ k: 'ping', id: 77 });
     await settle();
 
@@ -1797,11 +1846,11 @@ function twoWindows(options: { notify?: NotifyListeners } = {}): {
     // turn ends, which is the only way to have two of them in flight at once.
     notify:
       options.notify ??
-      ((eventName, data, ownerId) =>
-        host.notifyListeners(LLAMA_PLUGIN.name, eventName, data, ownerId)),
+      ((pluginName, eventName, data, ownerId) =>
+        host.notifyListeners(pluginName, eventName, data, ownerId)),
   });
 
-  host.register(LLAMA_PLUGIN, wired.supervisor as unknown as PluginImplementation);
+  host.register(LLAMA_PLUGIN, wired.supervisor.plugin(LLAMA_PLUGIN.name));
   const router = createMainRouter(host);
 
   for (const senderId of inbox.keys()) {
@@ -1850,8 +1899,8 @@ describe('a generation belongs to the window that started it', () => {
     void begin(w, 2, 'r2');
     await settle();
 
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'r1', token: 'one' } });
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'r2', token: 'two' } });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaToken', data: { requestId: 'r1', token: 'one' } });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaToken', data: { requestId: 'r2', token: 'two' } });
 
     expect(seen(w.inbox, 1, 'llamaToken')).toEqual([{ requestId: 'r1', token: 'one' }]);
     expect(seen(w.inbox, 2, 'llamaToken')).toEqual([{ requestId: 'r2', token: 'two' }]);
@@ -1863,7 +1912,7 @@ describe('a generation belongs to the window that started it', () => {
     void begin(w, 2, 'r2');
     await settle();
 
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endEvent('r1', 'stop') });
     await settle();
 
     expect(seen(w.inbox, 1, 'llamaEnd')).toHaveLength(1);
@@ -1879,7 +1928,7 @@ describe('a generation belongs to the window that started it', () => {
     void begin(w, 1, 'r1');
     await settle();
 
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaThermal', data: { state: 'nominal' } });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaThermal', data: { state: 'nominal' } });
 
     expect(seen(w.inbox, 1, 'llamaThermal')).toEqual([{ state: 'nominal' }]);
     expect(seen(w.inbox, 2, 'llamaThermal')).toEqual([{ state: 'nominal' }]);
@@ -1892,7 +1941,7 @@ describe('a generation belongs to the window that started it', () => {
     void begin(w, 1, 'r1');
     await settle();
 
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'ghost', token: 'x' } });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaToken', data: { requestId: 'ghost', token: 'x' } });
 
     expect(seen(w.inbox, 1, 'llamaToken')).toEqual([]);
     expect(seen(w.inbox, 2, 'llamaToken')).toEqual([]);
@@ -1916,7 +1965,7 @@ describe('a generation belongs to the window that started it', () => {
     expect(w.supervisor.inflightCount).toBe(1);
 
     // The survivor is still a live turn: it answers, and it answers to itself.
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r2', 'stop') });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endEvent('r2', 'stop') });
     const call = w.hosts[0]?.posted.find(
       (m) => (m as { method?: string }).method === 'generate',
     ) as { id: number } | undefined;
@@ -1972,7 +2021,7 @@ describe('two turns cannot share one requestId', () => {
     // turn's promise was left to the deadline — which is what this assertion
     // catches, and it catches it as a HANG rather than a wrong value.
     expect(w.supervisor.inflightCount).toBe(1);
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endEvent('r1', 'stop') });
     const call = w.hosts[0]?.posted.find(
       (m) => (m as { method?: string }).method === 'generate',
     ) as { id: number } | undefined;
@@ -2026,13 +2075,14 @@ describe('a terminal event that could not be delivered is not spent', () => {
     // A function in the payload: structured clone cannot carry it.
     w.hosts[0]?.send({
       k: 'ev',
+      plugin: LLAMA_PLUGIN.name,
       name: 'llamaEnd',
       data: { ...endEvent('r1', 'stop'), onDone: (): void => undefined },
     });
     await settle();
 
     expect(seen(w.inbox, 1, 'llamaEnd')).toEqual([]);
-    expect(w.warnings.join('\n')).toMatch(/could not deliver llamaEnd/);
+    expect(w.warnings.join('\n')).toMatch(/could not deliver LlamaCpp\.llamaEnd/);
 
     // The turn is still open, so the host's own return settles it — with a
     // payload we can actually deliver.
@@ -2054,7 +2104,7 @@ describe('a terminal event that could not be delivered is not spent', () => {
     void begin(w, 1, 'r1');
     await settle();
 
-    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endEvent('r1', 'stop') });
     const call = w.hosts[0]?.posted.find(
       (m) => (m as { method?: string }).method === 'generate',
     ) as { id: number } | undefined;
@@ -2077,10 +2127,10 @@ describe('a terminal event that could not be delivered is not spent', () => {
     await settle();
 
     expect(() =>
-      w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') }),
+      w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endEvent('r1', 'stop') }),
     ).not.toThrow();
     expect(() =>
-      w.hosts[0]?.send({ k: 'ev', name: 'llamaThermal', data: { state: 'hot' } }),
+      w.hosts[0]?.send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaThermal', data: { state: 'hot' } }),
     ).not.toThrow();
   });
 });
@@ -2128,8 +2178,9 @@ describe('PluginHost sender scoping', () => {
     // same answer for every window. If a method that owns per-window state is
     // added later, this list is where it has to appear.
     const { supervisor } = wiredSupervisor({});
-    expect([...(supervisor[SENDER_SCOPED] ?? [])].sort()).toEqual(['cancel', 'generate']);
-    for (const method of supervisor[SENDER_SCOPED] ?? []) {
+    const scoped = supervisor.plugin(LLAMA_PLUGIN.name)[SENDER_SCOPED] ?? [];
+    expect([...scoped].sort()).toEqual(['cancel', 'generate']);
+    for (const method of scoped) {
       expect(LLAMA_METHODS).toContain(method);
     }
   });
@@ -2248,7 +2299,8 @@ describe('renderer teardown', () => {
 /* ── The inference-host boundary checks what it is handed ─────────────── */
 
 /**
- * `serveLlamaCpp` on one side of a real port, driven by hand from the other.
+ * The host runtime serving llama.cpp on one side of a real port, driven by hand
+ * from the other.
  *
  * Direct rather than through the whole bridge, because the questions here are
  * about the host's own boundary: what it refuses, and what it is willing to say
@@ -2282,12 +2334,11 @@ function hostBoundary(options: {
     addListener: async () => ({ remove: async (): Promise<void> => undefined }),
   } as unknown as LlamaCppPlugin;
 
-  serveLlamaCpp({
-    link: pair.host,
+  createHostRuntime({ link: pair.host, warn: (message: string) => warnings.push(message) }).serve(
+    LLAMA_PLUGIN,
     plugin,
-    warn: (message) => warnings.push(message),
-    ...(options.guard === undefined ? {} : { guard: options.guard }),
-  });
+    { ...LLAMA_HOST_POLICY, ...(options.guard === undefined ? {} : { guard: options.guard }) },
+  );
 
   let nextId = 1;
   return {
@@ -2301,7 +2352,7 @@ function hostBoundary(options: {
           if (answer.k !== 'ret' || answer.id !== id) return;
           resolveCall({ ok: answer.ok, message: answer.error?.message ?? '' });
         });
-        pair.main.postMessage({ k: 'call', id, method, args });
+        pair.main.postMessage({ k: 'call', id, plugin: LLAMA_PLUGIN.name, method, args });
       }),
   };
 }
@@ -2482,5 +2533,883 @@ describe('load is not a filesystem oracle', () => {
       },
     });
     expect((await h.call('unload', [{ handle: 'h9' }])).message).toContain('no such handle: h9');
+  });
+});
+
+/* ══ TWO ENGINES ON ONE WIRE ═══════════════════════════════════════════ */
+
+/**
+ * A SECOND plugin, registered alongside llama.cpp.
+ *
+ * Not ONNX — that is milestone A3, and adding it here would be adding the
+ * feature rather than proving the seam. This is a fake with its own name, its
+ * own methods and its own event names, which is the only thing the plugin
+ * dimension needs in order to be exercised rather than merely declared.
+ *
+ * TWO OF ITS METHODS COLLIDE WITH LLAMA.CPP'S ON PURPOSE. `generate` and
+ * `cancel` are exactly the names a transcriber and a text model both want, and
+ * a wire that carries only a method name cannot tell those two calls apart —
+ * the old `{k:'call', id, method, args}` would have delivered either to
+ * whichever single plugin the host happened to be serving. Its EVENT names do
+ * not collide, because the sharper question there is different: an event has to
+ * find the right in-flight table, and the terminal-event name is what the
+ * supervisor matches on. A `Transcriber.end` must not settle a `LlamaCpp` turn,
+ * and — the case that costs a whole engine's guarantee if it is wrong — must
+ * not settle one that shares its requestId.
+ */
+const TRANSCRIBER: PluginDefinition = Object.freeze({
+  name: 'Transcriber',
+  methods: Object.freeze(['describe', 'load', 'generate', 'cancel']),
+  events: Object.freeze(['chunk', 'end', 'level']),
+});
+
+/** Its streaming contract: different method and event names, same guarantees. */
+const TRANSCRIBER_ENGINE: EngineSpec = Object.freeze({
+  definition: TRANSCRIBER,
+  stream: Object.freeze({
+    start: 'generate',
+    cancel: 'cancel',
+    terminal: 'end',
+    progress: Object.freeze(['chunk']),
+    synthesise: (requestId: string, error: string) => ({ requestId, error, aborted: true }),
+  }),
+});
+
+/** One call as it appears on the wire, so a test can assert who it was for. */
+interface PostedCall {
+  readonly k?: string;
+  readonly id?: number;
+  readonly plugin?: string;
+  readonly method?: string;
+  readonly args?: readonly unknown[];
+}
+
+/**
+ * Two engines, one supervisor, one host, two renderers.
+ *
+ * Everything between the router and the wire is production code; only the host
+ * is a double, because these tests have to hold two turns open simultaneously
+ * and decide by hand which one ends.
+ */
+function twoEngines(
+  options: { policy?: Partial<SupervisorPolicy>; engines?: readonly EngineSpec[] } = {},
+): {
+  readonly host: PluginHost;
+  readonly supervisor: Supervisor;
+  readonly hosts: WiredHost[];
+  readonly clock: ManualClock;
+  readonly warnings: string[];
+  readonly inbox: Map<number, EventPayload[]>;
+  call(
+    senderId: number,
+    pluginName: string,
+    method: string,
+    args: readonly unknown[],
+  ): Promise<InvokeResult>;
+  /** Every `{k:'call'}` the supervisor has posted, oldest first. */
+  posted(): PostedCall[];
+  /** Deliver an event as if the named plugin had emitted it. */
+  emit(pluginName: string, name: string, data: unknown): void;
+} {
+  const inbox = new Map<number, EventPayload[]>([
+    [1, []],
+    [2, []],
+  ]);
+  const host = new PluginHost((senderId, payload) => {
+    const box = inbox.get(senderId);
+    if (box === undefined) return false;
+    box.push(structuredClone(payload));
+    return true;
+  });
+
+  const wired = wiredSupervisor({
+    engines: options.engines ?? [LLAMA_ENGINE, TRANSCRIBER_ENGINE],
+    notify: (pluginName, eventName, data, ownerId) =>
+      host.notifyListeners(pluginName, eventName, data, ownerId),
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
+  });
+
+  host.register(LLAMA_PLUGIN, wired.supervisor.plugin(LLAMA_PLUGIN.name));
+  host.register(TRANSCRIBER, wired.supervisor.plugin(TRANSCRIBER.name));
+  const router = createMainRouter(host);
+
+  let subscriptionId = 1;
+  for (const senderId of inbox.keys()) {
+    for (const definition of [LLAMA_PLUGIN, TRANSCRIBER]) {
+      for (const eventName of definition.events) {
+        host.addListener(senderId, definition.name, eventName, subscriptionId++);
+      }
+    }
+  }
+
+  return {
+    host,
+    supervisor: wired.supervisor,
+    hosts: wired.hosts,
+    clock: wired.clock,
+    warnings: wired.warnings,
+    inbox,
+    call: (senderId, pluginName, method, args) =>
+      router.handle(senderId, methodChannel(pluginName, method), args),
+    posted: () =>
+      (wired.hosts[0]?.posted ?? []).filter((m) => (m as PostedCall).k === 'call') as PostedCall[],
+    emit: (pluginName, name, data) =>
+      wired.hosts[0]?.send({ k: 'ev', plugin: pluginName, name, data }),
+  };
+}
+
+/** Every event of one plugin+name a renderer received, newest last. */
+function sawFrom(
+  inbox: Map<number, EventPayload[]>,
+  senderId: number,
+  pluginName: string,
+  eventName: string,
+): unknown[] {
+  return (inbox.get(senderId) ?? [])
+    .filter((p) => p.pluginName === pluginName && p.eventName === eventName)
+    .map((p) => p.data);
+}
+
+/** Watch a promise without awaiting it, so "still pending" is assertable. */
+function watch<T>(promise: Promise<T>): () => T | undefined {
+  let value: T | undefined;
+  void promise.then((v) => {
+    value = v;
+  });
+  return () => value;
+}
+
+/** Start a turn on one engine and leave it in flight. */
+function beginOn(
+  w: ReturnType<typeof twoEngines>,
+  senderId: number,
+  pluginName: string,
+  requestId: string,
+): () => InvokeResult | undefined {
+  return watch(
+    w.call(senderId, pluginName, 'generate', [{ handle: 'h', prompt: 'p', requestId }]),
+  );
+}
+
+describe('two engines in flight at once', () => {
+  it('keeps their turns apart even when they share a requestId', async () => {
+    // THE REASON THIS PHASE EXISTS. Two engines, two turns, ONE requestId —
+    // which is not a contrived collision: ids are minted per caller and nothing
+    // coordinates them across engines. With a single `#inflight` map keyed by
+    // requestId alone, `engine.inflight.set('r1', …)` for the second turn
+    // overwrote the first and the two shared one terminal-event flag.
+    const w = twoEngines();
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(w.supervisor.inflightCountFor(TRANSCRIBER.name)).toBe(1);
+    expect(w.supervisor.inflightCount).toBe(2);
+
+    // Both calls went out addressed to their own plugin, under the method name
+    // they share.
+    const starts = w.posted().filter((m) => m.method === 'generate');
+    expect(starts.map((m) => m.plugin)).toEqual([LLAMA_PLUGIN.name, TRANSCRIBER.name]);
+    expect(llama()).toBeUndefined();
+    expect(transcript()).toBeUndefined();
+  });
+
+  it("one engine's abort does not settle or cancel the other's turn", async () => {
+    // The invariant named in the brief, stated as sharply as it can be: same
+    // requestId, same window, abort one. FAULT INJECTED: routing every `{k:
+    // 'call'}` through the first registered engine (`#engine()` returning
+    // `[...this.#engines.values()][0]`) failed this test with
+    // `expected 'LlamaCpp' to be 'Transcriber'` on the cancel that went out —
+    // the abort of a transcription arriving at llama.cpp for a requestId it
+    // also holds.
+    const w = twoEngines();
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    // Not awaited: the host double answers nothing on its own, which is what
+    // lets two turns stay open at once.
+    void w.call(1, TRANSCRIBER.name, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+
+    // The cancel that went out is the TRANSCRIBER's, on its own plugin address.
+    const cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(TRANSCRIBER.name);
+
+    // The transcription ends, exactly once, on its own event name, and its
+    // own call settles.
+    const start = w.posted().find((m) => m.plugin === TRANSCRIBER.name && m.method === 'generate');
+    w.emit(TRANSCRIBER.name, 'end', { requestId: 'r1', aborted: true });
+    w.hosts[0]?.send({ k: 'ret', id: start?.id ?? 0, ok: true, data: { requestId: 'r1' } });
+    await settle();
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end')).toHaveLength(1);
+
+    // And the generation is untouched: no terminal event, still in flight,
+    // still unsettled.
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(llama()).toBeUndefined();
+    expect(transcript()).toBeDefined();
+  });
+
+  it("one engine's terminal event does not end the other's turn", async () => {
+    // The same isolation from the event side. A `Transcriber.end` and a
+    // `LlamaCpp.llamaEnd` for requestId "r1" are two different facts, and
+    // before the plugin dimension the supervisor could only see the requestId.
+    const w = twoEngines();
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    w.emit(LLAMA_PLUGIN.name, 'llamaEnd', endEvent('r1', 'stop'));
+    await settle();
+
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toHaveLength(1);
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(TRANSCRIBER.name)).toBe(1);
+    expect(transcript()).toBeUndefined();
+    // The generation's own promise is still open until its `ret` arrives; the
+    // terminal event and the settlement are separate paths on purpose.
+    expect(llama()).toBeUndefined();
+  });
+
+  it("one engine's progress does not extend the other's deadline", async () => {
+    // A token is proof that THIS engine is working. Crediting it to another
+    // engine's turn would keep a wedged decode alive forever behind a healthy
+    // transcription — the exact failure the idle deadline exists to end.
+    const w = twoEngines({ policy: { generateIdleTimeoutMs: 1_000, tickMs: 100 } });
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    await w.clock.advance(900);
+    w.emit(TRANSCRIBER.name, 'chunk', { requestId: 'r1', text: 'hel' });
+    await w.clock.advance(200);
+
+    // The generation timed out on schedule; the transcription bought itself
+    // another second.
+    expect(llama()).toMatchObject({ ok: false, error: { code: HOST_TIMEOUT } });
+    expect(transcript()).toBeUndefined();
+    expect(w.supervisor.inflightCountFor(TRANSCRIBER.name)).toBe(1);
+
+    // The deadline's cancel named the engine whose call expired, with that
+    // engine's own cancel method — not a bare `cancel` the wrong plugin would
+    // have answered for a requestId they both hold.
+    const cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(LLAMA_PLUGIN.name);
+    expect(cancels[0]?.args).toEqual([{ requestId: 'r1' }]);
+  });
+
+  it("addresses a deadline's cancel at the engine whose call expired", async () => {
+    // The mirror of the test above, and it is the one that catches a hard-coded
+    // address. FAULT INJECTED: `plugin: LLAMA_PLUGIN.name, method: 'cancel'` in
+    // `#tick`'s cancel post — which every OTHER test in this file survives,
+    // because llama.cpp is the engine whose turn expires in all of them. Here
+    // it is the transcription that expires, and the injected build failed with
+    // `expected 'LlamaCpp' to be 'Transcriber'`: an abandoned transcription
+    // left decoding, and a cancel delivered to llama.cpp for a requestId it
+    // also holds.
+    const w = twoEngines({ policy: { generateIdleTimeoutMs: 1_000, tickMs: 100 } });
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    // Only the generation shows progress, so only the generation's deadline
+    // moves. A token credited to both would keep the wedged transcription alive.
+    await w.clock.advance(900);
+    w.emit(LLAMA_PLUGIN.name, 'llamaToken', { requestId: 'r1', token: 'a' });
+    await w.clock.advance(200);
+
+    expect(transcript()).toMatchObject({ ok: false, error: { code: HOST_TIMEOUT } });
+    expect(llama()).toBeUndefined();
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+
+    const cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(TRANSCRIBER.name);
+  });
+
+  it('lets an engine set its own idle deadline, shorter than the policy default', async () => {
+    // `generateIdleTimeoutMs` is a policy about text decode. A transcriber that
+    // has produced nothing for two minutes is a different judgement, so the
+    // spec may override it — and the override has to be read from the engine
+    // the call belongs to, not from the first one.
+    const impatient: EngineSpec = {
+      definition: TRANSCRIBER,
+      stream: { ...TRANSCRIBER_ENGINE.stream!, idleTimeoutMs: 300 },
+    };
+    const w = twoEngines({
+      policy: { generateIdleTimeoutMs: 5_000, tickMs: 100 },
+      engines: [LLAMA_ENGINE, impatient],
+    });
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    // Progress resets it to the ENGINE's 300ms, not to the policy's 5s. FAULT
+    // INJECTED: `pending.deadlineAt = now + this.#policy.generateIdleTimeoutMs`
+    // in `#extendDeadline` — the first expiry below still fired, so only this
+    // second half caught it (`expected undefined to match object`), which is
+    // why the chunk is here rather than the test stopping at the first.
+    await w.clock.advance(200);
+    w.emit(TRANSCRIBER.name, 'chunk', { requestId: 'r1', text: 'a' });
+    await w.clock.advance(200);
+    expect(transcript()).toBeUndefined();
+    await w.clock.advance(200);
+    expect(transcript()).toMatchObject({ ok: false, error: { code: HOST_TIMEOUT } });
+    expect(llama()).toBeUndefined();
+
+    // And with no progress at all it expires on its own clock, well before the
+    // policy default the generation is still waiting on.
+    const fresh = twoEngines({
+      policy: { generateIdleTimeoutMs: 5_000, tickMs: 100 },
+      engines: [LLAMA_ENGINE, impatient],
+    });
+    const other = beginOn(fresh, 1, TRANSCRIBER.name, 'r1');
+    const stillGoing = beginOn(fresh, 1, LLAMA_PLUGIN.name, 'r1');
+    await settle();
+    await fresh.clock.advance(400);
+    expect(other()).toMatchObject({ ok: false, error: { code: HOST_TIMEOUT } });
+    expect(stillGoing()).toBeUndefined();
+  });
+
+  it('gives each engine its own terminal event when the host dies', async () => {
+    // One process holds both engines, so losing it loses both — and each turn
+    // has to end on ITS OWN event name. A single hard-coded `llamaEnd` would
+    // have left the transcription with no terminal event at all, and would have
+    // sent a `llamaEnd` for a turn no `LlamaCpp` listener started.
+    const w = twoEngines();
+    const llama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    w.hosts[0]?.close('SIGKILL');
+    await settle();
+
+    const ends = sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd');
+    const stops = sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end');
+    expect(ends).toHaveLength(1);
+    expect(stops).toHaveLength(1);
+    // Each carries the payload ITS engine's spec synthesises, not the other's.
+    expect(ends[0]).toMatchObject({ requestId: 'r1', stopReason: 'error' });
+    expect(stops[0]).toMatchObject({ requestId: 'r1', aborted: true });
+    expect(llama()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+    expect(transcript()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+    expect(w.supervisor.inflightCount).toBe(0);
+  });
+
+  it('ends a turn exactly once per engine on a success the host forgot to announce', async () => {
+    // The terminal-event rule, per engine, on the success path: a `ret` with no
+    // event before it still produces exactly one terminal event — and a `ret`
+    // AFTER the event does not produce a second.
+    const w = twoEngines();
+    beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    const starts = w.posted().filter((m) => m.method === 'generate');
+    const llamaId = starts.find((m) => m.plugin === LLAMA_PLUGIN.name)?.id ?? 0;
+    const otherId = starts.find((m) => m.plugin === TRANSCRIBER.name)?.id ?? 0;
+
+    // The transcriber announces its end AND returns; llama.cpp only returns.
+    w.emit(TRANSCRIBER.name, 'end', { requestId: 'r1', aborted: false });
+    w.hosts[0]?.send({ k: 'ret', id: otherId, ok: true, data: { requestId: 'r1' } });
+    w.hosts[0]?.send({ k: 'ret', id: llamaId, ok: true, data: endEvent('r1', 'stop') });
+    await settle();
+
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end')).toHaveLength(1);
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toHaveLength(1);
+    expect(w.supervisor.inflightCount).toBe(0);
+  });
+
+  it('ends a turn exactly once per engine when the host rejects it', async () => {
+    // And the error path. The rejection reaches the caller, and the turn still
+    // gets its one terminal event — synthesised by the engine whose turn it is.
+    const w = twoEngines();
+    const transcript = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    await settle();
+
+    const start = w.posted().find((m) => m.plugin === TRANSCRIBER.name && m.method === 'generate');
+    w.hosts[0]?.send({
+      k: 'ret',
+      id: start?.id ?? 0,
+      ok: false,
+      error: { message: 'the decoder gave up' },
+    });
+    await settle();
+
+    expect(transcript()).toMatchObject({ ok: false, error: { message: 'the decoder gave up' } });
+    const stops = sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end');
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toMatchObject({ requestId: 'r1', error: 'the decoder gave up' });
+    // The other engine's turn is untouched by its neighbour's failure.
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+  });
+
+  it('scopes a second engine s events to the window that started the turn', async () => {
+    // Sender scoping is a property of every engine, not of llama.cpp. A new
+    // plugin whose events were broadcast would reintroduce defect [11] with a
+    // different payload — one window's transcript in another window's page.
+    const w = twoEngines();
+    beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    beginOn(w, 2, TRANSCRIBER.name, 'r2');
+    await settle();
+
+    w.emit(TRANSCRIBER.name, 'chunk', { requestId: 'r1', text: 'one' });
+    w.emit(TRANSCRIBER.name, 'chunk', { requestId: 'r2', text: 'two' });
+    await settle();
+
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'chunk')).toEqual([
+      { requestId: 'r1', text: 'one' },
+    ]);
+    expect(sawFrom(w.inbox, 2, TRANSCRIBER.name, 'chunk')).toEqual([
+      { requestId: 'r2', text: 'two' },
+    ]);
+
+    // An event with no turn — `level` is not in the stream's `progress` list —
+    // describes the machine and reaches both, exactly as `llamaThermal` does.
+    w.emit(TRANSCRIBER.name, 'level', { db: -12 });
+    await settle();
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'level')).toHaveLength(1);
+    expect(sawFrom(w.inbox, 2, TRANSCRIBER.name, 'level')).toHaveLength(1);
+  });
+
+  it('checks turn ownership in the engine the cancel names', async () => {
+    // The ownership check has to read THIS engine's table. Reading any other
+    // engine's is invisible while both engines' turns happen to belong to the
+    // same window — so the two turns here have DIFFERENT owners under the same
+    // requestId, which is the only arrangement in which a wrong-table lookup
+    // shows up at all.
+    //
+    // FAULT INJECTED: `[...this.#engines.values()][0]?.inflight.get(requestId)`
+    // in `#cancelTurn`, i.e. always the first engine's table. Every other test
+    // in this file stayed green; this one failed both ways round —
+    // `expected [] to have a length of 1` for the legitimate cancel, and
+    // `expected 1 to be +0` for the one that should have been refused.
+    const w = twoEngines();
+    beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    beginOn(w, 2, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    // Window 2 owns the transcription, so its cancel is honoured.
+    void w.call(2, TRANSCRIBER.name, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+    let cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(TRANSCRIBER.name);
+
+    // Window 2 does NOT own the generation under the same id, so its cancel of
+    // that one is the no-op the contract promises — indistinguishable from
+    // "not running", so a cancel cannot probe another window.
+    void w.call(2, LLAMA_PLUGIN.name, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+    cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+  });
+
+  it('refuses a cross-engine cancel from a window that owns neither turn', async () => {
+    // Ownership is checked in the turn's OWN engine. Window 2 cancelling
+    // window 1's transcription must be the same no-op it is for a generation.
+    const w = twoEngines();
+    beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    await settle();
+
+    await w.call(2, TRANSCRIBER.name, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+
+    expect(w.posted().filter((m) => m.method === 'cancel')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(TRANSCRIBER.name)).toBe(1);
+  });
+
+  it('releases both engines for a departing window, and only that window', async () => {
+    // A window that is gone is gone for every engine it was using. Scoped to
+    // the sender, across all engines — the two halves of the same rule.
+    const w = twoEngines();
+    const mineLlama = beginOn(w, 1, LLAMA_PLUGIN.name, 'r1');
+    const mineOther = beginOn(w, 1, TRANSCRIBER.name, 'r1');
+    const theirs = beginOn(w, 2, LLAMA_PLUGIN.name, 'r2');
+    await settle();
+    expect(w.supervisor.inflightCount).toBe(3);
+
+    w.supervisor.releaseRenderer(1, 'The window that started this generation was closed.');
+    await settle();
+
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(w.supervisor.inflightCountFor(TRANSCRIBER.name)).toBe(0);
+    expect(mineLlama()).toMatchObject({ ok: false, error: { code: 'RENDERER_GONE' } });
+    expect(mineOther()).toMatchObject({ ok: false, error: { code: 'RENDERER_GONE' } });
+    expect(theirs()).toBeUndefined();
+
+    // One cancel per abandoned turn, each on its own plugin — and none for the
+    // window that is still there.
+    const cancels = w.posted().filter((m) => m.method === 'cancel');
+    expect(cancels.map((m) => `${String(m.plugin)}/${String((m.args?.[0] as { requestId: string }).requestId)}`).sort()).toEqual(
+      ['LlamaCpp/r1', 'Transcriber/r1'],
+    );
+    // No terminal event was sent to a page that no longer exists.
+    expect(sawFrom(w.inbox, 1, TRANSCRIBER.name, 'end')).toEqual([]);
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+  });
+
+  it('drops an event from a plugin it serves no engine for', async () => {
+    // A host emitting for an engine main does not know about is not something
+    // to broadcast on a guess. Dropped, and said out loud.
+    const w = twoEngines();
+    w.emit('OnnxRuntime', 'onnxPartial', { requestId: 'r1' });
+    await settle();
+
+    expect(w.warnings.join('\n')).toMatch(/unknown plugin "OnnxRuntime"/);
+    expect(w.inbox.get(1)).toEqual([]);
+  });
+
+  it('drops an event name the engine s own definition does not declare', async () => {
+    // The manifest is the contract in both directions: a renderer cannot
+    // subscribe to an undeclared event, so delivering one would be delivering
+    // to nobody — and a host that has started emitting names we do not know is
+    // a host worth being told about.
+    const w = twoEngines();
+    w.emit(TRANSCRIBER.name, 'llamaToken', { requestId: 'r1', token: 'x' });
+    await settle();
+
+    expect(w.warnings.join('\n')).toMatch(/"llamaToken", which "Transcriber" does not declare/);
+    expect(w.inbox.get(1)).toEqual([]);
+  });
+
+  it('refuses two engines registered under one name', () => {
+    // The plugin name IS the wire address. Two engines sharing one is ambiguous
+    // in both directions and there is no arrangement of the maps that fixes it.
+    expect(
+      () =>
+        new Supervisor({
+          spawn: () => ({ link: createLinkPair().main, kill: () => undefined }),
+          notify: () => undefined,
+          timers: manualClock(),
+          engines: [LLAMA_ENGINE, { definition: LLAMA_PLUGIN }],
+        }),
+    ).toThrow(/two engines are registered as "LlamaCpp"/);
+  });
+
+  it('gives a plugin with no stream no turns, no owner and no scoped methods', () => {
+    // `DshHost` is one: two questions about the tree, no generation to own.
+    // It must still be servable, and it must not acquire a sender-scoped
+    // `generate` by accident.
+    const { supervisor } = wiredSupervisor({
+      engines: [LLAMA_ENGINE, { definition: DSH_PLUGIN }],
+    });
+    const dsh = supervisor.plugin(DSH_PLUGIN.name);
+    expect(dsh[SENDER_SCOPED]).toEqual([]);
+    expect(Object.keys(dsh).sort()).toEqual([...DSH_METHODS].sort());
+    expect(supervisor.inflightCountFor(DSH_PLUGIN.name)).toBe(0);
+    expect(supervisor.engines).toEqual([LLAMA_PLUGIN.name, DSH_PLUGIN.name]);
+  });
+});
+
+/* ══ The host runtime, serving two plugins ═════════════════════════════ */
+
+/**
+ * `HostRuntime` with llama.cpp AND a second engine on one link.
+ *
+ * This is the other end of the same seam: the supervisor's half is above, and
+ * this is the half that runs inside the utility process. It is driven through a
+ * real port, by hand, because the questions are about dispatch and refusal.
+ */
+function twoServed(
+  options: { fail?: Readonly<Record<string, string>>; guard?: CallGuard } = {},
+): {
+  call(plugin: string, method: string, args: readonly unknown[]): Promise<{
+    ok: boolean;
+    message: string;
+    data: unknown;
+  }>;
+  readonly events: { plugin: string; name: string; data: unknown }[];
+  readonly reached: { plugin: string; method: string; args: readonly unknown[] }[];
+  readonly warnings: string[];
+  /** Every (plugin, event) the runtime actually subscribed to, in order. */
+  readonly subscribed: { plugin: string; name: string }[];
+  /** Every subscription the runtime removed on dispose. */
+  readonly removed: string[];
+  dispose(): Promise<void>;
+  emitLlama(name: string, data: unknown): void;
+  emitOther(name: string, data: unknown): void;
+} {
+  const pair = createLinkPair();
+  const warnings: string[] = [];
+  const reached: { plugin: string; method: string; args: readonly unknown[] }[] = [];
+  const events: { plugin: string; name: string; data: unknown }[] = [];
+  const subscribed: { plugin: string; name: string }[] = [];
+  const removed: string[] = [];
+  const emitters = new Map<string, Map<string, (data: unknown) => void>>();
+
+  const implementation = (name: string, methods: readonly string[]): HostPluginImplementation => {
+    const listeners = new Map<string, (data: unknown) => void>();
+    emitters.set(name, listeners);
+    return {
+      ...Object.fromEntries(
+        methods.map((method) => [
+          method,
+          (...args: readonly unknown[]) => {
+            reached.push({ plugin: name, method, args });
+            const failure = options.fail?.[`${name}.${method}`];
+            if (failure !== undefined) return Promise.reject(new Error(failure));
+            return Promise.resolve({ plugin: name, method });
+          },
+        ]),
+      ),
+      addListener: (eventName: string, listener: (data: unknown) => void) => {
+        listeners.set(eventName, listener);
+        subscribed.push({ plugin: name, name: eventName });
+        return Promise.resolve({
+          remove: async (): Promise<void> => void removed.push(`${name}:${eventName}`),
+        });
+      },
+    } as unknown as HostPluginImplementation;
+  };
+
+  const runtime = createHostRuntime({
+    link: pair.host,
+    warn: (message: string) => warnings.push(message),
+  });
+  runtime.serve(LLAMA_PLUGIN, implementation(LLAMA_PLUGIN.name, LLAMA_METHODS), {
+    ...LLAMA_HOST_POLICY,
+    ...(options.guard === undefined ? {} : { guard: options.guard }),
+  });
+  // No shape table and no opacity table: a second engine's policy is its own,
+  // and llama.cpp's must not be applied to it by default.
+  runtime.serve(TRANSCRIBER, implementation(TRANSCRIBER.name, TRANSCRIBER.methods));
+
+  pair.main.onMessage((message) => {
+    const m = message as { k: string; plugin?: string; name?: string; data?: unknown };
+    if (m.k === 'ev') events.push({ plugin: m.plugin ?? '', name: m.name ?? '', data: m.data });
+  });
+
+  let nextId = 1;
+  return {
+    events,
+    reached,
+    warnings,
+    subscribed,
+    removed,
+    dispose: () => runtime.dispose(),
+    emitLlama: (name, data) => emitters.get(LLAMA_PLUGIN.name)?.get(name)?.(data),
+    emitOther: (name, data) => emitters.get(TRANSCRIBER.name)?.get(name)?.(data),
+    call: (plugin, method, args) =>
+      new Promise((done) => {
+        const id = nextId++;
+        pair.main.onMessage((message) => {
+          const answer = message as {
+            k: string;
+            id: number;
+            ok: boolean;
+            data?: unknown;
+            error?: { message: string };
+          };
+          if (answer.k !== 'ret' || answer.id !== id) return;
+          done({ ok: answer.ok, message: answer.error?.message ?? '', data: answer.data });
+        });
+        pair.main.postMessage({ k: 'call', id, plugin, method, args });
+      }),
+  };
+}
+
+describe('the inference host serves plugins by name', () => {
+  it('routes a shared method name to the plugin the call names', async () => {
+    // `generate` exists on both. Before the plugin dimension there was one
+    // implementation and one allowlist, so this call had exactly one possible
+    // destination whatever the caller meant.
+    const h = twoServed();
+    await h.call(TRANSCRIBER.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'r1' }]);
+    await h.call(LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'r1' }]);
+
+    expect(h.reached.map((r) => r.plugin)).toEqual([TRANSCRIBER.name, LLAMA_PLUGIN.name]);
+  });
+
+  it('applies each plugin s own method allowlist', async () => {
+    // `describe` is the transcriber's; `load` is llama.cpp's. Neither may be
+    // reached through the other's name, and the refusal says whose surface was
+    // actually asked.
+    const h = twoServed();
+    const wrongWay = await h.call(LLAMA_PLUGIN.name, 'describe', []);
+    const otherWay = await h.call(TRANSCRIBER.name, 'benchmark', [{ handle: 'h' }]);
+
+    expect(wrongWay.ok).toBe(false);
+    expect(wrongWay.message).toBe('inference host: "LlamaCpp" has no method "describe".');
+    expect(otherWay.ok).toBe(false);
+    expect(otherWay.message).toBe('inference host: "Transcriber" has no method "benchmark".');
+    expect(h.reached).toEqual([]);
+  });
+
+  it('refuses a call for a plugin it does not serve', async () => {
+    const h = twoServed();
+    const answer = await h.call('OnnxRuntime', 'transcribe', [{}]);
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toMatch(/no plugin named "OnnxRuntime"/);
+    expect(h.reached).toEqual([]);
+  });
+
+  it('applies each plugin s own argument-shape table, and only its own', async () => {
+    // llama.cpp's `generate` needs a handle and a requestId. The transcriber's
+    // `generate` is a different method that happens to share a name — applying
+    // llama's required fields to it would refuse legitimate calls, which is how
+    // a shared table breaks the engine it was not written for.
+    const h = twoServed();
+    const refused = await h.call(LLAMA_PLUGIN.name, 'generate', [{ prompt: 'p' }]);
+    const allowed = await h.call(TRANSCRIBER.name, 'generate', [{ audio: 'wav' }]);
+
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain('"generate"');
+    expect(refused.message).toContain('handle');
+    expect(allowed.ok).toBe(true);
+    expect(h.reached).toEqual([
+      { plugin: TRANSCRIBER.name, method: 'generate', args: [{ audio: 'wav' }] },
+    ]);
+  });
+
+  it('tags every forwarded event with the plugin that emitted it', async () => {
+    // The forwarding used to be `LLAMA_EVENTS.map(...)` with no plugin on the
+    // envelope. A second engine's events would have arrived indistinguishable
+    // from llama.cpp's — and `end` and `llamaEnd` are only different names by
+    // luck, not by construction.
+    const h = twoServed();
+    h.emitLlama('llamaToken', { requestId: 'r1', token: 'a' });
+    h.emitOther('chunk', { requestId: 'r1', text: 'b' });
+    await settle();
+
+    expect(h.events).toEqual([
+      { plugin: LLAMA_PLUGIN.name, name: 'llamaToken', data: { requestId: 'r1', token: 'a' } },
+      { plugin: TRANSCRIBER.name, name: 'chunk', data: { requestId: 'r1', text: 'b' } },
+    ]);
+  });
+
+  it('subscribes each plugin to exactly the events its definition declares', () => {
+    // The allowlist runs in this direction too. The forwarding loop used to be
+    // `LLAMA_EVENTS.map(...)` — a constant — so a second engine would have been
+    // subscribed to llama.cpp's three event names and to none of its own.
+    const h = twoServed();
+    expect(h.subscribed).toEqual([
+      ...LLAMA_EVENTS.map((name) => ({ plugin: LLAMA_PLUGIN.name, name })),
+      ...TRANSCRIBER.events.map((name) => ({ plugin: TRANSCRIBER.name, name })),
+    ]);
+  });
+
+  it('keeps one plugin s opaque-failure policy off the other', async () => {
+    // `load` is opaque for llama.cpp because its failure quotes the bytes of a
+    // file the renderer named. Nothing on the transcriber has that property, so
+    // its failures stay readable — which is the point of the table being per
+    // plugin rather than a rule about method names. Both engines fail here,
+    // with the same words, and only one of them is replaced.
+    // THE SAME METHOD NAME on both engines, so the only thing that can decide
+    // which policy applies is the plugin. FAULT INJECTED: making `#opaque` scan
+    // every registration's table for the method name replaced the transcriber's
+    // message too — `expected '…could not be loaded…' to be 'Invalid GGUF
+    // magic…'` — which is a diagnostic destroyed on behalf of an engine that
+    // never asked.
+    const quoted = 'Invalid GGUF magic. Expected "GGUF" but got "##"';
+    const h = twoServed({
+      fail: { 'LlamaCpp.load': quoted, 'Transcriber.load': quoted },
+    });
+    const hidden = await h.call(LLAMA_PLUGIN.name, 'load', [{ modelPath: '/m.gguf' }]);
+    const shown = await h.call(TRANSCRIBER.name, 'load', [{ anything: true }]);
+
+    expect(hidden.message).not.toContain('GGUF magic');
+    expect(hidden.message).toMatch(/could not be loaded/);
+    expect(shown.message).toBe(quoted);
+    // The engine's own words are kept on this side, named by plugin.
+    expect(h.warnings.join('\n')).toContain('LlamaCpp.load failed');
+    expect(Object.keys(LLAMA_OPAQUE_FAILURES)).toEqual(['load']);
+  });
+
+  it('keeps one plugin s path guard off the other', async () => {
+    // The model-directory confinement (defect [8]) is llama.cpp's, because it
+    // is about the directory llama.cpp's models live in. Applying it to another
+    // engine would refuse that engine's legitimate paths — a security control
+    // silently becoming a bug in code it was never written for.
+    //
+    // FAULT INJECTED: folding every registration's guard over the arguments
+    // (`reduce`) refused the transcriber's `/etc/hosts` too, and this test
+    // failed with `expected false to be true`.
+    const h = twoServed({ guard: modelPathGuard('/app-data/models') });
+    const refused = await h.call(LLAMA_PLUGIN.name, 'load', [{ modelPath: '/etc/hosts' }]);
+    const allowed = await h.call(TRANSCRIBER.name, 'load', [{ modelPath: '/etc/hosts' }]);
+
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toMatch(/model folder/);
+    expect(allowed.ok).toBe(true);
+    // Reached verbatim: no other engine's guard rewrote it on the way in.
+    expect(h.reached).toEqual([
+      { plugin: TRANSCRIBER.name, method: 'load', args: [{ modelPath: '/etc/hosts' }] },
+    ]);
+  });
+
+  it('answers one ping once, however many plugins are served', async () => {
+    // The ping is the boundary's, not a plugin's. Subscribed per plugin it
+    // would answer twice for two engines, and a supervisor matching on the
+    // echoed id would treat the second pong as an answer to a ping it never
+    // sent.
+    const pair = createLinkPair();
+    const seen: unknown[] = [];
+    const runtime = createHostRuntime({ link: pair.host });
+    const stub = {
+      addListener: async () => ({ remove: async (): Promise<void> => undefined }),
+    } as unknown as HostPluginImplementation;
+    runtime.serve({ name: 'A', methods: [], events: [] }, stub);
+    runtime.serve({ name: 'B', methods: [], events: [] }, stub);
+
+    pair.main.onMessage((message) => seen.push(message));
+    pair.main.postMessage({ k: 'ping', id: 9 });
+    await settle();
+
+    expect(seen).toEqual([{ k: 'pong', id: 9 }]);
+    expect(runtime.served).toEqual(['A', 'B']);
+  });
+
+  it('refuses to serve two plugins under one name', () => {
+    const runtime = createHostRuntime({ link: createLinkPair().host });
+    const stub = {
+      addListener: async () => ({ remove: async (): Promise<void> => undefined }),
+    } as unknown as HostPluginImplementation;
+    runtime.serve(LLAMA_PLUGIN, stub);
+    expect(() => runtime.serve(LLAMA_PLUGIN, stub)).toThrow(/"LlamaCpp" is already served/);
+  });
+
+  it('removes EVERY plugin s subscriptions on dispose, not just the first s', async () => {
+    // The disposer used to close over one plugin's handle array. With a
+    // registry it has to walk all of them, and a walk that stops at the first
+    // registration leaves the second engine subscribed to an engine that is
+    // going away.
+    const h = twoServed();
+    await h.dispose();
+    expect(h.removed.sort()).toEqual([
+      'LlamaCpp:llamaEnd',
+      'LlamaCpp:llamaThermal',
+      'LlamaCpp:llamaToken',
+      'Transcriber:chunk',
+      'Transcriber:end',
+      'Transcriber:level',
+    ]);
+  });
+
+  it('registers both definitions on the plugin bridge without a channel collision', () => {
+    // The renderer-facing half. Two plugins with two identically named methods
+    // are only safe because the channel scheme is `chatterang:call:<plugin>:
+    // <method>` — a flat namespace would register two handlers on one channel.
+    const host = new PluginHost(() => true);
+    const stub = (methods: readonly string[]): PluginImplementation =>
+      Object.fromEntries(methods.map((m) => [m, () => undefined])) as PluginImplementation;
+    host.register(LLAMA_PLUGIN, stub(LLAMA_METHODS));
+    host.register(TRANSCRIBER, stub(TRANSCRIBER.methods));
+
+    expect(channelCollisions([LLAMA_PLUGIN, TRANSCRIBER])).toEqual([]);
+    const channels = allowedChannels(host.manifest());
+    expect(channels.has(methodChannel(LLAMA_PLUGIN.name, 'generate'))).toBe(true);
+    expect(channels.has(methodChannel(TRANSCRIBER.name, 'generate'))).toBe(true);
+    expect(methodChannel(LLAMA_PLUGIN.name, 'generate')).not.toBe(
+      methodChannel(TRANSCRIBER.name, 'generate'),
+    );
   });
 });
