@@ -34,6 +34,31 @@ export interface PluginDefinition {
   readonly events: readonly string[];
 }
 
+/**
+ * Marks the methods of a plugin implementation that must be told WHICH renderer
+ * is calling.
+ *
+ * A plugin implementation is a bag of methods called with the renderer's own
+ * arguments and nothing else, which is the right default: a method that cannot
+ * see the caller cannot leak one caller's data to another. But two of
+ * `LlamaCpp`'s methods own per-renderer STATE — a generation belongs to the
+ * window that started it — and without the caller's identity the supervisor was
+ * cancelling every window's generations when any one of them navigated, and
+ * broadcasting every window's tokens to all of them. That is defect [11].
+ *
+ * A symbol rather than a string key, because the string namespace here IS the
+ * method namespace: a plugin with a method called `senderScopedMethods` would
+ * otherwise silently become a scoping declaration. Opt-in rather than
+ * positional, because a method quietly gaining a leading argument is exactly
+ * the kind of change that typechecks and then passes the renderer's first
+ * argument as a sender id.
+ *
+ * Methods listed under this key are invoked as `method(senderId, ...args)`.
+ * `PluginHost.register` refuses a name that the definition does not declare, so
+ * a typo is a boot failure rather than a method that silently stays unscoped.
+ */
+export const SENDER_SCOPED: unique symbol = Symbol('chatterang.bridge.senderScoped');
+
 /** What the renderer learns at boot: every plugin, and nothing else. */
 export interface BootManifest {
   readonly platform: 'electron';
@@ -105,8 +130,8 @@ export interface DshStatus {
   readonly services: readonly string[];
   /** Provider routes confirmed registered on the `llm` service. */
   readonly routes: readonly string[];
-  /** `BootReport.treeAssertion` — what was NOT checked, verbatim. */
-  readonly treeAssertion: string;
+  /** `BootReport.notChecked` — what was NOT checked, verbatim. */
+  readonly notChecked: string;
   /** The assertion failure, when there was one. */
   readonly error?: string;
 }

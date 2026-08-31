@@ -16,6 +16,7 @@ import type {
   LlamaTokenId,
 } from '@chatterang/inference-node';
 import { LlamaCppNode } from '@chatterang/inference-node';
+import { modelPathGuard } from '@chatterang/desktop/host/model-paths';
 
 import {
   BRIDGE_KEYS,
@@ -28,6 +29,8 @@ import {
   LLAMA_METHODS,
   LLAMA_PLUGIN,
   PluginHost,
+  RENDERER_TEARDOWN_EVENTS,
+  SENDER_SCOPED,
   Supervisor,
   allowedChannels,
   assertCloneable,
@@ -37,17 +40,25 @@ import {
   createRendererBridge,
   fromWireError,
   installCapacitorShim,
+  REQUIRED_ARGUMENTS,
+  assertCallShape,
   methodChannel,
+  releaseRendererOn,
   serveLlamaCpp,
+  teardownReason,
 } from '@chatterang/desktop/bridge';
 import type {
   BootManifest,
+  EventPayload,
   HostMessage,
+  InvokeResult,
   MessageLink,
   NotifyListeners,
   PluginImplementation,
   PreloadBridge,
   RendererIpc,
+  CallGuard,
+  RendererTeardownTargets,
   ShimTarget,
   SupervisorPolicy,
   SupervisorTimers,
@@ -420,8 +431,15 @@ function harness(
     killHost: (reason = 'SIGKILL') => hosts[hosts.length - 1]?.kill(reason),
     destroyRenderer: () => {
       rendererAlive = false;
-      host.releaseSender(1);
-      supervisor.releaseRenderer('The window that started this generation was closed.');
+      // Through the same dispatcher `main.ts` uses, rather than a copy of what
+      // it happens to do today: the point of `releaseRendererOn` is that all
+      // three departures run one teardown, and a test that reimplements the
+      // teardown proves only that the test agrees with itself.
+      releaseRendererOn('destroyed', 1, {
+        releaseSender: (id) => host.releaseSender(id),
+        releaseRenderer: (id, reason) => supervisor.releaseRenderer(id, reason),
+        forget: () => undefined,
+      });
     },
   };
 }
@@ -1363,11 +1381,11 @@ describe('a dead inference host is replaced, not mourned', () => {
     // inference stack is usable.
     const { supervisor, hosts, clock } = wiredSupervisor({});
     expect(supervisor.hostStatus().mounted).toBe(false);
-    expect(supervisor.hostStatus().treeAssertion).toMatch(/has not finished booting/);
+    expect(supervisor.hostStatus().notChecked).toMatch(/has not finished booting/);
 
     hosts[0]?.send({
       k: 'boot',
-      status: { mounted: true, services: ['llm'], routes: ['llama'], treeAssertion: 'walked' },
+      status: { mounted: true, services: ['llm'], routes: ['llama'], notChecked: 'walked' },
     });
     expect(supervisor.hostStatus()).toMatchObject({ mounted: true, routes: ['llama'] });
 
@@ -1380,7 +1398,7 @@ describe('a dead inference host is replaced, not mourned', () => {
     await clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
     hosts[1]?.send({
       k: 'boot',
-      status: { mounted: true, services: ['llm'], routes: ['llama-2'], treeAssertion: 'walked' },
+      status: { mounted: true, services: ['llm'], routes: ['llama-2'], notChecked: 'walked' },
     });
     expect(supervisor.hostStatus().routes).toEqual(['llama-2']);
   });
@@ -1734,5 +1752,735 @@ describe('an error code survives the contextBridge hop', () => {
     await expect(capacitor.nativePromise('LlamaCpp', 'load', {})).rejects.toThrow(
       /not a result/,
     );
+  });
+});
+
+/* ── Two windows, and the things that used to leak between them ───────── */
+
+/**
+ * A supervisor wired to a `PluginHost` with TWO renderers subscribed.
+ *
+ * The harness above ships one window because A5 ships one window, which is
+ * exactly why the sender-scoping defect went unnoticed: with a single renderer,
+ * "deliver to the owner" and "deliver to everyone" are the same behaviour and
+ * no test can tell them apart. These tests open a second one, where they are
+ * different behaviours and the shipped code chose the wrong one.
+ *
+ * The inference host is the `wiredSupervisor` fake, because these tests need to
+ * emit a token for a named requestId at a chosen moment — which is the whole
+ * question — rather than to run an engine.
+ */
+function twoWindows(options: { notify?: NotifyListeners } = {}): {
+  readonly host: PluginHost;
+  readonly supervisor: Supervisor;
+  readonly hosts: WiredHost[];
+  readonly clock: ManualClock;
+  readonly warnings: string[];
+  /** What each renderer actually received, in order. */
+  readonly inbox: Map<number, EventPayload[]>;
+  /** Invoke as a renderer, through the real router. */
+  call(senderId: number, method: string, args: readonly unknown[]): Promise<InvokeResult>;
+} {
+  const inbox = new Map<number, EventPayload[]>([
+    [1, []],
+    [2, []],
+  ]);
+  const host = new PluginHost((senderId, payload) => {
+    const box = inbox.get(senderId);
+    if (box === undefined) return false;
+    box.push(structuredClone(payload));
+    return true;
+  });
+
+  const wired = wiredSupervisor({
+    // A `generate` is deliberately left unanswered: the test decides when the
+    // turn ends, which is the only way to have two of them in flight at once.
+    notify:
+      options.notify ??
+      ((eventName, data, ownerId) =>
+        host.notifyListeners(LLAMA_PLUGIN.name, eventName, data, ownerId)),
+  });
+
+  host.register(LLAMA_PLUGIN, wired.supervisor as unknown as PluginImplementation);
+  const router = createMainRouter(host);
+
+  for (const senderId of inbox.keys()) {
+    for (const eventName of LLAMA_EVENTS) {
+      host.addListener(senderId, LLAMA_PLUGIN.name, eventName, 1 + LLAMA_EVENTS.indexOf(eventName));
+    }
+  }
+
+  return {
+    host,
+    supervisor: wired.supervisor,
+    hosts: wired.hosts,
+    clock: wired.clock,
+    warnings: wired.warnings,
+    inbox,
+    call: (senderId, method, args) =>
+      router.handle(senderId, methodChannel(LLAMA_PLUGIN.name, method), args),
+  };
+}
+
+/** Every event of one name a renderer received, newest last. */
+function seen(inbox: Map<number, EventPayload[]>, senderId: number, eventName: string): unknown[] {
+  return (inbox.get(senderId) ?? [])
+    .filter((payload) => payload.eventName === eventName)
+    .map((payload) => payload.data);
+}
+
+/** Start a generation from one window and leave it in flight. */
+function begin(
+  w: ReturnType<typeof twoWindows>,
+  senderId: number,
+  requestId: string,
+): Promise<InvokeResult> {
+  return w.call(senderId, 'generate', [{ handle: 'h', prompt: 'p', requestId }]);
+}
+
+describe('a generation belongs to the window that started it', () => {
+  it('[11] delivers a token only to the window whose turn it is', async () => {
+    // DEFECT [11]. `plugin-host.ts` did `void senderId` and `notifyListeners`
+    // had no owner parameter, so EVERY llamaToken went to EVERY subscribed
+    // window. Two windows chatting meant each one's answer appeared, token by
+    // token, inside the other one's turn. This is the leak half of the defect;
+    // the cancellation half is the test below.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    void begin(w, 2, 'r2');
+    await settle();
+
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'r1', token: 'one' } });
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'r2', token: 'two' } });
+
+    expect(seen(w.inbox, 1, 'llamaToken')).toEqual([{ requestId: 'r1', token: 'one' }]);
+    expect(seen(w.inbox, 2, 'llamaToken')).toEqual([{ requestId: 'r2', token: 'two' }]);
+  });
+
+  it('[11] delivers the terminal event only to the window whose turn it is', async () => {
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    void begin(w, 2, 'r2');
+    await settle();
+
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    await settle();
+
+    expect(seen(w.inbox, 1, 'llamaEnd')).toHaveLength(1);
+    expect(seen(w.inbox, 2, 'llamaEnd')).toEqual([]);
+  });
+
+  it('[11] broadcasts an event that belongs to the machine, not to a turn', async () => {
+    // The mirror test, and the reason ownership is a parameter rather than a
+    // blanket rule: `llamaThermal` describes the hardware. Scoping it to an
+    // owner it does not have would deliver it to nobody, which is a quieter
+    // failure than delivering it to everybody and just as wrong.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaThermal', data: { state: 'nominal' } });
+
+    expect(seen(w.inbox, 1, 'llamaThermal')).toEqual([{ state: 'nominal' }]);
+    expect(seen(w.inbox, 2, 'llamaThermal')).toEqual([{ state: 'nominal' }]);
+  });
+
+  it('[11] drops a token for a generation nobody is running', async () => {
+    // With no owner to address it to, the choice is broadcast or drop, and
+    // broadcast is how the leak worked in the first place.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaToken', data: { requestId: 'ghost', token: 'x' } });
+
+    expect(seen(w.inbox, 1, 'llamaToken')).toEqual([]);
+    expect(seen(w.inbox, 2, 'llamaToken')).toEqual([]);
+    expect(w.warnings.join('\n')).toMatch(/token for a generation that is not in flight/);
+  });
+
+  it('[11] a window going away ends its own generation and NOT the other one', async () => {
+    // The cancellation half. `releaseRenderer` walked the whole map, so one
+    // window's reload rejected the other window's generate promise with a
+    // reason that was, for it, simply false.
+    const w = twoWindows();
+    const first = begin(w, 1, 'r1');
+    const second = begin(w, 2, 'r2');
+    await settle();
+    expect(w.supervisor.inflightCount).toBe(2);
+
+    w.supervisor.releaseRenderer(1, 'The window that started this generation was closed.');
+    await settle();
+
+    expect(await first).toMatchObject({ ok: false, error: { code: 'RENDERER_GONE' } });
+    expect(w.supervisor.inflightCount).toBe(1);
+
+    // The survivor is still a live turn: it answers, and it answers to itself.
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r2', 'stop') });
+    const call = w.hosts[0]?.posted.find(
+      (m) => (m as { method?: string }).method === 'generate',
+    ) as { id: number } | undefined;
+    w.hosts[0]?.send({ k: 'ret', id: (call?.id ?? 0) + 1, ok: true, data: endEvent('r2', 'stop') });
+    await settle();
+    expect(await second).toMatchObject({ ok: true });
+    expect(seen(w.inbox, 2, 'llamaEnd')).toHaveLength(1);
+    expect(seen(w.inbox, 1, 'llamaEnd')).toEqual([]);
+  });
+
+  it('[11] one window cannot cancel another window s generation', async () => {
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+    const before = w.hosts[0]?.posted.length ?? 0;
+
+    // Window 2 asks to cancel window 1's turn. A no-op, and deliberately
+    // indistinguishable from cancelling something that was never running — a
+    // different answer would let one window probe what another is doing.
+    expect(await w.call(2, 'cancel', [{ requestId: 'r1' }])).toMatchObject({ ok: true });
+    expect(w.hosts[0]?.posted.length).toBe(before);
+
+    // Its owner can. Not awaited: the owner's cancel is a real call to the
+    // host and this fake host answers nothing, so the promise stays pending —
+    // which is itself the proof that window 2's cancel took the early return
+    // rather than the same path.
+    void w.call(1, 'cancel', [{ requestId: 'r1' }]);
+    await settle();
+    expect(w.hosts[0]?.posted.at(-1)).toMatchObject({ method: 'cancel' });
+    expect(w.hosts[0]?.posted.length).toBe(before + 1);
+  });
+});
+
+describe('two turns cannot share one requestId', () => {
+  it('[12] refuses a generation whose requestId is already running', async () => {
+    // DEFECT [12]. `#inflight.set` was unconditional, so the second generate
+    // REPLACED the first one's record — and that record carries `ended`. One
+    // llamaEnd then served two turns: the first never got one and was left to
+    // its deadline, and the second arrived against a record already settled.
+    const w = twoWindows();
+    const first = begin(w, 1, 'r1');
+    await settle();
+
+    const second = await begin(w, 1, 'r1');
+    expect(second).toMatchObject({ ok: false });
+    expect((second as { error: { message: string } }).error.message).toMatch(
+      /requestId "r1" is already running/,
+    );
+
+    // The refusal did not disturb the turn that was already running: it still
+    // ends exactly once, and its own promise still settles. Under the shipped
+    // code the second generate replaced the first one's record, so the first
+    // turn's promise was left to the deadline — which is what this assertion
+    // catches, and it catches it as a HANG rather than a wrong value.
+    expect(w.supervisor.inflightCount).toBe(1);
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    const call = w.hosts[0]?.posted.find(
+      (m) => (m as { method?: string }).method === 'generate',
+    ) as { id: number } | undefined;
+    w.hosts[0]?.send({ k: 'ret', id: call?.id ?? 0, ok: true, data: endEvent('r1', 'stop') });
+
+    expect(await first).toMatchObject({ ok: true });
+    expect(seen(w.inbox, 1, 'llamaEnd')).toHaveLength(1);
+    expect(w.supervisor.inflightCount).toBe(0);
+  });
+
+  it('[12] refuses it across windows too, because the host keys by it as well', async () => {
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+    const clash = await begin(w, 2, 'r1');
+    expect(clash).toMatchObject({ ok: false });
+    expect(w.supervisor.inflightCount).toBe(1);
+  });
+
+  it('[12] frees the id again once the turn is over', async () => {
+    // The refusal is about a LIVE id, not a used one. A renderer that restarts
+    // its counter after a reload must not be locked out.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+    w.supervisor.releaseRenderer(1, 'closed');
+    await settle();
+    expect(w.supervisor.inflightCount).toBe(0);
+
+    void begin(w, 1, 'r1');
+    await settle();
+    expect(w.supervisor.inflightCount).toBe(1);
+  });
+});
+
+describe('a terminal event that could not be delivered is not spent', () => {
+  it('[13] retries the turn s llamaEnd when the first delivery throws', async () => {
+    // DEFECT [13]. `#settle` set `entry.ended = true` and THEN notified, so a
+    // delivery that threw consumed the turn's one terminal event without
+    // delivering it. The page saw no llamaEnd at all — while the `ret` that
+    // arrived afterwards found `ended` already set, returned silently, and
+    // resolved the generate promise as a clean success.
+    //
+    // The payload here is one `PluginHost` refuses BEFORE delivering anything,
+    // which is the realistic shape: `assertCloneable` runs first, so a bad
+    // payload throws with nothing sent.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+
+    // A function in the payload: structured clone cannot carry it.
+    w.hosts[0]?.send({
+      k: 'ev',
+      name: 'llamaEnd',
+      data: { ...endEvent('r1', 'stop'), onDone: (): void => undefined },
+    });
+    await settle();
+
+    expect(seen(w.inbox, 1, 'llamaEnd')).toEqual([]);
+    expect(w.warnings.join('\n')).toMatch(/could not deliver llamaEnd/);
+
+    // The turn is still open, so the host's own return settles it — with a
+    // payload we can actually deliver.
+    const call = w.hosts[0]?.posted.find(
+      (m) => (m as { method?: string }).method === 'generate',
+    ) as { id: number } | undefined;
+    w.hosts[0]?.send({ k: 'ret', id: call?.id ?? 0, ok: true, data: endEvent('r1', 'stop') });
+    await settle();
+
+    expect(seen(w.inbox, 1, 'llamaEnd')).toHaveLength(1);
+    expect(w.supervisor.inflightCount).toBe(0);
+  });
+
+  it('[13] still emits exactly one when the first delivery succeeds', async () => {
+    // The other half: retrying a FAILED delivery must not turn a successful one
+    // into two. `ended` is set from the delivery's result, so a delivered event
+    // closes the turn exactly as before.
+    const w = twoWindows();
+    void begin(w, 1, 'r1');
+    await settle();
+
+    w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') });
+    const call = w.hosts[0]?.posted.find(
+      (m) => (m as { method?: string }).method === 'generate',
+    ) as { id: number } | undefined;
+    w.hosts[0]?.send({ k: 'ret', id: call?.id ?? 0, ok: true, data: endEvent('r1', 'stop') });
+    await settle();
+
+    expect(seen(w.inbox, 1, 'llamaEnd')).toHaveLength(1);
+  });
+
+  it('[13] a delivery failure does not escape into the message loop', async () => {
+    // `#receive` runs inside the link's message listener, which in production
+    // is Electron's `message` handler on a utility process. An exception
+    // thrown out of it is an unhandled error in the main process.
+    const w = twoWindows({
+      notify: () => {
+        throw new Error('delivery exploded');
+      },
+    });
+    void begin(w, 1, 'r1');
+    await settle();
+
+    expect(() =>
+      w.hosts[0]?.send({ k: 'ev', name: 'llamaEnd', data: endEvent('r1', 'stop') }),
+    ).not.toThrow();
+    expect(() =>
+      w.hosts[0]?.send({ k: 'ev', name: 'llamaThermal', data: { state: 'hot' } }),
+    ).not.toThrow();
+  });
+});
+
+/* ── Sender scoping, as a mechanism ───────────────────────────────────── */
+
+describe('PluginHost sender scoping', () => {
+  const DEFINITION = { name: 'Scoped', methods: ['plain', 'owned'], events: [] };
+
+  it('[11] passes the sender id only to the methods that asked for it', async () => {
+    const calls: { method: string; args: unknown[] }[] = [];
+    const host = new PluginHost(() => true);
+    host.register(DEFINITION, {
+      plain: (...args) => void calls.push({ method: 'plain', args: [...args] }),
+      owned: (...args) => void calls.push({ method: 'owned', args: [...args] }),
+      [SENDER_SCOPED]: ['owned'],
+    });
+
+    await host.invoke(7, 'Scoped', 'plain', ['a', 'b']);
+    await host.invoke(7, 'Scoped', 'owned', ['a', 'b']);
+
+    expect(calls[0]).toEqual({ method: 'plain', args: ['a', 'b'] });
+    // In FRONT of the renderer's arguments, never appended: appending would
+    // make the position depend on how many arguments the renderer chose to
+    // send, and the renderer chooses that.
+    expect(calls[1]).toEqual({ method: 'owned', args: [7, 'a', 'b'] });
+  });
+
+  it('[11] refuses to register a scoped name the plugin does not declare', () => {
+    // A typo here means an author believes a method is scoped and it is not,
+    // which is defect [11] reintroduced silently. Refused at boot instead.
+    const host = new PluginHost(() => true);
+    expect(() =>
+      host.register(DEFINITION, {
+        plain: () => undefined,
+        owned: () => undefined,
+        [SENDER_SCOPED]: ['owned', 'ownd'],
+      }),
+    ).toThrow(/marks method\(s\) sender-scoped that it does not declare: ownd/);
+  });
+
+  it('[11] the supervisor scopes exactly generate and cancel', () => {
+    // Named as an assertion rather than left implicit: every other LlamaCpp
+    // method answers a question about the machine or the loaded model, with the
+    // same answer for every window. If a method that owns per-window state is
+    // added later, this list is where it has to appear.
+    const { supervisor } = wiredSupervisor({});
+    expect([...(supervisor[SENDER_SCOPED] ?? [])].sort()).toEqual(['cancel', 'generate']);
+    for (const method of supervisor[SENDER_SCOPED] ?? []) {
+      expect(LLAMA_METHODS).toContain(method);
+    }
+  });
+
+  it('[11] scopes delivery in notifyListeners, without pruning the others', () => {
+    // The owner filter must SKIP a foreign subscription, not attempt delivery
+    // and prune it: `notifyListeners` deletes any subscription whose delivery
+    // is refused, so probing one window while addressing another would quietly
+    // unsubscribe it.
+    const reached: number[] = [];
+    const host = new PluginHost((senderId) => {
+      reached.push(senderId);
+      return true;
+    });
+    host.register(LLAMA_PLUGIN, {
+      ...Object.fromEntries(LLAMA_METHODS.map((m) => [m, () => undefined])),
+    });
+    host.addListener(1, LLAMA_PLUGIN.name, 'llamaToken', 1);
+    host.addListener(2, LLAMA_PLUGIN.name, 'llamaToken', 1);
+
+    expect(host.notifyListeners(LLAMA_PLUGIN.name, 'llamaToken', { t: 1 }, 2)).toBe(1);
+    expect(reached).toEqual([2]);
+    expect(host.subscriptionCount()).toBe(2);
+
+    expect(host.notifyListeners(LLAMA_PLUGIN.name, 'llamaToken', { t: 2 })).toBe(2);
+    expect(reached).toEqual([2, 1, 2]);
+  });
+});
+
+/* ── A renderer can go away three ways, and one of them was unhandled ─── */
+
+describe('renderer teardown', () => {
+  function targets(): {
+    log: string[];
+    released: number[];
+    forgotten: number[];
+    api: RendererTeardownTargets;
+  } {
+    const log: string[] = [];
+    const released: number[] = [];
+    const forgotten: number[] = [];
+    return {
+      log,
+      released,
+      forgotten,
+      api: {
+        releaseSender: (id) => log.push(`releaseSender:${String(id)}`),
+        releaseRenderer: (id, reason) => {
+          released.push(id);
+          log.push(`releaseRenderer:${String(id)}:${reason}`);
+        },
+        forget: (id) => {
+          forgotten.push(id);
+          log.push(`forget:${String(id)}`);
+        },
+      },
+    };
+  }
+
+  it('[6] a crash runs the same cleanup as a close', () => {
+    // DEFECT [6]. `main.ts` registered cleanup on `did-start-navigation` and
+    // `destroyed` only. A renderer CRASH fires neither — an instrumented build
+    // logged `render-process-gone reason=crashed destroyed=false` — so neither
+    // `releaseSender` nor `releaseRenderer` ran: the subscriptions stayed in
+    // the table and the generation kept decoding for a page that no longer
+    // existed.
+    const t = targets();
+    releaseRendererOn('render-process-gone', 5, t.api);
+    expect(t.log).toEqual([
+      'releaseSender:5',
+      `releaseRenderer:5:${teardownReason('render-process-gone')}`,
+    ]);
+  });
+
+  it('[6] every listed departure releases both the subscriptions and the turns', () => {
+    // Asserted over the LIST rather than per event, so an event added to
+    // `RENDERER_TEARDOWN_EVENTS` without a case is caught here.
+    for (const event of RENDERER_TEARDOWN_EVENTS) {
+      const t = targets();
+      releaseRendererOn(event, 9, t.api);
+      expect(t.log.slice(0, 2)).toEqual([
+        'releaseSender:9',
+        `releaseRenderer:9:${teardownReason(event)}`,
+      ]);
+      expect(t.released).toEqual([9]);
+      expect(teardownReason(event).length).toBeGreaterThan(10);
+    }
+  });
+
+  it('[6] only a destroyed renderer is forgotten', () => {
+    // A crashed webContents is NOT destroyed and can be reloaded into.
+    // Forgetting it would leave the reloaded page unable to receive events.
+    for (const event of RENDERER_TEARDOWN_EVENTS) {
+      const t = targets();
+      releaseRendererOn(event, 3, t.api);
+      expect(t.forgotten).toEqual(event === 'destroyed' ? [3] : []);
+    }
+  });
+
+  it('[6] names the three departures, and says which is which', () => {
+    expect([...RENDERER_TEARDOWN_EVENTS]).toEqual([
+      'did-start-navigation',
+      'render-process-gone',
+      'destroyed',
+    ]);
+    // Each reason describes what happened to THAT window. The page shows this
+    // string as the failure of its own turn, so a crash saying "navigated
+    // away" would be a lie the user could act on.
+    expect(teardownReason('render-process-gone')).toMatch(/stopped responding/);
+    expect(teardownReason('did-start-navigation')).toMatch(/navigated away/);
+    expect(teardownReason('destroyed')).toMatch(/closed/);
+    expect(new Set(RENDERER_TEARDOWN_EVENTS.map(teardownReason)).size).toBe(3);
+  });
+});
+
+/* ── The inference-host boundary checks what it is handed ─────────────── */
+
+/**
+ * `serveLlamaCpp` on one side of a real port, driven by hand from the other.
+ *
+ * Direct rather than through the whole bridge, because the questions here are
+ * about the host's own boundary: what it refuses, and what it is willing to say
+ * about a failure. The supervisor sitting in between would add nothing but
+ * distance from the assertion.
+ */
+function hostBoundary(options: {
+  plugin?: Partial<LlamaCppPlugin>;
+  guard?: CallGuard;
+}): {
+  call(method: string, args: readonly unknown[]): Promise<{ ok: boolean; message: string }>;
+  readonly warnings: string[];
+  readonly reached: { method: string; args: readonly unknown[] }[];
+} {
+  const pair = createLinkPair();
+  const warnings: string[] = [];
+  const reached: { method: string; args: readonly unknown[] }[] = [];
+
+  const base = Object.fromEntries(
+    LLAMA_METHODS.map((method) => [
+      method,
+      (...args: readonly unknown[]) => {
+        reached.push({ method, args });
+        return Promise.resolve({ ok: true });
+      },
+    ]),
+  );
+  const plugin = {
+    ...base,
+    ...options.plugin,
+    addListener: async () => ({ remove: async (): Promise<void> => undefined }),
+  } as unknown as LlamaCppPlugin;
+
+  serveLlamaCpp({
+    link: pair.host,
+    plugin,
+    warn: (message) => warnings.push(message),
+    ...(options.guard === undefined ? {} : { guard: options.guard }),
+  });
+
+  let nextId = 1;
+  return {
+    warnings,
+    reached,
+    call: (method, args) =>
+      new Promise((resolveCall) => {
+        const id = nextId++;
+        pair.main.onMessage((message) => {
+          const answer = message as { k: string; id: number; ok: boolean; error?: { message: string } };
+          if (answer.k !== 'ret' || answer.id !== id) return;
+          resolveCall({ ok: answer.ok, message: answer.error?.message ?? '' });
+        });
+        pair.main.postMessage({ k: 'call', id, method, args });
+      }),
+  };
+}
+
+describe('argument shape at the inference-host boundary', () => {
+  it('[16] names the method and the field, instead of a stack-trace artefact', async () => {
+    // DEFECT [16]. Passing `modelId` where the contract says `modelPath` used
+    // to produce `Cannot read properties of undefined (reading 'toLowerCase')`
+    // — raised inside node-llama-cpp, flattened onto the host link, flattened
+    // again onto the plugin bridge, and delivered to the page naming neither
+    // the method nor the field.
+    const h = hostBoundary({});
+    const answer = await h.call('load', [{ modelId: 'gemma-4-12b' }]);
+
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toContain('"load"');
+    expect(answer.message).toContain('modelPath');
+    // And the engine was never reached, so no native code ran on a bad call.
+    expect(h.reached).toEqual([]);
+  });
+
+  it('[16] checks every method that has a required field', async () => {
+    const cases: [string, unknown[], string][] = [
+      ['unload', [{}], 'handle'],
+      ['generate', [{ handle: 'h', prompt: 'p' }], 'requestId'],
+      ['generate', [{ prompt: 'p', requestId: 'r' }], 'handle'],
+      ['cancel', [{}], 'requestId'],
+      ['tokenize', [{ text: 'x' }], 'handle'],
+      ['countTokens', [{ handle: 'h' }], 'text'],
+      ['benchmark', [{}], 'handle'],
+    ];
+    for (const [method, args, field] of cases) {
+      const answer = await hostBoundary({}).call(method, args);
+      expect(answer.ok, `${method} should have been refused`).toBe(false);
+      expect(answer.message).toContain(field);
+      expect(answer.message).toContain(`"${method}"`);
+    }
+  });
+
+  it('[16] refuses an empty identifier but allows an empty prompt', async () => {
+    // An empty `handle` or `requestId` names nothing; letting one through only
+    // moves the failure further in. An empty prompt is unusual and meaningful.
+    expect((await hostBoundary({}).call('unload', [{ handle: '' }])).ok).toBe(false);
+    expect((await hostBoundary({}).call('cancel', [{ requestId: '' }])).ok).toBe(false);
+    expect(
+      (await hostBoundary({}).call('generate', [{ handle: 'h', prompt: '', requestId: 'r' }])).ok,
+    ).toBe(true);
+  });
+
+  it('[16] refuses a missing options object without reading through it', async () => {
+    for (const args of [[], [undefined], [null], ['a string'], [['an', 'array']]]) {
+      const answer = await hostBoundary({}).call('load', args);
+      expect(answer.ok).toBe(false);
+      expect(answer.message).toMatch(/needs an options object/);
+    }
+  });
+
+  it('[16] leaves the methods that need nothing alone', async () => {
+    for (const method of ['getCapabilities', 'getThermalState', 'listLoaded']) {
+      expect((await hostBoundary({}).call(method, [])).ok).toBe(true);
+    }
+  });
+
+  it('[16] never echoes the value back, because one of the fields is the prompt', async () => {
+    // This message crosses two boundaries and lands wherever the renderer logs
+    // errors. Naming the TYPE of a bad value is a diagnostic; quoting it puts a
+    // conversation in a log by way of an error message.
+    const answer = await hostBoundary({}).call('generate', [
+      { handle: 'h', prompt: { secret: 'the user typed this' }, requestId: 'r' },
+    ]);
+    expect(answer.ok).toBe(false);
+    expect(answer.message).not.toContain('the user typed this');
+    expect(answer.message).toContain('a object');
+  });
+
+  it('[16] covers every method the host serves, with no gaps', () => {
+    // The table lists methods that need nothing as empty arrays rather than
+    // omitting them, so it is a statement about all ten.
+    expect(Object.keys(REQUIRED_ARGUMENTS).sort()).toEqual([...LLAMA_METHODS].sort());
+  });
+
+  it('[16] is callable as a pure function, which is how it is checked', () => {
+    expect(() => assertCallShape('load', [{ modelPath: '/models/x.gguf' }])).not.toThrow();
+    expect(() => assertCallShape('load', [{}])).toThrow(/modelPath/);
+    // An unknown method is not this check's business — the allowlist runs
+    // first, and two guards disagreeing about which methods exist is how a
+    // legitimate call starts being refused for the wrong reason.
+    expect(() => assertCallShape('somethingElse', [])).not.toThrow();
+  });
+});
+
+describe('load is not a filesystem oracle', () => {
+  /** The guard `host/entry.ts` installs, with a root a test can name. */
+  const ROOT = '/app-data/models';
+
+  it('[8] refuses a path outside the model directory, before the engine runs', async () => {
+    const h = hostBoundary({ guard: modelPathGuard(ROOT) });
+    const answer = await h.call('load', [{ modelPath: '/etc/hosts' }]);
+
+    expect(answer.ok).toBe(false);
+    expect(answer.message).toMatch(/must name a file inside the application's model folder/);
+    expect(h.reached).toEqual([]);
+    // The refusal does not echo the path back. Reflecting a caller-supplied
+    // path is one more piece of the filesystem confirmed to a web page.
+    expect(answer.message).not.toContain('/etc/hosts');
+  });
+
+  it('[8] guards mmprojPath and draftModelPath too, not just modelPath', async () => {
+    // The same loader, under two other names. Fixing one of three would leave
+    // the oracle open with an extra keystroke.
+    for (const field of ['mmprojPath', 'draftModelPath']) {
+      const h = hostBoundary({ guard: modelPathGuard(ROOT) });
+      const answer = await h.call('load', [
+        { modelPath: `${ROOT}/ok.gguf`, [field]: '/etc/hosts' },
+      ]);
+      expect(answer.ok, field).toBe(false);
+      expect(answer.message).toContain(field);
+      expect(h.reached).toEqual([]);
+    }
+  });
+
+  it('[8] passes a legitimate model through, resolved', async () => {
+    const h = hostBoundary({ guard: modelPathGuard(ROOT) });
+    expect((await h.call('load', [{ modelPath: 'gemma/model.gguf', gpuLayers: -1 }])).ok).toBe(true);
+    expect(h.reached[0]?.args[0]).toEqual({ modelPath: `${ROOT}/gemma/model.gguf`, gpuLayers: -1 });
+  });
+
+  it('[8] leaves every other method s arguments untouched', async () => {
+    const h = hostBoundary({ guard: modelPathGuard(ROOT) });
+    await h.call('generate', [{ handle: 'h', prompt: 'p', requestId: 'r' }]);
+    expect(h.reached[0]?.args).toEqual([{ handle: 'h', prompt: 'p', requestId: 'r' }]);
+  });
+
+  it('[8] does NOT forward the engine s message, which quotes the file s bytes', async () => {
+    // The second half, and neither half is sufficient alone. node-llama-cpp
+    // answers a non-GGUF file with `Invalid GGUF magic. Expected "GGUF" but got
+    // "##\n#"` — the first four bytes, quoted back. Confining the path stops
+    // `/etc/hosts`; it does not stop the same read of anything the user has put
+    // in the model folder, and the page named the file either way.
+    const h = hostBoundary({
+      plugin: {
+        load: () => {
+          throw new Error('Invalid GGUF magic. Expected "GGUF" but got "##\n#"');
+        },
+      },
+      guard: modelPathGuard(ROOT),
+    });
+    const answer = await h.call('load', [{ modelPath: `${ROOT}/notes.txt` }]);
+
+    expect(answer.ok).toBe(false);
+    expect(answer.message).not.toContain('GGUF magic');
+    expect(answer.message).not.toContain('##');
+    expect(answer.message).toMatch(/could not be loaded/);
+    // The engine's own words are kept, on this side of the boundary, for
+    // anyone debugging. That is where the cost of the fixed message is paid.
+    expect(h.warnings.join('\n')).toContain('Invalid GGUF magic');
+  });
+
+  it('[8] still forwards OUR refusals verbatim — they are the useful ones', async () => {
+    // The shape check and the path guard raise messages we wrote, naming a
+    // method and a field. Those must not be swallowed by the same blanket that
+    // hides the engine's, or the fix for [16] is undone by the fix for [8].
+    const h = hostBoundary({ guard: modelPathGuard(ROOT) });
+    expect((await h.call('load', [{ modelId: 'x' }])).message).toContain('modelPath');
+    expect((await h.call('load', [{ modelPath: '/etc/hosts' }])).message).toMatch(
+      /model folder/,
+    );
+  });
+
+  it('[8] leaves other methods failures readable', async () => {
+    // Only `load` names a file whose contents an error can describe. Blanketing
+    // every method would cost every diagnostic in the app for nothing.
+    const h = hostBoundary({
+      plugin: {
+        unload: () => {
+          throw new Error('no such handle: h9');
+        },
+      },
+    });
+    expect((await h.call('unload', [{ handle: 'h9' }])).message).toContain('no such handle: h9');
   });
 });

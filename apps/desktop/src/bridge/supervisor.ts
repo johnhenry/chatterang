@@ -37,6 +37,13 @@
  * whatever is left, and it spawns again, up to a crash-loop cap. `HANDLE_LOST`
  * only means something because there is a live host to reload into.
  *
+ * AND A TURN BELONGS TO ONE WINDOW. Every generation records the renderer that
+ * started it. Its tokens and its `llamaEnd` are addressed at that renderer
+ * alone, only that renderer can cancel it, and only that renderer going away
+ * ends it. Before that, `PluginHost` discarded the invoking sender, so a second
+ * window received the first window's answer token by token and either window
+ * reloading cancelled both.
+ *
  * The renderer's authority is (1), not (2). `src/ai/backends/llama-cpp.ts`
  * loops `while (!finished && !failure)`, both set by the `generate` promise;
  * nothing in `src/` consumes `llamaEnd` at all. That is also the RIGHT thing
@@ -55,10 +62,20 @@ import type {
   LlamaEventName,
   WireError,
 } from './protocol.js';
-import { HANDLE_LOST, HOST_TIMEOUT, fromWireError } from './protocol.js';
+import { HANDLE_LOST, HOST_TIMEOUT, SENDER_SCOPED, fromWireError } from './protocol.js';
 
-/** How the supervisor reaches the renderer. Supplied by `PluginHost`. */
-export type NotifyListeners = (eventName: LlamaEventName, data: unknown) => void;
+/**
+ * How the supervisor reaches the renderer. Supplied by `PluginHost`.
+ *
+ * `ownerId` addresses the event at the one window the generation belongs to.
+ * Omitting it broadcasts, which is right for `llamaThermal` — a property of the
+ * machine — and was wrong for everything else.
+ */
+export type NotifyListeners = (
+  eventName: LlamaEventName,
+  data: unknown,
+  ownerId?: number,
+) => void;
 
 /**
  * The clock and the timers, injected.
@@ -145,7 +162,9 @@ interface PendingCall {
 
 interface InflightGeneration {
   readonly callId: number;
-  /** True once this turn's single `llamaEnd` has been emitted. */
+  /** The renderer that started this turn, and the only one it belongs to. */
+  readonly senderId: number;
+  /** True once this turn's single `llamaEnd` has been DELIVERED. */
   ended: boolean;
 }
 
@@ -269,7 +288,7 @@ export class Supervisor {
         mounted: false,
         services: [],
         routes: [],
-        treeAssertion: 'not reported: no inference host is running',
+        notChecked: 'not reported: no inference host is running',
         error: this.#closed,
       };
     }
@@ -277,11 +296,21 @@ export class Supervisor {
       mounted: false,
       services: [],
       routes: [],
-      treeAssertion: 'not reported: the inference host has not finished booting',
+      notChecked: 'not reported: the inference host has not finished booting',
     };
   }
 
   /* ── The declared LlamaCpp surface ─────────────────────────────────── */
+
+  /**
+   * The two methods `PluginHost` calls with the renderer's id in front.
+   *
+   * Exactly these two, and the shortness of the list is the point: everything
+   * else here is a question about the machine or the loaded model, with the
+   * same answer for every window. `generate` and `cancel` are the two that own
+   * per-window state.
+   */
+  readonly [SENDER_SCOPED]: readonly string[] = ['generate', 'cancel'];
 
   getCapabilities = (): Promise<unknown> => this.#call('getCapabilities', []);
   getThermalState = (): Promise<unknown> => this.#call('getThermalState', []);
@@ -306,8 +335,19 @@ export class Supervisor {
    * including when the host has already died, in which case the crash path has
    * settled the turn and there is nothing left to cancel.
    */
-  cancel = async (options: unknown): Promise<void> => {
+  cancel = async (senderId: number, options: unknown): Promise<void> => {
     if (this.#handle === null) return;
+    // A window may only cancel its own turn. Cancelling by requestId alone
+    // would let any window stop any other window's generation, which is the
+    // same missing ownership check as defect [11] pointing the other way.
+    const requestId = (options as { requestId?: unknown } | null)?.requestId;
+    if (typeof requestId === 'string') {
+      const entry = this.#inflight.get(requestId);
+      // Not in flight at all is a no-op per the contract; in flight for
+      // SOMEONE ELSE is also a no-op, and deliberately indistinguishable from
+      // it, so a cancel cannot be used to probe what another window is doing.
+      if (entry === undefined || entry.senderId !== senderId) return;
+    }
     await this.#call('cancel', [options]);
   };
 
@@ -317,7 +357,7 @@ export class Supervisor {
    * The in-flight record is created BEFORE the call is posted, so a host that
    * dies between the two still has its turn settled by `#onClose`.
    */
-  generate = (options: unknown): Promise<GenerateResult> => {
+  generate = (senderId: number, options: unknown): Promise<GenerateResult> => {
     const requestId = (options as GenerateOptions | undefined)?.requestId;
     if (typeof requestId !== 'string' || requestId.length === 0) {
       return Promise.reject(new Error('desktop bridge: generate requires a requestId.'));
@@ -325,9 +365,29 @@ export class Supervisor {
     if (this.#closed !== null) {
       return Promise.reject(codedError(this.#closed, HANDLE_LOST));
     }
+    // DEFECT [12]. This used to `set` unconditionally, so a second generation
+    // reusing a live requestId REPLACED the first one's record — and the record
+    // is what carries `ended`. Two turns then shared one terminal event: the
+    // first turn's `llamaEnd` was never emitted and its promise was left to the
+    // deadline, while the second's arrived against a record that had already
+    // been through `#settle`.
+    //
+    // Refused rather than merged, because the id is also the host's key: the
+    // inference host tracks generations by requestId too, so two live turns
+    // sharing one is ambiguous all the way down and there is no arrangement of
+    // this map that fixes that. Cancelling by that id would be ambiguous, and
+    // so would every token it emits.
+    if (this.#inflight.has(requestId)) {
+      return Promise.reject(
+        new Error(
+          `desktop bridge: a generation with requestId "${requestId}" is already running. ` +
+            'Each turn needs its own id; the inference host keys generations by it too.',
+        ),
+      );
+    }
 
     const callId = this.#nextCallId;
-    this.#inflight.set(requestId, { callId, ended: false });
+    this.#inflight.set(requestId, { callId, senderId, ended: false });
     return this.#call('generate', [options], {
       timeoutMs: this.#policy.generateIdleTimeoutMs,
       requestId,
@@ -360,15 +420,17 @@ export class Supervisor {
    * event no longer exists and a synthesised `llamaEnd` broadcast to whatever
    * page loaded next would be a turn it never started.
    *
-   * SCOPE. This cancels EVERY in-flight generation, not only the ones the
-   * departing renderer owned, because `PluginHost` does not pass the invoking
-   * sender down to a plugin implementation. That is correct for A5, which
-   * ships one window, and wrong the day a second one opens. The missing piece
-   * is a sender id on the invoke path; it is named here rather than left for
-   * someone to discover.
+   * SCOPED TO ONE RENDERER, which is defect [11]. This used to cancel EVERY
+   * in-flight generation regardless of which window departed, because
+   * `PluginHost` discarded the invoking sender and there was nothing here to
+   * scope by. With two windows open that made one window's reload silently kill
+   * the other window's answer mid-sentence — and the second window's `generate`
+   * promise rejected with a reason ("the page that started this generation
+   * navigated away") that was, for it, simply false.
    */
-  releaseRenderer(reason: string): void {
+  releaseRenderer(senderId: number, reason: string): void {
     for (const [requestId, entry] of this.#inflight) {
+      if (entry.senderId !== senderId) continue;
       entry.ended = true;
       this.#post({ k: 'call', id: this.#nextCallId++, method: 'cancel', args: [{ requestId }] });
       const pending = this.#calls.get(entry.callId);
@@ -478,13 +540,29 @@ export class Supervisor {
         return;
       }
       case 'ev': {
-        if (message.name === 'llamaToken') this.#extendDeadline(message.data);
         if (message.name === 'llamaEnd') {
           const end = message.data as GenerationEndEvent;
           this.#settle(end.requestId, end);
           return;
         }
-        this.#notify(message.name, message.data);
+        if (message.name === 'llamaToken') {
+          this.#extendDeadline(message.data);
+          const owner = this.#ownerOf(message.data);
+          // A token for a generation this supervisor is not tracking is
+          // DROPPED, not broadcast. Broadcasting it would put the text of one
+          // window's answer into every other window — which is what the code
+          // did for every token, and is the half of defect [11] that leaks data
+          // rather than merely cancelling the wrong thing.
+          if (owner === undefined) {
+            this.#warn('inference host sent a token for a generation that is not in flight.');
+            return;
+          }
+          this.#emit('llamaToken', message.data, owner);
+          return;
+        }
+        // `llamaThermal` describes the machine, not a conversation. It has no
+        // owner and every window is entitled to it.
+        this.#emit(message.name, message.data);
         return;
       }
       case 'boot': {
@@ -520,6 +598,38 @@ export class Supervisor {
     const pending = this.#calls.get(entry.callId);
     if (pending === undefined) return;
     pending.deadlineAt = this.#timers.now() + this.#policy.generateIdleTimeoutMs;
+  }
+
+  /** Which renderer owns the generation this event belongs to, if any. */
+  #ownerOf(data: unknown): number | undefined {
+    const requestId = (data as { requestId?: unknown } | null)?.requestId;
+    if (typeof requestId !== 'string') return undefined;
+    return this.#inflight.get(requestId)?.senderId;
+  }
+
+  /**
+   * Deliver one event, and say whether it actually went out.
+   *
+   * The swallow lives HERE rather than in `main.ts`, and moving it is what
+   * makes defect [13]'s fix real instead of decorative. `main.ts` used to wrap
+   * `notifyListeners` in its own try/catch and log — so a delivery that threw
+   * (a payload structured clone refuses, which `PluginHost` checks BEFORE it
+   * delivers anything) never reached this class, and `#settle` had already
+   * marked the turn ended. The page got no terminal event, ever, while the
+   * `generate` promise resolved perfectly happily.
+   *
+   * @returns false when the event did not reach anyone, so the caller can
+   *   decline to spend the turn's one terminal event on a delivery that failed.
+   */
+  #emit(eventName: LlamaEventName, data: unknown, ownerId?: number): boolean {
+    try {
+      this.#notify(eventName, data, ownerId);
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#warn(`could not deliver ${eventName}: ${detail}`);
+      return false;
+    }
   }
 
   /**
@@ -583,6 +693,15 @@ export class Supervisor {
    * discipline, applied at the boundary that flag cannot see across. A double
    * `llamaEnd` is not a hang; it is a conversation turn counted twice, which
    * is data corruption and harder to notice.
+   *
+   * DEFECT [13] was the ORDER of the two statements below. `entry.ended = true`
+   * came first, so a delivery that threw consumed the turn's one terminal event
+   * without delivering it: the page never saw `llamaEnd`, and the later `ret`
+   * from the host found `ended` already set, skipped silently, and resolved the
+   * `generate` promise as a success. Marking it from the delivery's own result
+   * means a failed delivery leaves the turn open for the next path — the
+   * host's `ret`, or `#onClose`'s synthesised end — to try again, with a
+   * payload we built ourselves rather than one the engine handed us.
    */
   #settle(requestId: string, end: GenerationEndEvent): void {
     const entry = this.#inflight.get(requestId);
@@ -591,8 +710,7 @@ export class Supervisor {
       return;
     }
     if (entry.ended) return;
-    entry.ended = true;
-    this.#notify('llamaEnd', end);
+    entry.ended = this.#emit('llamaEnd', end, entry.senderId);
   }
 
   /**
@@ -615,8 +733,7 @@ export class Supervisor {
     // promise it is racing rejects.
     for (const [requestId, entry] of this.#inflight) {
       if (!entry.ended) {
-        entry.ended = true;
-        this.#notify('llamaEnd', synthesiseEnd(requestId, message));
+        entry.ended = this.#emit('llamaEnd', synthesiseEnd(requestId, message), entry.senderId);
       }
     }
     this.#inflight.clear();

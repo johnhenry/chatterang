@@ -22,16 +22,29 @@ export interface BootReport {
   /** Provider routes confirmed registered on the `llm` service. */
   readonly routes: readonly string[];
   /**
-   * Why no tree-level (per-entry) assertion ran.
+   * What this report does NOT cover, in words.
    *
-   * Layers 1 and 2 below catch every failure mode this package can produce: a
-   * missing `llm` service, and a plugin that mounted but registered nothing. A
-   * third layer walking the loader's entries would additionally catch unrelated
-   * rows stuck PENDING — but no loader is mounted on this target, so that code
-   * could not be exercised and is not written. This field says so out loud
-   * instead of letting a caller assume the tree was checked.
+   * WAS CALLED `treeAssertion`, and that was defect [15]. The name read as the
+   * result of a third assertion layer — a per-entry walk of the loader's
+   * profile rows for anything stuck PENDING or FAILED — and both of its
+   * branches return a sentence saying no such walk ran. A field named for an
+   * assertion, always holding a description of an assertion that did not
+   * happen, is worse than an honestly-named one: it makes A4's "assert the
+   * mount" story read thicker than it is, and the whole reason this file exists
+   * is that Cordis is silent where it should be loud.
+   *
+   * THE WALK IS STILL NOT IMPLEMENTED, and it is not implemented rather than
+   * half-implemented on purpose: `@deepseek-ai/cordis` ships no loader, none is
+   * installed, and none is mounted on this target — so there is no way to
+   * exercise such a walk, and an unexercised assertion is precisely the kind of
+   * harness this project has already been burnt by. Renaming the field is the
+   * honest change; writing a walk that no test can reach would be the
+   * flattering one.
+   *
+   * Layers 1 and 2 do catch every failure mode this package can produce: a
+   * missing `llm` service, and a plugin that mounted but registered nothing.
    */
-  readonly treeAssertion: string;
+  readonly notChecked: string;
 }
 
 /**
@@ -107,9 +120,14 @@ export function assertBoot(ctx: Context, expectation: BootExpectation): BootRepo
   return {
     services: [...expectation.services],
     routes: [...routes],
-    treeAssertion:
+    // Neither branch performs a walk, and the field name now says so. The two
+    // branches differ only in WHY there was nothing to walk, which is worth
+    // keeping: "no loader" is a property of this target, "not implemented" is
+    // a property of this package, and a caller that ever sees the second one
+    // has mounted a loader and should know the rows are unchecked.
+    notChecked:
       ctx.get('loader') === undefined
-        ? 'skipped: no loader is mounted, so there are no profile entries to walk'
-        : 'not performed: a loader is mounted, but per-entry PENDING/FAILED assertion is not implemented in A4',
+        ? 'the per-entry tree walk: no loader is mounted, so there are no profile entries to walk'
+        : 'the per-entry tree walk: a loader IS mounted, but walking its rows for PENDING/FAILED is not implemented',
   };
 }

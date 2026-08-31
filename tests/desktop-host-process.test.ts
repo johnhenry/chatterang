@@ -141,7 +141,7 @@ describe('the inference host, killed for real', () => {
       expect(alive(second.pid)).toBe(true);
       expect(children).toHaveLength(2);
       // And the status is the new host's, not the dead one's.
-      expect(supervisor.hostStatus().treeAssertion).toContain(String(second.pid));
+      expect(supervisor.hostStatus().notChecked).toContain(String(second.pid));
     },
     15_000,
   );

@@ -18,14 +18,17 @@
  * only the Electron objects it has to touch. This is the same split that makes
  * `src/bridge` testable, applied to the security surface.
  *
- * NOTHING IN THIS FILE IS A FIX. It is an extraction: every predicate below
- * behaves exactly as the code in `main.ts` behaved before it moved, including
- * where that behaviour is wrong. The known-wrong parts are marked DEFECT and
- * have tests that assert the wrong answer on purpose, so the phase that fixes
- * them has a failing test to flip rather than a blank page.
+ * The file arrived as a pure EXTRACTION — every predicate behaving exactly as
+ * `main.ts` had behaved, wrong parts included, each marked DEFECT with a test
+ * asserting the wrong answer on purpose. Two of those have since been fixed
+ * here ([5] the origin test, [14] the external-scheme allowlist) and their
+ * tests flipped, which is the whole point of having pinned them: the change is
+ * visible as a diff in a test file rather than as a silent edit nothing was
+ * watching. Each fix keeps a WAS DEFECT note saying what the old behaviour was
+ * and why the obvious repair would have been wrong.
  */
 
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 /** The privileged scheme the production bundle is served from. */
 export const APP_SCHEME = 'chatterang-desktop';
@@ -34,18 +37,62 @@ export const APP_SCHEME = 'chatterang-desktop';
 export const APP_ORIGIN = `${APP_SCHEME}://app`;
 
 /**
+ * The two third-party origins the app's own `index.html` reaches for.
+ *
+ * DEFECT [9]: the production policy allowed NEITHER, while `index.html` links a
+ * Google Fonts stylesheet and the font files it pulls. In a packaged build the
+ * app's own typography was therefore refused by its own policy — silently, as a
+ * console message in a window nobody has open, with the page falling back to
+ * the system stack. The CSP and the markup disagreed and nothing checked.
+ *
+ * THE RIGHT FIX IS TO SELF-HOST THESE, AND THAT IS NOT WHAT THIS IS. Vendoring
+ * Archivo and IBM Plex Mono into the bundle would delete both origins, restore
+ * `font-src 'self' data:`, and remove a third-party round trip from the cold
+ * start of an app whose whole premise is that it does not phone anywhere. I did
+ * not do it because it means downloading font binaries into the repository, and
+ * that is not a thing to do on a user's machine without asking them. It is a
+ * fetch away for whoever picks this up:
+ *
+ *   1. put `archivo-*.woff2` and `ibm-plex-mono-*.woff2` under `public/fonts/`;
+ *   2. replace the `<link>` and both `<link rel="preconnect">` in `index.html`
+ *      with local `@font-face` rules (the family names in
+ *      `src/styles/tokens.css` already lead the stacks, so nothing else moves);
+ *   3. delete this constant and put `font-src 'self' data:` back.
+ *
+ * The test in `tests/desktop-security.test.ts` derives the allowed origins from
+ * `index.html` itself, so step 2 FAILS THE SUITE until step 3 is done — the
+ * policy cannot silently stay wide after the markup stops needing it, which is
+ * the drift that produced this defect in the first place.
+ *
+ * THE TRADE, PLAINLY: with these two origins the desktop build renders the
+ * typography the design was drawn in (Archivo's width axis is used by
+ * `--wdth-condensed`/`--wdth-expanded` and has no system-font equivalent) and
+ * matches the web build, at the cost of one request to Google on every cold
+ * start. Without them the app renders in the system stack and talks to nobody.
+ * The web build already makes that request unconditionally — it has no CSP — so
+ * this leaves the desktop shell no worse than the platform it mirrors, rather
+ * than quietly making the desktop the only place the design does not apply.
+ */
+const FONT_STYLE_ORIGIN = 'https://fonts.googleapis.com';
+const FONT_FILE_ORIGIN = 'https://fonts.gstatic.com';
+
+/**
  * The Content-Security-Policy served with every document from the app scheme.
  *
  * `'unsafe-inline'` in `style-src` is load-bearing: the renderer's styling
  * injects style elements at runtime. Scripts have no such escape hatch, which
  * is the half that matters.
+ *
+ * The two font origins are the ONLY external hosts in the whole policy, and
+ * they are named individually rather than as `https:` — see above for why they
+ * are here at all and what removing them takes.
  */
 export const CSP_PRODUCTION = [
   "default-src 'self'",
   "script-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
+  `style-src 'self' 'unsafe-inline' ${FONT_STYLE_ORIGIN}`,
   "img-src 'self' data: blob:",
-  "font-src 'self' data:",
+  `font-src 'self' data: ${FONT_FILE_ORIGIN}`,
   "connect-src 'self' https: wss:",
   "object-src 'none'",
   "frame-src 'none'",
@@ -82,44 +129,100 @@ const HTML_TYPE = MIME['.html'] ?? 'text/html; charset=utf-8';
  * sites in `main.ts` had their own copy of this expression; a single predicate
  * means a fix cannot land on one and miss the other.
  *
- * DEFECT [5]: this is a string prefix test, so it is not an origin test.
- * `chatterang-desktop://appzz` and `chatterang-desktop://app-evil` both pass —
- * and `protocol.handle` ignores the URL host entirely, so those sibling hosts
- * are served the same bundle from the same disk. `tests/desktop-security.test.ts`
- * asserts today's wrong answers so that the fix (compare `new URL(url).origin`)
- * shows up as those tests flipping rather than as a silent behaviour change.
+ * WAS DEFECT [5]: this used to be `url.startsWith(APP_ORIGIN)`, which is a
+ * string prefix test and therefore not an origin test at all.
+ * `chatterang-desktop://appzz`, `chatterang-desktop://app-evil` and
+ * `chatterang-desktop://app.evil.example` are all DIFFERENT origins that share
+ * the prefix, and every one of them was trusted — while `protocol.handle`
+ * ignored the URL host entirely and served each of them the same bundle off the
+ * same disk. A page there reached every plugin channel. The dev-server arm had
+ * the identical hole: `http://localhost:5273` prefixes `http://localhost:52739`.
  *
- * The dev-server arm has the same shape and the same hole:
- * `http://localhost:5273` prefixes `http://localhost:52739`. It only applies
- * when `CHATTERANG_DEV_SERVER_URL` is set, and `scripts/sync.mjs` refuses to
- * package a build that has one.
+ * NOT `new URL(url).origin`, WHICH WOULD HAVE BROKEN THE APP. The defect report
+ * proposed comparing `.origin`, and that is wrong here: WHATWG only defines a
+ * tuple origin for *special* schemes, so in Node — which is what runs in
+ * Electron's main process — `new URL('chatterang-desktop://app').origin` is the
+ * string `'null'`. Comparing it to `APP_ORIGIN` is false for our own pages, so
+ * the shipped app would have trusted nothing, shown no plugins, and refused to
+ * navigate to itself. The comparison is built from `protocol` + `host` instead,
+ * which is the tuple Chromium actually uses for a scheme registered
+ * `standard: true`.
  *
  * @param url the URL to judge, as `webContents.getURL()` reports it.
  * @param devServerUrl `CHATTERANG_DEV_SERVER_URL`, or `''` in a real build.
  */
 export function isTrustedOrigin(url: string, devServerUrl: string): boolean {
-  if (url.startsWith(APP_ORIGIN)) return true;
-  return devServerUrl !== '' && url.startsWith(devServerUrl);
+  const origin = originOf(url);
+  if (origin === null) return false;
+  if (origin === APP_ORIGIN) return true;
+  if (devServerUrl === '') return false;
+  const dev = originOf(devServerUrl);
+  return dev !== null && origin === dev;
+}
+
+/**
+ * The `scheme://host[:port]` tuple of `url`, or null if there isn't one.
+ *
+ * Null covers three separate refusals, and each is deliberate:
+ *
+ *   - the string does not parse as a URL at all (`''`, `'not a url'`);
+ *   - it carries no host (`file:///x`, `about:blank`, `chatterang-desktop:/x`
+ *     with one slash) — a hostless URL cannot equal a host-bearing origin, and
+ *     saying so here beats letting `'file://' === 'chatterang-desktop://app'`
+ *     answer it by accident;
+ *   - it carries credentials (`chatterang-desktop://app@evil/`). Those parse to
+ *     host `evil` so the comparison would already refuse them, but a URL whose
+ *     userinfo is designed to be mistaken for the host is refused outright
+ *     rather than by a coincidence of parsing.
+ *
+ * The host is lower-cased because Chromium lower-cases it for a standard
+ * scheme and Node does not, so `chatterang-desktop://APP/` is the same origin
+ * and must answer the same way.
+ */
+function originOf(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.host === '') return null;
+  if (parsed.username !== '' || parsed.password !== '') return null;
+  return `${parsed.protocol}//${parsed.host.toLowerCase()}`;
 }
 
 /* ── Leaving the app ──────────────────────────────────────────────────── */
 
+/** The only two schemes a link may hand to the operating system. */
+const EXTERNAL_SCHEMES: readonly string[] = ['http:', 'https:'];
+
 /**
  * May this URL be handed to the OS via `shell.openExternal`?
  *
- * DEFECT [14]: TODAY, ANYTHING MAY. There is no allowlist in `main.ts` — both
- * `will-navigate` and `setWindowOpenHandler` pass a page-controlled string
- * straight to the OS handler, so `file://`, `smb://` and every macOS-registered
- * application scheme launch on the user's behalf. Model output renders as
- * Markdown, which makes the string model-reachable.
+ * WAS DEFECT [14]: this returned `true` for everything, because `main.ts` had
+ * no allowlist — `will-navigate` and `setWindowOpenHandler` passed a
+ * page-controlled string straight to the OS handler. `file://`, `smb://` and
+ * every macOS-registered application scheme (`ms-msdt:`, and whatever else the
+ * user has installed) launched on the user's behalf. Model output renders as
+ * Markdown, so the string is model-reachable: a model that emits
+ * `[click](ms-excel:ofv|u|…)` was enough.
  *
- * This function exists so the fix has exactly one place to land and both call
- * sites already route through it. It returns `true` unconditionally because
- * that is what the shipped code does; the tests assert that, and the fix flips
- * them. The parameter is deliberately unused for now.
+ * Two schemes, matched on the PARSED protocol rather than on the text. A prefix
+ * test would be the same mistake as the one above: `https:...` is a scheme and
+ * `httpsfoo:` is a different one, and only the parser knows which is which.
+ * Anything that does not parse is refused — an unparseable string is not a
+ * safer input than a parseable one.
+ *
+ * This is a pure predicate on purpose. It is tested by calling it, never by
+ * firing a real OS handler; `shell.openExternal` is not something a test suite
+ * should be able to reach.
  */
-export function isAllowedExternalUrl(_url: string): boolean {
-  return true;
+export function isAllowedExternalUrl(url: string): boolean {
+  try {
+    return EXTERNAL_SCHEMES.includes(new URL(url).protocol);
+  } catch {
+    return false;
+  }
 }
 
 /* ── Serving the bundle from disk ─────────────────────────────────────── */
@@ -176,4 +279,83 @@ export function resolveBundleRequest(root: string, pathname: string): BundleTarg
     extension === '' ? HTML_TYPE : (MIME[extension] ?? 'application/octet-stream');
 
   return contentType === HTML_TYPE ? { file, contentType, csp: CSP_PRODUCTION } : { file, contentType };
+}
+
+/**
+ * Resolve a whole request URL, host included — what `protocol.handle` needs.
+ *
+ * The other half of DEFECT [5]. `protocol.handle` is registered for the SCHEME,
+ * not for one host on it, so it was handed `chatterang-desktop://app-evil/…`
+ * and answered by looking at the pathname alone. The sibling host was served
+ * the same bundle off the same disk, which is what turned a loose prefix test
+ * into a second, fully working copy of the app at an origin the trust check
+ * would then have to keep refusing forever.
+ *
+ * Refusing here means there is nothing at that origin to load in the first
+ * place, so the two halves close from opposite directions: `isTrustedOrigin`
+ * stops a page there reaching a plugin, and this stops a page existing there.
+ *
+ * @returns null for a foreign origin or an escaping path; the caller answers 404.
+ */
+export function resolveBundleUrl(root: string, url: string): BundleTarget | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  // `''` for the dev server: the dev server is loaded over http and never
+  // reaches this handler, so the only origin this may serve is our own.
+  if (!isTrustedOrigin(url, '')) return null;
+  return resolveBundleRequest(root, parsed.pathname);
+}
+
+/* ── Model files ──────────────────────────────────────────────────────── */
+
+/**
+ * Confine a model path to the app's model directory, or refuse it.
+ *
+ * WAS DEFECT [8], THE FIRST HALF. `LlamaCpp.load` took an arbitrary absolute
+ * path and handed it to the engine, which made the plugin a filesystem oracle
+ * for the page: calling
+ * `invoke('LlamaCpp','load',[{modelPath:'/etc/hosts'}])` from the live page
+ * rejected with `Invalid GGUF magic. Expected "GGUF" but got "##\n#"` — the
+ * literal first four bytes of a file the renderer cannot otherwise read. The
+ * same applies to `mmprojPath` and `draftModelPath`, which are the same
+ * parameter under two other names and were both open.
+ *
+ * The second half is in `bridge/host-runtime.ts`: even for a path inside the
+ * directory, the engine's own failure message is not forwarded. Either half
+ * alone leaves the other leak — confine the path and the message still quotes
+ * bytes of any file the user put in the model directory; hide the message and
+ * the *timing* and *shape* of the failure still distinguish a readable file
+ * from an absent one anywhere on the disk.
+ *
+ * A RELATIVE path is resolved against the root, so `gemma/model.gguf` works and
+ * `../../../etc/hosts` does not. An ABSOLUTE path is kept absolute — that is
+ * what `resolve` does with one — and then has to be inside the root like any
+ * other, which is what makes `/etc/hosts` a refusal rather than a read.
+ *
+ * WHAT THIS DOES NOT DO: it does not resolve symlinks. A symlink placed INSIDE
+ * the model directory and pointing outside it would still be followed by the
+ * engine. Closing that needs `realpath`, which is async and file-existence
+ * dependent, and belongs in the host rather than in a pure function; it is
+ * stated here rather than left to be assumed, and it requires an attacker who
+ * can already write into app-private storage.
+ *
+ * @param modelRoot the app's model directory, absolute.
+ * @param candidate the path the renderer asked for.
+ * @returns the resolved absolute path, or null if it is not inside the root.
+ */
+export function confineModelPath(modelRoot: string, candidate: string): string | null {
+  // A NUL byte cannot escape the root — truncation only shortens, and a prefix
+  // of something under the root is still under it. What it CAN do is make the
+  // path we validate and return differ from the path the native addon opens,
+  // because the C representation stops at the NUL. A guard whose answer
+  // describes a different file than the one that gets opened is not a guard.
+  if (candidate === '' || candidate.includes('\0')) return null;
+  const root = resolve(modelRoot);
+  const resolved = resolve(root, candidate);
+  // Strictly inside: the root itself is a directory, never a model.
+  return resolved.startsWith(root.endsWith(sep) ? root : `${root}${sep}`) ? resolved : null;
 }

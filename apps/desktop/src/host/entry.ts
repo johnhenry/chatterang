@@ -23,7 +23,28 @@ import { LlamaCppNode } from '@chatterang/inference-node';
 import { serveLlamaCpp } from '../bridge/host-runtime.js';
 import type { MessageLink } from '../bridge/protocol.js';
 import { mountDsh } from './dsh.js';
+import { modelPathGuard } from './model-paths.js';
 import { DesktopLlamaBackend } from './llama-backend.js';
+
+/**
+ * Where models live, as main told us.
+ *
+ * Passed as `argv[2]` by `main.ts` because only main can call
+ * `app.getPath('userData')`. There is no fallback ON PURPOSE: a host that
+ * cannot tell where the model directory is has no basis for confining anything
+ * to it, and quietly picking a directory would be a confinement to the wrong
+ * place — which reads as a working guard and is not one.
+ */
+function modelRoot(): string {
+  const root = process.argv[2];
+  if (root === undefined || root === '') {
+    throw new Error(
+      'inference host: no model directory was supplied. main.ts must fork this entry point ' +
+        'with the model root as its first argument.',
+    );
+  }
+  return root;
+}
 
 /** Electron's utility-process parent port, typed only as much as we use it. */
 interface ParentPort {
@@ -59,6 +80,7 @@ async function main(): Promise<void> {
     link,
     plugin,
     warn: (message) => console.warn(`[inference-host] ${message}`),
+    guard: modelPathGuard(modelRoot()),
   });
 
   const router = new Router({ routingStrategy: 'explicit', fallbackStrategy: 'none' });

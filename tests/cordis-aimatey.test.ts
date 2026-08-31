@@ -922,7 +922,13 @@ describe('boot assertion', () => {
     expect(report.routes).toEqual([ROUTER_SENTINEL, 'echo']);
     // Layers 1 and 2 are all this target can honestly assert: no loader is
     // mounted, so there are no profile entries to walk.
-    expect(report.treeAssertion).toMatch(/^skipped: no loader/);
+    // [15]: this field was called `treeAssertion`, which read as the result of
+    // a third assertion layer while both of its branches said no such layer
+    // ran. Renamed to say what it holds. The walk is still not implemented —
+    // no loader ships with `@deepseek-ai/cordis`, so nothing could exercise
+    // one — and the name is now honest about that rather than flattering.
+    expect(report.notChecked).toMatch(/^the per-entry tree walk: no loader/);
+    expect(report).not.toHaveProperty('treeAssertion');
   });
 
   it('names every missing service, not just the first', () => {

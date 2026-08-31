@@ -106,11 +106,15 @@ not:
    no runtime export, so there is nothing to compare against anyway);
 2. every route you shipped is actually registered on `llm`.
 
-It returns a `BootReport` whose `treeAssertion` field says what it did **not**
+It returns a `BootReport` whose `notChecked` field says what it did **not**
 check. A third layer, walking a loader's entries for rows stuck PENDING or
 FAILED, is not implemented: no loader is mounted on this target, so that code
 could not be exercised, and an unexercised assertion is exactly the kind of
 harness this project has already been burnt by.
+
+That field used to be called `treeAssertion`, which read as the *result of* a
+third layer while every value it could hold described a layer that never ran.
+The walk is still unimplemented; the name no longer implies otherwise.
 
 ## `@deepseek-ai/dsh-llm` is not a DeepSeek provider
 

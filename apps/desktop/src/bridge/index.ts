@@ -24,6 +24,8 @@ export {
   methodChannel,
 } from './channels.js';
 export { PluginHost } from './plugin-host.js';
+export { RENDERER_TEARDOWN_EVENTS, releaseRendererOn, teardownReason } from './renderer-lifecycle.js';
+export type { RendererTeardownEvent, RendererTeardownTargets } from './renderer-lifecycle.js';
 export { createMainRouter } from './main-router.js';
 export type { MainRouter } from './main-router.js';
 export type { EventDelivery, EventPayload, PluginImplementation, PluginMethod } from './plugin-host.js';
@@ -39,7 +41,8 @@ export type {
   SupervisorTimers,
 } from './supervisor.js';
 export { serveLlamaCpp } from './host-runtime.js';
-export type { HostRuntimeOptions } from './host-runtime.js';
+export type { CallGuard, HostRuntimeOptions } from './host-runtime.js';
+export { REQUIRED_ARGUMENTS, assertCallShape } from './call-shape.js';
 export {
   DSH_METHODS,
   DSH_PLUGIN,
@@ -48,6 +51,7 @@ export {
   LLAMA_EVENTS,
   LLAMA_METHODS,
   LLAMA_PLUGIN,
+  SENDER_SCOPED,
   fromWireError,
   toWireError,
 } from './protocol.js';

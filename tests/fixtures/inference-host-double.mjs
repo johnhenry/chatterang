@@ -54,7 +54,7 @@ process.send({
     mounted: true,
     services: ['llm'],
     routes: ['llama'],
-    treeAssertion: `walked by pid ${process.pid}`,
+    notChecked: `walked by pid ${process.pid}`,
   },
 });
 

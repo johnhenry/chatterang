@@ -44,7 +44,7 @@ import {
   PluginHost,
   Supervisor,
   createMainRouter,
-  toWireError,
+  releaseRendererOn,
 } from './bridge/index.js';
 import type {
   BootManifest,
@@ -52,13 +52,14 @@ import type {
   HostHandle,
   InvokeResult,
   PluginImplementation,
+  RendererTeardownEvent,
 } from './bridge/index.js';
 import {
   APP_ORIGIN,
   APP_SCHEME,
   isAllowedExternalUrl,
   isTrustedOrigin,
-  resolveBundleRequest,
+  resolveBundleUrl,
 } from './security.js';
 
 /** Set only in development; a packaged build must never carry one. */
@@ -78,9 +79,28 @@ function appRoot(): string {
   return join(app.getAppPath(), 'app');
 }
 
+/**
+ * The only directory a model may be loaded from.
+ *
+ * Under `userData`, which is per-user, app-private and outside the bundle. This
+ * is the directory the desktop download manager will have to write into: today
+ * `src/lib/download.ts` takes its native branch through `@capacitor/filesystem`,
+ * which has no desktop implementation, so no model reaches disk through the app
+ * on this platform at all. Naming the directory here is what a working
+ * downloader will target, and confining `load` to it is what stops the page
+ * naming anything else in the meantime.
+ */
+function modelRoot(): string {
+  return join(app.getPath('userData'), 'models');
+}
+
 async function serveBundle(request: Request): Promise<Response> {
   const root = appRoot();
-  const target = resolveBundleRequest(root, new URL(request.url).pathname);
+  // The whole URL, not just its pathname: `protocol.handle` is registered for
+  // the SCHEME, so it is also asked for `chatterang-desktop://app-evil/…`, and
+  // answering those served a second working copy of the app at an origin the
+  // trust check then had to keep refusing.
+  const target = resolveBundleUrl(root, request.url);
   if (target === null) return new Response('Not found', { status: 404 });
 
   try {
@@ -105,7 +125,12 @@ async function serveBundle(request: Request): Promise<Response> {
  * `Supervisor`, where tests can reach it.
  */
 function spawnInferenceHost(): HostHandle {
-  const child = utilityProcess.fork(join(app.getAppPath(), 'build', 'host.mjs'), [], {
+  // The model directory is passed as an ARGUMENT because only main can ask
+  // Electron where `userData` is, and the host needs it to confine the paths
+  // `LlamaCpp.load` is asked to open (defect [8]). The host refuses to start
+  // without it rather than guessing a directory, so a wiring mistake here is a
+  // boot failure and not a confinement to the wrong place.
+  const child = utilityProcess.fork(join(app.getAppPath(), 'build', 'host.mjs'), [modelRoot()], {
     serviceName: 'chatterang-inference',
     // Piped, not inherited: the host's stdout must not reach a terminal or a
     // log the user did not ask for.
@@ -163,15 +188,14 @@ function start(): void {
 
   const supervisor = new Supervisor({
     spawn: spawnInferenceHost,
-    notify: (eventName, data) => {
-      try {
-        pluginHost.notifyListeners(LLAMA_PLUGIN.name, eventName, data);
-      } catch (error) {
-        // A non-cloneable event payload. Loud in the log, and dropped rather
-        // than delivered half-formed; it must not take main down.
-        console.error(`[main] refused to deliver ${eventName}: ${toWireError(error).message}`);
-      }
-    },
+    // No try/catch here on purpose. The swallow used to live at this call site,
+    // which meant a delivery that threw never reached the supervisor and it
+    // marked the turn ended anyway — the page got no `llamaEnd` at all while
+    // its `generate` promise resolved successfully (defect [13]). `Supervisor`
+    // now catches it, logs through `warn`, and leaves the turn open for the
+    // next terminal path.
+    notify: (eventName, data, ownerId) =>
+      pluginHost.notifyListeners(LLAMA_PLUGIN.name, eventName, data, ownerId),
     onBoot: (status) => {
       console.log(
         status.mounted
@@ -252,20 +276,31 @@ function createWindow(
   const contents = window.webContents;
   senders.set(contents.id, contents);
 
-  // A reload does NOT destroy a webContents, so cleaning up only on destroy
-  // leaks one page's worth of subscriptions per Cmd+R and leaves the previous
-  // page's generation running in the host, burning GPU for nobody.
-  contents.on('did-start-navigation', (event) => {
-    if (!event.isMainFrame || event.isSameDocument) return;
-    pluginHost.releaseSender(contents.id);
-    supervisor.releaseRenderer('The page that started this generation navigated away.');
-  });
+  // A renderer stops being a renderer in three different ways, and only one of
+  // them is closing. The cleanup itself, and the list of which events need it,
+  // live in `bridge/renderer-lifecycle.ts` where a test can reach them; this is
+  // only the registration. A handler missing here is a test failure, because
+  // that file's list is checked against the text of this one.
+  //
+  // `render-process-gone` is the one that was absent: a crash fires neither of
+  // the other two (an instrumented build logged `reason=crashed
+  // destroyed=false`), so a crashed window's subscriptions stayed in the table
+  // and its generation kept decoding with no page left to receive it.
+  const teardown = (event: RendererTeardownEvent): void =>
+    releaseRendererOn(event, contents.id, {
+      releaseSender: (id) => pluginHost.releaseSender(id),
+      releaseRenderer: (id, reason) => supervisor.releaseRenderer(id, reason),
+      forget: (id) => senders.delete(id),
+    });
 
-  contents.once('destroyed', () => {
-    senders.delete(contents.id);
-    pluginHost.releaseSender(contents.id);
-    supervisor.releaseRenderer('The window that started this generation was closed.');
+  contents.on('did-start-navigation', (event) => {
+    // A same-document route change is the SPA doing its job, not a page going
+    // away; the filter is Electron-shaped and therefore stays here.
+    if (!event.isMainFrame || event.isSameDocument) return;
+    teardown('did-start-navigation');
   });
+  contents.on('render-process-gone', () => teardown('render-process-gone'));
+  contents.once('destroyed', () => teardown('destroyed'));
 
   // Navigation lock: nothing may leave our origin in-window, and window.open
   // is refused outright.

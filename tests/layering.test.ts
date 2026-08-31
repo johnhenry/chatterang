@@ -15,6 +15,31 @@ import { describe, expect, it } from 'vitest';
 
 const SRC = resolve(process.cwd(), 'src');
 
+/**
+ * Every module specifier a file names, by any of the four doors.
+ *
+ *   `import x from 'y'` / `export … from 'y'`   — the `from` form
+ *   `import 'y'`                                 — a side-effect import, no `from`
+ *   `import('y')`                                — dynamic
+ *   `require('y')`                               — CommonJS
+ *
+ * ONE constant, used by every guard below, because the recurring failure in
+ * this file has been a matcher that only recognised the form it was written
+ * against. That happened twice. `require(...)` was the door all three guards
+ * were still blind to: `const { app } = require('electron')` typechecks under
+ * `allowJs`/`@ts-expect-error`, bundles, and matched nothing.
+ *
+ * A single shared constant also means the next door only has to be added once,
+ * rather than to three regexes that have already drifted apart before.
+ *
+ * Note this is a lexical scan, not a parse: it will also match the text inside
+ * a string or a comment. That is why the guards test the captured SPECIFIER
+ * against an allowlist-shaped pattern rather than searching the raw source —
+ * `packages/contracts/src/listener.ts` names `@capacitor/core` in a comment
+ * explaining why it does not import it, and a text search flagged that.
+ */
+const SPECIFIER = /(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g;
+
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir)) {
@@ -33,6 +58,7 @@ function importsOf(file: string): string[] {
     /(?:^|\n)\s*import\s[^;]*?from\s+['"](@\/[^'"]+)['"]/g,
     /(?:^|\n)\s*export\s[^;]*?from\s+['"](@\/[^'"]+)['"]/g,
     /import\(\s*['"](@\/[^'"]+)['"]\s*\)/g,
+    /require\s*\(\s*['"](@\/[^'"]+)['"]\s*\)/g,
   ];
   for (const pattern of patterns) {
     for (const match of source.matchAll(pattern)) specifiers.push(match[1]!);
@@ -176,10 +202,12 @@ describe('contracts package', () => {
     // through. Specifiers, not raw text — listener.ts names
     // `@capacitor/core` in a comment explaining why it does not import it, and
     // a text search flags that as a violation.
-    const banned = /^(@capacitor\/|node:|electron$)/;
+    // `electron$` alone missed `electron/main` and `electron/renderer`, which
+    // are the same package through a subpath.
+    const banned = /^(@capacitor\/|node:|electron($|\/))/;
     const offenders = contractFiles
       .filter((file) =>
-        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
+        [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
           banned.test(m[1] ?? ''),
         ),
       )
@@ -218,7 +246,7 @@ describe('the app never reaches the desktop-only layer', () => {
       /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node)(\/|$))|(^|\/)packages\/(cordis-aimatey|inference-node)(\/|$)/;
     const offenders = files
       .filter((file) =>
-        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
+        [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
           banned.test(m[1] ?? ''),
         ),
       )
@@ -226,11 +254,11 @@ describe('the app never reaches the desktop-only layer', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('src/ never imports the Electron shell either', () => {
-    // A5 added `apps/desktop`, and it is the same seam as the two above with
-    // the same three doors. The shell imports Electron, `node:fs`,
-    // `utilityProcess` and `@deepseek-ai/*`; one import from `src/` would put
-    // all of that in the mobile bundle, where none of it exists.
+  it('src/ never imports the Electron shell, Electron itself, or a Node builtin', () => {
+    // A5 added `apps/desktop`, and it is the same seam as the one above with
+    // the same doors. The shell imports Electron, `node:fs`, `utilityProcess`
+    // and `@deepseek-ai/*`; one import from `src/` would put all of that in the
+    // mobile bundle, where none of it exists.
     //
     // The direction is one-way ON PURPOSE and only in this direction:
     // `apps/desktop` DOES import `src/ai/prompt.ts`, so the inference host
@@ -238,18 +266,48 @@ describe('the app never reaches the desktop-only layer', () => {
     // a copy that drifts. That is why this guard names the desktop layer
     // rather than banning the pair from knowing about each other.
     //
-    // Three doors, checked as three: the bare specifier, a subpath
+    // AND ELECTRON AND `node:` DIRECTLY, which is what this guard was missing.
+    // Naming only the desktop DIRECTORY assumed the only way to reach Electron
+    // from `src/` was through the shell — but `import { ipcRenderer } from
+    // 'electron'` and `import { readFile } from 'node:fs'` reach it without
+    // mentioning `apps/desktop` at all, and `src/` is the mobile and web bundle
+    // too. `node:fs` in the renderer is not a desktop feature; on iOS it is a
+    // module that does not exist, and the failure is a blank page.
+    //
+    // Doors, checked as five: the bare specifier, a subpath
     // (`@chatterang/desktop/bridge` — which is how the tests import it, so it
-    // is not hypothetical), and a relative path into the directory.
-    const banned = /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)/;
+    // is not hypothetical), a relative path into the directory, bare
+    // `electron`/`electron/...`, and any `node:` builtin. The specifier matcher
+    // itself covers `require(...)` as well as the three import forms.
+    const banned =
+      /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)|^electron($|\/)|^node:/;
     const offenders = files
       .filter((file) =>
-        [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
+        [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
           banned.test(m[1] ?? ''),
         ),
       )
       .map((file) => relative(SRC, file));
     expect(offenders).toEqual([]);
+  });
+
+  it('the specifier matcher sees all four import forms, including require', () => {
+    // The guards above are only as good as what they can see, and this file's
+    // recurring failure is a matcher revert-checked against the one form it
+    // already caught. Asserted directly on the matcher, so each door is a named
+    // expectation rather than something a reader has to infer from a regex.
+    const forms = [
+      "import { app } from 'electron';",
+      "export { x } from 'electron/main';",
+      "import 'electron';",
+      "const m = await import('electron');",
+      "const { app } = require('electron');",
+      "const { app } = require ( 'electron' );",
+    ];
+    for (const form of forms) {
+      const found = [...form.matchAll(new RegExp(SPECIFIER.source, 'g'))].map((m) => m[1]);
+      expect(found, form).toContain(form.includes('/main') ? 'electron/main' : 'electron');
+    }
   });
 });
 
@@ -272,9 +330,12 @@ describe('the desktop bridge stays platform-free', () => {
   });
 
   it('imports neither Electron nor a Node builtin', () => {
+    // Same banned set as before; what changed is that the shared SPECIFIER
+    // matcher now also sees `require('electron')`, which this guard was blind
+    // to for as long as it existed.
     const banned = /^(electron$|electron\/|node:)/;
     const offenders = bridgeFiles.flatMap((file) =>
-      [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)]
+      [...readFileSync(file, 'utf8').matchAll(SPECIFIER)]
         .map((m) => m[1] ?? '')
         .filter((specifier) => banned.test(specifier))
         .map((specifier) => `${relative(BRIDGE, file)} -> ${specifier}`),

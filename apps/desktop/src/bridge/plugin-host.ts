@@ -17,12 +17,22 @@
 import { channelCollisions } from './channels.js';
 import { assertCloneable } from './clone.js';
 import type { BootManifest, PluginDefinition } from './protocol.js';
+import { SENDER_SCOPED } from './protocol.js';
 
 /** A method a plugin exposes to the renderer. */
 export type PluginMethod = (...args: readonly unknown[]) => unknown;
 
-/** The main-process object a plugin's declared methods are called on. */
-export type PluginImplementation = Readonly<Record<string, PluginMethod>>;
+/**
+ * The main-process object a plugin's declared methods are called on.
+ *
+ * The optional {@link SENDER_SCOPED} key names the methods that are called with
+ * the calling renderer's id as their first argument. See the symbol's own
+ * documentation for why that is opt-in and why it is a symbol.
+ */
+export interface PluginImplementation {
+  readonly [method: string]: PluginMethod;
+  readonly [SENDER_SCOPED]?: readonly string[];
+}
 
 /** One event, addressed at one subscription in one renderer. */
 export interface EventPayload {
@@ -120,6 +130,18 @@ export class PluginHost {
       );
     }
 
+    // A scoped name the definition never declared is unreachable, which means
+    // the author believes a method is sender-scoped and it is not — the exact
+    // shape of defect [11], reintroduced by a typo. Refused at registration.
+    const scoped = implementation[SENDER_SCOPED] ?? [];
+    const undeclared = scoped.filter((method) => !definition.methods.includes(method));
+    if (undeclared.length > 0) {
+      throw new Error(
+        `desktop bridge: plugin "${definition.name}" marks method(s) sender-scoped that it does ` +
+          `not declare: ${undeclared.join(', ')}.`,
+      );
+    }
+
     const definitions = [...[...this.#plugins.values()].map((it) => it.definition), definition];
     const collisions = channelCollisions(definitions);
     if (collisions.length > 0) {
@@ -144,6 +166,11 @@ export class PluginHost {
    * manifest BEFORE the arguments are looked at and before the implementation
    * is touched, so an unknown name never reaches plugin code.
    *
+   * `senderId` reaches the implementation only for methods it marked
+   * {@link SENDER_SCOPED}. It used to reach nothing at all — the parameter was
+   * accepted and immediately discarded with `void senderId`, which is what left
+   * the supervisor unable to tell one window's generations from another's.
+   *
    * @throws BridgeError for an unknown plugin or method.
    * @throws NotCloneableError when arguments or the result would not survive.
    */
@@ -153,7 +180,6 @@ export class PluginHost {
     method: string,
     args: readonly unknown[],
   ): Promise<unknown> {
-    void senderId;
     const registration = this.#plugins.get(pluginName);
     if (registration === undefined) {
       throw new BridgeError('UNKNOWN_PLUGIN', `desktop bridge: no plugin named "${pluginName}".`);
@@ -173,7 +199,14 @@ export class PluginHost {
     const implementation = registration.implementation[method];
     /* c8 ignore next */
     if (implementation === undefined) throw new BridgeError('UNKNOWN_METHOD', 'unreachable');
-    const result = await implementation.apply(registration.implementation, [...args]);
+    // The sender id goes in FRONT of the renderer's arguments, never appended:
+    // appending would make it depend on how many arguments the renderer chose
+    // to send, and the renderer chooses that.
+    const scoped = registration.implementation[SENDER_SCOPED]?.includes(method) ?? false;
+    const result = await implementation.apply(
+      registration.implementation,
+      scoped ? [senderId, ...args] : [...args],
+    );
     assertCloneable(result, `${pluginName}.${method}() result`);
     return result;
   }
@@ -244,18 +277,36 @@ export class PluginHost {
   }
 
   /**
-   * Deliver one event to every renderer listening for it.
+   * Deliver one event to the renderers listening for it.
    *
+   * `ownerId` is what makes a stream private. Without it, every `llamaToken` of
+   * every window's conversation was delivered to every other window that had
+   * ever subscribed — one page's answer appearing, token by token, in another
+   * page's turn. Events that genuinely belong to nobody in particular
+   * (`llamaThermal` describes the machine, not a conversation) omit it and are
+   * broadcast, which is the correct behaviour for them and is why this is a
+   * parameter rather than a rule.
+   *
+   * @param ownerId deliver only to this renderer; omit to broadcast.
    * @returns how many subscriptions it actually reached.
    * @throws NotCloneableError if the payload would not survive the boundary.
    *   Deliberately not swallowed: an event that silently loses half its
    *   payload is the failure this whole file is trying to make impossible.
    */
-  notifyListeners(pluginName: string, eventName: string, data: unknown): number {
+  notifyListeners(
+    pluginName: string,
+    eventName: string,
+    data: unknown,
+    ownerId?: number,
+  ): number {
     assertCloneable(data, `${pluginName}.${eventName} event`);
     let delivered = 0;
     for (const [key, subscription] of this.#subscriptions) {
       if (subscription.pluginName !== pluginName || subscription.eventName !== eventName) continue;
+      // Checked BEFORE delivery is attempted, so a foreign subscription is
+      // skipped rather than probed — a non-owner must not even be able to tell
+      // that an event happened by having its delivery callback invoked.
+      if (ownerId !== undefined && subscription.senderId !== ownerId) continue;
       const reached = this.#deliver(subscription.senderId, {
         pluginName,
         subscriptionId: subscription.subscriptionId,

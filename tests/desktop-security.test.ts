@@ -6,12 +6,15 @@ import {
   APP_ORIGIN,
   APP_SCHEME,
   CSP_PRODUCTION,
+  confineModelPath,
   MIME,
   isAllowedExternalUrl,
   isTrustedOrigin,
   resolveBundleRequest,
+  resolveBundleUrl,
   resolveWithinRoot,
 } from '@chatterang/desktop/security';
+import { RENDERER_TEARDOWN_EVENTS } from '@chatterang/desktop/bridge';
 
 /**
  * THE DESKTOP SHELL'S SECURITY POSTURE, ACTUALLY EXERCISED.
@@ -26,12 +29,13 @@ import {
  * wrong, which is why each was written by breaking `security.ts` first and
  * watching vitest exit non-zero.
  *
- * SOME OF THESE TESTS ASSERT THE WRONG ANSWER ON PURPOSE. `isTrustedOrigin`
- * admits a sibling origin and `isAllowedExternalUrl` admits `file://`; both are
- * known defects ([5] and [14]) that later phases fix. Pinning today's behaviour
- * means the fix announces itself as these tests flipping — a visible, reviewed
- * change — instead of arriving as a silent edit nothing was watching. Each such
- * test is marked DEFECT and says what the corrected answer will be.
+ * SOME OF THESE TESTS USED TO ASSERT THE WRONG ANSWER ON PURPOSE, and have
+ * since flipped. `isTrustedOrigin` admitted any sibling origin and
+ * `isAllowedExternalUrl` admitted `file://`; those were defects [5] and [14],
+ * pinned as they were so the fix would announce itself as a visible change to a
+ * test file rather than arrive as a silent edit nothing was watching. They are
+ * now marked FIXED and say what they used to assert. That is the mechanism
+ * working, and it is worth keeping for the next one.
  */
 
 /* ── The file stays reachable ─────────────────────────────────────────── */
@@ -83,17 +87,64 @@ describe('isTrustedOrigin', () => {
     expect(isTrustedOrigin(`${APP_SCHEME}://evil/index.html`, '')).toBe(false);
   });
 
-  it('DEFECT [5]: admits a sibling origin, because it is a string prefix test', () => {
-    // `startsWith` is not an origin comparison. These are DIFFERENT origins and
-    // every one of them is trusted today — and `protocol.handle` ignores the
-    // URL host, so each is served the same bundle off the same disk and can
-    // then reach every plugin channel.
-    //
-    // AFTER [5] these three become `false` (parsed-origin equality). This test
-    // is the one that flips.
-    expect(isTrustedOrigin('chatterang-desktop://appzz/index.html', '')).toBe(true);
-    expect(isTrustedOrigin('chatterang-desktop://app-evil/index.html', '')).toBe(true);
-    expect(isTrustedOrigin('chatterang-desktop://app.evil.example/', '')).toBe(true);
+  it('[5] FIXED: refuses a sibling origin that merely shares the prefix', () => {
+    // THIS TEST FLIPPED. It used to assert `true` for all three, because
+    // `url.startsWith(APP_ORIGIN)` is not an origin comparison: these are
+    // DIFFERENT origins that happen to begin with the same characters, and
+    // every one of them was trusted — while `protocol.handle` ignored the URL
+    // host and served each the same bundle off the same disk, so a page there
+    // was a working copy of the app that could reach every plugin channel.
+    expect(isTrustedOrigin('chatterang-desktop://appzz/index.html', '')).toBe(false);
+    expect(isTrustedOrigin('chatterang-desktop://app-evil/index.html', '')).toBe(false);
+    expect(isTrustedOrigin('chatterang-desktop://app.evil.example/', '')).toBe(false);
+    // The reviewer's two exact strings, spelled out as the bar asked.
+    expect(isTrustedOrigin('chatterang-desktop://appzz', '')).toBe(false);
+    expect(isTrustedOrigin('chatterang-desktop://app-evil', '')).toBe(false);
+    // ...and the legitimate origin still works, which is the half a fix like
+    // this loses if `new URL(url).origin` is used naively: WHATWG gives a
+    // non-special scheme the origin string 'null', so comparing `.origin` to
+    // APP_ORIGIN would refuse OUR OWN pages too and the app would show no
+    // plugins and refuse to navigate to itself.
+    expect(isTrustedOrigin(APP_ORIGIN, '')).toBe(true);
+    expect(isTrustedOrigin(`${APP_ORIGIN}/index.html`, '')).toBe(true);
+  });
+
+  it('[5] treats the host case-insensitively, as Chromium does', () => {
+    // Chromium lower-cases the host of a `standard: true` scheme; Node's URL
+    // does not. Same origin, so it must answer the same way — otherwise the
+    // fix above would refuse a page the browser considers ours.
+    expect(isTrustedOrigin('chatterang-desktop://APP/index.html', '')).toBe(true);
+  });
+
+  it('[5] refuses a URL whose userinfo is dressed up as our host', () => {
+    // Parses to host `evil` with username `app`, so the origin comparison
+    // already refuses it. Refused explicitly as well: a URL carrying
+    // credentials has no business being a page of ours under any parse.
+    expect(isTrustedOrigin('chatterang-desktop://app@evil/index.html', '')).toBe(false);
+    expect(isTrustedOrigin('chatterang-desktop://app:x@evil/', '')).toBe(false);
+
+    // And the case the origin comparison does NOT catch on its own, which is
+    // why the explicit refusal is there and not merely belt-and-braces: the
+    // host really is `app`, so the tuple matches, and only the userinfo check
+    // rejects it. Without this assertion that line is a mutant that survives —
+    // it was, until this expectation was added.
+    expect(isTrustedOrigin('chatterang-desktop://evil@app/index.html', '')).toBe(false);
+    expect(isTrustedOrigin('http://user:pw@localhost:5273/', 'http://localhost:5273')).toBe(false);
+  });
+
+  it('refuses a hostless URL on our own scheme', () => {
+    // One slash, so there is no authority at all: host is ''. It must not
+    // compare equal to anything.
+    expect(isTrustedOrigin('chatterang-desktop:/app/index.html', '')).toBe(false);
+    expect(isTrustedOrigin('chatterang-desktop:app', '')).toBe(false);
+
+    // The case that makes the hostless refusal load-bearing rather than tidy,
+    // and the one that kept a mutant alive until it was written: TWO hostless
+    // URLs would otherwise compare EQUAL. Point the dev-server variable at a
+    // `file://` URL — a plausible thing to try — and every file on the disk
+    // becomes a trusted origin, because both sides reduce to `file://`.
+    expect(isTrustedOrigin('file:///etc/passwd', 'file:///Users/me/app/index.html')).toBe(false);
+    expect(isTrustedOrigin('about:blank', 'about:blank')).toBe(false);
   });
 
   it('ignores the dev server when none is configured', () => {
@@ -108,13 +159,16 @@ describe('isTrustedOrigin', () => {
     expect(isTrustedOrigin('http://localhost:5273/index.html', 'http://localhost:5273')).toBe(true);
   });
 
-  it('DEFECT [5]: a dev-server port prefixes a longer port', () => {
-    // `http://localhost:5273` prefixes `http://localhost:52739`, so a page on
-    // that other port is trusted. It only bites when a dev URL is set, and
-    // `scripts/sync.mjs` refuses to package a build carrying one — but it is
-    // the same missing origin comparison, so [5] fixes it in the same edit and
-    // this expectation becomes `false`.
-    expect(isTrustedOrigin('http://localhost:52739/', 'http://localhost:5273')).toBe(true);
+  it('[5] FIXED: a dev-server port no longer prefixes a longer port', () => {
+    // THIS TEST FLIPPED. `http://localhost:5273` prefixes
+    // `http://localhost:52739`, so a page on that other port was trusted. It
+    // only bit when a dev URL was set, and `scripts/sync.mjs` refuses to
+    // package a build carrying one — but it was the same missing origin
+    // comparison, so it was fixed in the same edit.
+    expect(isTrustedOrigin('http://localhost:52739/', 'http://localhost:5273')).toBe(false);
+    // A dev server URL that does not parse trusts nothing rather than
+    // everything.
+    expect(isTrustedOrigin('http://localhost:5273/', 'not a url')).toBe(false);
   });
 });
 
@@ -126,16 +180,42 @@ describe('isAllowedExternalUrl', () => {
     expect(isAllowedExternalUrl('http://example.com/docs')).toBe(true);
   });
 
-  it('DEFECT [14]: allows every other scheme too, because there is no allowlist', () => {
-    // `main.ts` hands `will-navigate` and `setWindowOpenHandler` URLs straight
-    // to `shell.openExternal`. Model output renders as Markdown, so the string
-    // is model-reachable, and the OS launches whatever is registered for the
-    // scheme. Every expectation below becomes `false` under [14].
-    expect(isAllowedExternalUrl('file:///Users/someone/.ssh/id_ed25519')).toBe(true);
-    expect(isAllowedExternalUrl('smb://attacker.example/share')).toBe(true);
-    expect(isAllowedExternalUrl('ms-msdt:/id')).toBe(true);
-    expect(isAllowedExternalUrl('javascript:alert(1)')).toBe(true);
-    expect(isAllowedExternalUrl('not a url at all')).toBe(true);
+  it('[14] FIXED: refuses every other scheme', () => {
+    // THIS TEST FLIPPED — every expectation below used to be `true`. `main.ts`
+    // handed `will-navigate` and `setWindowOpenHandler` URLs straight to
+    // `shell.openExternal` with no allowlist at all, and model output renders
+    // as Markdown, so the string is model-reachable and the OS launched
+    // whatever was registered for the scheme.
+    expect(isAllowedExternalUrl('file:///Users/someone/.ssh/id_ed25519')).toBe(false);
+    expect(isAllowedExternalUrl('smb://attacker.example/share')).toBe(false);
+    expect(isAllowedExternalUrl('ms-msdt:/id')).toBe(false);
+    expect(isAllowedExternalUrl('javascript:alert(1)')).toBe(false);
+    expect(isAllowedExternalUrl('not a url at all')).toBe(false);
+    expect(isAllowedExternalUrl('')).toBe(false);
+    // Two more registered-handler schemes that exist on a stock macOS install.
+    expect(isAllowedExternalUrl('ftp://attacker.example/x')).toBe(false);
+    expect(isAllowedExternalUrl('mailto:someone@example.com')).toBe(false);
+  });
+
+  it('[14] matches the parsed protocol, not a prefix of the text', () => {
+    // The mirror of the [5] mistake. A scheme that merely BEGINS with `http`
+    // is a different scheme, and a URL whose path begins with `https://` is
+    // not an https URL at all.
+    expect(isAllowedExternalUrl('httpsfoo://example.com/')).toBe(false);
+    expect(isAllowedExternalUrl('javascript:void("https://example.com")')).toBe(false);
+    expect(isAllowedExternalUrl('x-custom:https://example.com')).toBe(false);
+    // ...and the two real ones still pass, in mixed case, which is what the
+    // parser normalises and a text comparison would not.
+    expect(isAllowedExternalUrl('HTTPS://Example.com/Docs')).toBe(true);
+  });
+
+  it('[14] is a pure predicate — no OS handler is reachable from a test', () => {
+    // Stated as an assertion rather than a comment: this module exports a
+    // function that answers a question about a string. `shell.openExternal`
+    // lives in main.ts and is never called from here, so there is no arrangement
+    // of these tests that can launch anything on the machine running them.
+    expect(typeof isAllowedExternalUrl).toBe('function');
+    expect(isAllowedExternalUrl.length).toBe(1);
   });
 });
 
@@ -257,6 +337,73 @@ describe('resolveBundleRequest', () => {
   });
 });
 
+describe('resolveBundleUrl', () => {
+  const ROOT = '/opt/chatterang/app';
+
+  it('serves our own origin exactly as the pathname resolver would', () => {
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/index.html`)).toEqual(
+      resolveBundleRequest(ROOT, '/index.html'),
+    );
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/assets/main-a1b2.js`)).toEqual(
+      resolveBundleRequest(ROOT, '/assets/main-a1b2.js'),
+    );
+    // The SPA fallback survives the extra layer, query string and all.
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/settings?tab=models#x`)?.file).toBe(
+      `${ROOT}/index.html`,
+    );
+  });
+
+  it('[5] FIXED: serves NOTHING to a sibling host on our own scheme', () => {
+    // The second half of [5], and the one that made the first half so bad:
+    // `protocol.handle` is registered for the SCHEME, so Chromium hands it
+    // requests for every host on it, and the old code read the pathname and
+    // answered. `chatterang-desktop://app-evil/` was a complete, working,
+    // second copy of the application served off the same disk.
+    expect(resolveBundleUrl(ROOT, 'chatterang-desktop://appzz/index.html')).toBeNull();
+    expect(resolveBundleUrl(ROOT, 'chatterang-desktop://app-evil/index.html')).toBeNull();
+    expect(resolveBundleUrl(ROOT, 'chatterang-desktop://app.evil.example/')).toBeNull();
+    expect(resolveBundleUrl(ROOT, 'chatterang-desktop://evil/assets/main.js')).toBeNull();
+  });
+
+  it('refuses a foreign scheme and an unparseable request', () => {
+    expect(resolveBundleUrl(ROOT, 'https://app/index.html')).toBeNull();
+    expect(resolveBundleUrl(ROOT, 'file:///opt/chatterang/app/index.html')).toBeNull();
+    expect(resolveBundleUrl(ROOT, 'not a url')).toBeNull();
+  });
+
+  it('still refuses a traversal the URL parser does not eat first', () => {
+    // The origin check is in ADDITION to the path check, not instead of it —
+    // but which traversals reach the path check is worth pinning, because it
+    // is not what you would guess. The URL parser normalises `..` segments out
+    // of a pathname, INCLUDING `%2e%2e` ones, so those never arrive here at
+    // all: `chatterang-desktop://app/../../../etc/passwd` has pathname
+    // `/etc/passwd` by the time anyone looks at it, and resolves harmlessly
+    // inside the root.
+    expect(new URL(`${APP_ORIGIN}/../../../etc/passwd`).pathname).toBe('/etc/passwd');
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/../../../etc/passwd`)?.file).toBe(
+      `${ROOT}/index.html`,
+    );
+
+    // An ENCODED SLASH is the form the parser leaves intact, and it is the one
+    // the path guard exists for: `%2e%2e%2f` is not a path segment to the
+    // parser, so it survives into `resolveWithinRoot`, which decodes and
+    // resolves before comparing and therefore catches it.
+    expect(new URL(`${APP_ORIGIN}/%2e%2e%2f%2e%2e%2fetc/passwd`).pathname).toBe(
+      '/%2e%2e%2f%2e%2e%2fetc/passwd',
+    );
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/%2e%2e%2f%2e%2e%2fetc/passwd`)).toBeNull();
+    expect(resolveBundleUrl(ROOT, `${APP_ORIGIN}/assets/%2e%2e%2f%2e%2e%2fapp-secrets/k.json`)).toBeNull();
+  });
+
+  it('does not consult the dev server', () => {
+    // `protocol.handle` only ever serves the custom scheme; a dev build loads
+    // over http and never reaches it. So this resolver has exactly one
+    // acceptable origin and takes no parameter that could widen it.
+    expect(resolveBundleUrl.length).toBe(2);
+    expect(resolveBundleUrl(ROOT, 'http://localhost:5273/index.html')).toBeNull();
+  });
+});
+
 /* ── The policy itself ────────────────────────────────────────────────── */
 
 describe('CSP_PRODUCTION', () => {
@@ -286,18 +433,212 @@ describe('CSP_PRODUCTION', () => {
     expect(directives.get('default-src')).toEqual(["'self'"]);
   });
 
-  it('DEFECT [9]: blocks the webfonts index.html actually asks for', () => {
-    // `index.html` links `fonts.googleapis.com` and preconnects
-    // `fonts.gstatic.com`; the policy allows neither in style-src nor font-src,
-    // so in a packaged build the app's own typography is refused. The fix is to
-    // self-host the two families and delete the link — which makes this test's
-    // expectations the CORRECT ones and leaves the tightened policy in place.
-    expect(directives.get('style-src')).toEqual(["'self'", "'unsafe-inline'"]);
-    expect(directives.get('font-src')).toEqual(["'self'", 'data:']);
-    expect(CSP_PRODUCTION).not.toContain('fonts.googleapis.com');
-    expect(CSP_PRODUCTION).not.toContain('fonts.gstatic.com');
+  /**
+   * [9], AND THE ONLY VERSION OF THIS TEST THAT STAYS TRUE.
+   *
+   * The defect was a DISAGREEMENT: the policy allowed no external origin while
+   * `index.html` linked two, so the packaged app refused its own typography and
+   * nothing noticed. A test that hard-codes either side pins today's answer and
+   * lets the two drift apart again the moment one of them moves.
+   *
+   * So the expected origins are DERIVED FROM THE MARKUP. Whichever way the next
+   * person resolves this — self-hosting the families and deleting the link, or
+   * adding a third-party asset — the policy has to move with the markup or this
+   * fails. It is a bidirectional check: no origin the page needs may be missing,
+   * and no origin the page has stopped needing may remain.
+   */
+  const html = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
+  const htmlOrigins = new Set(
+    [...html.matchAll(/https?:\/\/[^"'\s/]+/g)].map((match) => match[0]),
+  );
 
-    const html = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
-    expect(html).toContain('fonts.googleapis.com');
+  it('[9] allows every external origin index.html actually reaches for', () => {
+    // Missing one is the defect as it shipped: the app's own fonts, refused by
+    // the app's own policy, silently, in a window nobody has a console open on.
+    for (const origin of htmlOrigins) {
+      expect(CSP_PRODUCTION, `index.html loads ${origin} and the CSP must allow it`).toContain(
+        origin,
+      );
+    }
+  });
+
+  it('[9] allows NOTHING external that index.html has stopped needing', () => {
+    // The other direction, and the one that makes self-hosting a real event
+    // rather than a good intention: vendor the two families, delete the
+    // `<link>` and both preconnects, and this test fails until `style-src` and
+    // `font-src` go back to `'self'`. The policy cannot quietly stay wide.
+    const external = [...CSP_PRODUCTION.matchAll(/https?:\/\/[^\s;]+/g)].map((m) => m[0]);
+    expect([...new Set(external)].sort()).toEqual([...htmlOrigins].sort());
+  });
+
+  it('[9] names the font origins individually, not as a blanket scheme', () => {
+    // `style-src https:` would also satisfy the test above and would allow
+    // every host on the internet to supply a stylesheet. The origins are the
+    // point; the scheme is not.
+    expect(directives.get('style-src')).toEqual([
+      "'self'",
+      "'unsafe-inline'",
+      'https://fonts.googleapis.com',
+    ]);
+    expect(directives.get('font-src')).toEqual([
+      "'self'",
+      'data:',
+      'https://fonts.gstatic.com',
+    ]);
+    for (const directive of ['style-src', 'font-src', 'img-src', 'script-src', 'default-src']) {
+      expect(directives.get(directive), directive).not.toContain('https:');
+    }
+    // And there are exactly two, so a third arriving is a decision someone has
+    // to make on purpose.
+    expect(htmlOrigins.size).toBe(2);
+  });
+});
+
+/* ── main.ts, checked the only way it can be ──────────────────────────── */
+
+/**
+ * STATIC GUARDS ON THE FILE NO TEST CAN IMPORT.
+ *
+ * `main.ts` runs `protocol.registerSchemesAsPrivileged` and `app.whenReady()`
+ * at module scope, so importing it needs a live Electron runtime and the suite
+ * cannot. Everything with a decision in it has been moved out — but the WIRING
+ * is still a place things go wrong, and defect [6] was exactly that: a
+ * `webContents` event nobody registered a handler for.
+ *
+ * These assertions read the file as text. That is weaker than executing it and
+ * is said plainly rather than dressed up: they prove a call site exists, not
+ * that Electron delivers to it. What they do catch is the whole class of defect
+ * [6] — a required handler simply absent — and a predicate call site quietly
+ * bypassed, both of which were unverified before.
+ */
+describe('main.ts wiring', () => {
+  const MAIN = resolve(process.cwd(), 'apps/desktop/src/main.ts');
+  const source = readFileSync(MAIN, 'utf8');
+
+  it('reads the real file', () => {
+    expect(source.length).toBeGreaterThan(2000);
+    expect(source).toContain('function createWindow');
+  });
+
+  it('[6] registers a handler for EVERY renderer departure, crash included', () => {
+    // The list lives in `bridge/renderer-lifecycle.ts`, which is testable; this
+    // is the join between that list and the file that has to act on it. Adding
+    // a name there without wiring it here fails this test, and so does deleting
+    // the `render-process-gone` line that closes [6].
+    const missing = RENDERER_TEARDOWN_EVENTS.filter(
+      (event) =>
+        !new RegExp(`contents\\.(on|once)\\(\\s*'${event}'`).test(source) ||
+        !source.includes(`teardown('${event}')`),
+    );
+    expect(missing).toEqual([]);
+    // And specifically the one that was absent, spelled out so the reason this
+    // test exists survives a refactor of the loop above.
+    expect(source).toContain("contents.on('render-process-gone'");
+  });
+
+  it('[14] routes BOTH openExternal call sites through the allowlist', () => {
+    // `will-navigate` and `setWindowOpenHandler`. Two call sites is how a fix
+    // lands on one and misses the other, so the count is asserted rather than
+    // assumed.
+    const opens = [...source.matchAll(/shell\.openExternal\(/g)];
+    expect(opens.length).toBe(2);
+    const guarded = [...source.matchAll(/isAllowedExternalUrl\(url\)\)\s*void shell\.openExternal\(url\)/g)];
+    expect(guarded.length).toBe(2);
+  });
+
+  it('[5] serves the bundle by URL, not by pathname alone', () => {
+    // `resolveBundleRequest` takes a pathname and cannot see the host, which is
+    // how a sibling origin was served the same bundle. `protocol.handle` must
+    // go through the URL-aware resolver.
+    expect(source).toContain('resolveBundleUrl(root, request.url)');
+    expect(source).not.toContain('resolveBundleRequest(');
+  });
+
+  it('keeps the security defaults on the window it opens', () => {
+    // Not a decision that can be extracted — it is an object literal Electron
+    // reads — so it is pinned here.
+    for (const setting of [
+      'contextIsolation: true',
+      'nodeIntegration: false',
+      'sandbox: true',
+      'webviewTag: false',
+    ]) {
+      expect(source).toContain(setting);
+    }
+  });
+});
+
+/* ── Model files ──────────────────────────────────────────────────────── */
+
+describe('confineModelPath', () => {
+  const ROOT = '/Users/someone/Library/Application Support/Chatterang/models';
+
+  it('accepts a model inside the directory, absolute or relative', () => {
+    expect(confineModelPath(ROOT, `${ROOT}/llama-cpp/gemma/model.gguf`)).toBe(
+      `${ROOT}/llama-cpp/gemma/model.gguf`,
+    );
+    // A relative path is resolved against the root rather than the process cwd.
+    expect(confineModelPath(ROOT, 'llama-cpp/gemma/model.gguf')).toBe(
+      `${ROOT}/llama-cpp/gemma/model.gguf`,
+    );
+  });
+
+  it('[8] FIXED: refuses the arbitrary absolute path that made this an oracle', () => {
+    // The reviewer's exact reproduction. From the live page,
+    // `invoke('LlamaCpp','load',[{modelPath:'/etc/hosts'}])` came back with
+    // `Invalid GGUF magic. Expected "GGUF" but got "##\n#"` — the first four
+    // bytes of a file the renderer cannot otherwise read.
+    expect(confineModelPath(ROOT, '/etc/hosts')).toBeNull();
+    expect(confineModelPath(ROOT, '/etc/passwd')).toBeNull();
+    expect(confineModelPath(ROOT, '/Users/someone/.ssh/id_ed25519')).toBeNull();
+  });
+
+  it('[8] refuses a traversal out of the directory', () => {
+    expect(confineModelPath(ROOT, '../../../etc/hosts')).toBeNull();
+    expect(confineModelPath(ROOT, 'llama-cpp/../../../../etc/hosts')).toBeNull();
+    expect(confineModelPath(ROOT, `${ROOT}/../secrets/key.pem`)).toBeNull();
+  });
+
+  it('[8] refuses a SIBLING directory that shares the root as a prefix', () => {
+    // `…/Chatterang/models-backup` starts with `…/Chatterang/models`. The
+    // separator in the comparison is the only thing that rejects it.
+    expect(confineModelPath(ROOT, `${ROOT}-backup/model.gguf`)).toBeNull();
+    expect(confineModelPath(`${ROOT}/`, `${ROOT}-backup/model.gguf`)).toBeNull();
+  });
+
+  it('[8] refuses the root itself, which is a directory and not a model', () => {
+    expect(confineModelPath(ROOT, ROOT)).toBeNull();
+    expect(confineModelPath(ROOT, '')).toBeNull();
+    expect(confineModelPath(ROOT, '.')).toBeNull();
+  });
+
+  it('[8] refuses a NUL byte, so the checked path is the opened path', () => {
+    // Stated precisely, because the obvious claim is wrong and a mutant proved
+    // it: a NUL CANNOT be used to escape the root here. Truncation only
+    // shortens a string, and a prefix of something under the root is either
+    // still under the root or shorter than it — `ok.gguf\0/../../../etc/hosts`
+    // resolves out of the root and is refused by the containment check alone.
+    //
+    // What the NUL check does buy is that the path we validated and RETURN is
+    // the path the native addon opens. Without it, `gemma/model.gguf\0extra`
+    // is inside the root, passes, and comes back as a resolved path whose C
+    // representation stops four characters earlier than the string we checked.
+    // A guard whose answer describes a different file than the one that gets
+    // opened is not a guard, however narrow the gap is today.
+    expect(confineModelPath(ROOT, 'gemma/model.gguf\0extra')).toBeNull();
+    expect(confineModelPath(ROOT, `${ROOT}/a.gguf\0`)).toBeNull();
+    // These two are refused by the containment check, with or without it.
+    expect(confineModelPath(ROOT, 'ok.gguf\0/../../../etc/hosts')).toBeNull();
+    expect(confineModelPath(ROOT, '/etc/hosts\0.gguf')).toBeNull();
+  });
+
+  it('[8] does not reject a legitimate name with dots or spaces in it', () => {
+    // The mirror test. A containment check written as "reject any string
+    // containing .." would 404 a real model, and Hugging Face filenames are
+    // full of dots.
+    expect(confineModelPath(ROOT, 'gemma-4-12b.Q4_K_M..v2.gguf')).toBe(
+      `${ROOT}/gemma-4-12b.Q4_K_M..v2.gguf`,
+    );
+    expect(confineModelPath(ROOT, 'my models/a model.gguf')).toBe(`${ROOT}/my models/a model.gguf`);
   });
 });

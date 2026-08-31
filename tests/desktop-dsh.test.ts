@@ -66,8 +66,11 @@ describe('the DSH tree the desktop shell boots', () => {
     // The sentinel means "let the Router choose"; `echo` pins that backend.
     expect(mount.status.routes).toEqual([ROUTER_SENTINEL, 'echo']);
     expect(mount.status.error).toBeUndefined();
-    // Honest about what was NOT checked, verbatim from assertBoot.
-    expect(mount.status.treeAssertion).toContain('no loader is mounted');
+    // Honest about what was NOT checked, verbatim from assertBoot. The field
+    // was `treeAssertion` until [15]: a name that read as an assertion result
+    // while every value it ever held described an assertion that did not run.
+    expect(mount.status.notChecked).toContain('the per-entry tree walk');
+    expect(mount.status.notChecked).toContain('no loader is mounted');
     // Layer 2: the routes are actually registered, not merely expected.
     expect(mount.listProviders()).toEqual(expect.arrayContaining([ROUTER_SENTINEL, 'echo']));
   });
@@ -175,7 +178,7 @@ describe('the renderer can see whether the tree came up', () => {
       mounted: false,
       services: [],
       routes: [],
-      treeAssertion: 'n/a',
+      notChecked: 'n/a',
     }));
     expect(DSH_PLUGIN.events).toEqual([]);
     expect(() => host.addListener(1, 'DshHost', 'anything', 1)).toThrow(/emits no event/);

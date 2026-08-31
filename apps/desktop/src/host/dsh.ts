@@ -129,7 +129,7 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
         mounted: true,
         services: report.services,
         routes: report.routes,
-        treeAssertion: report.treeAssertion,
+        notChecked: report.notChecked,
       },
     };
   } catch (error) {
@@ -140,7 +140,7 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
         mounted: false,
         services: [],
         routes: [],
-        treeAssertion: 'not reached: the boot assertion failed first',
+        notChecked: 'not reached: the boot assertion failed first',
         error: error instanceof Error ? error.message : String(error),
       },
     };

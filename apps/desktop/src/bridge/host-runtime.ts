@@ -14,15 +14,54 @@
 
 import type { LlamaCppPlugin } from '@chatterang/contracts';
 
+import { assertCallShape } from './call-shape.js';
 import { assertCloneable } from './clone.js';
 import type { HostCall, HostPing, LlamaEventName, MessageLink } from './protocol.js';
 import { LLAMA_EVENTS, LLAMA_METHODS, toWireError } from './protocol.js';
+
+/**
+ * Rewrite a call's arguments before the plugin sees them, or throw to refuse.
+ *
+ * Exists for exactly one policy: confining `load`'s three path fields to the
+ * app's model directory (defect [8]). That needs `node:path` and the app's
+ * `userData` location, neither of which this directory may know about — the
+ * layering guard in `tests/layering.test.ts` forbids a Node builtin here, and
+ * it forbids it for a reason (this code is driven end-to-end by tests through
+ * fake ports). So the policy is INJECTED from `host/entry.ts`, which is allowed
+ * both, and the seam is one function rather than a set of hooks.
+ *
+ * @returns the arguments to actually call the method with.
+ * @throws Error to refuse the call outright. The message reaches the renderer.
+ */
+export type CallGuard = (method: string, args: readonly unknown[]) => readonly unknown[];
+
+/**
+ * Methods whose ENGINE failure message must not cross the boundary verbatim.
+ *
+ * DEFECT [8], the second half. node-llama-cpp's load failure is
+ * `Invalid GGUF magic. Expected "GGUF" but got "##\n#"` — the first four bytes
+ * of the file, quoted back. Forwarded to the renderer that named the file, that
+ * is a read primitive: the page learns the leading bytes of anything the check
+ * above lets through, and the presence/absence of a file from which error it
+ * gets. Replaced by a fixed sentence; the real text goes to the host's own
+ * `warn`, which stays inside this process.
+ *
+ * The cost is real and is accepted rather than hidden: a genuine load failure
+ * (a truncated download, a model too large for memory) now reads the same as a
+ * wrong file. The engine's own words are one `warn` away for anyone debugging,
+ * and a diagnostic that is also an oracle is not a diagnostic worth keeping.
+ */
+const OPAQUE_FAILURES: Readonly<Record<string, string>> = Object.freeze({
+  load: 'The model could not be loaded. Check that the file is a complete GGUF model in the app’s model folder.',
+});
 
 export interface HostRuntimeOptions {
   readonly link: MessageLink;
   readonly plugin: LlamaCppPlugin;
   /** Where anomalies go. Never a prompt, never generated text. */
   readonly warn?: (message: string) => void;
+  /** Argument policy that needs the filesystem. See {@link CallGuard}. */
+  readonly guard?: CallGuard;
 }
 
 /**
@@ -84,17 +123,42 @@ export function serveLlamaCpp(options: HostRuntimeOptions): () => Promise<void> 
       if (!(LLAMA_METHODS as readonly string[]).includes(call.method)) {
         throw new Error(`inference host: no method "${call.method}".`);
       }
+      // Three steps, in this order, and the order is the point. The allowlist
+      // decides the method exists; the shape check decides the arguments are
+      // the ones it needs and says which field is missing if not; the guard
+      // decides the paths among them are ones we are willing to open. Only
+      // then does anything native run. Every one of these throws OUR message,
+      // which is why they are outside the inner try below.
+      assertCallShape(call.method, call.args);
+      const args = options.guard?.(call.method, call.args) ?? call.args;
+
       const method = (plugin as unknown as Record<string, (...a: readonly unknown[]) => unknown>)[
         call.method
       ];
       /* c8 ignore next */
       if (typeof method !== 'function') throw new Error(`inference host: "${call.method}" is absent.`);
-      const data = await method.apply(plugin, [...call.args]);
+
+      let data: unknown;
+      try {
+        data = await method.apply(plugin, [...args]);
+      } catch (engineError) {
+        // The engine's own words, for the methods where those words describe
+        // the CONTENTS of a file the renderer named.
+        throw opaque(call.method, engineError);
+      }
       assertCloneable(data, `${call.method}() result`);
       send({ k: 'ret', id: call.id, ok: true, data });
     } catch (error) {
       send({ k: 'ret', id: call.id, ok: false, error: toWireError(error) });
     }
+  }
+
+  /** Replace an engine failure whose message would leak, and log the original. */
+  function opaque(method: string, error: unknown): unknown {
+    const replacement = OPAQUE_FAILURES[method];
+    if (replacement === undefined) return error;
+    warn(`inference host: ${method} failed: ${toWireError(error).message}`);
+    return new Error(replacement);
   }
 
   return async (): Promise<void> => {
