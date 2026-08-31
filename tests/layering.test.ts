@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { builtinModules } from 'node:module';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -38,7 +39,35 @@ const SRC = resolve(process.cwd(), 'src');
  * `packages/contracts/src/listener.ts` names `@capacitor/core` in a comment
  * explaining why it does not import it, and a text search flagged that.
  */
-const SPECIFIER = /(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g;
+/**
+ * Every module specifier a file names, in any form we can write one.
+ *
+ * Widened twice after revert-checks found doors standing open. A template
+ * literal (`require(\`electron\`)`) and a comment between the callee and its
+ * paren (`require /* x *\/ ('electron')`) both slipped a matcher that handled
+ * only straight quotes and adjacent parens.
+ */
+const COMMENT = String.raw`(?:\s|/\*[\s\S]*?\*/)*`;
+const SPECIFIER = new RegExp(
+  String.raw`(?:from|import|require)${COMMENT}\(?${COMMENT}['"\`]([^'"\`]+)['"\`]`,
+  'g',
+);
+
+/**
+ * Node builtins, bare as well as `node:`-prefixed.
+ *
+ * The prefix is a convention, not a requirement: `import 'fs'` resolves to the
+ * same module as `import 'node:fs'`. Banning only the prefixed spelling let the
+ * unprefixed one through, and Vite answers it by externalising the module with
+ * a warning while the build still exits 0 — so the failure lands at runtime in
+ * the browser, which is exactly how an optional peer once blanked every page.
+ */
+const NODE_BUILTINS = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
+
+/** A specifier that reaches Node's own modules, however it is spelled. */
+function isNodeBuiltin(specifier: string): boolean {
+  return NODE_BUILTINS.has(specifier) || specifier.startsWith('node:');
+}
 
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
@@ -280,12 +309,13 @@ describe('the app never reaches the desktop-only layer', () => {
     // `electron`/`electron/...`, and any `node:` builtin. The specifier matcher
     // itself covers `require(...)` as well as the three import forms.
     const banned =
-      /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)|^electron($|\/)|^node:/;
+      /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)|^electron($|\/)|(^|\/)node_modules(\/|$)/;
     const offenders = files
       .filter((file) =>
-        [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) =>
-          banned.test(m[1] ?? ''),
-        ),
+        [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) => {
+          const specifier = m[1] ?? '';
+          return banned.test(specifier) || isNodeBuiltin(specifier);
+        }),
       )
       .map((file) => relative(SRC, file));
     expect(offenders).toEqual([]);
