@@ -5,7 +5,15 @@
  * imports no Electron and is therefore driven end-to-end by
  * `tests/desktop-bridge.test.ts` through fake ports. This file's whole job is
  * to turn Electron's objects into the three narrow interfaces that code works
- * against, and to hold the security posture in one readable place.
+ * against.
+ *
+ * It holds no security DECISIONS. Every predicate the posture rests on — the
+ * trusted-origin test, the external-scheme test, the bundle path resolver and
+ * the CSP — lives in `./security.ts`, which imports no Electron and is driven
+ * directly by `tests/desktop-security.test.ts`. Importing this file needs a
+ * live Electron runtime (`protocol.registerSchemesAsPrivileged` and
+ * `app.whenReady()` run at module scope), so anything decided here would be
+ * decided where no test can reach it.
  *
  * THREE PROCESSES, TWO BOUNDARIES:
  *
@@ -45,41 +53,16 @@ import type {
   MessageLink,
   PluginImplementation,
 } from './bridge/index.js';
-
-/** The privileged scheme the production bundle is served from. */
-const APP_SCHEME = 'chatterang-desktop';
-const APP_ORIGIN = `${APP_SCHEME}://app`;
+import {
+  APP_ORIGIN,
+  APP_SCHEME,
+  isAllowedExternalUrl,
+  isTrustedOrigin,
+  resolveBundleRequest,
+} from './security.js';
 
 /** Set only in development; a packaged build must never carry one. */
 const DEV_SERVER_URL = process.env['CHATTERANG_DEV_SERVER_URL'] ?? '';
-
-const CSP_PRODUCTION = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
-  "font-src 'self' data:",
-  "connect-src 'self' https: wss:",
-  "object-src 'none'",
-  "frame-src 'none'",
-  "base-uri 'self'",
-  "form-action 'self'",
-].join('; ');
-
-const MIME: Readonly<Record<string, string>> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.woff2': 'font/woff2',
-  '.wasm': 'application/wasm',
-  '.map': 'application/json; charset=utf-8',
-};
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -95,34 +78,15 @@ function appRoot(): string {
   return join(app.getAppPath(), 'app');
 }
 
-/**
- * Resolve a request path inside the app root, or reject it.
- *
- * Returns null for anything that escapes, so `../../../etc/passwd` is a 404
- * rather than a file read.
- */
-function resolveWithinRoot(root: string, pathname: string): string | null {
-  const decoded = decodeURIComponent(pathname).replace(/^\/+/, '');
-  const resolved = join(root, decoded);
-  const prefix = root.endsWith('/') ? root : `${root}/`;
-  return resolved === root || resolved.startsWith(prefix) ? resolved : null;
-}
-
 async function serveBundle(request: Request): Promise<Response> {
   const root = appRoot();
-  const url = new URL(request.url);
-  const target = resolveWithinRoot(root, url.pathname === '/' ? '/index.html' : url.pathname);
+  const target = resolveBundleRequest(root, new URL(request.url).pathname);
   if (target === null) return new Response('Not found', { status: 404 });
 
-  const extension = /\.[a-z0-9]+$/i.exec(target)?.[0]?.toLowerCase() ?? '';
-  // SPA fallback: an extensionless path is a client route, not a file.
-  const file = extension === '' ? join(root, 'index.html') : target;
-
   try {
-    const body = await readFile(file);
-    const type = extension === '' ? MIME['.html'] : (MIME[extension] ?? 'application/octet-stream');
-    const headers: Record<string, string> = { 'content-type': type ?? 'text/plain' };
-    if (type === MIME['.html']) headers['content-security-policy'] = CSP_PRODUCTION;
+    const body = await readFile(target.file);
+    const headers: Record<string, string> = { 'content-type': target.contentType };
+    if (target.csp !== undefined) headers['content-security-policy'] = target.csp;
     return new Response(new Uint8Array(body), { headers });
   } catch {
     return new Response('Not found', { status: 404 });
@@ -158,12 +122,7 @@ function isTrusted(event: { senderFrame: unknown; sender: WebContents }): boolea
   // Every iframe is refused outright: only the top frame of a window we
   // created may reach a plugin.
   if (event.senderFrame !== event.sender.mainFrame) return false;
-  const url = event.sender.getURL();
-  if (url.startsWith(APP_ORIGIN)) return true;
-  // A dev-server prefix is a string prefix, so `http://localhost:5273` also
-  // prefixes `http://localhost:52739`. That only matters when a dev URL is
-  // set, and `scripts/sync.mjs` refuses to package a build that has one.
-  return DEV_SERVER_URL !== '' && url.startsWith(DEV_SERVER_URL);
+  return isTrustedOrigin(event.sender.getURL(), DEV_SERVER_URL);
 }
 
 /* ── Wiring ───────────────────────────────────────────────────────────── */
@@ -293,12 +252,12 @@ function createWindow(
   // Navigation lock: nothing may leave our origin in-window, and window.open
   // is refused outright.
   contents.on('will-navigate', (event, url) => {
-    if (url.startsWith(APP_ORIGIN) || (DEV_SERVER_URL !== '' && url.startsWith(DEV_SERVER_URL))) return;
+    if (isTrustedOrigin(url, DEV_SERVER_URL)) return;
     event.preventDefault();
-    void shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
   });
   contents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
 
