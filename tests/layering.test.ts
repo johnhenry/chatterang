@@ -205,6 +205,9 @@ describe('the app never reaches the desktop-only layer', () => {
     // import from src/ would put them in the mobile bundle, where they cannot
     // load at all. The seam is one-way by construction: cordis-aimatey imports
     // aimatey, never the reverse.
+    // Two Node-only packages, three doors each. inference-node was missed on
+    // the first pass: it pulls node-llama-cpp's native binaries, which cannot
+    // load in a webview, and it was simply absent from the list.
     // Three doors, not one. A bare specifier is the obvious route; a subpath
     // (`@chatterang/cordis-aimatey/src/adapter`) and a relative path into the
     // package (`../packages/cordis-aimatey/...`) reach exactly the same code.
@@ -212,7 +215,7 @@ describe('the app never reaches the desktop-only layer', () => {
     // rule, and was revert-checked only against bare specifiers — the one form
     // it already caught. Both other doors were open.
     const banned =
-      /^(@deepseek-ai\/|@chatterang\/cordis-aimatey(\/|$))|(^|\/)packages\/cordis-aimatey(\/|$)/;
+      /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node)(\/|$))|(^|\/)packages\/(cordis-aimatey|inference-node)(\/|$)/;
     const offenders = files
       .filter((file) =>
         [...readFileSync(file, 'utf8').matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].some((m) =>
