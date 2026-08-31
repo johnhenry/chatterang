@@ -21,9 +21,17 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import type { Router } from '@johnhenry/aimatey-core';
-import type { BackendAdapter, BackendInfo, IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
+import type {
+  BackendAdapter,
+  BackendInfo,
+  IRChatRequest,
+  IRStreamChunk,
+  RouterConfig,
+} from '@johnhenry/aimatey-types';
 
 import { translate } from './chunks.js';
+import { ROUTE_UNAVAILABLE_CODE } from './errors.js';
+import { pinRouter } from './pin.js';
 import { ROUTER_SENTINEL, toIRRequest } from './request.js';
 import type { TranslationHooks } from './request.js';
 
@@ -43,6 +51,15 @@ export interface AimateyRouter {
   get(name: string): BackendAdapter | undefined;
   /** Metadata for one registered backend. */
   getBackendInfo(name: string): BackendInfo | undefined;
+  /**
+   * This router with different settings, sharing the same adapter INSTANCES.
+   *
+   * `RouterConfig` comes from `@johnhenry/aimatey-types`; `aimatey-core` does
+   * not export it (tsc: TS2305).
+   */
+  clone(config: Partial<RouterConfig>): AimateyRouter;
+  /** Drop one backend registration. Throws if the name is not registered. */
+  unregister(name: string): AimateyRouter;
   /** Route and stream one IR request. Cancellation is threaded POSITIONALLY. */
   executeStream(request: IRChatRequest, signal?: AbortSignal): AsyncIterable<IRStreamChunk>;
 }
@@ -167,9 +184,24 @@ export class AimateyAdapter extends LlmAdapter {
    * `prepareCall` is deliberately not overridden: the base implementation calls
    * `resolveModel` and binds `stream`, and our `resolveModel` does no I/O, so
    * the extra per-request call costs nothing.
+   *
+   * Two paths. {@link ROUTER_SENTINEL} means "let the Router choose", so it
+   * streams through the app's Router untouched. Every other route NAMES one
+   * backend, and a named route is a promise about provenance — so it is
+   * refused up front if that backend is not routable, and otherwise streamed
+   * through a Router that structurally cannot reach any other backend.
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, undefined> {
-    if (options.provider !== ROUTER_SENTINEL && !this.#router.has(options.provider)) {
+    if (options.provider === ROUTER_SENTINEL) {
+      const request = toIRRequest(options, options.provider, this.#hooks);
+      // The signal is threaded positionally; aimatey does not read it from the
+      // request object.
+      yield* translate(this.#router.executeStream(request, options.signal), options.signal, this.#hooks);
+      return;
+    }
+
+    const info = this.#router.getBackendInfo(options.provider);
+    if (info === undefined) {
       // The route set is captured once at mount; a backend removed since then
       // would otherwise surface as an opaque routing failure from inside the
       // Router.
@@ -178,9 +210,48 @@ export class AimateyAdapter extends LlmAdapter {
         'NO_BACKEND_AVAILABLE',
       );
     }
+
+    // Pre-flight. The pin below already makes substitution impossible, so this
+    // is not the guarantee — it is the diagnostic front door, and it earns its
+    // place by failing BEFORE any I/O: no API key is used and no prompt leaves
+    // the device on a backend the caller did not name.
+    //
+    // The condition mirrors aimatey's own `isBackendAvailable`
+    // (router.js:1651-1655) exactly, including `!== 'open'` rather than
+    // `=== 'closed'`, so a HALF-OPEN backend — one the breaker is letting
+    // recover — is not spuriously refused. Both fields are required members of
+    // `BackendInfo` (aimatey-types dist/types/router.d.ts:216-226), so a shape
+    // change breaks the build here rather than silently reading `undefined`.
+    if (!info.isHealthy || info.circuitBreakerState === 'open') {
+      throw new LlmError(
+        `aimatey backend "${options.provider}" is not routable right now ` +
+          `(healthy=${String(info.isHealthy)}, circuit=${String(info.circuitBreakerState)}) — ` +
+          'refusing to substitute another backend for a named route; ' +
+          `use the "${ROUTER_SENTINEL}" route to let the router choose.`,
+        ROUTE_UNAVAILABLE_CODE,
+      );
+    }
+
     const request = toIRRequest(options, options.provider, this.#hooks);
-    // The signal is threaded positionally; aimatey does not read it from the
-    // request object.
-    yield* translate(this.#router.executeStream(request, options.signal), options.signal, this.#hooks);
+    // WHAT THIS BUYS: substitution is structurally impossible, because a
+    // one-backend Router leaves router.js:537-540 ("first available backend")
+    // nothing to select and leaves the mid-stream fallback chain empty. It
+    // holds whatever `routingStrategy`/`fallbackStrategy` the app configured,
+    // which this adapter neither owns nor can enforce.
+    //
+    // WHAT IT COSTS: failures on this path never reach the APP router's
+    // breaker. Measured — five failing pinned requests left the app router at
+    // `circuitBreakerState='closed', consecutiveFailures=0, totalRequests=0`,
+    // where five direct ones opened it after three. There is no public API to
+    // record a failure back onto a Router, so this is documented rather than
+    // half-fixed; it is bounded by `providerRetryPolicy` already being
+    // `maxRetries: 0` above, so DSH cannot hammer a dead backend, and by the
+    // pre-flight still reading the APP router's verdict, so the app's own
+    // traffic keeps gating the DSH path.
+    yield* translate(
+      pinRouter(this.#router, options.provider).executeStream(request, options.signal),
+      options.signal,
+      this.#hooks,
+    );
   }
 }

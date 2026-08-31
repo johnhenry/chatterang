@@ -80,6 +80,28 @@ export const PASS_THROUGH_CODES: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * The code a named route is refused under when its backend is not routable.
+ *
+ * Minted on the DSH side by this adapter — it is not one of aimatey's 34
+ * `ErrorCode` members — so it is deliberately absent from
+ * {@link AIMATEY_TO_DSH_CODE} and {@link PASS_THROUGH_CODES}: both of those
+ * translate codes coming OUT of aimatey, and the ErrorCode-coverage test walks
+ * aimatey's enum, not this constant.
+ *
+ * Distinct from `NO_BACKEND_AVAILABLE` on purpose. A pinned clone with no
+ * routable backend produces `NO_BACKEND_AVAILABLE` anyway, so if the pre-flight
+ * refusal shared that code, DELETING the pre-flight would change nothing a test
+ * could see except a message substring. A distinct code makes that mutation
+ * catchable by code rather than by prose.
+ *
+ * Not spelled `PROVIDER_UNAVAILABLE`: that is an aimatey code which
+ * {@link AIMATEY_TO_DSH_CODE} already maps to `SERVER`, and `SERVER` is in the
+ * default retryable set — a refusal that says "this exact backend is out" must
+ * not read as "the server hiccuped, try again".
+ */
+export const ROUTE_UNAVAILABLE_CODE = 'ROUTE_UNAVAILABLE';
+
+/**
  * Translate one aimatey error code into the DSH code to throw it under.
  *
  * @param code - the aimatey `ErrorCode` member, or any provider string.

@@ -34,7 +34,8 @@ export const REQUIRED_SERVICES = ['llm'] as const;
 export { AimateyAdapter } from './adapter.js';
 export type { AimateyAdapterOptions, AimateyRouter, RouterConformance } from './adapter.js';
 export { translate } from './chunks.js';
-export { AIMATEY_TO_DSH_CODE, PASS_THROUGH_CODES, mapCode } from './errors.js';
+export { AIMATEY_TO_DSH_CODE, PASS_THROUGH_CODES, ROUTE_UNAVAILABLE_CODE, mapCode } from './errors.js';
+export { pinRouter } from './pin.js';
 export { ROUTER_SENTINEL, toIRRequest } from './request.js';
 export type { TranslationHooks } from './request.js';
 export { assertBoot, assertRoutes, assertServices } from './assert-boot.js';
@@ -55,6 +56,15 @@ export interface AimateyRouterConfig {
    * The plugin never calls `router.dispose()` on unmount: `src/ai/engine.ts`
    * holds the same instance and owns its health-check timer, so disposing it
    * here would stop the app's own routing.
+   *
+   * ROUTING CONTRACT. A NAMED route is pinned adapter-side and does not consult
+   * this router's `routingStrategy`, `fallbackStrategy`, `defaultBackend` or
+   * capability routing at all: it streams through a per-request clone holding
+   * only the named backend (see `pinRouter`), and is refused outright if that
+   * backend is unhealthy or its circuit is open. Only {@link ROUTER_SENTINEL}
+   * lets this router choose. The behaviour change that buys: a named route
+   * that used to be served quietly by a SUBSTITUTE backend now fails with
+   * `ROUTE_UNAVAILABLE`.
    */
   readonly router: AimateyRouter;
 }

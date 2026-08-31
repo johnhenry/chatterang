@@ -9,7 +9,7 @@ reverse, and nothing under `src/` may import this package or any
 `@deepseek-ai/*` module. DSH is Node-only and pulls native addons that cannot
 load in a mobile webview. `tests/layering.test.ts` enforces it.
 
-## The two decisions a reader has to know about
+## The three decisions a reader has to know about
 
 ### 1. It wraps `Router.executeStream`, not `Bridge.chatStream`
 
@@ -29,8 +29,8 @@ holds the same `Router` instance and owns its health-check timer.
 ### 2. Routes are `['aimatey', ...router.listBackends()]`
 
 `aimatey` is a sentinel route meaning *let the Router choose the backend*. Every
-other route names one backend and pins the request to it through
-`metadata.custom.backend`, the single key `Router.executeStream` reads.
+other route names one backend, and a named route is **pinned by construction**
+(see below), not by preference.
 
 Two consequences:
 
@@ -42,6 +42,53 @@ Two consequences:
 - If a backend is literally registered under the name `aimatey`, the sentinel is
   dropped with a warning. `registerAdapter` is all-or-nothing: a duplicate route
   anywhere in the array throws `DUPLICATE_ADAPTER` and nothing registers at all.
+
+### 3. A named route is pinned by CONSTRUCTION, and that costs something
+
+`metadata.custom.backend` is a **preference, not a pin**.
+`Router.selectBackend` honours it only while `isBackendAvailable(name)` holds
+(aimatey-core `dist/esm/router.js:495`); when the named backend is unhealthy or
+its breaker is open, control falls through to *"Final fallback: first available
+backend"* (`router.js:537-540`) and **another backend serves the request with no
+signal to the caller**. That line is on the primary selection path, so
+`fallbackStrategy: 'none'` does not gate it — it only gates
+`nextStreamFallbackBackend` (`router.js:1386-1388`). Reproduced under this app's
+own Router config: with `openai`'s breaker open, a request pinned to `openai`
+was served by `llama-cpp`.
+
+So a named route now does two things:
+
+1. **Refuses up front** with the adapter-minted code `ROUTE_UNAVAILABLE` when
+   `getBackendInfo(name)` reports `isHealthy: false` or
+   `circuitBreakerState: 'open'` — the same condition aimatey's own
+   `isBackendAvailable` reads (`router.js:1651-1655`), including `!== 'open'`
+   so a **half-open** (recovering) backend is not spuriously refused. This
+   fails before any I/O: no API key is used and no prompt leaves the device on
+   a backend the caller did not name.
+2. **Streams through a per-request `router.clone(...)` pruned to that one
+   backend** (`pinRouter`). Substitution is then structurally impossible — a
+   one-backend Router has nothing to substitute — under *any* config the
+   adapter is handed. This matters because a pre-flight check alone is blind to
+   mid-stream replacement: under aimatey's default
+   `fallbackStrategy: 'sequential'`, a backend that is healthy at selection time
+   and dies after its `start` chunk is silently replaced, and the adapter does
+   not own that setting.
+
+**The behaviour change:** a named route that was previously being served
+quietly by a substitute now fails.
+
+**The cost, measured:** failures on the pinned path never reach the *app*
+router's circuit breaker. Five failing pinned requests left the app router at
+`circuitBreakerState: 'closed'`, `consecutiveFailures: 0`, `totalRequests: 0`,
+where five direct ones opened it after three. There is no public API to record
+a failure back onto a `Router`, so this is written down rather than
+half-fixed. It is bounded on both sides: `providerRetryPolicy` is already
+`maxRetries: 0`, so DSH cannot hammer a dead backend, and the pre-flight still
+reads the **app** router's verdict, so the app's own traffic keeps gating the
+DSH path. The clone itself is cheap (1000 clone+prune cycles ≈ 1.3 ms) and is
+built per request, never cached by name — `connectProvider` calls
+`Router.replace` on API-key rotation, and a name-keyed cache would keep
+streaming through the pre-rotation adapter.
 
 ## Why the boot assertion exists
 

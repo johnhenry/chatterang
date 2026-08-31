@@ -94,19 +94,55 @@ interface FakeBackend {
 class FakeRouter implements AimateyRouter {
   readonly #backends = new Map<string, FakeBackend>();
   /** Every request this router was handed, for assertions on the translation. */
-  readonly seen: IRChatRequest[] = [];
+  readonly seen: IRChatRequest[];
   /** Backend chosen per request, in order. */
-  readonly routed: string[] = [];
+  readonly routed: string[];
+  /** Availability, per backend — what `getBackendInfo` reports. */
+  readonly #health = new Map<string, { isHealthy: boolean; circuitBreakerState: string }>();
   disposed = false;
+
+  /**
+   * @param seen - shared with the router this one was cloned from, so a test
+   *   that asserts on `seen`/`routed` still sees a request the adapter sent
+   *   through a per-request pinned CLONE rather than through this instance.
+   */
+  constructor(seen: IRChatRequest[] = [], routed: string[] = []) {
+    this.seen = seen;
+    this.routed = routed;
+  }
 
   register(name: string, backend: FakeBackend): this {
     this.#backends.set(name, backend);
+    this.#health.set(name, { isHealthy: true, circuitBreakerState: 'closed' });
+    return this;
+  }
+
+  /** Model an unhealthy or breaker-tripped backend, which the real one can. */
+  setHealth(name: string, health: { isHealthy?: boolean; circuitBreakerState?: string }): this {
+    const current = this.#health.get(name) ?? { isHealthy: true, circuitBreakerState: 'closed' };
+    this.#health.set(name, { ...current, ...health });
     return this;
   }
 
   unregister(name: string): this {
     this.#backends.delete(name);
+    this.#health.delete(name);
     return this;
+  }
+
+  /**
+   * A copy holding the same backends, sharing this one's observation log.
+   *
+   * Config is not modelled: what a clone's config does is asserted directly
+   * against the REAL Router in `tests/cordis-aimatey-seam.test.ts`, because a
+   * fake that answers config questions about itself proves nothing about
+   * aimatey.
+   */
+  clone(): FakeRouter {
+    const next = new FakeRouter(this.seen, this.routed);
+    for (const [name, backend] of this.#backends) next.register(name, backend);
+    for (const [name, health] of this.#health) next.#health.set(name, { ...health });
+    return next;
   }
 
   listBackends(): readonly string[] {
@@ -139,11 +175,17 @@ class FakeRouter implements AimateyRouter {
   getBackendInfo(name: string): BackendInfo | undefined {
     const backend = this.#backends.get(name);
     if (backend === undefined) return undefined;
+    const health = this.#health.get(name) ?? { isHealthy: true, circuitBreakerState: 'closed' };
     return {
       name,
       adapter: this.get(name) as BackendAdapter,
       metadata: { name, version: '0.0.0', provider: backend.provider },
-      isHealthy: true,
+      // Both fields are REQUIRED on the real `BackendInfo`. An earlier version
+      // hardcoded `isHealthy: true` and omitted `circuitBreakerState` entirely
+      // behind the cast below — so every availability assertion written against
+      // this fake passed for free.
+      isHealthy: health.isHealthy,
+      circuitBreakerState: health.circuitBreakerState,
     } as unknown as BackendInfo;
   }
 
