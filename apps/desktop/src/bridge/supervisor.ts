@@ -145,6 +145,44 @@ export interface StreamSpec {
   synthesise(requestId: string, error: string): unknown;
 }
 
+/**
+ * The SESSION contract of one engine, for engines that have one.
+ *
+ * A turn is short and ends by itself; a session is neither. `createSession`
+ * opens native graphs — 79 MB of Whisper encoder and 199 MB of decoder for
+ * whisper-base, and diffusion is larger — and they stay open until something
+ * asks for them back. Nothing did. `renderer-lifecycle.ts` released
+ * subscriptions and generations on every renderer departure and had no third
+ * member; a window that reloaded left its sessions resident in the host with
+ * no handle anywhere that could name them again. Every Cmd+R was another
+ * pipeline.
+ *
+ * Modelled the same way the stream is, and for the same reason: the supervisor
+ * must not know what "Whisper" is. It knows that ONE method opens a resource
+ * whose handle comes back in the result, that another closes it by that
+ * handle, and that the window which opened it owns it.
+ *
+ * llama.cpp has no spec here on purpose. Its `load`/`unload` pair looks
+ * similar and is not: a loaded GGUF is deliberately shared between windows —
+ * `src/ai/backends/llama-cpp.ts` caches the handle across the whole app — so
+ * releasing one on a window's departure would unload the model out from under
+ * every other window. ONNX sessions are per-caller (`src/lib/voice.ts` keeps a
+ * module-scoped map, which is per renderer), so theirs are not.
+ */
+export interface SessionSpec {
+  /** The method that opens a session, answering with something that has a handle. */
+  readonly open: string;
+  /** The method that closes one, called as `close({ handle })`. */
+  readonly close: string;
+  /**
+   * The handle in `open`'s result, or undefined if it did not carry one.
+   *
+   * A function rather than a field name so an engine whose result is shaped
+   * differently does not need this class to grow a case for it.
+   */
+  handleOf(result: unknown): string | undefined;
+}
+
 /** One plugin the supervisor forwards to, and how its turns behave. */
 export interface EngineSpec {
   readonly definition: PluginDefinition;
@@ -159,6 +197,8 @@ export interface EngineSpec {
   readonly senderScoped?: readonly string[];
   /** Omitted for a plugin with no turns. */
   readonly stream?: StreamSpec;
+  /** Omitted for a plugin whose resources are not per-renderer. */
+  readonly sessions?: SessionSpec;
 }
 
 /** A zeroed result, for the ends the host never got to report itself. */
@@ -230,10 +270,16 @@ function synthesiseTranscriptionEnd(requestId: string, error: string): Transcrip
  * call. What is never legitimate is silence for five minutes.
  *
  * `senderScoped` is omitted deliberately: the default is
- * `[stream.start, stream.cancel]` = `['transcribe', 'cancel']`, which is
- * exactly right. A transcription belongs to the window that started it, and
- * naming anything else would claim that e.g. `createSession`'s answer differs
- * per window.
+ * `[stream.start, stream.cancel, sessions.open]` = `['transcribe', 'cancel',
+ * 'createSession']`, which is exactly right. A transcription belongs to the
+ * window that started it, and so does the session it runs on — that is what
+ * lets a departing window's native graphs be released. `releaseSession` is
+ * NOT scoped: a handle is opaque and unguessable, the renderer only ever holds
+ * its own, and scoping it would turn a duplicate release into a silent no-op
+ * instead of the idempotent one the contract promises.
+ *
+ * `sessions` is what closes the leak. `createSession` opens two native graphs
+ * for Whisper and nothing released them when the window that asked went away.
  */
 export const ONNX_ENGINE: EngineSpec = Object.freeze({
   definition: ONNX_PLUGIN,
@@ -244,6 +290,14 @@ export const ONNX_ENGINE: EngineSpec = Object.freeze({
     progress: Object.freeze(['onnxPartial']),
     idleTimeoutMs: 300_000,
     synthesise: synthesiseTranscriptionEnd,
+  }),
+  sessions: Object.freeze({
+    open: 'createSession',
+    close: 'releaseSession',
+    handleOf: (result: unknown): string | undefined => {
+      const handle = (result as { handle?: unknown } | null)?.handle;
+      return typeof handle === 'string' && handle.length > 0 ? handle : undefined;
+    },
   }),
 });
 
@@ -359,6 +413,13 @@ interface InflightGeneration {
 interface EngineState {
   readonly spec: EngineSpec;
   readonly inflight: Map<string, InflightGeneration>;
+  /**
+   * Open session handle -> the renderer that opened it.
+   *
+   * Per engine for the same reason `inflight` is: a handle is only meaningful
+   * to the engine that minted it, and two engines may mint the same string.
+   */
+  readonly sessions: Map<string, number>;
 }
 
 function codedError(message: string, code: string): Error {
@@ -478,7 +539,32 @@ export class Supervisor {
         }
       }
 
-      this.#engines.set(spec.definition.name, { spec, inflight: new Map() });
+      /*
+       * The same check for the session pair, and it fails the same way.
+       *
+       * An `open` the definition does not declare is never called, so nothing
+       * is ever recorded and the release on teardown silently frees nothing; a
+       * `close` it does not declare is posted to a host that answers
+       * UNKNOWN_METHOD, which is a rejection nobody is waiting for. Both read
+       * as a working cleanup and are not one, which is the whole reason this
+       * gap existed in the first place.
+       */
+      const sessions = spec.sessions;
+      if (sessions !== undefined) {
+        const methods = new Set(spec.definition.methods);
+        const missing: string[] = [];
+        if (!methods.has(sessions.open)) missing.push(`method "${sessions.open}" (session open)`);
+        if (!methods.has(sessions.close)) missing.push(`method "${sessions.close}" (session close)`);
+        if (missing.length > 0) {
+          throw new Error(
+            `desktop bridge: engine "${spec.definition.name}" names ${missing.join(', ')}, ` +
+              'which its plugin definition does not declare. A session that cannot be opened ' +
+              'or closed by name is a session nothing will ever release.',
+          );
+        }
+      }
+
+      this.#engines.set(spec.definition.name, { spec, inflight: new Map(), sessions: new Map() });
     }
 
     this.#attach();
@@ -566,7 +652,7 @@ export class Supervisor {
    */
   plugin(pluginName: string): PluginImplementation {
     const engine = this.#engine(pluginName);
-    const { definition, stream } = engine.spec;
+    const { definition, stream, sessions } = engine.spec;
 
     const methods: Record<string, (...args: readonly unknown[]) => unknown> = {};
     for (const method of definition.methods) {
@@ -574,15 +660,23 @@ export class Supervisor {
         methods[method] = (senderId, ...args) => this.#startTurn(engine, senderId as number, args);
       } else if (stream !== undefined && method === stream.cancel) {
         methods[method] = (senderId, ...args) => this.#cancelTurn(engine, senderId as number, args);
+      } else if (sessions !== undefined && method === sessions.open) {
+        methods[method] = (senderId, ...args) => this.#openSession(engine, senderId as number, args);
+      } else if (sessions !== undefined && method === sessions.close) {
+        methods[method] = (...args) => this.#closeSession(engine, args);
       } else {
         methods[method] = (...args) => this.#call(pluginName, method, args);
       }
     }
 
+    const scoped: string[] = [];
+    if (stream !== undefined) scoped.push(stream.start, stream.cancel);
+    // `open` only. See ONNX_ENGINE for why `close` deliberately is not.
+    if (sessions !== undefined) scoped.push(sessions.open);
+
     return {
       ...methods,
-      [SENDER_SCOPED]:
-        engine.spec.senderScoped ?? (stream === undefined ? [] : [stream.start, stream.cancel]),
+      [SENDER_SCOPED]: engine.spec.senderScoped ?? scoped,
     } as unknown as PluginImplementation;
   }
 
@@ -707,6 +801,59 @@ export class Supervisor {
     await this.#call(engine.spec.definition.name, stream.cancel, args);
   }
 
+  /* ── Sessions ──────────────────────────────────────────────────────── */
+
+  /**
+   * Open a session and record which window owns it.
+   *
+   * Recorded from the RESULT rather than from the arguments, because the
+   * handle is minted by the host: the caller cannot name it, and a table keyed
+   * by anything the caller supplies would not be the table the host answers
+   * to. A result that carries no handle is forwarded untouched and tracked as
+   * nothing — an engine is allowed to refuse, and a refusal is a rejection
+   * this method does not catch.
+   */
+  async #openSession(
+    engine: EngineState,
+    senderId: number,
+    args: readonly unknown[],
+  ): Promise<unknown> {
+    const sessions = engine.spec.sessions;
+    /* c8 ignore next */
+    if (sessions === undefined) return Promise.reject(new Error('unreachable: no session spec'));
+    const result = await this.#call(engine.spec.definition.name, sessions.open, args);
+    const handle = sessions.handleOf(result);
+    if (handle !== undefined) engine.sessions.set(handle, senderId);
+    return result;
+  }
+
+  /**
+   * Close a session the caller named, and forget it.
+   *
+   * Forgotten BEFORE the call is posted, so a release that fails still leaves
+   * the table honest — a handle we no longer believe in must not be released a
+   * second time on teardown, and the engine's own release is documented as
+   * idempotent for exactly one caller, not two racing ones.
+   *
+   * Not sender-scoped, so any window may release any handle it can name. That
+   * is the pre-existing contract and it is safe: handles are minted by the
+   * host and never broadcast, so the only window that can name one is the one
+   * that opened it.
+   */
+  async #closeSession(engine: EngineState, args: readonly unknown[]): Promise<unknown> {
+    const sessions = engine.spec.sessions;
+    /* c8 ignore next */
+    if (sessions === undefined) return Promise.reject(new Error('unreachable: no session spec'));
+    const handle = (args[0] as { handle?: unknown } | undefined)?.handle;
+    if (typeof handle === 'string') engine.sessions.delete(handle);
+    return this.#call(engine.spec.definition.name, sessions.close, args);
+  }
+
+  /** Open sessions for ONE engine. Exists so a test can assert they drain. */
+  sessionCountFor(pluginName: string): number {
+    return this.#engine(pluginName).sessions.size;
+  }
+
   /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
   /**
@@ -729,25 +876,50 @@ export class Supervisor {
    * ACROSS EVERY ENGINE, because the window really is gone: a departing
    * renderer's transcription is as abandoned as its generation. Each engine is
    * cancelled with its OWN cancel method, on its own plugin address.
+   *
+   * AND ITS SESSIONS ARE RELEASED, which is the part that was missing
+   * entirely. Cancelling a turn stops work; it frees nothing. The window's
+   * ONNX sessions are hundreds of megabytes of native graphs that no handle
+   * anywhere can name once the page holding them is gone, so every reload left
+   * another Whisper pipeline resident in the host for the rest of the app's
+   * life. Fired and not awaited, in the same posted-call style as the cancels
+   * above: this runs from an Electron event handler that cannot await, and a
+   * host that has already died has had its whole table dropped by `#onClose`.
    */
   releaseRenderer(senderId: number, reason: string): void {
     for (const engine of this.#engines.values()) {
       const stream = engine.spec.stream;
-      if (stream === undefined) continue;
-      for (const [requestId, entry] of engine.inflight) {
-        if (entry.senderId !== senderId) continue;
-        entry.ended = true;
+      const name = engine.spec.definition.name;
+      if (stream !== undefined) {
+        for (const [requestId, entry] of engine.inflight) {
+          if (entry.senderId !== senderId) continue;
+          entry.ended = true;
+          this.#post({
+            k: 'call',
+            id: this.#nextCallId++,
+            plugin: name,
+            method: stream.cancel,
+            args: [{ requestId }],
+          });
+          const pending = this.#calls.get(entry.callId);
+          this.#calls.delete(entry.callId);
+          engine.inflight.delete(requestId);
+          pending?.reject(codedError(reason, 'RENDERER_GONE'));
+        }
+      }
+
+      const sessions = engine.spec.sessions;
+      if (sessions === undefined) continue;
+      for (const [handle, owner] of engine.sessions) {
+        if (owner !== senderId) continue;
+        engine.sessions.delete(handle);
         this.#post({
           k: 'call',
           id: this.#nextCallId++,
-          plugin: engine.spec.definition.name,
-          method: stream.cancel,
-          args: [{ requestId }],
+          plugin: name,
+          method: sessions.close,
+          args: [{ handle }],
         });
-        const pending = this.#calls.get(entry.callId);
-        this.#calls.delete(entry.callId);
-        engine.inflight.delete(requestId);
-        pending?.reject(codedError(reason, 'RENDERER_GONE'));
       }
     }
   }
@@ -1103,6 +1275,13 @@ export class Supervisor {
         );
       }
       engine.inflight.clear();
+      // The process that held these graphs is gone, so the handles name
+      // nothing. Keeping them would make the next renderer teardown post a
+      // `releaseSession` for a session that died with its host — into the
+      // REPLACEMENT host, where the handle is either unknown (a harmless
+      // no-op) or, once handle names are reused across lives, somebody
+      // else's.
+      engine.sessions.clear();
     }
 
     for (const [, pending] of this.#calls) pending.reject(codedError(message, HANDLE_LOST));

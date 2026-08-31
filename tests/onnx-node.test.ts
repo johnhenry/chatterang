@@ -416,6 +416,42 @@ describe('session lifecycle', () => {
     expect((await plugin.listLoaded()).handles).toEqual([]);
   });
 
+  it('releases BOTH graphs when the pair opens and then fails inspection', async () => {
+    /*
+     * THE ERROR PATH THAT WAS UNGUARDED. Both graphs open, and
+     * `inspectWhisper` then refuses the pair — the ordinary "you pointed
+     * `companions.decoder` at the wrong file" failure. That is the largest
+     * stranding this class can produce: whisper-base is 79 MB of encoder and
+     * 199 MB of decoder, both live native sessions, and after the throw
+     * nothing holds a handle to either.
+     *
+     * FAULT INJECTED, against the code as it was: deleting the two
+     * `graph.release()` lines from `#loadWhisper`'s `inspectWhisper` catch
+     * left the WHOLE SUITE green — `npx vitest run` exited 0 with 662 passed.
+     * With this test present the same deletion fails (`[0, 0]` received for
+     * `[1, 1]`). The release now lives in `createSession`'s single catch, over
+     * the array `#openGraph` fills as it opens, so deleting THAT fails here
+     * too.
+     */
+    const record = fakeEngine({
+      // Both files answer with an ENCODER graph, so the second one is opened
+      // successfully and is then not a merged decoder — no `input_ids`.
+      open: () => new FakeGraph(whisperEncoderSpec()),
+    });
+    const plugin = new OnnxRuntimeNode({ createEngine: async () => record.engine });
+
+    await expect(
+      plugin.createSession({ task: 'stt', modelPath: whisperDirectory() }),
+    ).rejects.toThrowError(/not a merged Whisper decoder/);
+
+    // Two graphs opened; two released, exactly once each. The fake throws on a
+    // second release, so a double free would surface as a rejection above
+    // rather than as a silent extra count.
+    expect(record.graphs).toHaveLength(2);
+    expect(record.graphs.map((graph) => graph.releases)).toEqual([1, 1]);
+    expect((await plugin.listLoaded()).handles).toEqual([]);
+  });
+
   it('warns that a tts or diffusion graph has no pipeline behind it', async () => {
     const record = fakeEngine({ open: () => new FakeGraph(whisperEncoderSpec()) });
     const plugin = new OnnxRuntimeNode({ createEngine: async () => record.engine });

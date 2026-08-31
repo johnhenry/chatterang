@@ -23,6 +23,8 @@ export {
   channelCollisions,
   methodChannel,
 } from './channels.js';
+export { HostFleet } from './host-fleet.js';
+export type { FleetEntry, HostFleetOptions } from './host-fleet.js';
 export { PluginHost } from './plugin-host.js';
 export { RENDERER_TEARDOWN_EVENTS, releaseRendererOn, teardownReason } from './renderer-lifecycle.js';
 export type { RendererTeardownEvent, RendererTeardownTargets } from './renderer-lifecycle.js';
@@ -37,6 +39,7 @@ export { DEFAULT_POLICY, LLAMA_ENGINE, ONNX_ENGINE, Supervisor, systemTimers } f
 export type {
   EngineSpec,
   NotifyListeners,
+  SessionSpec,
   StreamSpec,
   SupervisorOptions,
   SupervisorPolicy,

@@ -15,13 +15,28 @@
  * `app.whenReady()` run at module scope), so anything decided here would be
  * decided where no test can reach it.
  *
- * THREE PROCESSES, TWO BOUNDARIES:
+ * FOUR PROCESSES, TWO BOUNDARIES — and the fourth is the point of this
+ * milestone:
  *
  *   renderer (sandboxed, the existing `src/` bundle, unchanged)
  *      | boundary 1 — the plugin bridge, allowlisted channels
- *   main (this file: PluginHost, Supervisor, window, protocol)
- *      | boundary 2 — a utilityProcess message port
- *   inference host (LlamaCppNode + node-llama-cpp + the Cordis/DSH tree)
+ *   main (this file: PluginHost, HostFleet, window, protocol)
+ *      | boundary 2 — one utilityProcess message port PER ENGINE
+ *   inference host `llama` (LlamaCppNode + node-llama-cpp + the Cordis/DSH tree)
+ *   inference host `onnx`  (OnnxRuntimeNode + onnxruntime-node, and nothing else)
+ *
+ * THE TWO HOSTS ARE NOT A TIDINESS. `InferenceSession.run` is a synchronous
+ * native call: it holds its process's event loop for its whole duration, and
+ * the supervisor's liveness ping is answered on that loop. Measured in this
+ * repo with the real models in one host: a whisper-base encoder run at batch
+ * 32 blocked 5506 ms and llama.cpp emitted zero tokens inside it; and at the
+ * supervisor level, with the shipped policy, an unbroken block of 11-25 s is
+ * CONDEMNED — which kills the process and destroys llama.cpp's in-flight
+ * generation with a synthesised terminal and `HANDLE_LOST`. The plugin
+ * dimension gave the engines logical isolation; only separate processes give
+ * them physical isolation. `bridge/host-fleet.ts` owns the multiplicity, and
+ * `Supervisor` itself needed no change at all — it was already generic over
+ * hosts, so two engines in two processes is two instances of it.
  *
  * LOGGING RULE, and it is a rule rather than a preference: never log a
  * `GenerateOptions.prompt`, never log a `GenerateResult.text`, and never build
@@ -40,18 +55,19 @@ import {
   BOOTSTRAP_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
+  HostFleet,
   LLAMA_ENGINE,
   LLAMA_PLUGIN,
   ONNX_ENGINE,
   ONNX_PLUGIN,
   PluginHost,
-  Supervisor,
   createMainRouter,
   releaseRendererOn,
 } from './bridge/index.js';
 import type {
   BootManifest,
   DshStatus,
+  FleetEntry,
   HostHandle,
   InvokeResult,
   RendererTeardownEvent,
@@ -126,20 +142,32 @@ async function serveBundle(request: Request): Promise<Response> {
  * how long to wait, how to notice a host that is alive but wedged) lives in
  * `Supervisor`, where tests can reach it.
  */
-function spawnInferenceHost(): HostHandle {
+function spawnInferenceHost(engineName: string): HostHandle {
   // The model directory is passed as an ARGUMENT because only main can ask
   // Electron where `userData` is, and the host needs it to confine the paths
   // `LlamaCpp.load` is asked to open (defect [8]). The host refuses to start
   // without it rather than guessing a directory, so a wiring mistake here is a
   // boot failure and not a confinement to the wrong place.
-  const child = utilityProcess.fork(join(app.getAppPath(), 'build', 'host.mjs'), [modelRoot()], {
-    serviceName: 'chatterang-inference',
-    // Piped, not inherited: the host's stdout must not reach a terminal or a
-    // log the user did not ask for.
-    stdio: 'pipe',
-  });
-  child.stdout?.on('data', (chunk: Buffer) => process.stdout.write(`[inference] ${chunk}`));
-  child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`[inference] ${chunk}`));
+  //
+  // The ENGINE NAME is the second argument, and it is the whole of the split
+  // on this side: one bundled entry point, forked twice, each fork loading its
+  // own engine through a dynamic import. `host/host-engine.ts` refuses to
+  // guess if it is missing, for the same reason the model root is refused —
+  // a host that guessed would load the wrong native addon and look like it
+  // worked.
+  const child = utilityProcess.fork(
+    join(app.getAppPath(), 'build', 'host.mjs'),
+    [modelRoot(), engineName],
+    {
+      serviceName: `chatterang-inference-${engineName}`,
+      // Piped, not inherited: the host's stdout must not reach a terminal or a
+      // log the user did not ask for.
+      stdio: 'pipe',
+    },
+  );
+  const tag = `[inference:${engineName}]`;
+  child.stdout?.on('data', (chunk: Buffer) => process.stdout.write(`${tag} ${chunk}`));
+  child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`${tag} ${chunk}`));
 
   let exited = false;
   child.once('exit', () => {
@@ -188,13 +216,36 @@ function start(): void {
     return true;
   });
 
-  const supervisor = new Supervisor({
+  /*
+   * ONE HOST PER ENGINE, and the per-host liveness budget the split makes safe.
+   *
+   * The `onnx` entry's `pingTimeoutMs` is the second half of the fix. A ping
+   * budget sized to the worst legitimate blocking call is dangerous while one
+   * process holds both engines: it means a genuinely wedged host takes that
+   * much longer to be replaced, and text generation is stuck behind it the
+   * whole time. Once the ONNX host holds ONLY ONNX, relaxing its liveness
+   * costs nothing llama.cpp depends on — and the llama host keeps the shipped
+   * 10 s, because nothing it runs blocks the loop synchronously.
+   *
+   * 60 s is chosen against what was MEASURED, not against diffusion. The worst
+   * single ONNX run observed on this machine is 5506 ms (whisper-base encoder,
+   * batch 32); shipped whisper is 132 ms per batch-1 window with a return to
+   * the loop between every run. 60 s is an order of magnitude over the
+   * measured worst and still terminates a truly wedged host inside 75 s. What
+   * it is NOT is a measured bound for a diffusion UNet step, which is one
+   * uninterruptible `run()` and which nothing in this repo can time yet. If
+   * that step turns out to exceed this, the failure is now confined to the
+   * ONNX host: it is condemned and respawned alone, and llama.cpp does not
+   * notice.
+   */
+  const FLEET: readonly FleetEntry[] = [
+    { engine: LLAMA_ENGINE, host: 'llama' },
+    { engine: ONNX_ENGINE, host: 'onnx', policy: { pingTimeoutMs: 60_000 } },
+  ];
+
+  const fleet = new HostFleet({
     spawn: spawnInferenceHost,
-    // BOTH engines, named explicitly. The option defaults to `[LLAMA_ENGINE]`,
-    // so passing it at all means passing the whole list: an engine served by
-    // the host but missing from here is refused on arrival by `#receive`
-    // rather than dispatched to the wrong place.
-    engines: [LLAMA_ENGINE, ONNX_ENGINE],
+    entries: FLEET,
     // No try/catch here on purpose. The swallow used to live at this call site,
     // which meant a delivery that threw never reached the supervisor and it
     // marked the turn ended anyway — the page got no `llamaEnd` at all while
@@ -208,31 +259,37 @@ function start(): void {
     // would have delivered a second engine's events on llama.cpp's channels.
     notify: (pluginName, eventName, data, ownerId) =>
       pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
-    onBoot: (status) => {
+    onBoot: (hostName, status) => {
       console.log(
         status.mounted
-          ? `[main] DSH tree mounted: services ${status.services.join(', ')}; routes ${status.routes.join(', ')}`
-          : `[main] DSH tree did NOT mount: ${status.error ?? 'unknown reason'}`,
+          ? `[main] ${hostName}: DSH tree mounted: services ${status.services.join(', ')}; routes ${status.routes.join(', ')}`
+          : `[main] ${hostName}: DSH tree did NOT mount: ${status.error ?? 'unknown reason'}`,
       );
     },
-    warn: (message) => console.warn(`[main] ${message}`),
+    warn: (hostName, message) => console.warn(`[main:${hostName}] ${message}`),
   });
 
-  // The facade the supervisor builds from the engine's own definition, rather
-  // than the supervisor object itself. With one engine the two were the same
-  // thing; with two, an object carrying every engine's methods at once has no
-  // way to say which `generate` a call meant.
-  pluginHost.register(LLAMA_PLUGIN, supervisor.plugin(LLAMA_PLUGIN.name));
-  pluginHost.register(ONNX_PLUGIN, supervisor.plugin(ONNX_PLUGIN.name));
+  // The facade each supervisor builds from its own engine's definition. The
+  // fleet routes by plugin name, so registering a plugin no host serves throws
+  // here at boot rather than failing every call at runtime.
+  pluginHost.register(LLAMA_PLUGIN, fleet.plugin(LLAMA_PLUGIN.name));
+  pluginHost.register(ONNX_PLUGIN, fleet.plugin(ONNX_PLUGIN.name));
   pluginHost.register(DSH_PLUGIN, {
+    // THE LLAMA HOST, deliberately and by name. The Cordis tree mounts only
+    // where the Router and the llama backend are (`host/llama-engine.ts`);
+    // the ONNX host has no route into it and reports no boot status, so
+    // asking any other host would answer "not mounted" for a tree that was
+    // never supposed to be there. An ONNX host loss is therefore invisible in
+    // `DshStatus` — correctly: `DshStatus` describes the tree, not the fleet.
+    //
     // Asked of the supervisor on every call rather than served from a variable
     // captured at boot. The route set within one host's life is still a
     // snapshot — cordis-aimatey captures it once at mount, because aimatey
     // emits no event when a backend appears — but which HOST it describes is
     // now the one that is running, not the one that was running at startup.
-    getStatus: async (): Promise<DshStatus> => supervisor.hostStatus(),
+    getStatus: async (): Promise<DshStatus> => fleet.statusOf(LLAMA_PLUGIN.name),
     listProviders: async (): Promise<{ providers: readonly string[] }> => ({
-      providers: supervisor.hostStatus().routes,
+      providers: fleet.statusOf(LLAMA_PLUGIN.name).routes,
     }),
   });
 
@@ -259,18 +316,20 @@ function start(): void {
     });
   }
 
-  // A quitting app must not fork a replacement host on its way out.
-  app.once('will-quit', () => supervisor.dispose());
+  // A quitting app must not fork a replacement host on its way out — for
+  // EITHER host. `dispose` over the whole fleet, from the fleet, so a host
+  // added later cannot be forgotten here.
+  app.once('will-quit', () => fleet.dispose());
 
-  createWindow(pluginHost, supervisor, senders);
+  createWindow(pluginHost, fleet, senders);
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, supervisor, senders);
+    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, fleet, senders);
   });
 }
 
 function createWindow(
   pluginHost: PluginHost,
-  supervisor: Supervisor,
+  fleet: HostFleet,
   senders: Map<number, WebContents>,
 ): BrowserWindow {
   const window = new BrowserWindow({
@@ -306,7 +365,13 @@ function createWindow(
   const teardown = (event: RendererTeardownEvent): void =>
     releaseRendererOn(event, contents.id, {
       releaseSender: (id) => pluginHost.releaseSender(id),
-      releaseRenderer: (id, reason) => supervisor.releaseRenderer(id, reason),
+      // OVER THE WHOLE FLEET. This is the one wiring mistake the split makes
+      // possible that fails SILENTLY: a teardown reaching only one supervisor
+      // leaks exactly the other engine's turns and sessions, for every window
+      // that ever closes, with no error and nothing a boot check can see. So
+      // the fan-out lives in `HostFleet`, where `tests/desktop-bridge.test.ts`
+      // drives it, and this call site cannot name one host.
+      releaseRenderer: (id, reason) => fleet.releaseRenderer(id, reason),
       forget: (id) => senders.delete(id),
     });
 

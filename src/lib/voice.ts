@@ -203,10 +203,39 @@ export async function startDictation(options: DictationOptions): Promise<Dictati
 
 /* ── Session management ─────────────────────────────────────────────── */
 
+/**
+ * The sessions this renderer has open, by `task:modelPath`.
+ *
+ * MODULE-SCOPED, WHICH MAKES IT PER WINDOW. That is the property the desktop
+ * bridge relies on: an ONNX session belongs to the page that opened it, so a
+ * departing renderer's sessions can be released on its behalf
+ * (`Supervisor.releaseRenderer`). It is also why this map is not the whole
+ * answer — a page that reloads loses the map along with every handle in it,
+ * and only main can free what it was holding.
+ *
+ * A session is not a small thing. `createSession` opens native graphs in the
+ * inference host: 79 MB of encoder and 199 MB of decoder for whisper-base,
+ * and diffusion is larger. They stay open until something names their handle.
+ */
 const sessions = new Map<string, OnnxSession>();
 
+export type OnnxTaskName = 'stt' | 'tts' | 'diffusion';
+
+/**
+ * Get the session for one model, opening it if this window has none.
+ *
+ * ONE SESSION PER TASK, NOT ONE PER PATH. A session for this task under a
+ * DIFFERENT path is a model the user has switched away from, and it was
+ * stranded: the map kept both entries, `releaseSessions` was never called for
+ * `stt` by anything, and the old pipeline stayed resident in the host for the
+ * rest of the app's life. Switching speech models three times cost three
+ * Whisper pipelines. So the previous one is released BEFORE the new one is
+ * opened — before rather than after, because holding two at once is the
+ * double-occupancy this is trying to avoid, and on this engine that is
+ * hundreds of megabytes of native memory.
+ */
 export async function ensureSession(
-  task: 'stt' | 'tts' | 'diffusion',
+  task: OnnxTaskName,
   modelPath: string,
   companions?: Record<string, string>,
 ): Promise<OnnxSession> {
@@ -214,14 +243,32 @@ export async function ensureSession(
   const existing = sessions.get(key);
   if (existing) return existing;
 
+  if ([...sessions.keys()].some((open) => open.startsWith(`${task}:`))) {
+    await releaseSessions(task);
+  }
+
   const session = await OnnxRuntime.createSession({ task, modelPath, companions });
   sessions.set(key, session);
   return session;
 }
 
-export async function releaseSessions(task: 'stt' | 'tts' | 'diffusion'): Promise<void> {
-  for (const [key, session] of sessions) {
-    if (session.task === task) sessions.delete(key);
+/**
+ * Free every session this window holds for one task.
+ *
+ * Keyed by the map KEY rather than by `session.task`, which is what the host
+ * echoed back: the key is what `ensureSession` wrote and is therefore the one
+ * thing guaranteed to match. A host that answered with a different task would
+ * otherwise leave the entry in the map forever, naming a handle already freed
+ * by `releaseTask`.
+ *
+ * The map is cleared even if the release rejects. A handle whose release
+ * failed is not a handle worth retrying — the host is the only thing that can
+ * still name it, and keeping it here would make the next `ensureSession`
+ * believe a dead session is live.
+ */
+export async function releaseSessions(task: OnnxTaskName): Promise<void> {
+  for (const key of [...sessions.keys()]) {
+    if (key.startsWith(`${task}:`)) sessions.delete(key);
   }
   await OnnxRuntime.releaseTask({ task });
 }

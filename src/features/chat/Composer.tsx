@@ -7,7 +7,7 @@ import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
 import { startDictation, type DictationHandle } from '@/lib/voice';
-import { ensureSession } from '@/lib/voice';
+import { ensureSession, releaseSessions } from '@/lib/voice';
 
 export interface ComposerProps {
   disabled: boolean;
@@ -34,6 +34,37 @@ export function Composer({
   const textarea = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const toast = useApp((state) => state.toast);
+
+  /*
+   * DICTATION DOES NOT SURVIVE THIS COMPONENT, and neither does its model.
+   *
+   * `ensureSession('stt', …)` opens native graphs in the inference host — 79
+   * MB of Whisper encoder and 199 MB of decoder for whisper-base — and NOTHING
+   * in `src/` released the `stt` task. `releaseSessions` existed and was called
+   * only for `diffusion`, from `src/state/images.ts`. So the first time a user
+   * tapped the microphone, a quarter of a gigabyte became resident for the
+   * rest of the app's life whether or not they ever dictated again.
+   *
+   * This unmount is a REAL event, not a theoretical one: `App.tsx` renders
+   * `{tab === 'chat' ? <ChatScreen /> : null}`, so every switch to Models,
+   * Personas, Studio or Settings unmounts this component. Releasing here is
+   * the same policy `images.ts` already applies to diffusion ("free the
+   * pipeline immediately rather than waiting for pressure"), and the cost is
+   * one reload on the next dictation rather than a permanent resident.
+   *
+   * The in-flight turn is stopped first. Cancelling a transcription and
+   * releasing the session it runs on are different things — the first stops
+   * work, the second frees memory — and this component owned both and did
+   * neither, so a tab switch mid-dictation left a turn streaming partials at a
+   * page that had gone away.
+   */
+  useEffect(() => {
+    return () => {
+      dictation.current?.stop();
+      dictation.current = null;
+      void releaseSessions('stt').catch(() => undefined);
+    };
+  }, []);
 
   // Grow with content up to the max height set in CSS.
   useEffect(() => {

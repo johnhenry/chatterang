@@ -74,7 +74,7 @@ describe('the web bundle cannot ship an unresolved optional peer', () => {
 });
 
 describe('every source file on disk is a source file in git', () => {
-  it('tracks all of src, packages and apps/desktop/src', () => {
+  it('tracks every source file under src, packages, apps/desktop and tests', () => {
     /*
      * `.gitignore` carried an unanchored `models/` rule for downloaded weights.
      * It also matched `src/features/models/`, so four UI source files were
@@ -85,7 +85,18 @@ describe('every source file on disk is a source file in git', () => {
      * This compares the two sources of truth directly, which is the only check
      * that could have caught it.
      */
-    const roots = ['src', 'packages', 'apps/desktop/src'];
+    /*
+     * EVERY directory that holds code this repo needs to build or to check
+     * itself — not just the app's own source.
+     *
+     * `tests` and `apps/desktop/scripts` were outside the check, and both can
+     * break a fresh clone in the way the comment above describes: an untracked
+     * test file is a guard that exists only on the machine that wrote it, and
+     * `apps/desktop/scripts/build.mjs` is what produces `build/host.mjs` at
+     * all. This milestone added source to three of these five roots at once,
+     * which is exactly when the old list would have missed one.
+     */
+    const roots = ['src', 'packages', 'apps/desktop/src', 'apps/desktop/scripts', 'tests'];
     const onDisk = new Set<string>();
     const walk = (dir: string): void => {
       if (!existsSync(dir)) return;
@@ -94,18 +105,26 @@ describe('every source file on disk is a source file in git', () => {
         if (entry.isDirectory()) {
           if (entry.name === 'node_modules' || entry.name === 'dist') continue;
           walk(full);
-        } else if (/\.(ts|tsx|css)$/.test(entry.name)) {
+          // `.mjs` too: the desktop build scripts are ESM JavaScript, and an
+          // untracked build script is a clone that cannot produce a host.
+        } else if (/\.(ts|tsx|css|mjs)$/.test(entry.name)) {
           onDisk.add(full);
         }
       }
     };
     for (const root of roots) walk(root);
     expect(onDisk.size).toBeGreaterThan(60);
+    // The walker really reached the roots this test just grew. Without this,
+    // a typo'd root name is an empty set, and an empty set is trivially
+    // tracked — the failure mode of every "nothing is missing" assertion.
+    for (const root of roots) {
+      expect([...onDisk].some((file) => file.startsWith(`${root}/`))).toBe(true);
+    }
 
     const tracked = new Set(
       execFileSync('git', ['ls-files', ...roots], { encoding: 'utf8' })
         .split('\n')
-        .filter((line) => /\.(ts|tsx|css)$/.test(line)),
+        .filter((line) => /\.(ts|tsx|css|mjs)$/.test(line)),
     );
 
     const untracked = [...onDisk].filter((file) => !tracked.has(file)).sort();

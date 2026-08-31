@@ -268,15 +268,27 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
     requested: OnnxExecutionProvider,
     threads: number | undefined,
     warnings: string[],
+    /** Every graph opened by this `createSession`, in the order it opened. */
+    opened: OnnxGraph[],
   ): Promise<{ graph: OnnxGraph; provider: OnnxExecutionProvider }> {
     const threadOption = threads === undefined ? {} : { intraOpNumThreads: threads };
+    // Recorded BEFORE this method returns, not by its caller afterwards. The
+    // caller's `push` is a separate statement, and every statement between an
+    // open and its record is a window in which a throw strands native memory
+    // nothing holds a handle to.
+    const record = (graph: OnnxGraph): OnnxGraph => {
+      opened.push(graph);
+      return graph;
+    };
     if (requested !== 'cpu') {
       try {
         return {
-          graph: await engine.createSession(path, {
-            executionProviders: [requested],
-            ...threadOption,
-          }),
+          graph: record(
+            await engine.createSession(path, {
+              executionProviders: [requested],
+              ...threadOption,
+            }),
+          ),
           provider: requested,
         };
       } catch (error) {
@@ -287,7 +299,9 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
       }
     }
     return {
-      graph: await engine.createSession(path, { executionProviders: ['cpu'], ...threadOption }),
+      graph: record(
+        await engine.createSession(path, { executionProviders: ['cpu'], ...threadOption }),
+      ),
       provider: 'cpu',
     };
   }
@@ -307,16 +321,33 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
     const provider: OnnxExecutionProvider =
       PROVIDER_NAMES[requested] === undefined ? 'cpu' : requested;
 
+    /*
+     * EVERY graph this call opens, recorded the instant it opens.
+     *
+     * ONE release path, and the array is the reason it can be one. There used
+     * to be three: this method's `catch`, and two more inside `#loadWhisper`.
+     * Two of the three were unguarded and the third was DEAD — nothing between
+     * `#loadWhisper` returning and `graphs.push(...)` can throw, so this
+     * `catch` could only ever run with an empty array, and deleting its body
+     * left the whole suite green (measured: exit 0, 662 passed). A cleanup
+     * that cannot execute is not a backstop; it reads as one.
+     *
+     * So the array is passed DOWN and filled as each `createSession` returns.
+     * Every failure after the first graph opens — a decoder that will not
+     * parse, a tokenizer read that throws, `inspectWhisper` refusing a graph
+     * whose shape it does not recognise — now lands in one `catch` that has
+     * the real list in front of it. `tests/onnx-node.test.ts` injects all
+     * three.
+     */
     const graphs: OnnxGraph[] = [];
     let whisper: LoadedWhisper | null = null;
     let resolved: OnnxExecutionProvider = provider;
 
     try {
       if (options.task === 'stt') {
-        const loaded = await this.#loadWhisper(engine, options, provider, warnings);
+        const loaded = await this.#loadWhisper(engine, options, provider, warnings, graphs);
         whisper = loaded.whisper;
         resolved = loaded.provider;
-        graphs.push(loaded.whisper.encoder, loaded.whisper.decoder);
       } else {
         const opened = await this.#openGraph(
           engine,
@@ -324,8 +355,8 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
           provider,
           options.threads,
           warnings,
+          graphs,
         );
-        graphs.push(opened.graph);
         resolved = opened.provider;
         warnings.push(
           options.task === 'tts'
@@ -336,7 +367,8 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
         );
       }
     } catch (error) {
-      // Nothing is registered, so nothing would ever release these.
+      // Nothing is registered, so nothing would ever release these. Native
+      // memory, and on this engine that is hundreds of megabytes per graph.
       for (const graph of graphs) await graph.release().catch(() => undefined);
       throw error;
     }
@@ -360,12 +392,20 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
    * `companions` wins where it is given. The layout looked for is the one
    * every Hugging Face ONNX export uses: weights under `onnx/`, the tokenizer
    * and configs beside it.
+   *
+   * THROWS FREELY, and does not clean up. Every graph it opens is appended to
+   * `opened` as it opens, and `createSession` — the only caller — releases
+   * that list in one `catch`. It used to release its own, in two separate
+   * `catch` blocks that had to be kept in step with the sequence between
+   * them; the second of the two was missing from the path where
+   * `inspectWhisper` throws, and the suite was green with it deleted.
    */
   async #loadWhisper(
     engine: OnnxEngine,
     options: OnnxSessionOptions,
     provider: OnnxExecutionProvider,
     warnings: string[],
+    opened: OnnxGraph[],
   ): Promise<{ whisper: LoadedWhisper; provider: OnnxExecutionProvider }> {
     const companions = options.companions ?? {};
     const root = (await isDirectory(options.modelPath))
@@ -422,47 +462,37 @@ export class OnnxRuntimeNode implements OnnxRuntimePlugin {
       provider,
       options.threads,
       warnings,
+      opened,
     );
-    let decoderOpen;
-    try {
-      decoderOpen = await this.#openGraph(
-        engine,
-        decoderPath!,
-        encoderOpen.provider,
-        options.threads,
-        warnings,
-      );
-    } catch (error) {
-      await encoderOpen.graph.release().catch(() => undefined);
-      throw error;
-    }
+    const decoderOpen = await this.#openGraph(
+      engine,
+      decoderPath!,
+      encoderOpen.provider,
+      options.threads,
+      warnings,
+      opened,
+    );
 
-    try {
-      const shape = inspectWhisper(encoderOpen.graph, decoderOpen.graph);
-      if (shape.vocabSize > 0 && shape.vocabSize !== tokenizer.size) {
-        // Loud, not silent. A decoder that emits 51865 ids decoded against a
-        // 51866-entry table is off by one for every special token — which
-        // reads as a working transcriber producing slightly wrong words.
-        warnings.push(
-          `The decoder emits ${shape.vocabSize} logits but the tokenizer defines ` +
-            `${tokenizer.size} tokens. They are not the same model's; expect wrong text.`,
-        );
-      }
-      return {
-        whisper: {
-          encoder: encoderOpen.graph,
-          decoder: decoderOpen.graph,
-          tokenizer,
-          generation,
-          shape,
-        },
-        provider: decoderOpen.provider,
-      };
-    } catch (error) {
-      await decoderOpen.graph.release().catch(() => undefined);
-      await encoderOpen.graph.release().catch(() => undefined);
-      throw error;
+    const shape = inspectWhisper(encoderOpen.graph, decoderOpen.graph);
+    if (shape.vocabSize > 0 && shape.vocabSize !== tokenizer.size) {
+      // Loud, not silent. A decoder that emits 51865 ids decoded against a
+      // 51866-entry table is off by one for every special token — which
+      // reads as a working transcriber producing slightly wrong words.
+      warnings.push(
+        `The decoder emits ${shape.vocabSize} logits but the tokenizer defines ` +
+          `${tokenizer.size} tokens. They are not the same model's; expect wrong text.`,
+      );
     }
+    return {
+      whisper: {
+        encoder: encoderOpen.graph,
+        decoder: decoderOpen.graph,
+        tokenizer,
+        generation,
+        shape,
+      },
+      provider: decoderOpen.provider,
+    };
   }
 
   /** Releasing a handle that is not loaded, or is already released, is a no-op. */

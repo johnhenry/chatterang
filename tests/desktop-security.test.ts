@@ -595,7 +595,48 @@ describe('main.ts wiring', () => {
     expect(at).toBeGreaterThan(0);
     expect(source.slice(at, at + 60)).toMatch(/notifyListeners\(\s*pluginName,/);
     expect(source).not.toMatch(/notifyListeners\(\s*LLAMA_PLUGIN\.name/);
-    expect(source).toContain('supervisor.plugin(LLAMA_PLUGIN.name)');
+    expect(source).toContain('fleet.plugin(LLAMA_PLUGIN.name)');
+    expect(source).toContain('fleet.plugin(ONNX_PLUGIN.name)');
+  });
+
+  it('forks one host PER ENGINE, and names the engine in the fork', () => {
+    // THE ISOLATION, at the one site no test can execute. `main.ts` is where
+    // the multiplicity lands, and three things about it are load-bearing:
+    //
+    //  1. the fork carries the engine name, or `host-engine.ts` refuses to
+    //     boot (that refusal is what stops a silent wrong-addon load);
+    //  2. the fleet is built from an entry PER ENGINE — one entry serving both
+    //     is the shared process this milestone removed;
+    //  3. the ONNX entry gets its own ping budget, which is only safe because
+    //     its host holds nothing llama.cpp depends on.
+    //
+    // FAULT INJECTED, one at a time, each against the wired file: dropping
+    // `engineName` from the fork args failed (1); collapsing the two FLEET
+    // entries to one failed (2); deleting the ONNX `policy` failed (3).
+    expect(source).toMatch(/\[modelRoot\(\),\s*engineName\]/);
+    expect(source).toContain("{ engine: LLAMA_ENGINE, host: 'llama' }");
+    expect(source).toMatch(/\{ engine: ONNX_ENGINE, host: 'onnx', policy: \{ pingTimeoutMs: \d/);
+    // Two hosts, not one shared one. `HostFleet` throws on a duplicate host
+    // name, so this pins the half a boot check cannot: that they DIFFER.
+    const hosts = [...source.matchAll(/host: '([a-z]+)'/g)].map((m) => m[1]);
+    expect(hosts).toHaveLength(2);
+    expect(new Set(hosts).size).toBe(2);
+  });
+
+  it('tears a departed renderer down across the WHOLE fleet', () => {
+    // The one wiring mistake the split makes possible that fails SILENTLY: a
+    // teardown reaching one supervisor leaks exactly the other engine's turns
+    // and sessions, forever, with the app still working. So the call site must
+    // name the fleet and must not be able to name a single supervisor.
+    //
+    // FAULT INJECTED: `releaseRenderer: (id, reason) => llamaSupervisor
+    // .releaseRenderer(id, reason)` fails the first assertion.
+    expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*fleet\.releaseRenderer\(/);
+    // And the quit path, which has the same shape and the same silence.
+    expect(source).toContain('fleet.dispose()');
+    // No supervisor is constructed here at all any more. One built beside the
+    // fleet would be a second, unsupervised host serving the same plugins.
+    expect(source).not.toMatch(/new Supervisor\(/);
   });
 
   it('[13] does not re-swallow a throwing notify', () => {
@@ -722,16 +763,50 @@ describe('the files no test can import still carry their guards', () => {
     expect([...preload.matchAll(/exposeInMainWorld\s*\(/g)].length).toBe(1);
   });
 
-  it('[8] the host confines model paths, and the entry point applies it', () => {
+  it('[8] the host confines model paths, and the engine that serves them applies it', () => {
     const paths = read('apps/desktop/src/host/model-paths.ts');
     expect(paths).toContain('PATH_FIELDS');
     // The confinement is worth nothing if the process boundary skips it.
     // Pin the import and the call, not a loose alternation: the first version
     // accepted the word "confinement" from a nearby comment, so breaking the
     // real import left the test green.
+    //
+    // It moved out of `entry.ts` when the host was split one process per
+    // engine: `entry.ts` now only picks a branch, and each branch mounts its
+    // own plugin with its own guard. Pinning the OLD file would have been a
+    // test that passes because the thing it names no longer does anything.
+    const llama = read('apps/desktop/src/host/llama-engine.ts');
+    expect(llama).toMatch(/import\s*\{[^}]*modelPathGuard[^}]*\}\s*from\s*'\.\/model-paths\.js'/);
+    expect(llama).toContain('modelPathGuard(');
+  });
+
+  it('[8] the ONNX host confines its own paths, which are a different set', () => {
+    // The second engine's guard, which nothing pinned at all. `onnxPathGuard`
+    // covers `modelPath` and every `companions` value — a different field set
+    // from llama.cpp's — so the llama assertion above says nothing about it,
+    // and after the split they are applied in two different files.
+    const paths = read('apps/desktop/src/host/onnx-paths.ts');
+    // Every `companions` value, not a fixed field list — that is the whole
+    // reason this guard is not a copy of llama.cpp's.
+    expect(paths).toContain('confineModelPath');
+    expect(paths).toContain('companions');
+    const onnx = read('apps/desktop/src/host/onnx-engine.ts');
+    expect(onnx).toMatch(/import\s*\{[^}]*onnxPathGuard[^}]*\}\s*from\s*'\.\/onnx-paths\.js'/);
+    expect(onnx).toContain('onnxPathGuard(');
+  });
+
+  it('the entry point still refuses to serve an engine it was not told to be', () => {
+    // What is left in `entry.ts` after the guards moved out: the selector. A
+    // host that guessed its engine would load the wrong native addon, and the
+    // wrong guard with it, and would look like it worked — so the selector is
+    // read before anything is imported and there is no default.
     const entry = read('apps/desktop/src/host/entry.ts');
-    expect(entry).toMatch(/import\s*\{[^}]*modelPathGuard[^}]*\}\s*from\s*'\.\/model-paths\.js'/);
-    expect(entry).toContain('modelPathGuard(');
+    expect(entry).toMatch(/import\s*\{[^}]*parseEngineName[^}]*\}\s*from\s*'\.\/host-engine\.js'/);
+    expect(entry).toContain('parseEngineName(process.argv)');
+    const selector = read('apps/desktop/src/host/host-engine.ts');
+    // No default: the `??` and `||` forms are exactly how a default gets
+    // added, and either one silently makes every mis-fork a llama host.
+    expect(selector).not.toMatch(/argv\[3\]\s*(\?\?|\|\|)/);
   });
 });
 

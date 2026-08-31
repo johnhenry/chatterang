@@ -47,7 +47,24 @@ export type RendererTeardownEvent = (typeof RENDERER_TEARDOWN_EVENTS)[number];
 export interface RendererTeardownTargets {
   /** Drop every event subscription this renderer holds. */
   releaseSender(senderId: number): void;
-  /** End every generation this renderer started, with a reason it can be told. */
+  /**
+   * End every generation this renderer started, and FREE EVERY SESSION IT
+   * OPENED, with a reason the caller can be told.
+   *
+   * The second half was absent, and its absence was invisible: this interface
+   * had exactly three members, none of them released a session, and the whole
+   * suite was green. Ending a turn stops work and frees nothing — an ONNX
+   * `createSession` opens native graphs (79 MB + 199 MB for whisper-base) that
+   * live in the inference host until something names their handle, and after
+   * the page that holds them reloads, nothing can. Every Cmd+R was another
+   * resident pipeline.
+   *
+   * It is one member rather than two because it is one question — "what did
+   * this window own?" — and only the supervisor can answer it: the handles are
+   * minted by the host and recorded per sender there. A fourth member here
+   * would be a second place to forget, in the file whose entire subject is
+   * something that was forgotten once.
+   */
   releaseRenderer(senderId: number, reason: string): void;
   /** Stop holding the renderer for event delivery. Only after `destroyed`. */
   forget(senderId: number): void;

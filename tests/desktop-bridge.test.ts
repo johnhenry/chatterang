@@ -27,6 +27,7 @@ import {
   EVENT_CHANNEL,
   HANDLE_LOST,
   HOST_TIMEOUT,
+  LISTENER_REMOVE_ALL_CHANNEL,
   LLAMA_ENGINE,
   LLAMA_EVENTS,
   LLAMA_OPAQUE_FAILURES,
@@ -49,6 +50,7 @@ import {
   channelCollisions,
   createMainRouter,
   createRendererBridge,
+  HostFleet,
   fromWireError,
   installCapacitorShim,
   REQUIRED_ARGUMENTS,
@@ -62,6 +64,7 @@ import {
 import type {
   BootManifest,
   EngineSpec,
+  HostHandle,
   EventPayload,
   HostMessage,
   HostPluginImplementation,
@@ -2218,6 +2221,189 @@ describe('PluginHost sender scoping', () => {
   });
 });
 
+/* ── The plugin dimension in event DELIVERY ───────────────────────────── */
+
+/**
+ * THE HALF OF THE PLUGIN DIMENSION NOTHING PINNED.
+ *
+ * The supervisor's side is well covered: an event naming an unknown engine is
+ * dropped, a terminal event is matched against the emitting plugin's own
+ * `terminal`, two engines may share a requestId. What was NOT covered is what
+ * happens after `notify` is called — the three places downstream that compare
+ * a plugin NAME, all of which could be deleted with the whole suite green.
+ * Measured, one at a time, against 4afd1f7:
+ *
+ *   `PluginHost.notifyListeners`      -> 662 passed, exit 0
+ *   `createRendererBridge`'s `on`     -> 662 passed, exit 0
+ *   `PluginHost.removeAllListeners`   -> 662 passed, exit 0
+ *
+ * They stayed green for one reason: every existing test uses ONE plugin that
+ * emits a given event name. The dimension only becomes observable when two
+ * plugins emit the same name, which is not hypothetical — `LlamaCpp` and
+ * `OnnxRuntime` both declare `cancel`, and the whole reason `HostEvent` grew a
+ * `plugin` field is that two engines may both call their terminal event `end`.
+ *
+ * So these tests use two definitions that share an event name, and they drive
+ * the ENFORCED objects — the real `PluginHost`, the real
+ * `createRendererBridge` — not a restatement of their logic.
+ */
+describe('an event reaches only the plugin it was emitted for', () => {
+  /** Two engines whose event names collide, which is the case that matters. */
+  const ALPHA = { name: 'Alpha', methods: ['go'], events: ['end', 'chunk'] };
+  const BETA = { name: 'Beta', methods: ['go'], events: ['end', 'chunk'] };
+
+  function twoPluginHost(): { host: PluginHost; delivered: EventPayload[] } {
+    const delivered: EventPayload[] = [];
+    const host = new PluginHost((_senderId, payload) => {
+      delivered.push(payload);
+      return true;
+    });
+    host.register(ALPHA, { go: () => undefined });
+    host.register(BETA, { go: () => undefined });
+    return { host, delivered };
+  }
+
+  it('notifyListeners does not deliver Beta.end to an Alpha.end subscriber', () => {
+    // FAULT INJECTED: dropping `subscription.pluginName !== pluginName` from
+    // `PluginHost.notifyListeners` fails this on the first expectation
+    // (received 1, expected 0) and again on the payload list. Without this
+    // test that same deletion is invisible: exit 0, 662 passed.
+    const { host, delivered } = twoPluginHost();
+    host.addListener(1, ALPHA.name, 'end', 1);
+
+    expect(host.notifyListeners(BETA.name, 'end', { who: 'beta' })).toBe(0);
+    expect(delivered).toEqual([]);
+
+    // And the subscription is still there afterwards. `notifyListeners` prunes
+    // any subscription whose delivery is refused, so a foreign event must be
+    // SKIPPED rather than attempted — otherwise one engine's traffic silently
+    // unsubscribes another engine's listeners.
+    expect(host.subscriptionCount()).toBe(1);
+    expect(host.notifyListeners(ALPHA.name, 'end', { who: 'alpha' })).toBe(1);
+    expect(delivered).toEqual([
+      { pluginName: ALPHA.name, subscriptionId: 1, eventName: 'end', data: { who: 'alpha' } },
+    ]);
+  });
+
+  it('removeAllListeners(plugin) leaves the other plugin subscribed', () => {
+    // FAULT INJECTED: dropping the `subscription.pluginName !== pluginName`
+    // clause from `PluginHost.removeAllListeners` fails this at
+    // `subscriptionCount()` (0, expected 1) and at the delivery below. That
+    // deletion is otherwise green across the whole suite.
+    //
+    // It matters because the contract's `removeAllListeners()` takes no
+    // arguments and means "all of MINE" — one plugin's. A page that stops
+    // listening to `LlamaCpp` must not also go deaf to `OnnxRuntime`, and the
+    // no-argument form used for sender teardown must still clear everything.
+    const { host, delivered } = twoPluginHost();
+    host.addListener(1, ALPHA.name, 'end', 1);
+    host.addListener(1, BETA.name, 'end', 2);
+    expect(host.subscriptionCount()).toBe(2);
+
+    host.removeAllListeners(1, ALPHA.name);
+    expect(host.subscriptionCount()).toBe(1);
+    expect(host.notifyListeners(ALPHA.name, 'end', { who: 'alpha' })).toBe(0);
+    expect(host.notifyListeners(BETA.name, 'end', { who: 'beta' })).toBe(1);
+    expect(delivered.map((it) => it.pluginName)).toEqual([BETA.name]);
+
+    // The plugin-less form is the teardown one and must still take everything.
+    host.removeAllListeners(1);
+    expect(host.subscriptionCount()).toBe(0);
+  });
+
+  it('removeAllListeners(plugin) does not scope by SENDER alone either', () => {
+    // The mirror of the clause above: scoping by plugin must not be achieved
+    // by dropping the sender check. Two windows, same plugin, one of them
+    // unsubscribing.
+    const { host } = twoPluginHost();
+    host.addListener(1, ALPHA.name, 'end', 1);
+    host.addListener(2, ALPHA.name, 'end', 1);
+    host.removeAllListeners(1, ALPHA.name);
+    expect(host.subscriptionCount()).toBe(1);
+    expect(host.notifyListeners(ALPHA.name, 'end', { who: 'alpha' })).toBe(1);
+  });
+
+  /**
+   * The preload's own copy of the check, driven through the real
+   * `createRendererBridge`.
+   *
+   * It is a SECOND check of the same property at a different boundary, and it
+   * is not redundant: the preload's callback table is keyed by subscription id
+   * alone, ids are per-renderer and restart at 1 on a reload, and main's
+   * `EventPayload` is the only thing that says which plugin an event is. Main
+   * getting it right does not make the preload safe — an id collision after a
+   * reload delivers whatever is in that slot.
+   */
+  function preloadOnTwoPlugins(): {
+    bridge: ReturnType<typeof createRendererBridge>;
+    emit: (payload: EventPayload) => void;
+    invoked: { channel: string; payload: unknown }[];
+  } {
+    const invoked: { channel: string; payload: unknown }[] = [];
+    let listener: ((payload: unknown) => void) | null = null;
+    const bridge = createRendererBridge({
+      sendSync: () => ({ platform: 'electron', plugins: [ALPHA, BETA] }),
+      invoke: async (channel, payload) => {
+        invoked.push({ channel, payload });
+        return { ok: true, data: null };
+      },
+      on: (channel, fn) => {
+        if (channel === EVENT_CHANNEL) listener = fn;
+      },
+    });
+    return {
+      bridge,
+      emit: (payload) => listener?.(payload),
+      invoked,
+    };
+  }
+
+  it('the preload drops an event whose plugin is not the one it subscribed to', async () => {
+    // FAULT INJECTED: dropping `record.pluginName !== payload.pluginName` from
+    // `createRendererBridge`'s EVENT_CHANNEL handler fails this at the first
+    // expectation (`alpha` received `['beta']`). Green across the whole suite
+    // without it.
+    const { bridge, emit } = preloadOnTwoPlugins();
+    const alpha: unknown[] = [];
+    const beta: unknown[] = [];
+    await bridge.addListener(ALPHA.name, 'end', (data) => alpha.push(data));
+    await bridge.addListener(BETA.name, 'end', (data) => beta.push(data));
+
+    // Addressed at Alpha's SUBSCRIPTION ID but carrying Beta's plugin name —
+    // exactly what a stale id from before a reload looks like.
+    emit({ pluginName: BETA.name, subscriptionId: 1, eventName: 'end', data: 'beta' });
+    expect(alpha).toEqual([]);
+    expect(beta).toEqual([]);
+
+    emit({ pluginName: ALPHA.name, subscriptionId: 1, eventName: 'end', data: 'alpha' });
+    expect(alpha).toEqual(['alpha']);
+    expect(beta).toEqual([]);
+  });
+
+  it('the preload keeps the other plugin listening after removeAllListeners', async () => {
+    // FAULT INJECTED: dropping `record.pluginName === pluginName` from the
+    // preload's `removeAllListeners` (deleting every callback instead) fails
+    // this at `beta` — `[]` for `['beta']`.
+    const { bridge, emit, invoked } = preloadOnTwoPlugins();
+    const alpha: unknown[] = [];
+    const beta: unknown[] = [];
+    await bridge.addListener(ALPHA.name, 'end', (data) => alpha.push(data));
+    await bridge.addListener(BETA.name, 'end', (data) => beta.push(data));
+
+    await bridge.removeAllListeners(ALPHA.name);
+    // The round trip happened, on the listener channel, naming that plugin.
+    expect(invoked.at(-1)).toEqual({
+      channel: LISTENER_REMOVE_ALL_CHANNEL,
+      payload: { pluginName: ALPHA.name },
+    });
+
+    emit({ pluginName: ALPHA.name, subscriptionId: 1, eventName: 'end', data: 'alpha' });
+    emit({ pluginName: BETA.name, subscriptionId: 2, eventName: 'end', data: 'beta' });
+    expect(alpha).toEqual([]);
+    expect(beta).toEqual(['beta']);
+  });
+});
+
 /* ── A renderer can go away three ways, and one of them was unhandled ─── */
 
 describe('renderer teardown', () => {
@@ -3669,6 +3855,115 @@ describe('llama.cpp and ONNX in flight at once', () => {
     expect(generation()).toBeUndefined();
   });
 
+  it("a window cannot cancel another window's transcription by owning a llama turn with its id", async () => {
+    /*
+     * THE HALF THE REAL ENGINES DID NOT PIN, and the reason this test exists
+     * beside the one above rather than inside it.
+     *
+     * `#cancelTurn` looks the requestId up in THIS engine's table and refuses
+     * if the caller does not own what it finds. Both clauses are load-bearing
+     * and they fail differently, so a single test that exercises one window
+     * and one id cannot tell them apart.
+     *
+     * MEASURED. Making the lookup fall back to every OTHER engine's table —
+     *
+     *   let entry = engine.inflight.get(requestId);
+     *   if (entry === undefined) {
+     *     for (const other of this.#engines.values()) entry ??= other.inflight.get(requestId);
+     *   }
+     *
+     * — left the neighbouring "does not settle or cancel the other's turn"
+     * test GREEN (exit 0, 2 passed), because there one window owns both turns
+     * and the fallback finds the same owner either way. It was caught only by
+     * the FAKE second engine's tests, which is precisely the gap: the property
+     * was proven for a double and not for the engine that ships.
+     *
+     * The shape it lets through is a real cross-window leak. Window 1 owns a
+     * llama.cpp turn with id `r`; window 2 owns an ONNX turn with the same id,
+     * which is the normal case because ids are minted per caller and nothing
+     * coordinates them across engines or windows. Window 1 then sends an ONNX
+     * cancel for `r`. It owns nothing on that engine, so the correct answer is
+     * silence — and with the fallback it stops window 2's transcription.
+     */
+    const w = shippedEngines();
+
+    const generation = watch(
+      w.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'rx' }]),
+    );
+    const transcription = watch(
+      w.call(2, ONNX_PLUGIN.name, 'transcribe', [
+        { handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId: 'rx' },
+      ]),
+    );
+    await settle();
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(w.supervisor.inflightCountFor(ONNX_PLUGIN.name)).toBe(1);
+
+    // Window 1 aims an ONNX cancel at an id it owns only on llama.cpp.
+    // Not awaited: a cancel that IS posted never settles here — this host
+    // double answers no `ret` — so awaiting would turn the fault into a
+    // five-second timeout instead of the assertion below.
+    void w.call(1, ONNX_PLUGIN.name, 'cancel', [{ requestId: 'rx' }]);
+    await settle();
+
+    // NOTHING was posted. Not "a cancel that the host ignores" — a cancel that
+    // never left main, because the ownership check is what stands between one
+    // window and another window's work.
+    expect(w.posted().filter((call) => call.method === 'cancel')).toEqual([]);
+    expect(w.supervisor.inflightCountFor(ONNX_PLUGIN.name)).toBe(1);
+    expect(transcription()).toBeUndefined();
+    expect(sawFrom(w.inbox, 2, ONNX_PLUGIN.name, 'onnxEnd')).toEqual([]);
+
+    // And the CONTROL, so "no cancel was posted" is a fact about ownership
+    // rather than about a cancel path that does not work at all: the window
+    // that DOES own the transcription cancels it, and one goes out.
+    void w.call(2, ONNX_PLUGIN.name, 'cancel', [{ requestId: 'rx' }]);
+    await settle();
+    const cancels = w.posted().filter((call) => call.method === 'cancel');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.plugin).toBe(ONNX_PLUGIN.name);
+
+    // llama.cpp's turn is still untouched throughout.
+    expect(generation()).toBeUndefined();
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+    expect(sawFrom(w.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+  });
+
+  it('an ONNX cancel for an id only llama.cpp knows reaches no host at all', async () => {
+    /*
+     * THE OTHER WAY THE LOOKUP CAN GO CROSS-ENGINE, and it needs its own
+     * scenario because the two clauses of the guard fail on different inputs.
+     *
+     * Above, the id EXISTS in the ONNX table and the owner is wrong. Here it
+     * does not exist there at all — only llama.cpp has it, and the caller owns
+     * that one. A lookup that falls back to other engines' tables when its own
+     * misses finds a matching owner and lets the cancel through, so a
+     * `cancel` addressed at the transcriber is posted to the ONNX host
+     * carrying a text generation's id.
+     *
+     * That is not harmless. `OnnxRuntimeNode.cancel` keys by requestId alone
+     * (`onnx-runtime.ts:674`), and so does every other host-side plugin: main
+     * is the only place ownership is known. A cancel that gets past main is a
+     * cancel that will stop whatever holds that id on the far side — and ids
+     * collide across engines and windows by construction.
+     *
+     * MEASURED, with the fallback in place: the test above stays GREEN (exit
+     * 0, 2 passed) because there the id IS in the ONNX table, so the fallback
+     * never runs. This one fails on `posted` (one cancel, expected none).
+     */
+    const w = shippedEngines();
+    watch(w.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId: 'ry' }]));
+    await settle();
+    expect(w.supervisor.inflightCountFor(ONNX_PLUGIN.name)).toBe(0);
+
+    void w.call(1, ONNX_PLUGIN.name, 'cancel', [{ requestId: 'ry' }]);
+    await settle();
+
+    expect(w.posted().filter((call) => call.method === 'cancel')).toEqual([]);
+    // …and llama.cpp's own turn, whose id it is, was not cancelled either.
+    expect(w.supervisor.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+  });
+
   it("a partial on one engine does not become the other's progress", async () => {
     const w = shippedEngines();
     watch(
@@ -3724,6 +4019,246 @@ describe('llama.cpp and ONNX in flight at once', () => {
     expect(transcription()).toBeDefined();
   });
 });
+
+/* ── The sessions nothing ever released ───────────────────────────────── */
+
+/**
+ * A SESSION IS NOT A TURN, AND NOTHING WAS FREEING THEM.
+ *
+ * `renderer-lifecycle.ts` had exactly three members — `releaseSender`,
+ * `releaseRenderer`, `forget` — and not one of them released a session. Ending
+ * a turn stops work; it frees nothing. `OnnxRuntime.createSession` opens
+ * native graphs (79 MB of encoder and 199 MB of decoder for whisper-base,
+ * diffusion larger) that live in the inference host until something names
+ * their handle, and once the page holding that handle has reloaded, nothing
+ * can. Every Cmd+R left another Whisper pipeline resident for the rest of the
+ * app's life, and the whole suite was green.
+ *
+ * `SessionSpec` is modelled the way `StreamSpec` is and for the same reason:
+ * the supervisor must not know what Whisper is. It knows that one method opens
+ * a resource whose handle comes back in the RESULT, that another closes it by
+ * that handle, and that the window which opened it owns it.
+ */
+function sessionHarness(): {
+  supervisor: Supervisor;
+  hosts: WiredHost[];
+  clock: ManualClock;
+  open(senderId: number, task: string): Promise<InvokeResult>;
+  call(senderId: number, method: string, args: readonly unknown[]): Promise<InvokeResult>;
+  released(): string[];
+} {
+  let next = 0;
+  const wired = wiredSupervisor({
+    engines: [LLAMA_ENGINE, ONNX_ENGINE],
+    // The host answers `createSession` with a handle IT mints — which is the
+    // reason the supervisor records from the result and not from the
+    // arguments. `load` is answered too, so llama.cpp's own open/close pair
+    // is exercised beside ONNX's and its deliberate absence from the session
+    // table is a measured fact rather than an untested claim.
+    answer: (host, message) => {
+      if (message.k !== 'call') return;
+      if (message.method === 'createSession') {
+        next += 1;
+        host.send({
+          k: 'ret',
+          id: message.id,
+          ok: true,
+          data: { handle: `sess-${next}`, task: 'stt', provider: 'cpu', warnings: [] },
+        });
+      } else if (message.method === 'load') {
+        next += 1;
+        host.send({ k: 'ret', id: message.id, ok: true, data: { handle: `gguf-${next}` } });
+      } else if (message.method === 'releaseSession') {
+        host.send({ k: 'ret', id: message.id, ok: true, data: undefined });
+      }
+    },
+  });
+  const pluginHost = new PluginHost(() => true);
+  pluginHost.register(LLAMA_PLUGIN, wired.supervisor.plugin(LLAMA_PLUGIN.name));
+  pluginHost.register(ONNX_PLUGIN, wired.supervisor.plugin(ONNX_PLUGIN.name));
+  const router = createMainRouter(pluginHost);
+  const call = (senderId: number, method: string, args: readonly unknown[]): Promise<InvokeResult> =>
+    router.handle(senderId, methodChannel(ONNX_PLUGIN.name, method), args);
+
+  return {
+    supervisor: wired.supervisor,
+    hosts: wired.hosts,
+    clock: wired.clock,
+    call,
+    open: (senderId, task) =>
+      call(senderId, 'createSession', [{ task, modelPath: `/models/${task}` }]),
+    released: () =>
+      (wired.hosts[0]?.posted ?? [])
+        .filter(
+          (m) => (m as PostedCall).k === 'call' && (m as PostedCall).method === 'releaseSession',
+        )
+        .map((m) => ((m as PostedCall).args?.[0] as { handle?: string } | undefined)?.handle ?? "(none)"),
+  };
+}
+
+describe('a window that goes away takes its ONNX sessions with it', () => {
+  it('records the handle the HOST minted, against the window that asked', async () => {
+    // The CONTROL. Everything below asserts that sessions DRAIN, and a table
+    // that was never filled drains trivially — so first: opening one puts it
+    // in, and the handle is the one the host answered with rather than
+    // anything the caller could have named.
+    const h = sessionHarness();
+    const answer = await h.open(1, 'stt');
+    expect(answer).toMatchObject({ ok: true, data: { handle: 'sess-1' } });
+    expect(h.supervisor.sessionCountFor(ONNX_PLUGIN.name)).toBe(1);
+  });
+
+  it('releases only the departing window’s sessions, by handle', async () => {
+    /*
+     * THE GAP. FAULT INJECTED: deleting the `sessions` loop from
+     * `Supervisor.releaseRenderer` — which is the state this repo shipped in,
+     * where the whole cleanup did not exist — fails this at `released()`
+     * (`[]` for `['sess-1', 'sess-2']`). Nothing else in the suite notices.
+     */
+    const h = sessionHarness();
+    await h.open(1, 'stt');
+    await h.open(1, 'diffusion');
+    await h.open(2, 'stt');
+    await settle();
+    expect(h.supervisor.sessionCountFor(ONNX_PLUGIN.name)).toBe(3);
+
+    h.supervisor.releaseRenderer(1, 'The window went away.');
+    await settle();
+
+    // Two released, by the handles the host minted, and the third window's
+    // pipeline is still open — a reload in one window must not unload the
+    // model another window is dictating into.
+    expect(h.released().sort()).toEqual(['sess-1', 'sess-2']);
+    expect(h.supervisor.sessionCountFor(ONNX_PLUGIN.name)).toBe(1);
+
+    // Idempotent: the same window departing twice (navigate, then destroy —
+    // both fire) must not post a second release for a handle already freed.
+    h.supervisor.releaseRenderer(1, 'And again.');
+    await settle();
+    expect(h.released()).toHaveLength(2);
+  });
+
+  it('forgets a session the renderer released itself, so teardown does not double-free', async () => {
+    // FAULT INJECTED: deleting `engine.sessions.delete(handle)` from
+    // `#closeSession` fails this — teardown posts a second `releaseSession`
+    // for `sess-1` (2 received, 1 expected). The engine documents release as
+    // idempotent for ONE caller, not for two racing ones, and a handle main
+    // no longer believes in must not be released again on a table it has
+    // since reused.
+    const h = sessionHarness();
+    await h.open(1, 'stt');
+    await h.call(1, 'releaseSession', [{ handle: 'sess-1' }]);
+    await settle();
+    expect(h.supervisor.sessionCountFor(ONNX_PLUGIN.name)).toBe(0);
+
+    h.supervisor.releaseRenderer(1, 'gone');
+    await settle();
+    expect(h.released()).toEqual(['sess-1']);
+  });
+
+  it('drops the table when the host dies, because the handles name nothing', async () => {
+    // FAULT INJECTED: deleting `engine.sessions.clear()` from `#onClose` fails
+    // this — the next teardown posts a `releaseSession` into the REPLACEMENT
+    // host for a session that died with its predecessor, where the handle is
+    // either unknown or, once names are reused across lives, somebody else's.
+    const h = sessionHarness();
+    await h.open(1, 'stt');
+    await settle();
+
+    h.hosts[0]?.close('exit code 5');
+    await settle();
+    expect(h.supervisor.sessionCountFor(ONNX_PLUGIN.name)).toBe(0);
+
+    await h.clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    h.supervisor.releaseRenderer(1, 'gone');
+    await settle();
+    const replacement = (h.hosts[1]?.posted ?? []).filter(
+      (m) => (m as PostedCall).method === 'releaseSession',
+    );
+    expect(replacement).toEqual([]);
+  });
+
+  it('does NOT release a loaded GGUF, which is shared between windows on purpose', async () => {
+    /*
+     * The deliberate asymmetry, asserted so it reads as a decision rather than
+     * an oversight. `LlamaCpp.load`/`unload` looks like the same pair and is
+     * not: `src/ai/backends/llama-cpp.ts` caches one handle for the whole app,
+     * so releasing it when a window departs would unload the model out from
+     * under every other window mid-generation. ONNX sessions are per-caller
+     * (`src/lib/voice.ts` keeps a module-scoped map, which is per renderer),
+     * so theirs are.
+     *
+     * `LLAMA_ENGINE` therefore declares no `sessions`, and this is what says
+     * so: a `load` from the departing window leaves the session table empty
+     * and posts no `unload`.
+     */
+    const h = sessionHarness();
+    const pluginHost = new PluginHost(() => true);
+    pluginHost.register(LLAMA_PLUGIN, h.supervisor.plugin(LLAMA_PLUGIN.name));
+    const router = createMainRouter(pluginHost);
+    await router.handle(1, methodChannel(LLAMA_PLUGIN.name, 'load'), [
+      { modelPath: '/models/gemma.gguf' },
+    ]);
+    await settle();
+    expect(h.supervisor.sessionCountFor(LLAMA_PLUGIN.name)).toBe(0);
+
+    h.supervisor.releaseRenderer(1, 'gone');
+    await settle();
+    expect(
+      (h.hosts[0]?.posted ?? []).filter((m) => (m as PostedCall).method === 'unload'),
+    ).toEqual([]);
+  });
+
+  it('refuses a session pair the plugin definition does not declare', () => {
+    // The same boot-time refusal `stream` gets, and it fails the same way if
+    // absent: an `open` the definition never declares is never called, so
+    // nothing is recorded and the teardown frees nothing while looking as
+    // though it worked.
+    expect(
+      () =>
+        new Supervisor({
+          spawn: () => {
+            throw new Error('not reached');
+          },
+          notify: () => undefined,
+          engines: [
+            {
+              ...ONNX_ENGINE,
+              sessions: { ...ONNX_ENGINE.sessions!, open: 'openTheThing' },
+            },
+          ],
+        }),
+    ).toThrowError(/method "openTheThing" \(session open\)/);
+  });
+
+  it('scopes createSession to the sender, and releaseSession deliberately not', () => {
+    // `createSession` must be sender-scoped or the supervisor could not know
+    // whose session it is. `releaseSession` must NOT be: a handle is opaque,
+    // unguessable and never broadcast, so the only window that can name one is
+    // the one that opened it — and scoping it would turn a duplicate release
+    // into a silent no-op instead of the idempotent one the contract promises.
+    const scoped = (ONNX_ENGINE.senderScoped ??
+      (h0().plugin(ONNX_PLUGIN.name) as unknown as Record<symbol, string[]>)[
+        SENDER_SCOPED
+      ]) as readonly string[];
+    expect(scoped).toContain('createSession');
+    expect(scoped).toContain('transcribe');
+    expect(scoped).not.toContain('releaseSession');
+  });
+});
+
+/** One supervisor, built only to read the facade it hands out. */
+function h0(): Supervisor {
+  return new Supervisor({
+    spawn: () => ({
+      link: { postMessage: () => undefined, onMessage: () => undefined, onClose: () => undefined },
+      kill: () => undefined,
+    }),
+    notify: () => undefined,
+    engines: [ONNX_ENGINE],
+    timers: manualClock(),
+  });
+}
 
 /** The ONNX half of the host boundary, driven through the real HostRuntime. */
 function onnxHostBoundary(options: {
@@ -3947,5 +4482,508 @@ describe('the ONNX path guard', () => {
     expect(h.reached).toEqual([
       { method: 'createSession', args: [{ task: 'stt', modelPath: '/app/models/whisper-base' }] },
     ]);
+  });
+});
+
+
+/* ══ ONE PROCESS PER ENGINE ═════════════════════════════════════════════ */
+
+/**
+ * THE ISOLATION, AND THE THING IT ISOLATES AGAINST.
+ *
+ * `InferenceSession.run` is a synchronous native call. It holds the event loop
+ * of its process for its whole duration, and the supervisor's liveness ping is
+ * answered on that loop — so a long enough ONNX run is INDISTINGUISHABLE from
+ * a wedged host. Measured on this machine with the real models in one process:
+ * a whisper-base encoder run at batch 32 blocked for 5506 ms and llama.cpp
+ * emitted 0 tokens inside that interval, its decode frozen rather than merely
+ * its event delivery. And at the supervisor level, driven with the real
+ * `DEFAULT_POLICY`, an unbroken block of 11-25 s is CONDEMNED: the host is
+ * killed, every in-flight turn gets a synthesised terminal event, and every
+ * pending call rejects with `HANDLE_LOST`. Reproduced end to end with the real
+ * GGUF and the real whisper encoder — a real llama.cpp generation destroyed by
+ * an ONNX run in the same process.
+ *
+ * A frozen host below is that state exactly: its process is alive, its link is
+ * open, it emits no `exit`, and it answers nothing. That is what a blocking
+ * native call looks like from main, and it is the ONE failure `#onClose`
+ * cannot reach any other way.
+ *
+ * THE TEST THAT MATTERS IS THE PAIR. `ONE HOST PER ENGINE` and `BOTH ENGINES
+ * IN ONE HOST` below apply the SAME freeze to the SAME two engines with the
+ * SAME policy on the SAME clock, and differ only in whether the engines share
+ * a process. The second is not a fault injected by hand — it is the
+ * arrangement that shipped, kept as an executable control, so "the split
+ * works" is measured against the thing it replaced rather than asserted. Every
+ * expectation in it is the negation of one in its neighbour.
+ */
+describe('a blocking call on one engine does not reach the other', () => {
+  /** A fake host process: alive, killable, and freezable mid-call. */
+  interface Fleet {
+    /** Hosts by the name they were forked with, oldest first. */
+    readonly hosts: Map<string, WiredHost[]>;
+    readonly clock: ManualClock;
+    readonly inbox: Map<number, EventPayload[]>;
+    readonly supervisors: Map<string, Supervisor>;
+    /** The real `HostFleet`, when this arrangement is the split one. */
+    readonly fleet: HostFleet | null;
+    /** Stop answering ANYTHING, without exiting: a blocking native call. */
+    freeze(host: string): void;
+    call(
+      senderId: number,
+      plugin: string,
+      method: string,
+      args: readonly unknown[],
+    ): Promise<InvokeResult>;
+    latest(host: string): WiredHost;
+    releaseRenderer(senderId: number, reason: string): void;
+  }
+
+  /**
+   * Build one arrangement of engines over host processes.
+   *
+   * `groups` is the only thing that varies between the split and the shared
+   * arrangement: `[[llama], [onnx]]` is what `main.ts` ships, `[[llama, onnx]]`
+   * is what it shipped before. Everything else — the fake hosts, the freeze,
+   * the two renderers, the subscriptions, the clock — is identical, so a
+   * difference in the results is a difference in the wiring and nothing else.
+   *
+   * A one-engine-per-group arrangement is built through the REAL `HostFleet`,
+   * because that is the object `main.ts` uses and a harness that reimplemented
+   * it would be proving something about the harness. A group with two engines
+   * cannot go through `HostFleet` — it refuses to put two engines on one host,
+   * which is the point of it — so the control builds its `Supervisor`
+   * directly, exactly as `main.ts` used to.
+   */
+  function arrange(groups: readonly (readonly EngineSpec[])[]): Fleet {
+    const clock = manualClock();
+    const hosts = new Map<string, WiredHost[]>();
+    const frozen = new Set<string>();
+    const supervisors = new Map<string, Supervisor>();
+    const inbox = new Map<number, EventPayload[]>([
+      [1, []],
+      [2, []],
+    ]);
+
+    const pluginHost = new PluginHost((senderId, payload) => {
+      const box = inbox.get(senderId);
+      if (box === undefined) return false;
+      box.push(structuredClone(payload));
+      return true;
+    });
+    const notify: NotifyListeners = (plugin, event, data, ownerId) =>
+      pluginHost.notifyListeners(plugin, event, data, ownerId);
+
+    const spawn = (hostName: string): HostHandle => {
+      const listeners: ((m: unknown) => void)[] = [];
+      const closers: ((r: string) => void)[] = [];
+      const host: WiredHost = {
+        posted: [],
+        killed: false,
+        send: (message) => {
+          for (const listener of listeners) listener(message);
+        },
+        close: (reason) => {
+          for (const closer of closers) closer(reason);
+        },
+      };
+      const list = hosts.get(hostName) ?? [];
+      list.push(host);
+      hosts.set(hostName, list);
+      return {
+        link: {
+          postMessage: (message) => {
+            host.posted.push(message);
+            // A HEALTHY host answers its pings and nothing else: calls are
+            // left in flight so a turn stays observable. A FROZEN one answers
+            // nothing at all, which is the whole point — it is alive, its link
+            // is open, and no `exit` will ever come.
+            if (frozen.has(hostName)) return;
+            const wire = message as HostMessage;
+            if (wire.k === 'ping') host.send({ k: 'pong', id: wire.id });
+          },
+          onMessage: (listener) => listeners.push(listener),
+          onClose: (listener) => closers.push(listener),
+        },
+        kill: () => {
+          host.killed = true;
+        },
+      };
+    };
+
+    const named = (engines: readonly EngineSpec[]): string =>
+      engines.map((engine) => engine.definition.name.toLowerCase()).join('+');
+
+    let fleet: HostFleet | null = null;
+    if (groups.every((group) => group.length === 1)) {
+      fleet = new HostFleet({
+        spawn,
+        notify,
+        timers: clock,
+        entries: groups.map((group) => ({ engine: group[0]!, host: named(group) })),
+      });
+      for (const group of groups) {
+        supervisors.set(group[0]!.definition.name, fleet.supervisorFor(group[0]!.definition.name));
+      }
+    } else {
+      for (const group of groups) {
+        const hostName = named(group);
+        const supervisor = new Supervisor({
+          spawn: () => spawn(hostName),
+          notify,
+          engines: group,
+          timers: clock,
+        });
+        for (const engine of group) supervisors.set(engine.definition.name, supervisor);
+      }
+    }
+
+    for (const [name, supervisor] of supervisors) {
+      pluginHost.register(name === LLAMA_PLUGIN.name ? LLAMA_PLUGIN : ONNX_PLUGIN, supervisor.plugin(name));
+    }
+    let subscriptionId = 1;
+    for (const senderId of inbox.keys()) {
+      for (const definition of [LLAMA_PLUGIN, ONNX_PLUGIN]) {
+        if (!supervisors.has(definition.name)) continue;
+        for (const eventName of definition.events) {
+          pluginHost.addListener(senderId, definition.name, eventName, subscriptionId++);
+        }
+      }
+    }
+    const router = createMainRouter(pluginHost);
+
+    return {
+      hosts,
+      clock,
+      inbox,
+      supervisors,
+      fleet,
+      freeze: (host) => frozen.add(host),
+      latest: (host) => {
+        const found = (hosts.get(host) ?? []).at(-1);
+        if (found === undefined) {
+          throw new Error(`no host was forked for "${host}"; forked: ${[...hosts.keys()].join(', ')}`);
+        }
+        return found;
+      },
+      call: (senderId, plugin, method, args) =>
+        router.handle(senderId, methodChannel(plugin, method), args),
+      releaseRenderer: (senderId, reason) => {
+        if (fleet !== null) fleet.releaseRenderer(senderId, reason);
+        else for (const s of new Set(supervisors.values())) s.releaseRenderer(senderId, reason);
+      },
+    };
+  }
+
+  const SPLIT = [[LLAMA_ENGINE], [ONNX_ENGINE]] as const;
+  const SHARED = [[LLAMA_ENGINE, ONNX_ENGINE]] as const;
+  const LLAMA_HOST = 'llamacpp';
+  const ONNX_HOST = 'onnxruntime';
+  const SHARED_HOST = 'llamacpp+onnxruntime';
+
+  /**
+   * Advance past the ping deadline, in the two steps the mechanism takes.
+   *
+   * One jump is not equivalent: `#pingTick` sends a ping when one is due and
+   * only condemns on a LATER tick that finds it unanswered, so a single
+   * advance of interval+timeout sends the first ping and stops. The first
+   * version of these tests did exactly that and reported every host healthy.
+   */
+  async function blockPast(fleet: Fleet, timeoutMs = DEFAULT_POLICY.pingTimeoutMs): Promise<void> {
+    await fleet.clock.advance(DEFAULT_POLICY.pingIntervalMs + 1);
+    await settle();
+    await fleet.clock.advance(timeoutMs + 1);
+    await settle();
+  }
+
+  /** Start one turn on each engine, sharing a requestId on purpose. */
+  function twoTurns(
+    f: Fleet,
+    requestId: string,
+  ): { generation: () => InvokeResult | undefined; transcription: () => InvokeResult | undefined } {
+    const generation = watch(
+      f.call(1, LLAMA_PLUGIN.name, 'generate', [{ handle: 'h', prompt: 'p', requestId }]),
+    );
+    const transcription = watch(
+      f.call(1, ONNX_PLUGIN.name, 'transcribe', [
+        { handle: 's', audio: 'AAAA', mediaType: 'audio/wav', requestId },
+      ]),
+    );
+    return { generation, transcription };
+  }
+
+  it('the harness really does condemn a frozen host — the mechanism, alone', async () => {
+    // THE CONTROL FOR EVERY ASSERTION BELOW. The interesting results are
+    // ABSENCES on the llama side, and an absence is what a dead harness
+    // reports for everything: a freeze that does not freeze, a clock nothing
+    // is subscribed to, a supervisor with no ping running. So first,
+    // positively: the freeze condemns the host it is applied to.
+    const f = arrange(SPLIT);
+    const { transcription } = twoTurns(f, 'ctrl');
+    await settle();
+    f.freeze(ONNX_HOST);
+
+    await blockPast(f);
+
+    expect(f.latest(ONNX_HOST).killed).toBe(true);
+    expect(transcription()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+    expect(sawFrom(f.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd')).toHaveLength(1);
+  });
+
+  it('a block INSIDE the budget condemns nobody, so the cause is the block', async () => {
+    // The negative control. Condemnation must come from the block outlasting
+    // the timeout, not from the clock moving at all.
+    const f = arrange(SPLIT);
+    twoTurns(f, 'short');
+    await settle();
+    f.freeze(ONNX_HOST);
+
+    await f.clock.advance(DEFAULT_POLICY.pingIntervalMs + 1);
+    await settle();
+    await f.clock.advance(DEFAULT_POLICY.pingTimeoutMs - 1_000);
+    await settle();
+
+    expect(f.latest(ONNX_HOST).killed).toBe(false);
+    expect(sawFrom(f.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd')).toEqual([]);
+  });
+
+  it('ONE HOST PER ENGINE: the frozen ONNX host is condemned and llama.cpp is untouched', async () => {
+    /*
+     * THE WHOLE MILESTONE, in one block.
+     *
+     * The ONNX host blocks past its ping timeout and is condemned, killed and
+     * replaced — which is correct and unavoidable: a process that answers
+     * nothing cannot be told from a dead one. What must NOT happen is any of
+     * that reaching llama.cpp, and every route it used to take is checked —
+     * the kill, the synthesised terminal event, the settled promise, the
+     * emptied in-flight table, the posted cancel and the respawn.
+     */
+    const f = arrange(SPLIT);
+    const { generation, transcription } = twoTurns(f, 'shared-id');
+    await settle();
+    expect(f.fleet?.spawnCount).toBe(2);
+
+    f.freeze(ONNX_HOST);
+    await blockPast(f);
+
+    // The blocked engine paid for its own block.
+    expect(f.latest(ONNX_HOST).killed).toBe(true);
+    expect(sawFrom(f.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd')).toHaveLength(1);
+    expect(transcription()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+
+    // AND LLAMA.CPP DID NOT. Its process is alive, its turn never ended, its
+    // promise never settled, and its in-flight table still holds it.
+    expect(f.latest(LLAMA_HOST).killed).toBe(false);
+    expect(sawFrom(f.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toEqual([]);
+    expect(generation()).toBeUndefined();
+    expect(f.supervisors.get(LLAMA_PLUGIN.name)!.inflightCountFor(LLAMA_PLUGIN.name)).toBe(1);
+
+    // No cancel reached the llama host either — a retirement that swept every
+    // engine would have posted one there on its way out.
+    expect(
+      f.latest(LLAMA_HOST).posted.filter((m) => (m as PostedCall).method === 'cancel'),
+    ).toEqual([]);
+
+    // Exactly ONE replacement was forked, and it was the ONNX one. A shared
+    // supervisor respawns one host for both engines, so counting per host is
+    // what tells the two arrangements apart.
+    await f.clock.advance(DEFAULT_POLICY.restartDelayMs + 1);
+    await settle();
+    expect(f.hosts.get(ONNX_HOST)).toHaveLength(2);
+    expect(f.hosts.get(LLAMA_HOST)).toHaveLength(1);
+
+    // And llama.cpp's crash-loop budget was not spent on ONNX's crash.
+    expect(f.supervisors.get(LLAMA_PLUGIN.name)!.spawnCount).toBe(1);
+    expect(f.supervisors.get(ONNX_PLUGIN.name)!.spawnCount).toBe(2);
+  });
+
+  it('BOTH ENGINES IN ONE HOST: the same freeze destroys llama.cpp — the arrangement that shipped', async () => {
+    /*
+     * THE FAULT, AS AN EXECUTABLE CONTROL RATHER THAN A HAND EDIT.
+     *
+     * One `Supervisor` over both `EngineSpec`s on one `utilityProcess` is
+     * exactly what `main.ts` did before this milestone. Nothing else changes:
+     * same freeze, same clock, same policy, same two turns, same requestId.
+     *
+     * Without this test, "llama.cpp is untouched" above could equally be true
+     * of a harness that never condemns anything at all. With it, the two
+     * arrangements are measured side by side and disagree on every line.
+     */
+    const f = arrange(SHARED);
+    const { generation, transcription } = twoTurns(f, 'shared-id');
+    await settle();
+    // ONE process for both engines — that IS the coupling.
+    expect(f.hosts.get(SHARED_HOST)).toHaveLength(1);
+
+    f.freeze(SHARED_HOST);
+    await blockPast(f);
+
+    // The ONNX block condemned the host, as before…
+    expect(f.latest(SHARED_HOST).killed).toBe(true);
+    expect(sawFrom(f.inbox, 1, ONNX_PLUGIN.name, 'onnxEnd')).toHaveLength(1);
+
+    // …and llama.cpp's turn died with it. Every one of these is the negation
+    // of the corresponding expectation in the test above.
+    expect(sawFrom(f.inbox, 1, LLAMA_PLUGIN.name, 'llamaEnd')).toHaveLength(1);
+    expect(generation()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+    expect(transcription()).toMatchObject({ ok: false, error: { code: HANDLE_LOST } });
+    expect(f.supervisors.get(LLAMA_PLUGIN.name)!.inflightCountFor(LLAMA_PLUGIN.name)).toBe(0);
+  });
+
+  it('the ONNX host gets its own ping budget, which is only safe because it is its own host', async () => {
+    // THE SECOND HALF OF THE FIX. A block that condemns a host on the shipped
+    // 10 s budget is survived by an ONNX host given a longer one — while
+    // llama.cpp keeps the strict budget, because nothing it runs blocks the
+    // loop synchronously. This option only exists once the hosts are split:
+    // relaxing liveness on a shared process would mean a genuinely wedged host
+    // holding text generation hostage for exactly as long.
+    const clock = manualClock();
+    const hosts = new Map<string, WiredHost[]>();
+    const frozen = new Set<string>();
+    const spawn = (hostName: string): HostHandle => {
+      const listeners: ((m: unknown) => void)[] = [];
+      const closers: ((r: string) => void)[] = [];
+      const host: WiredHost = {
+        posted: [],
+        killed: false,
+        send: (m) => {
+          for (const l of listeners) l(m);
+        },
+        close: (r) => {
+          for (const c of closers) c(r);
+        },
+      };
+      const list = hosts.get(hostName) ?? [];
+      list.push(host);
+      hosts.set(hostName, list);
+      return {
+        link: {
+          postMessage: (message) => {
+            host.posted.push(message);
+            if (frozen.has(hostName)) return;
+            const wire = message as HostMessage;
+            if (wire.k === 'ping') host.send({ k: 'pong', id: wire.id });
+          },
+          onMessage: (l) => listeners.push(l),
+          onClose: (c) => closers.push(c),
+        },
+        kill: () => {
+          host.killed = true;
+        },
+      };
+    };
+    const fleet = new HostFleet({
+      spawn,
+      notify: () => undefined,
+      timers: clock,
+      entries: [
+        { engine: LLAMA_ENGINE, host: 'llama' },
+        // The shipped number, from `main.ts`.
+        { engine: ONNX_ENGINE, host: 'onnx', policy: { pingTimeoutMs: 60_000 } },
+      ],
+    });
+    expect(fleet.spawnCount).toBe(2);
+    frozen.add('llama');
+    frozen.add('onnx');
+
+    await clock.advance(DEFAULT_POLICY.pingIntervalMs + 1);
+    await settle();
+    // Past llama's 10 s budget, well inside ONNX's 60 s one.
+    await clock.advance(30_000);
+    await settle();
+    expect(hosts.get('llama')!.at(-1)!.killed).toBe(true);
+    expect(hosts.get('onnx')!.at(-1)!.killed).toBe(false);
+
+    // …and the ONNX host IS condemned once its own budget is spent. A longer
+    // leash, not the removal of the mechanism — which is the difference
+    // between this and simply suspending the ping.
+    await clock.advance(40_000);
+    await settle();
+    expect(hosts.get('onnx')!.at(-1)!.killed).toBe(true);
+  });
+
+  it('a departed renderer is released from EVERY host, not just the first', async () => {
+    // The one wiring mistake the split makes possible that fails SILENTLY: a
+    // teardown reaching one supervisor leaks exactly the other engine's turns
+    // for every window that ever closes, with the app still working and
+    // nothing logged. Driven through the real `HostFleet.releaseRenderer`.
+    const f = arrange(SPLIT);
+    const { generation, transcription } = twoTurns(f, 'gone');
+    await settle();
+
+    f.releaseRenderer(1, 'The window went away.');
+    await settle();
+
+    expect(generation()).toMatchObject({ ok: false });
+    expect(transcription()).toMatchObject({ ok: false });
+    // Cancelled at its OWN host, on its own plugin address, once each.
+    for (const host of [LLAMA_HOST, ONNX_HOST]) {
+      const cancels = f
+        .latest(host)
+        .posted.filter((m) => (m as PostedCall).method === 'cancel') as PostedCall[];
+      expect(cancels).toHaveLength(1);
+    }
+    expect(f.supervisors.get(LLAMA_PLUGIN.name)!.inflightCount).toBe(0);
+    expect(f.supervisors.get(ONNX_PLUGIN.name)!.inflightCount).toBe(0);
+  });
+
+  it('dispose stops every host, so a quitting app forks no replacements', async () => {
+    const f = arrange(SPLIT);
+    await settle();
+    f.fleet!.dispose();
+    expect(f.latest(LLAMA_HOST).killed).toBe(true);
+    expect(f.latest(ONNX_HOST).killed).toBe(true);
+    await f.clock.advance(DEFAULT_POLICY.restartDelayMs * 10);
+    expect(f.fleet!.spawnCount).toBe(2);
+  });
+});
+
+describe('HostFleet refuses the wiring mistakes that would fail silently', () => {
+  const spawn = (): never => {
+    throw new Error('not reached: each of these fails before a host is forked');
+  };
+  const options = { spawn, notify: (): void => undefined };
+
+  it('refuses two entries serving one plugin', () => {
+    // Two processes both answering to `OnnxRuntime` would each take a share of
+    // the calls, unpredictably, with no error anywhere.
+    expect(
+      () =>
+        new HostFleet({
+          ...options,
+          entries: [
+            { engine: ONNX_ENGINE, host: 'a' },
+            { engine: ONNX_ENGINE, host: 'b' },
+          ],
+        }),
+    ).toThrowError(/two fleet entries serve plugin "OnnxRuntime"/);
+  });
+
+  it('refuses two entries sharing one host', () => {
+    // Sharing a host is the coupling this milestone removes; without this it
+    // is a one-word typo in `main.ts` that reintroduces it with every test
+    // still green.
+    expect(
+      () =>
+        new HostFleet({
+          ...options,
+          entries: [
+            { engine: LLAMA_ENGINE, host: 'same' },
+            { engine: ONNX_ENGINE, host: 'same' },
+          ],
+        }),
+    ).toThrowError(/two fleet entries name host "same"/);
+  });
+
+  it('refuses to hand out a plugin no entry serves', () => {
+    // A boot-time throw, so registering a manifest entry the fleet cannot
+    // serve is a crash at startup rather than every call failing at runtime.
+    const fleet = new HostFleet({ ...options, entries: [{ engine: ONNX_ENGINE, host: 'onnx' }] });
+    expect(() => fleet.plugin(LLAMA_PLUGIN.name)).toThrowError(/serves no plugin named "LlamaCpp"/);
+    expect(fleet.plugins).toEqual([ONNX_PLUGIN.name]);
+  });
+
+  it('refuses a fleet with no engines at all', () => {
+    expect(() => new HostFleet({ ...options, entries: [] })).toThrowError(/serves nothing/);
   });
 });

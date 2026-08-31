@@ -106,11 +106,35 @@ await esbuild.build({
   external: ['electron'],
 });
 
+/*
+ * The inference host, CODE-SPLIT — and the splitting is load-bearing.
+ *
+ * One entry point, forked twice with different arguments; `entry.ts` picks its
+ * engine with a dynamic `import()`. In a single-file ESM bundle that choice is
+ * only half real: esbuild keeps a local dynamic import lazy, but it HOISTS
+ * every EXTERNAL import to the top of the file as a static `import` statement.
+ * Built that way, the ONNX host still loaded `@deepseek-ai/cordis`,
+ * `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-invariants` and
+ * `@johnhenry/aimatey-core` at startup — verified by reading the emitted
+ * `host.mjs` — for an engine that has no route to any of them.
+ *
+ * With `splitting`, each dynamically imported branch becomes its own chunk and
+ * its external imports stay inside it. `tests/desktop-host-split.test.ts`
+ * asserts, against the built output when it exists, that the entry chunk
+ * hoists neither engine's dependencies.
+ *
+ * `outdir` rather than `outfile` because splitting emits more than one file;
+ * `out: 'host'` plus the `.mjs` extension keeps the path `main.ts` forks
+ * (`build/host.mjs`) exactly as it was.
+ */
 await esbuild.build({
   ...shared,
-  entryPoints: [join(desktop, 'src/host/entry.ts')],
-  outfile: join(out, 'host.mjs'),
+  entryPoints: [{ in: join(desktop, 'src/host/entry.ts'), out: 'host' }],
+  outdir: out,
+  outExtension: { '.js': '.mjs' },
   format: 'esm',
+  splitting: true,
+  chunkNames: 'host-[name]-[hash]',
   external: ['node-llama-cpp', 'onnxruntime-node', '@deepseek-ai/*', '@johnhenry/*'],
 });
 

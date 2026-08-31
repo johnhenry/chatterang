@@ -1,35 +1,46 @@
 /**
  * The inference host: entry point of the utility process.
  *
- * Everything that touches a native addon lives on this side of the boundary —
- * `LlamaCppNode`, node-llama-cpp, the GGUF, the GPU — together with the Cordis
- * tree that consumes it. That is the whole point of the process: a native
- * addon can abort the process it runs in, and this is the process we can
- * afford to lose. The supervisor in main turns that loss into exactly one
- * `llamaEnd` per in-flight turn and one rejected `generate` promise.
+ * ONE ENTRY POINT, TWO PROCESSES. `main.ts` forks this file twice — once with
+ * `llama` and once with `onnx` — and each fork loads exactly one engine,
+ * through the DYNAMIC import at the bottom of `main()`. Everything else here
+ * (the parent port, the model root, the runtime, the ping) is identical in
+ * both, which is why there is one file rather than two.
+ *
+ * WHY TWO PROCESSES, AND NOT ONE WITH BOTH ENGINES SERVED ON IT.
+ * `InferenceSession.run` is a synchronous native call: it holds the event loop
+ * of its process for its whole duration. In the single-host arrangement this
+ * file used to build, one real whisper-base encoder run at batch 32 blocked
+ * for 5506 ms and llama.cpp emitted ZERO tokens inside that interval — its
+ * decode frozen, not merely its event delivery. Worse, the supervisor's ping
+ * is answered on the same loop, so a long enough run is indistinguishable from
+ * a wedged host: with the shipped policy an unbroken block of 11-25 s is
+ * condemned, and condemnation kills the process, taking llama.cpp's in-flight
+ * generation with it. That was reproduced end to end with the real GGUF and
+ * the real whisper encoder.
+ *
+ * The plugin dimension already gave the two engines LOGICAL isolation —
+ * separate in-flight tables, per-engine cancel, per-engine terminal events.
+ * The shared process left them PHYSICALLY coupled. Two processes is what
+ * severs it. See `onnx-engine.ts` for why a worker thread does not.
+ *
+ * Everything that touches a native addon lives on this side of the boundary,
+ * because a native addon can abort the process it runs in and this is the
+ * process we can afford to lose. The supervisor in main turns that loss into
+ * exactly one terminal event per in-flight turn and one rejected promise — and
+ * now into a loss of ONE engine rather than of both.
  *
  * Nothing here reads an API key, and nothing can. The Router mounted into the
- * Cordis tree is built HERE with exactly one backend — local llama.cpp — and
- * zero remote providers. Remote backends and the keys they need stay in the
- * renderer, where they already live. A key therefore has no path into an IPC
- * payload, a host log, or a crash dump on this side, because nothing here ever
- * holds one.
+ * Cordis tree is built in `llama-engine.ts` with exactly one backend — local
+ * llama.cpp — and zero remote providers. Remote backends and the keys they
+ * need stay in the renderer, where they already live. A key therefore has no
+ * path into an IPC payload, a host log, or a crash dump on this side, because
+ * nothing here ever holds one.
  */
 
-import { Router } from '@johnhenry/aimatey-core';
-
-import { LlamaCppNode } from '@chatterang/inference-node';
-import { OnnxRuntimeNode } from '@chatterang/onnx-node';
-
-import { LLAMA_HOST_POLICY } from '../bridge/call-shape.js';
-import { ONNX_HOST_POLICY } from '../bridge/onnx-call-shape.js';
 import { createHostRuntime } from '../bridge/host-runtime.js';
 import type { MessageLink } from '../bridge/protocol.js';
-import { LLAMA_PLUGIN, ONNX_PLUGIN } from '../bridge/protocol.js';
-import { mountDsh } from './dsh.js';
-import { modelPathGuard } from './model-paths.js';
-import { onnxPathGuard } from './onnx-paths.js';
-import { DesktopLlamaBackend } from './llama-backend.js';
+import { parseEngineName } from './host-engine.js';
 
 /**
  * Where models live, as main told us.
@@ -75,51 +86,43 @@ async function main(): Promise<void> {
       'inference host: no parentPort. This entry point only runs inside an Electron utilityProcess.',
     );
   }
-  const link = parentPortLink(port);
-  const plugin = new LlamaCppNode();
-
-  // ONE runtime, any number of plugins on it. A3's ONNX engine is the second
-  // `runtime.serve(...)` line below: its own definition, its own argument
-  // table, its own path guard — and nothing else, which is the point of the
-  // generalisation.
-  const runtime = createHostRuntime({
-    link,
-    warn: (message: string) => console.warn(`[inference-host] ${message}`),
-  });
-
+  // Read BEFORE anything is loaded, so a bad selector is a boot failure rather
+  // than a host that has already imported an addon it should not have.
+  const engine = parseEngineName(process.argv);
   const root = modelRoot();
 
-  // Serve the plugins FIRST. Inference must work even if the DSH mount below
-  // fails; the tree is an additional consumer of these engines, not a
-  // prerequisite for them.
-  runtime.serve(LLAMA_PLUGIN, plugin, {
-    ...LLAMA_HOST_POLICY,
-    guard: modelPathGuard(root),
-  });
+  const link = parentPortLink(port);
+  const warn = (message: string): void => console.warn(`[inference-host:${engine}] ${message}`);
 
-  // ONNX Runtime, in the SAME process as llama.cpp, and that is a decision
-  // with a measured cost. `InferenceSession.run` is a synchronous native call
-  // behind a `setImmediate`: it blocks this process's event loop for its whole
-  // duration — 0 timer ticks across a 134 ms whisper-base encoder pass, and
-  // four concurrent runs serialise at 4x. So an ONNX run freezes llama.cpp's
-  // decode, the DSH tree AND the supervisor's ping traffic while it lasts,
-  // which is exactly the "alive but WEDGED" state the supervisor's tick exists
-  // to notice. Whisper-base's encoder is ~130 ms per 30-second window, well
-  // inside the 10 s ping timeout; a larger model, or diffusion, is not
-  // obviously so, and would need its own host or a worker thread.
-  runtime.serve(ONNX_PLUGIN, new OnnxRuntimeNode(), {
-    ...ONNX_HOST_POLICY,
-    guard: onnxPathGuard(root),
-  });
+  // ONE runtime, any number of plugins on it. Each host puts exactly one
+  // plugin on its own, which is the point of the split; the runtime stays
+  // generic because nothing about it is per-engine.
+  const runtime = createHostRuntime({ link, warn });
 
-  const router = new Router({ routingStrategy: 'explicit', fallbackStrategy: 'none' });
-  router.register('llama-cpp-desktop', new DesktopLlamaBackend({ plugin }));
+  /*
+   * DYNAMIC, and load-bearing rather than stylistic.
+   *
+   * A static `import { LlamaCppNode } from '@chatterang/inference-node'` at
+   * the top of this file would run in BOTH processes, and importing
+   * node-llama-cpp registers a SIGTERM listener that replaces the OS default
+   * action with a JS callback — a callback that cannot run while a
+   * synchronous native call holds the loop. The ONNX host would then survive
+   * the supervisor's `kill()` until its blocking run returned, which is
+   * exactly the preemption the split exists to restore. Measured: 24 ms to
+   * exit without node-llama-cpp loaded, 1136 ms after the run completed with
+   * it. Every measured benefit of the split except loop isolation disappears
+   * if these become static imports, and nothing would fail — which is why
+   * `tests/desktop-host-split.test.ts` walks the import graph.
+   */
+  if (engine === 'llama') {
+    const { mountLlamaEngine } = await import('./llama-engine.js');
+    const status = await mountLlamaEngine({ runtime, modelRoot: root, warn });
+    link.postMessage({ k: 'boot', status });
+    return;
+  }
 
-  const mount = await mountDsh({
-    router,
-    warn: (message) => console.warn(`[inference-host] ${message}`),
-  });
-  link.postMessage({ k: 'boot', status: mount.status });
+  const { mountOnnxEngine } = await import('./onnx-engine.js');
+  mountOnnxEngine({ runtime, modelRoot: root });
 }
 
 void main().catch((error: unknown) => {
