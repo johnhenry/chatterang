@@ -98,23 +98,42 @@ reports no failure, and simply has no model provider. Verified directly:
 mounting this plugin before `LlmRuntime` gives a clean resolution with
 `fiber.state === 0` and `ctx.get('llm') === undefined`.
 
-`assertBoot(ctx, { services, routes })` therefore checks two things Cordis will
-not:
+`assertBoot(ctx, { services, routes, entries })` therefore checks three things
+Cordis will not:
 
 1. every named service is present and ACTIVE (`ctx.get(name) !== undefined` —
-   strict mode already encodes ACTIVE, and `FiberState` is a `const enum` with
-   no runtime export, so there is nothing to compare against anyway);
-2. every route you shipped is actually registered on `llm`.
+   strict mode already encodes ACTIVE);
+2. every route you shipped is actually registered on `llm`;
+3. every profile row you mounted is in `FiberState.ACTIVE`.
 
-It returns a `BootReport` whose `notChecked` field says what it did **not**
-check. A third layer, walking a loader's entries for rows stuck PENDING or
-FAILED, is not implemented: no loader is mounted on this target, so that code
-could not be exercised, and an unexercised assertion is exactly the kind of
-harness this project has already been burnt by.
+Layer 3 is the one the other two are structurally blind to. `llm-invariant`
+provides no service and claims no provider route, so a boot in which it never
+activates has every service present, every route registered, and the DSH stream
+grammar simply unenforced. The reachable version of that: a row whose `inject`
+is unsatisfied at mount is PARKED — `await` on its fiber resolves, so
+`applyProfile` returns normally — and its `apply` runs later, when the service
+arrives. A throw at *that* point has no caller left to reject, and the fiber
+goes FAILED in silence. Row order is documented as carrying no load semantics,
+so reordering the profile is a legal edit that can produce exactly this.
+
+The walk was previously called impossible here, on the grounds that it needed a
+loader's entry list and no loader is installed. It does not. `ctx.plugin()`
+returns `Fiber & PromiseLike<Fiber>` (cordis `registry.d.ts:198`) and a fiber
+knows its own state; `applyProfile` now hands those fibers back as
+`MountedEntry[]` instead of awaiting them for their timing and dropping them.
+
+`FiberState` is a `const enum` with no runtime export — importing it and reading
+a member yields `undefined` — so `FIBER_ACTIVE` is a literal, and the test suite
+reads the ordinals back off real fibers in known states rather than trusting the
+literal to have been copied correctly.
+
+`BootReport.notChecked` still says what was **not** checked: with no entries
+supplied, that no fiber state was read at all; with entries, that the walk covers
+exactly the rows it was handed and Cordis offers no enumeration of the rest.
 
 That field used to be called `treeAssertion`, which read as the *result of* a
 third layer while every value it could hold described a layer that never ran.
-The walk is still unimplemented; the name no longer implies otherwise.
+The layer is now real, and `notChecked` describes only the remainder.
 
 ## `@deepseek-ai/dsh-llm` is not a DeepSeek provider
 
@@ -131,10 +150,18 @@ at runtime.
 ## The profile
 
 `src/profile.ts` is the source of truth; `cordis.patch.yml` is generated from it
-and checked by the test suite. The YAML cannot be loaded here — a DSH patch file
-is consumed by `@deepseek-ai/cordis-plugin-loader`, which this repo does not
-install — so `applyProfile()` mounts the same rows by hand on a tree built with
-`ctx.plugin()`, which is how the target boots today.
+and checked by the test suite. **The YAML is not a boot input and nothing reads
+it at runtime** — its own header says so, and a test asserts that no shipped
+source file so much as names it. A DSH patch file is consumed by
+`@deepseek-ai/cordis-plugin-loader`, which this repo does not install (`npm ls`
+reports it empty) and which `@deepseek-ai/cordis` 4.0.2 does not provide; the
+only YAML parser present is transitive (`yaml@2.9.0`, via vite and just-bash).
+
+So the shipped tree does come from the profile — from `PROFILE_ROWS`, which
+`applyProfile()` mounts row by row on a tree built with `ctx.plugin()`, and
+which `apps/desktop/src/host/dsh.ts` then asserts. What it does not come from is
+the YAML. Deleting that file changes no runtime behaviour; it fails exactly one
+test.
 
 Deliberately excluded, with reasons recorded in `EXCLUDED_ROWS`:
 `dsh-llm-deepseek`, `dsh-llm-pi-ai`, `dsh-web-search-deepseek`,

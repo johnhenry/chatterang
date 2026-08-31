@@ -107,7 +107,7 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
   const warn = options.warn ?? ((): void => undefined);
 
   const ctx = new Context();
-  await applyProfile(ctx, profileModules(router), rows);
+  const entries = await applyProfile(ctx, profileModules(router), rows);
   // Fibers parked waiting on a service activate on a macrotask once it
   // appears. Asserting before that runs would fail a tree that is fine.
   await new Promise((done) => setTimeout(done, 0));
@@ -121,6 +121,12 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
     const report = assertBoot(ctx, {
       services: ['llm', 'invariants'],
       routes: routesFor(router, warn),
+      // LAYER 3. `llm-invariant` provides no service and claims no route, so
+      // neither of the other layers can see it: without this walk it can sit
+      // PENDING — the stream grammar unenforced — while the boot reports
+      // green. The fibers come from `applyProfile`, which is why nothing here
+      // needs the loader the walk was once thought to require.
+      entries,
     });
     return {
       ctx,
@@ -129,6 +135,7 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
         mounted: true,
         services: report.services,
         routes: report.routes,
+        entries: report.entries,
         notChecked: report.notChecked,
       },
     };
@@ -140,6 +147,7 @@ export async function mountDsh(options: MountDshOptions): Promise<DshMount> {
         mounted: false,
         services: [],
         routes: [],
+        entries: [],
         notChecked: 'not reached: the boot assertion failed first',
         error: error instanceof Error ? error.message : String(error),
       },

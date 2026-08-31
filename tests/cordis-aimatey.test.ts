@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, resolve, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { Context } from '@deepseek-ai/cordis';
@@ -20,12 +20,16 @@ import type {
 import {
   AIMATEY_TO_DSH_CODE,
   AimateyAdapter,
+  FIBER_ACTIVE,
+  FIBER_STATE_NAMES,
+  NOT_LOADED_MARKER,
   PASS_THROUGH_CODES,
   PROFILE_ROWS,
   ROUTER_SENTINEL,
   aimateyRouterPlugin,
   applyProfile,
   assertBoot,
+  assertEntries,
   assertRoutes,
   assertServices,
   mapCode,
@@ -33,7 +37,7 @@ import {
   routesFor,
   toIRRequest,
 } from '@chatterang/cordis-aimatey';
-import type { AimateyRouter, RouterConformance } from '@chatterang/cordis-aimatey';
+import type { AimateyRouter, MountedEntry, RouterConformance } from '@chatterang/cordis-aimatey';
 
 /**
  * A4: aimatey's Router registered as an LLM provider inside a DSH Cordis tree.
@@ -244,12 +248,20 @@ function profileModules(router: AimateyRouter): Map<string, Plugin> {
 
 /** Boot the narrowed profile, optionally leaving rows out. */
 async function boot(router: AimateyRouter, omit: string[] = []): Promise<Context> {
+  return (await bootWithEntries(router, omit)).ctx;
+}
+
+/** The same boot, keeping the fibers `applyProfile` hands back. */
+async function bootWithEntries(
+  router: AimateyRouter,
+  omit: string[] = [],
+): Promise<{ ctx: Context; entries: MountedEntry[] }> {
   const ctx = new Context();
   const rows = PROFILE_ROWS.filter((row) => !omit.includes(row.id));
-  await applyProfile(ctx, profileModules(router), rows);
+  const entries = await applyProfile(ctx, profileModules(router), rows);
   // Pending fibers settle on a microtask once their services appear.
   await new Promise((done) => setTimeout(done, 0));
-  return ctx;
+  return { ctx, entries };
 }
 
 /** A minimal DSH request. */
@@ -915,20 +927,137 @@ describe('registration lifecycle', () => {
 
 describe('boot assertion', () => {
   it('passes on a complete tree and reports what it could not check', async () => {
-    const ctx = await boot(new FakeRouter().register('echo', echoBackend));
-    const report = assertBoot(ctx, { services: ['llm', 'invariants'], routes: [ROUTER_SENTINEL, 'echo'] });
+    const { ctx, entries } = await bootWithEntries(new FakeRouter().register('echo', echoBackend));
+    const report = assertBoot(ctx, {
+      services: ['llm', 'invariants'],
+      routes: [ROUTER_SENTINEL, 'echo'],
+      entries,
+    });
 
     expect(report.services).toEqual(['llm', 'invariants']);
     expect(report.routes).toEqual([ROUTER_SENTINEL, 'echo']);
-    // Layers 1 and 2 are all this target can honestly assert: no loader is
-    // mounted, so there are no profile entries to walk.
-    // [15]: this field was called `treeAssertion`, which read as the result of
-    // a third assertion layer while both of its branches said no such layer
-    // ran. Renamed to say what it holds. The walk is still not implemented —
-    // no loader ships with `@deepseek-ai/cordis`, so nothing could exercise
-    // one — and the name is now honest about that rather than flattering.
-    expect(report.notChecked).toMatch(/^the per-entry tree walk: no loader/);
+    // LAYER 3, which used to be a sentence explaining why it did not exist.
+    // [15] renamed `treeAssertion` to `notChecked` because both of its branches
+    // described a walk that never ran; the walk now runs, over the fibers
+    // `applyProfile` returns, and `notChecked` describes what is genuinely
+    // left rather than the missing layer.
+    expect(report.entries).toEqual(['llm', 'invariants', 'llm-invariant', 'aimatey-router']);
+    expect(report.notChecked).toMatch(/^plugins mounted outside the 4 row\(s\) supplied/);
     expect(report).not.toHaveProperty('treeAssertion');
+  });
+
+  it('still says so when no entries are supplied, rather than reporting a walk', async () => {
+    // A caller that built its tree some other way has no fibers to hand in.
+    // The assertion that cannot run must SAY it did not run — this is the
+    // branch that keeps `notChecked` honest now that the other one is real.
+    const ctx = await boot(new FakeRouter().register('echo', echoBackend));
+    const report = assertBoot(ctx, { services: ['llm'] });
+    expect(report.entries).toEqual([]);
+    expect(report.notChecked).toMatch(/^the per-entry tree walk: no mounted rows were supplied/);
+  });
+
+  /* ── LAYER 3: the per-entry walk ────────────────────────────────────── */
+
+  it('reads the const-enum ordinals off REAL fibers rather than trusting the table', async () => {
+    // `FiberState` is a `const enum` (cordis lib/types/fiber.d.ts:67) with NO
+    // runtime export: importing it and reading a member yields `undefined`, so
+    // the walk compares against a literal. A literal copied wrong would make
+    // every fiber look wrong or every fiber look fine, and nothing else in this
+    // repo would notice. So the ordinals are checked against fibers whose state
+    // we know from the outside.
+    expect(FIBER_STATE_NAMES[FIBER_ACTIVE]).toBe('ACTIVE');
+
+    const healthy = await bootWithEntries(new FakeRouter().register('echo', echoBackend));
+    for (const entry of healthy.entries) {
+      expect(FIBER_STATE_NAMES[entry.fiber.state]).toBe('ACTIVE');
+    }
+
+    // The same row, with the service it injects removed: Cordis parks it and
+    // resolves the fiber anyway. This is the state the whole file exists for.
+    const parked = await bootWithEntries(new FakeRouter().register('echo', echoBackend), ['llm']);
+    const router = parked.entries.find((entry) => entry.id === 'aimatey-router');
+    expect(router).toBeDefined();
+    expect(FIBER_STATE_NAMES[router!.fiber.state]).toBe('PENDING');
+    expect(router!.fiber.state).not.toBe(FIBER_ACTIVE);
+  });
+
+  it('fails loudly when a row throws AT mount — that case never needed a walk', async () => {
+    // Worth pinning, because it bounds what layer 3 is for. `ctx.plugin()`
+    // returns `Fiber & PromiseLike<Fiber>`, and awaiting it REJECTS when the
+    // plugin's `apply` throws while that await is outstanding. Mounting
+    // `llm-invariant` twice does exactly that — the invariant registry refuses
+    // a second registration of the same package — so `applyProfile` throws and
+    // no assertion is involved at all.
+    const ctx = new Context();
+    await expect(
+      applyProfile(ctx, profileModules(new FakeRouter().register('echo', echoBackend)), [
+        ...PROFILE_ROWS,
+        { id: 'llm-invariant-again', name: '@deepseek-ai/dsh-llm/invariant' },
+      ]),
+    ).rejects.toThrow(/already registered/);
+  });
+
+  it('catches a dead row that layers 1 and 2 cannot see at all', async () => {
+    // THE CASE FOR LAYER 3, and the reason it is not covered by the test above.
+    // A row whose `inject` is unsatisfied at mount is PARKED: `await` on its
+    // fiber resolves cleanly, `applyProfile` returns, and the plugin's `apply`
+    // runs LATER — when the service it waited for appears. A throw at that
+    // point has no caller left to reject: the fiber goes FAILED in silence.
+    //
+    // Row order is what makes this reachable, and the profile's own header
+    // says order carries no load semantics — so a reordering is a legal edit
+    // that can produce exactly this. Both `llm-invariant` rows here mount
+    // BEFORE the `invariants` registry they inject, so both park; when the
+    // registry arrives, the first registers `@deepseek-ai/dsh-llm` and the
+    // second is refused.
+    //
+    // `llm-invariant` also provides no service and claims no provider route,
+    // so layers 1 and 2 are structurally blind to it — the stream grammar goes
+    // unenforced while every other assertion passes.
+    const ctx = new Context();
+    const entries = await applyProfile(
+      ctx,
+      profileModules(new FakeRouter().register('echo', echoBackend)),
+      [
+        { id: 'llm-invariant', name: '@deepseek-ai/dsh-llm/invariant' },
+        { id: 'llm-invariant-again', name: '@deepseek-ai/dsh-llm/invariant' },
+        { id: 'llm', name: '@deepseek-ai/dsh-llm' },
+        { id: 'invariants', name: '@deepseek-ai/dsh-invariants' },
+        { id: 'aimatey-router', name: '@chatterang/cordis-aimatey' },
+      ],
+    );
+    await new Promise((done) => setTimeout(done, 0));
+
+    // Layers 1 and 2 are perfectly happy.
+    expect(() => assertServices(ctx, ['llm', 'invariants'])).not.toThrow();
+    expect(() => assertRoutes(ctx, [ROUTER_SENTINEL, 'echo'])).not.toThrow();
+
+    // Layer 3 is not.
+    expect(() => assertEntries(entries)).toThrow(/llm-invariant-again/);
+    expect(() => assertEntries(entries)).toThrow(/is FAILED/);
+    // And assertBoot fails for the same reason once it is given the entries.
+    expect(() =>
+      assertBoot(ctx, { services: ['llm', 'invariants'], routes: [ROUTER_SENTINEL], entries }),
+    ).toThrow(/did not activate/);
+  });
+
+  it('names every stuck row and the state it is in, not just the first', () => {
+    // Synthetic entries, because a real tree cannot be held still in DISPOSED
+    // and UNLOADING at the same time — and because a message that reported one
+    // row would send a reader back for a second run to find the next.
+    expect(() =>
+      assertEntries([
+        { id: 'a', name: '@x/a', fiber: { state: 0 } },
+        { id: 'b', name: '@x/b', fiber: { state: 2 } },
+        { id: 'c', name: '@x/c', fiber: { state: 3 } },
+        { id: 'd', name: '@x/d', fiber: { state: 99 } },
+      ]),
+    ).toThrow(/a \(@x\/a\) is PENDING, c \(@x\/c\) is FAILED, d \(@x\/d\) is UNKNOWN\(99\)/);
+  });
+
+  it('accepts a tree in which every row is ACTIVE', () => {
+    expect(() => assertEntries([{ id: 'a', name: '@x/a', fiber: { state: FIBER_ACTIVE } }])).not.toThrow();
+    expect(() => assertEntries([])).not.toThrow();
   });
 
   it('names every missing service, not just the first', () => {
@@ -981,6 +1110,58 @@ describe('the narrowed profile', () => {
     // mounted on this target, so nothing else can check the file at all.
     const path = resolve(process.cwd(), 'packages/cordis-aimatey/cordis.patch.yml');
     expect(readFileSync(path, 'utf8')).toBe(renderPatchYaml());
+  });
+
+  it('says in its own first lines that it is not a boot input', () => {
+    // A checked-in profile in DSH's own patch format, sitting in the package
+    // that mounts the tree, reads as load-bearing whatever a README says. The
+    // marker is asserted against the exported constant rather than a copy, so
+    // rewording it in one place and not the other fails here.
+    const path = resolve(process.cwd(), 'packages/cordis-aimatey/cordis.patch.yml');
+    const header = readFileSync(path, 'utf8').split('\n\n')[0] ?? '';
+    expect(header).toContain(NOT_LOADED_MARKER);
+    // And it names what DOES boot the tree, so a reader is not left to guess.
+    expect(header).toContain('applyProfile(ctx, modules, PROFILE_ROWS)');
+    expect(header).toContain('apps/desktop/src/host/entry.ts');
+  });
+
+  it('is named by no shipped source file — the claim, machine-checked', () => {
+    // THE EVIDENCE FOR THE HEADER. "Nothing reads this file" is a claim about
+    // the whole tree, and prose cannot keep it true. This is a lexical scan
+    // for the file's own name across everything that ships: if someone later
+    // wires a loader in, they must also correct the header that says nobody
+    // did.
+    const roots = [
+      resolve(process.cwd(), 'src'),
+      resolve(process.cwd(), 'packages/contracts/src'),
+      resolve(process.cwd(), 'packages/cordis-aimatey/src'),
+      resolve(process.cwd(), 'packages/inference-node/src'),
+      resolve(process.cwd(), 'apps/desktop/src'),
+      resolve(process.cwd(), 'apps/desktop/scripts'),
+    ];
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (/\.(tsx?|mjs|cjs|js)$/.test(entry)) files.push(full);
+      }
+    };
+    for (const root of roots) walk(root);
+    // A scan that silently walked nothing would pass for free. This suite has
+    // shipped exactly that failure before.
+    expect(files.length).toBeGreaterThan(40);
+
+    const namers = files
+      .filter((file) => {
+        const source = readFileSync(file, 'utf8');
+        // The comment in profile.ts that explains the file is the one place
+        // the name is legitimately written; it is prose, not a read.
+        if (file.endsWith(`${sep}profile.ts`)) return false;
+        return source.includes('cordis.patch');
+      })
+      .map((file) => relative(process.cwd(), file));
+    expect(namers).toEqual([]);
   });
 
   it('applyProfile refuses a row it has no module for', async () => {

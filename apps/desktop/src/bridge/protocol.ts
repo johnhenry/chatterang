@@ -130,6 +130,13 @@ export interface DshStatus {
   readonly services: readonly string[];
   /** Provider routes confirmed registered on the `llm` service. */
   readonly routes: readonly string[];
+  /**
+   * Profile row ids the per-entry walk confirmed ACTIVE.
+   *
+   * A row can provide no service and claim no route — `llm-invariant` does
+   * exactly that — so this is the only field in which its absence is visible.
+   */
+  readonly entries: readonly string[];
   /** `BootReport.notChecked` — what was NOT checked, verbatim. */
   readonly notChecked: string;
   /** The assertion failure, when there was one. */

@@ -33,7 +33,12 @@ import type {
   IRChatStream,
 } from '@johnhenry/aimatey-types';
 
-import type { GenerateResult, LlamaCppPlugin, TokenEvent } from '@chatterang/contracts';
+import type {
+  GenerateResult,
+  GenerateSampler,
+  LlamaCppPlugin,
+  TokenEvent,
+} from '@chatterang/contracts';
 
 import type { PromptTemplate } from '@/domain/manifest';
 import { inferTemplate, renderPrompt, templateStopSequences } from '@/ai/prompt';
@@ -83,6 +88,48 @@ export class DesktopLlamaBackend implements BackendAdapter<{ prompt: string }, G
 
   #template(modelId: string): PromptTemplate {
     return this.#options.resolveTemplate?.(modelId) ?? inferTemplate(modelId);
+  }
+
+  /**
+   * The sampler for one request.
+   *
+   * FOUND BY THE FIRST REAL TURN. Until this existed, `execute` and `#stream`
+   * passed the plugin `{ stopSequences: templateStopSequences(...) }` and
+   * nothing else — so every sampling parameter a DSH caller set was accepted by
+   * `GenerateOptions`, translated into `IRChatRequest.parameters` by
+   * `toIRRequest`, carried across the IR, and then dropped one call short of
+   * the engine. The visible symptom on a real model: a turn that asked for a
+   * short answer ran to `SAMPLER_DEFAULTS.maxTokens` (1024) and terminated
+   * `max-tokens`. Nothing caught it, because every other test of this class
+   * feeds it a fake plugin that ignores the sampler too.
+   *
+   * The mapping mirrors `src/ai/backends/llama-cpp.ts` (`#sampler`), minus the
+   * parts that need a resolver the inference host does not have: there are no
+   * saved per-model settings and no draft model on this side, so an unset
+   * field is left unset and the engine's own default applies. A `0` is
+   * forwarded — `temperature: 0` is greedy decoding, not "unspecified" — which
+   * is why every guard below tests `undefined` rather than falsiness.
+   *
+   * Template stop sequences are appended rather than substituted: a caller's
+   * `stop` is additional to the ones that end a turn in this chat format, and
+   * dropping the template's would let the model keep talking past its own
+   * end-of-turn marker.
+   */
+  #sampler(request: IRChatRequest, modelId: string): GenerateSampler {
+    const params = request.parameters ?? {};
+    return {
+      ...(params.temperature === undefined ? {} : { temperature: params.temperature }),
+      ...(params.topP === undefined ? {} : { topP: params.topP }),
+      ...(params.topK === undefined ? {} : { topK: params.topK }),
+      ...(params.frequencyPenalty === undefined ? {} : { frequencyPenalty: params.frequencyPenalty }),
+      ...(params.presencePenalty === undefined ? {} : { presencePenalty: params.presencePenalty }),
+      ...(params.maxTokens === undefined ? {} : { maxTokens: params.maxTokens }),
+      ...(params.seed === undefined ? {} : { seed: params.seed }),
+      stopSequences: [
+        ...(params.stopSequences ?? []),
+        ...templateStopSequences(this.#template(modelId)),
+      ],
+    };
   }
 
   fromIR(request: IRChatRequest): { prompt: string } {
@@ -148,7 +195,7 @@ export class DesktopLlamaBackend implements BackendAdapter<{ prompt: string }, G
       const result = await this.#options.plugin.generate({
         handle,
         prompt: this.fromIR(request).prompt,
-        sampler: { stopSequences: [...templateStopSequences(this.#template(modelId))] },
+        sampler: this.#sampler(request, modelId),
         requestId,
       });
       return this.toIR(result, request, Date.now() - started);
@@ -208,7 +255,7 @@ export class DesktopLlamaBackend implements BackendAdapter<{ prompt: string }, G
       .generate({
         handle,
         prompt: this.fromIR(request).prompt,
-        sampler: { stopSequences: [...templateStopSequences(this.#template(modelId))] },
+        sampler: this.#sampler(request, modelId),
         requestId,
       })
       .then((result) => {

@@ -288,6 +288,7 @@ export class Supervisor {
         mounted: false,
         services: [],
         routes: [],
+        entries: [],
         notChecked: 'not reported: no inference host is running',
         error: this.#closed,
       };
@@ -296,6 +297,7 @@ export class Supervisor {
       mounted: false,
       services: [],
       routes: [],
+      entries: [],
       notChecked: 'not reported: the inference host has not finished booting',
     };
   }

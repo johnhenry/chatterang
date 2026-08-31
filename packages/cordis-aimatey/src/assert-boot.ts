@@ -13,7 +13,67 @@
  * started fine".
  */
 
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Fiber } from '@deepseek-ai/cordis';
+
+/**
+ * The part of a Cordis `Fiber` the tree walk reads.
+ *
+ * Structural rather than nominal for the same reason `AimateyRouter` is: a test
+ * has to be able to hand the walk an entry in a state a real tree is hard to
+ * hold still in — DISPOSED, UNLOADING — without disposing a live tree to get
+ * there. {@link FiberConformance} below is the compile-time proof that the real
+ * class still satisfies it.
+ */
+export interface FiberLike {
+  /** Current lifecycle state; see {@link FIBER_STATE_NAMES}. */
+  readonly state: number;
+}
+
+/**
+ * Compile-time proof that {@link FiberLike} is a real subset of `Fiber`.
+ *
+ * If cordis renames `state` or stops typing it as a number, this alias resolves
+ * to `never` and `typecheck` fails here rather than the walk quietly reading
+ * `undefined` and finding every row healthy.
+ */
+export type FiberConformance = Fiber extends FiberLike ? true : never;
+
+/**
+ * `FiberState`, spelled out, because it cannot be imported at runtime.
+ *
+ * `FiberState` is declared `const enum` in `@deepseek-ai/cordis`
+ * (lib/types/fiber.d.ts:67), so it has no runtime export at all — importing it
+ * and reading a member yields `undefined`, and `state !== undefined` would then
+ * be true for every fiber in every state. The ordinals are therefore written
+ * here, and `tests/cordis-aimatey.test.ts` reads them back off REAL fibers in
+ * real states rather than trusting this array to have been copied correctly.
+ */
+export const FIBER_STATE_NAMES = [
+  'PENDING',
+  'LOADING',
+  'ACTIVE',
+  'FAILED',
+  'DISPOSED',
+  'UNLOADING',
+] as const;
+
+/** The one state a mounted profile row is allowed to be in after boot. */
+export const FIBER_ACTIVE = 2;
+
+/** Name one fiber state for a human, without pretending to know an unknown one. */
+function stateName(state: number): string {
+  return FIBER_STATE_NAMES[state] ?? `UNKNOWN(${String(state)})`;
+}
+
+/** One profile row, and the fiber `ctx.plugin()` returned for it. */
+export interface MountedEntry {
+  /** The row's stable id, as written in the profile. */
+  readonly id: string;
+  /** The plugin module specifier the row names. */
+  readonly name: string;
+  /** The fiber that row's mount produced. */
+  readonly fiber: FiberLike;
+}
 
 /** What {@link assertBoot} checked, and what it could not. */
 export interface BootReport {
@@ -22,27 +82,31 @@ export interface BootReport {
   /** Provider routes confirmed registered on the `llm` service. */
   readonly routes: readonly string[];
   /**
+   * Profile row ids confirmed ACTIVE by the per-entry walk.
+   *
+   * Empty when no entries were supplied — which is not the same as "the walk
+   * found nothing", and is why {@link BootReport.notChecked} still says so in
+   * words.
+   */
+  readonly entries: readonly string[];
+  /**
    * What this report does NOT cover, in words.
    *
    * WAS CALLED `treeAssertion`, and that was defect [15]. The name read as the
-   * result of a third assertion layer — a per-entry walk of the loader's
-   * profile rows for anything stuck PENDING or FAILED — and both of its
-   * branches return a sentence saying no such walk ran. A field named for an
-   * assertion, always holding a description of an assertion that did not
-   * happen, is worse than an honestly-named one: it makes A4's "assert the
-   * mount" story read thicker than it is, and the whole reason this file exists
-   * is that Cordis is silent where it should be loud.
+   * result of a third assertion layer — a per-entry walk of the profile rows
+   * for anything stuck PENDING or FAILED — and both of its branches returned a
+   * sentence saying no such walk ran.
    *
-   * THE WALK IS STILL NOT IMPLEMENTED, and it is not implemented rather than
-   * half-implemented on purpose: `@deepseek-ai/cordis` ships no loader, none is
-   * installed, and none is mounted on this target — so there is no way to
-   * exercise such a walk, and an unexercised assertion is precisely the kind of
-   * harness this project has already been burnt by. Renaming the field is the
-   * honest change; writing a walk that no test can reach would be the
-   * flattering one.
+   * THE WALK NOW EXISTS; see {@link assertEntries}. What made it look
+   * impossible was framing it as a walk of a LOADER's rows: no loader is
+   * installed, so there was nothing to enumerate. But this target does not need
+   * one. `applyProfile` mounts each row with `ctx.plugin()`, which returns
+   * `Fiber & PromiseLike<Fiber>` (cordis registry.d.ts:198), and a fiber knows
+   * its own state. Handing those fibers back turns the walk into an ordinary
+   * assertion over data we were already producing and throwing away.
    *
-   * Layers 1 and 2 do catch every failure mode this package can produce: a
-   * missing `llm` service, and a plugin that mounted but registered nothing.
+   * This field now describes what is left: rows nobody handed in, and plugins
+   * mounted outside `applyProfile`.
    */
   readonly notChecked: string;
 }
@@ -97,12 +161,47 @@ export function assertRoutes(ctx: Context, expected: readonly string[]): void {
   }
 }
 
+/**
+ * LAYER 3 — every profile row this boot mounted is ACTIVE.
+ *
+ * The layer the other two cannot cover. Layer 1 asks whether a SERVICE is
+ * there, so a row that provides no service — `llm-invariant` is the one that
+ * matters here — can be parked PENDING forever and pass: it injects
+ * `invariants`, and without that registry the stream grammar is simply not
+ * enforced while every other assertion stays green. Layer 2 asks whether OUR
+ * routes are registered, which says nothing about anyone else's row.
+ *
+ * `await fiber` is not this assertion. A fiber whose `inject` is unsatisfied
+ * resolves cleanly with `state === PENDING`, which is the whole reason this
+ * file exists.
+ *
+ * @param entries - the rows mounted, each with the fiber its mount returned.
+ * @throws Error naming every row that is not ACTIVE, and the state it is in.
+ */
+export function assertEntries(entries: readonly MountedEntry[]): void {
+  const stuck = entries.filter((entry) => entry.fiber.state !== FIBER_ACTIVE);
+  if (stuck.length > 0) {
+    throw new Error(
+      'cordis-aimatey: profile row(s) did not activate: ' +
+        stuck.map((entry) => `${entry.id} (${entry.name}) is ${stateName(entry.fiber.state)}`).join(', ') +
+        '. A PENDING row is waiting on a service nobody provides; Cordis resolves its fiber anyway.',
+    );
+  }
+}
+
 /** What a full boot assertion is asked to confirm. */
 export interface BootExpectation {
   /** Service names that must be present and active. */
   readonly services: readonly string[];
   /** Provider routes that must be registered on `llm`. */
   readonly routes?: readonly string[];
+  /**
+   * The rows this boot mounted, for the per-entry walk.
+   *
+   * Optional because a caller that built its tree some other way has no fibers
+   * to offer, and an assertion that cannot run must say so rather than pass.
+   */
+  readonly entries?: readonly MountedEntry[];
 }
 
 /**
@@ -114,20 +213,22 @@ export interface BootExpectation {
  * @throws Error on the first layer that fails.
  */
 export function assertBoot(ctx: Context, expectation: BootExpectation): BootReport {
+  // Order matters for the message a human reads first. A missing `llm` service
+  // is the cause; the aimatey-router row sitting PENDING is the symptom, and
+  // reporting the symptom first would send the reader to the wrong file.
   assertServices(ctx, expectation.services);
   const routes = expectation.routes ?? [];
   if (routes.length > 0) assertRoutes(ctx, routes);
+  const entries = expectation.entries ?? [];
+  if (entries.length > 0) assertEntries(entries);
   return {
     services: [...expectation.services],
     routes: [...routes],
-    // Neither branch performs a walk, and the field name now says so. The two
-    // branches differ only in WHY there was nothing to walk, which is worth
-    // keeping: "no loader" is a property of this target, "not implemented" is
-    // a property of this package, and a caller that ever sees the second one
-    // has mounted a loader and should know the rows are unchecked.
+    entries: entries.map((entry) => entry.id),
     notChecked:
-      ctx.get('loader') === undefined
-        ? 'the per-entry tree walk: no loader is mounted, so there are no profile entries to walk'
-        : 'the per-entry tree walk: a loader IS mounted, but walking its rows for PENDING/FAILED is not implemented',
+      entries.length === 0
+        ? 'the per-entry tree walk: no mounted rows were supplied, so no fiber state was read'
+        : `plugins mounted outside the ${String(entries.length)} row(s) supplied — the walk reads ` +
+          'exactly the fibers it was handed, and Cordis offers no enumeration of the rest',
   };
 }

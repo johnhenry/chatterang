@@ -38,10 +38,24 @@ export { AIMATEY_TO_DSH_CODE, PASS_THROUGH_CODES, ROUTE_UNAVAILABLE_CODE, mapCod
 export { pinRouter } from './pin.js';
 export { ROUTER_SENTINEL, toIRRequest } from './request.js';
 export type { TranslationHooks } from './request.js';
-export { assertBoot, assertRoutes, assertServices } from './assert-boot.js';
-export type { BootExpectation, BootReport } from './assert-boot.js';
+export {
+  FIBER_ACTIVE,
+  FIBER_STATE_NAMES,
+  assertBoot,
+  assertEntries,
+  assertRoutes,
+  assertServices,
+} from './assert-boot.js';
+export type {
+  BootExpectation,
+  BootReport,
+  FiberConformance,
+  FiberLike,
+  MountedEntry,
+} from './assert-boot.js';
 export {
   EXCLUDED_ROWS,
+  NOT_LOADED_MARKER,
   PROFILE_ROWS,
   applyProfile,
   renderPatchYaml,
