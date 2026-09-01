@@ -91,6 +91,21 @@
   display: grid;
   grid-template-areas: 'history main';
   grid-template-columns: var(--history-w) minmax(0, 1fr);
+  /*
+   * THE ROW IS DECLARED, and `minmax(0, 1fr)` rather than `1fr`.
+   *
+   * The single implicit row this grid had was `auto`. An auto row stretches to
+   * the container when the content is short, which is why the layout looked
+   * right — but its MINIMUM is the content's, so a tall enough column would
+   * have pushed the row past the body and been clipped by `.app`'s
+   * `overflow: hidden` instead of scrolling. `minmax(0, 1fr)` says the row is
+   * exactly the body's height whatever is in it, which is the precondition for
+   * `.history__body` to be the scroller rather than the overflow.
+   *
+   * Measured with 200 seeded chats in a real engine at 1184 and 1440 —
+   * tests/layout-engine.test.ts — which is the only place this is visible.
+   */
+  grid-template-rows: minmax(0, 1fr);
 }
 
 /* The thread and its composer. Takes over the flex column .app__body had. */
@@ -149,6 +164,28 @@
   flex-direction: column;
   gap: var(--s-3);
   padding: var(--s-3);
+}
+
+/*
+ * WHY A SCROLL CONTAINER'S CHILDREN MUST NOT SHRINK.
+ *
+ * This is the rule that made A7's headline feature reachable, and its absence
+ * is invisible to a static reading of the sheet: `.history__body` already had
+ * `overflow-y: auto` and `min-height: 0`, which is everything the recipe asks
+ * for. But it is also a FLEX COLUMN, and a flex item's default is
+ * `flex-shrink: 1` — so `.card--flush`, which holds every row, was shrunk to
+ * whatever height was left instead of overflowing. It clips (`overflow:
+ * hidden`, for the rounded corners), so the rows past the fold were laid out
+ * and then cut off: `scrollHeight === clientHeight`, nothing to scroll, and
+ * the 191st of 200 chats sat at y=14016 in a box 617px tall.
+ *
+ * Measured in a real engine, before and after — tests/layout-engine.test.ts.
+ * `flex-shrink` rather than `flex: none`, so a child that legitimately asks to
+ * grow into spare room still can.
+ */
+.history__body > *,
+.sheet__body > * {
+  flex-shrink: 0;
 }
 
 /* ── Instrument rail: the always-on readout of what the device is doing ── */
