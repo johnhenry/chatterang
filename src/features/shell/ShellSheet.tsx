@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Icon } from '@/ui/Icon';
 import { Confirm, Sheet } from '@/ui/primitives';
 import { hasFinePointer } from '@/lib/platform';
+import { commandFor } from '@/lib/keys';
 import { ChatterangShell, type ShellResult } from '@/shell';
 import { liveStores } from '@/shell/stores';
 
@@ -212,15 +213,20 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {
               // Shell history, because retyping a pipeline on a phone is
-              // punishing.
-              if (event.key === 'ArrowUp') {
+              // punishing. The chords are field-scoped entries in the same
+              // table as everything else — a bare arrow key is ordinary
+              // navigation in every other field, so the window listener must
+              // not claim it, and this field asks what the event means rather
+              // than naming the key itself.
+              const command = commandFor(event);
+              if (command === 'terminal.historyPrev') {
                 event.preventDefault();
                 const next = Math.min(historyAt.current + 1, history.current.length - 1);
                 if (next >= 0) {
                   historyAt.current = next;
                   setInput(history.current[next] ?? '');
                 }
-              } else if (event.key === 'ArrowDown') {
+              } else if (command === 'terminal.historyNext') {
                 event.preventDefault();
                 const next = historyAt.current - 1;
                 historyAt.current = Math.max(next, -1);

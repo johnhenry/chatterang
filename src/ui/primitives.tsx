@@ -15,6 +15,7 @@ import {
 import { createPortal } from 'react-dom';
 
 import { Icon, type IconName } from '@/ui/Icon';
+import { registerCommand } from '@/lib/keys';
 
 /* ── Sheet ──────────────────────────────────────────────────────────── */
 
@@ -47,15 +48,27 @@ export function Sheet({ open, title, onClose, children, footer }: SheetProps): R
     onCloseRef.current = onClose;
   });
 
+  /*
+   * Escape goes through the dispatch layer, not through a listener per sheet.
+   *
+   * Each open sheet used to install its own `document` keydown handler and call
+   * `stopPropagation()`. That does not stop other listeners on the same node —
+   * only `stopImmediatePropagation` would — so a Confirm opened over a Sheet
+   * and then dismissed with Escape closed BOTH. `registerCommand` is a stack:
+   * the sheet that opened last registered last, and it is the only one Escape
+   * reaches.
+   */
+  useEffect(() => {
+    if (!open) return undefined;
+    return registerCommand('layer.close', () => {
+      onCloseRef.current();
+    });
+  }, [open]);
+
   useEffect(() => {
     if (!open) return undefined;
 
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') {
-        event.stopPropagation();
-        onCloseRef.current();
-        return;
-      }
       if (event.key !== 'Tab' || !panel.current) return;
 
       const focusable = panel.current.querySelectorAll<HTMLElement>(

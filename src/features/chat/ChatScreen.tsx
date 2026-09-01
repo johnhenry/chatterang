@@ -15,6 +15,7 @@ import { Composer } from '@/features/chat/Composer';
 import { MessageView } from '@/features/chat/MessageView';
 import { SamplerPanel } from '@/features/chat/SamplerPanel';
 import { exportConversation } from '@/lib/export';
+import { registerCommand } from '@/lib/keys';
 
 export function ChatScreen(): ReactNode {
   const chats = useChats((state) => state.chats);
@@ -88,6 +89,44 @@ export function ChatScreen(): ReactNode {
 
   const showThinking = chat?.showThinking ?? settings.showThinking;
 
+  /*
+   * The screen's three commands.
+   *
+   * Registered here rather than bound to a button, because a menu accelerator
+   * and a key press must reach the same code and neither of them has a button
+   * to click. `chat.next`/`chat.previous` walk `chats`, which is the same
+   * order the session column renders — so "next" means the row below the one
+   * highlighted, which is the only definition a user can predict.
+   */
+  useEffect(
+    () =>
+      registerCommand('chat.new', () => {
+        void useChats.getState().newChat();
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    const step = (delta: number) => (): boolean => {
+      const store = useChats.getState();
+      const at = store.chats.findIndex((entry) => entry.id === store.activeChatId);
+      if (at < 0) return false;
+      const target = store.chats[at + delta];
+      // No wrap: at either end the command declines rather than teleporting
+      // from the newest chat to the oldest, which is disorienting on a list
+      // whose length the user cannot see.
+      if (!target) return false;
+      void store.openChat(target.id);
+      return true;
+    };
+    const offNext = registerCommand('chat.next', step(1));
+    const offPrevious = registerCommand('chat.previous', step(-1));
+    return () => {
+      offNext();
+      offPrevious();
+    };
+  }, []);
+
   return (
     <>
       <Rail
@@ -96,7 +135,7 @@ export function ChatScreen(): ReactNode {
           <>
             <button
               type="button"
-              className="icon-btn"
+              className="icon-btn chat__history-toggle"
               onClick={() => setDrawer('chats')}
               aria-label="All chats"
             >
@@ -122,39 +161,74 @@ export function ChatScreen(): ReactNode {
         }
       />
 
-      <main className="app__body">
-        {messages.length === 0 ? (
-          <StartState hasTarget={hasTarget} onPickModel={() => setDrawer('model')} />
-        ) : (
-          <div className="screen__scroll" ref={scroller} onScroll={onScroll}>
-            <div className="thread">
-              {messages.map((message) => (
-                <MessageView
-                  key={message.id}
-                  message={message}
-                  showThinking={showThinking}
-                  onRegenerate={(id) => void useChats.getState().regenerate(id)}
-                  onEdit={setEditing}
-                />
-              ))}
-            </div>
+      <main className="app__body app__body--split">
+        {/*
+          The session list, as a COLUMN. Always mounted; `display: none` below
+          the workbench tier, where ChatListSheet is the container instead.
+          Which container the list is in is a viewport question, so CSS answers
+          it — there is no width in this file and no resize listener anywhere.
+        */}
+        <aside className="history" aria-label="Chats">
+          <div className="history__head">
+            <span className="history__title">Chats</span>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => void useChats.getState().newChat({ mode: 'task' })}
+              aria-label="New task"
+              title="New task"
+            >
+              <Icon name="tool" size={16} />
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => void useChats.getState().newChat()}
+              aria-label="New chat"
+              title="New chat"
+            >
+              <Icon name="plus" size={16} />
+            </button>
           </div>
-        )}
+          <div className="history__body">
+            <ChatList onPick={() => undefined} onDelete={setConfirmDelete} />
+          </div>
+        </aside>
 
-        <Composer
-          disabled={!hasTarget}
-          generating={generating}
-          acceptsImages={acceptsImages}
-          placeholder={
-            hasTarget
-              ? chat?.mode === 'task'
-                ? 'Describe the one-off task…'
-                : 'Message'
-              : 'Install a model or connect a provider first'
-          }
-          onSend={send}
-          onStop={() => useChats.getState().stop()}
-        />
+        <div className="chat__main">
+          {messages.length === 0 ? (
+            <StartState hasTarget={hasTarget} onPickModel={() => setDrawer('model')} />
+          ) : (
+            <div className="screen__scroll" ref={scroller} onScroll={onScroll}>
+              <div className="thread">
+                {messages.map((message) => (
+                  <MessageView
+                    key={message.id}
+                    message={message}
+                    showThinking={showThinking}
+                    onRegenerate={(id) => void useChats.getState().regenerate(id)}
+                    onEdit={setEditing}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          <Composer
+            disabled={!hasTarget}
+            generating={generating}
+            acceptsImages={acceptsImages}
+            placeholder={
+              hasTarget
+                ? chat?.mode === 'task'
+                  ? 'Describe the one-off task…'
+                  : 'Message'
+                : 'Install a model or connect a provider first'
+            }
+            onSend={send}
+            onStop={() => useChats.getState().stop()}
+          />
+        </div>
       </main>
 
       <ChatListSheet
@@ -232,13 +306,24 @@ function StartState({
 
 /* ── Chat list ──────────────────────────────────────────────────────── */
 
-function ChatListSheet({
-  open,
-  onClose,
+/**
+ * The session list itself — search box, rows, pin and delete.
+ *
+ * ONE component in TWO containers, which is the whole reason this was pulled
+ * out of the sheet. Below the workbench tier it is the body of
+ * ChatListSheet; at and above it, it is the body of the `.history` column.
+ * A sibling implementation would have been the alternative and would have
+ * meant two search boxes, two filters, and two definitions of what "selected"
+ * looks like — the second of which is always the one that drifts.
+ *
+ * `onPick` is what the container does AFTER a row is opened: the sheet closes
+ * itself, the column does nothing, because it is not in the way.
+ */
+function ChatList({
+  onPick,
   onDelete,
 }: {
-  open: boolean;
-  onClose: () => void;
+  onPick: () => void;
   onDelete: (chatId: string) => void;
 }): ReactNode {
   const chats = useChats((state) => state.chats);
@@ -255,36 +340,7 @@ function ChatListSheet({
   }, [chats, query]);
 
   return (
-    <Sheet
-      open={open}
-      title="Chats"
-      onClose={onClose}
-      footer={
-        <>
-          <button
-            type="button"
-            className="btn btn--secondary grow"
-            onClick={() => {
-              void useChats.getState().newChat({ mode: 'task' });
-              onClose();
-            }}
-          >
-            New task
-          </button>
-          <button
-            type="button"
-            className="btn btn--primary grow"
-            onClick={() => {
-              void useChats.getState().newChat();
-              onClose();
-            }}
-          >
-            <Icon name="plus" size={15} />
-            New chat
-          </button>
-        </>
-      }
-    >
+    <>
       <input
         className="input"
         placeholder="Search chats"
@@ -310,7 +366,7 @@ function ChatListSheet({
                   style={{ background: 'none', textAlign: 'left' }}
                   onClick={() => {
                     void useChats.getState().openChat(chat.id);
-                    onClose();
+                    onPick();
                   }}
                 >
                   <span className="list__title truncate">
@@ -345,6 +401,52 @@ function ChatListSheet({
           </div>
         </div>
       )}
+    </>
+  );
+}
+
+/** The narrow-width container for {@link ChatList}: a modal over the thread. */
+function ChatListSheet({
+  open,
+  onClose,
+  onDelete,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDelete: (chatId: string) => void;
+}): ReactNode {
+  return (
+    <Sheet
+      open={open}
+      title="Chats"
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            type="button"
+            className="btn btn--secondary grow"
+            onClick={() => {
+              void useChats.getState().newChat({ mode: 'task' });
+              onClose();
+            }}
+          >
+            New task
+          </button>
+          <button
+            type="button"
+            className="btn btn--primary grow"
+            onClick={() => {
+              void useChats.getState().newChat();
+              onClose();
+            }}
+          >
+            <Icon name="plus" size={15} />
+            New chat
+          </button>
+        </>
+      }
+    >
+      <ChatList onPick={onClose} onDelete={onDelete} />
     </Sheet>
   );
 }

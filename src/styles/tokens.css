@@ -68,12 +68,50 @@
   --r-full: 999px;
 
   --hairline: 1px;
-  --tap: 44px; /* minimum comfortable touch target */
+
+  /* ---- Density axis -----------------------------------------------------
+   * --tap is a TOUCH minimum — 44px, WCAG 2.5.5 (AAA) — and it does not move.
+   * A finger has a contact patch; a mouse cursor is a point. So the control
+   * heights below are TOKENS rather than numbers in the component sheet, and
+   * they change in exactly one place, further down this file, under
+   * `(pointer: fine)`.
+   *
+   * That is a media query, not a platform question, and deliberately so: an
+   * Electron window dragged onto a touch display is still touch, an iPad on a
+   * Magic Keyboard is still fine, and `capabilities().id` could not tell you
+   * either. `pointer` describes the PRIMARY pointing device, which is the one
+   * the user is actually reaching for.
+   *
+   * THE FLOOR, AND WHY IT IS 28 RATHER THAN 24. WCAG 2.5.8 (AA, 2.2) asks for
+   * 24x24 CSS px per pointer target, with two exceptions: a target inline in a
+   * sentence, and an undersized target that has enough clear space around it
+   * (no other target's 24px circle may intersect its own). NOTHING here
+   * qualifies for either. `.rail__actions` sets `gap: var(--s-1)` — 4px — so
+   * the rail's icon buttons sit four pixels apart, and `.list__item` puts the
+   * pin and the delete button 12px apart. At those gaps the spacing exception
+   * is unavailable and 24 is a hard floor.
+   *
+   * So the floor is 24 and the value used is 28: four pixels of headroom, so
+   * that a control which later loses a padding step or gains a border is still
+   * compliant rather than one rounding error under it. Anything that is a
+   * standalone SQUARE target — icon buttons, the composer's send — stays at
+   * 32, because those are aimed at rather than fallen into on the way past.
+   */
+  --tap: 44px; /* touch minimum, WCAG 2.5.5 (AAA) — never scaled down */
+  --ctl-row: var(--tap); /* full-width rows: list items, tab bar items */
+  --ctl-rail: 46px; /* the two strips of the instrument rail */
+  --ctl-lg: 40px; /* composer field, send button, composer icon buttons */
+  --ctl: 38px; /* buttons, inputs, selects */
+  --icon-btn: 36px; /* square icon buttons */
+  --ctl-sm: 30px; /* .btn--sm */
+  --ctl-xs: 32px; /* segmented items — was a bare 28px, under the floor on touch */
 
   /* ---- Size layer -------------------------------------------------------
-   * Everything above is size-agnostic. These four change per tier, and are the
-   * only things that do — so a breakpoint adds a block here rather than a rule
-   * in the component sheet.
+   * Everything above is size-agnostic. These change per tier, and are very
+   * nearly the only things that do — so a breakpoint adds a block here rather
+   * than a rule in the component sheet. The two exceptions are the shell's own
+   * grid and the session column's `display`, both of which are a re-layout
+   * rather than a number and live in components.css.
    *
    * --measure is the width of the TEXT, not of its container. Each container
    * adds its own padding on top, so the thread and the composer align to the
@@ -87,7 +125,16 @@
   --rail-w: 232px;
   --nav-h: 76px;
   --pad-screen: var(--s-4);
-  --icon-btn: 36px;
+
+  /*
+   * The session column, and the width of nothing below the tier that has one.
+   *
+   * Zero rather than absent so the chat body's grid is written ONCE, as
+   * `var(--history-w) minmax(0, 1fr)`, instead of being a different grid on
+   * either side of a breakpoint. The column is `display: none` below the tier
+   * (components.css), so a 0px track holds nothing focusable.
+   */
+  --history-w: 0px;
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
@@ -153,6 +200,80 @@
 @media (min-width: 920px) {
   :root {
     --content-wide: 900px;
+  }
+}
+
+/*
+ * Workbench: wide enough to keep the session list OPEN, beside the thread,
+ * instead of behind a modal.
+ *
+ * WHERE 1152 COMES FROM. It is a sum of three widths this app already had, not
+ * a device and not a round number. Above 920 the shell is `rail | body`, and
+ * both columns are spoken for; the reading column stops growing at the measure
+ * and everything past that is gutter. The workbench tier spends that gutter on
+ * a third column, and it may open only at the width where the gutter is
+ * already big enough to pay for it — otherwise the reading column NARROWS as
+ * the window gets wider, which is the exact defect the 920 tier exists to fix
+ * (see the note above, and the invariant in tests/layout.test.ts).
+ *
+ *   --rail-w                                     232
+ *   --history-w                                  304
+ *   --measure (66ch)                             594
+ *   2 × --pad-screen (the thread's own gutters)   48
+ *                                               ————
+ *                                              1178
+ *
+ * 1184 is the next multiple of 8 above that floor. At 1183 the thread sits at
+ * its cap with ~150px of dead gutter either side; at 1184 the thread is
+ * exactly as wide as it was and the gutter has become the session list.
+ *
+ * WHY 594 AND NOT 564 FOR THE MEASURE. `ch` is the advance of "0" IN THE FONT
+ * THAT ACTUALLY RENDERED, measured live — not in the font we hope loaded.
+ * Archivo's digit is ~0.57em, which puts 66ch at 564px and the sum at 1148;
+ * the rest of the declared stack (system-ui / SF Pro, Segoe UI, the generic
+ * sans) runs up to ~0.60em, which puts 66ch at 594px and the sum at 1178. The
+ * tier is sized for the wider end, because the narrower end is not the case
+ * that breaks: a threshold tuned to 1148 would be correct once Archivo is
+ * resident and would narrow the reading column during the font swap, on the
+ * first paint of a cold load, and for anyone who blocks web fonts.
+ * tests/layout.test.ts checks the fit at both ratios for this reason.
+ *
+ * WHY 304 FOR THE HISTORY COLUMN. A row in that list is
+ * `[title + preview] [pin] [delete]`, and it is measured, not guessed:
+ * `.list__item` contributes 2 × --s-4 of padding (32) and two --s-3 gaps (24),
+ * and the two icon buttons are --icon-btn each (2 × 36 = 72). That is 128px
+ * before a single character of title. The remaining 176px carries ~23
+ * characters at --t-base, which is the point where two chats opened from
+ * similar prompts stop looking identical in the list. 128 + 176 = 304.
+ *
+ * A tier is a statement about CONTENT, so nothing here mentions a device: an
+ * Electron window at 800px gets the modal, and a tablet in landscape at 1194px
+ * gets the column.
+ */
+@media (min-width: 1184px) {
+  :root {
+    --history-w: 304px;
+  }
+}
+
+/*
+ * Density, the other axis.
+ *
+ * Everything above is about how much ROOM there is. This is about what is
+ * POINTING at it, and the two are independent — a 1400px window driven by a
+ * touchscreen still wants 44px rows, and a 700px Electron window driven by a
+ * mouse does not. See the density block at the top of this file for the floor
+ * and the WCAG citation.
+ */
+@media (pointer: fine) {
+  :root {
+    --ctl-row: 34px;
+    --ctl-rail: 38px;
+    --ctl-lg: 34px;
+    --ctl: 32px;
+    --icon-btn: 32px;
+    --ctl-sm: 28px;
+    --ctl-xs: 28px;
   }
 }
 

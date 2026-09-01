@@ -18,6 +18,7 @@ import { SettingsScreen } from '@/features/settings/SettingsScreen';
 import { Toasts } from '@/features/shell/Toasts';
 import { ShimNotice } from '@/features/shell/ShimNotice';
 import { ApprovalGate } from '@/features/shell/ApprovalGate';
+import { installKeyboard } from '@/lib/keys';
 
 export type Tab = 'chat' | 'models' | 'personas' | 'studio' | 'settings';
 
@@ -54,6 +55,13 @@ export function App(): ReactNode {
       ]);
     })();
   }, [initialize]);
+
+  /*
+   * One keydown listener for the whole app, and the door an out-of-page
+   * accelerator arrives through. Idempotent, so StrictMode's double mount in
+   * development does not stack two listeners and fire every command twice.
+   */
+  useEffect(() => installKeyboard(), []);
 
   // The rail's thermal readout is only meaningful if it is actually sampled.
   useEffect(() => {

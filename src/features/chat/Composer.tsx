@@ -7,6 +7,7 @@ import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
 import { hasFinePointer } from '@/lib/platform';
+import { commandFor, registerCommand } from '@/lib/keys';
 import { startDictation, type DictationHandle } from '@/lib/voice';
 import { ensureSession, releaseSessions } from '@/lib/voice';
 
@@ -67,6 +68,24 @@ export function Composer({
     };
   }, []);
 
+  /*
+   * The composer's two commands, published to the dispatch layer.
+   *
+   * `chat.focusComposer` is the one a window user reaches for blindly and had
+   * no way to express before: there was no path from "somewhere else on the
+   * page" to this textarea. `chat.send` is registered as well as handled
+   * locally, because the local handler answers a KEY PRESS IN THIS FIELD and
+   * the registration answers a menu item or an accelerator, which have no
+   * focus and no event.
+   */
+  useEffect(
+    () =>
+      registerCommand('chat.focusComposer', () => {
+        textarea.current?.focus();
+      }),
+    [],
+  );
+
   // Grow with content up to the max height set in CSS.
   useEffect(() => {
     const element = textarea.current;
@@ -82,6 +101,18 @@ export function Composer({
     setText('');
     setAttachments([]);
   }, [text, attachments, onSend]);
+
+  useEffect(
+    () =>
+      registerCommand('chat.send', () => {
+        // `false` hands the command back to the dispatcher rather than
+        // pretending a disabled composer sent something.
+        if (disabled) return false;
+        send();
+        return true;
+      }),
+    [disabled, send],
+  );
 
   const addImages = useCallback(
     async (files: FileList | null) => {
@@ -186,8 +217,7 @@ export function Composer({
             />
             <button
               type="button"
-              className="icon-btn"
-              style={{ width: 40, height: 40 }}
+              className="icon-btn composer__btn"
               onClick={() => fileInput.current?.click()}
               aria-label="Attach an image"
               disabled={disabled}
@@ -199,8 +229,7 @@ export function Composer({
 
         <button
           type="button"
-          className="icon-btn"
-          style={{ width: 40, height: 40 }}
+          className="icon-btn composer__btn"
           data-active={dictating ? 'true' : undefined}
           onClick={() => void toggleDictation()}
           aria-label={dictating ? 'Stop dictation' : 'Dictate'}
@@ -218,13 +247,15 @@ export function Composer({
           disabled={disabled}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
-            // Enter sends on a physical keyboard; on touch it inserts a
-            // newline, because there is no comfortable way to type Shift+Enter
-            // on a phone.
-            if (event.key === 'Enter' && !event.shiftKey && hasFinePointer()) {
-              event.preventDefault();
-              send();
-            }
+            // The table decides what the key MEANS; this field decides whether
+            // it applies. Enter sends on a physical keyboard and inserts a
+            // newline on touch, because there is no comfortable way to type
+            // Shift+Enter on a phone — while Mod+Enter sends either way, which
+            // is what a phone with a Bluetooth keyboard actually needs.
+            if (commandFor(event) !== 'chat.send') return;
+            if (!event.metaKey && !event.ctrlKey && !hasFinePointer()) return;
+            event.preventDefault();
+            send();
           }}
           onPaste={(event) => {
             if (!acceptsImages) return;

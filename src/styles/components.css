@@ -78,6 +78,79 @@
   flex-direction: column;
 }
 
+/*
+ * The chat body, which is two columns at every width — one of them usually 0.
+ *
+ * `--history-w` is 0px below the workbench tier and 304px at it (tokens.css),
+ * so this grid is written once instead of being a flex column below the
+ * breakpoint and a grid above it. The empty track costs nothing: `.history` is
+ * `display: none` until the tier, so there is no focusable content sitting in
+ * a zero-width column.
+ */
+.app__body--split {
+  display: grid;
+  grid-template-areas: 'history main';
+  grid-template-columns: var(--history-w) minmax(0, 1fr);
+}
+
+/* The thread and its composer. Takes over the flex column .app__body had. */
+.chat__main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+/*
+ * The session list AS A COLUMN — the same <ChatList> the sheet renders, in a
+ * different container rather than a second implementation of the same list.
+ *
+ * Hidden below the workbench tier, where ChatListSheet is the container
+ * instead. This is the one place besides the shell grid where a breakpoint
+ * buys a re-layout rather than a number.
+ */
+.history {
+  grid-area: history;
+  display: none;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--surface);
+  border-right: var(--hairline) solid var(--line);
+}
+
+.history__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-4);
+  min-height: var(--ctl-rail);
+  border-bottom: var(--hairline) solid var(--line);
+}
+
+.history__title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-2xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-variation-settings: 'wdth' var(--wdth-condensed);
+}
+
+.history__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3);
+}
+
 /* ── Instrument rail: the always-on readout of what the device is doing ── */
 .rail {
   grid-area: rail;
@@ -93,7 +166,7 @@
   align-items: center;
   gap: var(--s-3);
   padding: var(--s-2) var(--s-4);
-  min-height: 46px;
+  min-height: var(--ctl-rail);
   min-width: 0;
 }
 
@@ -393,7 +466,7 @@
   justify-content: center;
   gap: var(--s-2);
   padding: 0 var(--s-4);
-  min-height: 38px;
+  min-height: var(--ctl);
   border-radius: var(--r-sm);
   font-size: var(--t-sm);
   font-weight: 650;
@@ -453,7 +526,7 @@
 }
 
 .btn--sm {
-  min-height: 30px;
+  min-height: var(--ctl-sm);
   padding: 0 var(--s-3);
   font-size: var(--t-xs);
 }
@@ -466,8 +539,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   border-radius: var(--r-sm);
   color: var(--ink-2);
   transition:
@@ -569,7 +642,7 @@
   transition:
     background var(--dur-fast) var(--ease-out),
     color var(--dur-fast) var(--ease-out);
-  min-height: 28px;
+  min-height: var(--ctl-xs);
 }
 
 .segmented__item[aria-pressed='true'] {
@@ -614,7 +687,7 @@
   padding: var(--s-2) var(--s-3);
   font-size: var(--t-control);
   color: var(--ink);
-  min-height: 38px;
+  min-height: var(--ctl);
   transition: border-color var(--dur-fast) var(--ease-out);
 }
 
@@ -893,7 +966,7 @@
 
 .composer__input {
   flex: 1;
-  min-height: 40px;
+  min-height: var(--ctl-lg);
   max-height: 40vh;
   resize: none;
   background: var(--surface-2);
@@ -909,9 +982,22 @@
   border-color: var(--ember);
 }
 
+/*
+ * The composer's attach and dictate buttons.
+ *
+ * These were `style={{ width: 40, height: 40 }}` in Composer.tsx — two control
+ * heights living outside the token system entirely, where the density axis
+ * could not reach them and where nobody looking at the stylesheet would find
+ * them. They are `.icon-btn` sized up to the composer's own row height.
+ */
+.composer__btn {
+  width: var(--ctl-lg);
+  height: var(--ctl-lg);
+}
+
 .composer__send {
-  width: 40px;
-  height: 40px;
+  width: var(--ctl-lg);
+  height: var(--ctl-lg);
   border-radius: var(--r-md);
   background: var(--ember);
   color: var(--on-ember);
@@ -1672,5 +1758,28 @@
     right: var(--s-5);
     bottom: var(--s-5);
     width: min(380px, 40vw);
+  }
+}
+
+/* ── Workbench: the session list comes out from behind the modal ────── */
+/*
+ * The threshold and its arithmetic are in tokens.css, beside the rest of the
+ * ladder. Everything this block does is a RE-LAYOUT — a `display`, not a
+ * number — because the number (`--history-w`) already moved in the token
+ * layer, and the grid that consumes it is written unconditionally above.
+ */
+@media (min-width: 1184px) {
+  .history {
+    display: flex;
+  }
+
+  /*
+   * The rail's "All chats" button opens ChatListSheet, which at this tier
+   * would be a modal over a list that is already on screen. Hidden rather than
+   * removed in TSX: which container the list is in is a question about the
+   * viewport, and the viewport is answered in CSS.
+   */
+  .chat__history-toggle {
+    display: none;
   }
 }
