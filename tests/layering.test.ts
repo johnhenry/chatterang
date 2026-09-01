@@ -412,6 +412,33 @@ describe('only the platform seam names a platform', () => {
   const NAMES_A_PLATFORM = /\bCapacitor\s*\.\s*(isNativePlatform|getPlatform)\b/;
 
   /**
+   * READING THE SEAM'S OWN `id` FIELD — the front door this guard used to hold
+   * open.
+   *
+   * The rule above bans `Capacitor.getPlatform()`, and the table it forced
+   * everyone through exposes `id`. So `capabilities().id === 'electron'` is
+   * `isNativePlatform()` again with better manners: it typechecks, it reads as
+   * principled, it goes through the seam, and it is the SAME mistake. This
+   * file previously listed `const platform = capabilities().id;` as an ALLOWED
+   * form — a matcher assertion that read as a sanction, and would have been
+   * one the first time A7 wanted "is this desktop chrome?" for a keyboard
+   * shortcut or a density switch.
+   *
+   * It is wrong on the merits and not merely on principle. An Electron window
+   * can be 400 px wide; an iPad can be 1200 px on a trackpad; a phone can have
+   * a Bluetooth keyboard. Viewport and input are MEDIA QUERIES —
+   * `hasFinePointer()`, `matchMedia('(min-width: …)')` — asked of the browser
+   * at the moment they matter, not of a table fixed before the bundle loaded.
+   *
+   * TWO DOORS, because a property read is not the only way to reach a field.
+   * `const { id } = capabilities()` gets there without the word `.id` ever
+   * following a paren, and a guard that saw only the first spelling would have
+   * been a guard against one spelling.
+   */
+  const BRANCHES_ON_IDENTITY =
+    /\bcapabilities\s*\(\s*\)\s*\.\s*id\b|\{[^}]*\bid\b[^}]*\}\s*=\s*capabilities\s*\(\s*\)/;
+
+  /**
    * Source with comments removed, and with strings left intact.
    *
    * A raw text search is what the guards above deliberately avoid, for a
@@ -496,7 +523,6 @@ describe('only the platform seam names a platform', () => {
       '// the guard used to be Capacitor.isNativePlatform()',
       '/* Capacitor.getPlatform() answers "electron" here */',
       "capabilities().modelStore === 'filesystem'",
-      'const platform = capabilities().id;',
     ]) {
       expect(NAMES_A_PLATFORM.test(codeOf(allowed)), allowed).toBe(false);
     }
@@ -505,6 +531,66 @@ describe('only the platform seam names a platform', () => {
     // comment, and what follows it on that line still counts.
     const tricky = "const u = 'https://example.com'; Capacitor.getPlatform();";
     expect(NAMES_A_PLATFORM.test(codeOf(tricky))).toBe(true);
+  });
+
+  it('no file in src/ branches on WHICH platform this is, seam included', () => {
+    // The seam may NAME a platform — that is its job — but nothing in `src/`,
+    // the seam included, may read `capabilities().id` and compare it. The
+    // table's own rows are object literals; `capabilities()` is what callers
+    // hold, and `.id` on it is a decision site by definition.
+    const offenders = files
+      .filter((file) => BRANCHES_ON_IDENTITY.test(codeOf(readFileSync(file, 'utf8'))))
+      .map((file) => rel(file));
+    expect(offenders).toEqual([]);
+  });
+
+  it('the identity matcher sees both doors and does not fire on a capability', () => {
+    // The failure this file keeps re-learning is a matcher revert-checked only
+    // against the spelling it already caught, so both halves are asserted.
+    for (const branch of [
+      "if (capabilities().id === 'electron') return;",
+      'const platform = capabilities().id;',
+      'switch (capabilities() . id) {',
+      'const { id } = capabilities();',
+      'const { modelStore, id } = capabilities();',
+      'const { id: host } = capabilities();',
+    ]) {
+      expect(BRANCHES_ON_IDENTITY.test(codeOf(branch)), branch).toBe(true);
+    }
+
+    // Controls. Every other field of the table is the whole point of having
+    // one, and `id` on something that is not the seam is just an id.
+    for (const allowed of [
+      "capabilities().modelStore === 'filesystem'",
+      "capabilities().fileHandoff === 'share-sheet'",
+      'if (!capabilities().purchases) return false;',
+      'const { modelStore } = capabilities();',
+      'const { offlineCache, purchases } = capabilities();',
+      'void usePersonas.getState().acquire(listing.id);',
+      'if (manifest.id === active.id) return;',
+      "hasFinePointer() ? 'desktop' : 'touch'",
+    ]) {
+      expect(BRANCHES_ON_IDENTITY.test(codeOf(allowed)), allowed).toBe(false);
+    }
+  });
+
+  it('the two pointer questions ask the browser, not the table', () => {
+    // The precedent the rule above generalises. Both sites were already
+    // correct and both were hand-rolled, which is how the second copy becomes
+    // the one someone rewrites as `capabilities().id === 'electron'`.
+    const callers = ['features/chat/Composer.tsx', 'features/shell/ShellSheet.tsx'];
+    for (const caller of callers) {
+      const file = files.find((f) => rel(f) === caller);
+      expect(file, `${caller} is missing`).toBeDefined();
+      const source = readFileSync(file!, 'utf8');
+      expect(source, caller).toContain('hasFinePointer');
+      // And not a fourth private copy of the query alongside the helper.
+      expect(codeOf(source), caller).not.toContain("matchMedia('(pointer: fine)')");
+    }
+
+    // The helper itself is where the query lives, and it lives in the seam.
+    const seam = files.find((f) => rel(f) === SEAM);
+    expect(readFileSync(seam!, 'utf8')).toContain("'(pointer: fine)'");
   });
 });
 

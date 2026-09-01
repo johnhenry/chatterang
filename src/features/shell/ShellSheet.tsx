@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import { Icon } from '@/ui/Icon';
 import { Confirm, Sheet } from '@/ui/primitives';
+import { hasFinePointer } from '@/lib/platform';
 import { ChatterangShell, type ShellResult } from '@/shell';
 import { liveStores } from '@/shell/stores';
 
@@ -125,7 +126,7 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
             // Desktop convention only. On touch it inverts: tapping the
             // transcript is how you dismiss the keyboard, and WebKit
             // synthesises mouseup on tap, so this would re-summon it.
-            if (!window.matchMedia('(pointer: fine)').matches) return;
+            if (!hasFinePointer()) return;
             // Do not steal focus mid-selection: a user dragging to copy output
             // is not asking to type.
             if ((window.getSelection()?.toString().length ?? 0) > 0) return;

@@ -56,7 +56,7 @@ vi.mock('@capacitor/core', async (importActual) => {
 
 const billing = vi.hoisted(() => ({ available: true, calls: [] as string[] }));
 
-const { capabilities } = await import('@/lib/platform');
+const { capabilities, hasFinePointer } = await import('@/lib/platform');
 const { billingAvailable, restorePurchases } = await import('@/lib/billing');
 
 function on<T>(id: string, work: () => T): T {
@@ -184,5 +184,74 @@ describe('billing states its desktop answer instead of inheriting it', () => {
     await expect(restorePurchases()).rejects.toThrow(/only available in the iOS and Android apps/);
     expect(billing.calls).toEqual([]);
     platform.id = 'web';
+  });
+});
+
+/**
+ * The pointer question, which is NOT a platform question.
+ *
+ * A6's review found the seam's front door standing open: `capabilities().id
+ * === 'electron'` for "is this desktop chrome?" would have typechecked, read
+ * as principled, and been WRONG — an Electron window can be 400 px wide and an
+ * iPad can be 1200 px on a trackpad. `tests/layering.test.ts` now bans that
+ * spelling in `src/`; this is the answer it leaves in its place.
+ */
+describe('viewport and input are asked of the browser, not of the table', () => {
+  const asked: string[] = [];
+
+  function withPointer<T>(matches: boolean | null, work: () => T): T {
+    const before = Object.getOwnPropertyDescriptor(globalThis, 'matchMedia');
+    Object.defineProperty(globalThis, 'matchMedia', {
+      value:
+        matches === null
+          ? undefined
+          : (query: string) => {
+              asked.push(query);
+              return { matches } as MediaQueryList;
+            },
+      configurable: true,
+      writable: true,
+    });
+    try {
+      return work();
+    } finally {
+      if (before) Object.defineProperty(globalThis, 'matchMedia', before);
+      else Reflect.deleteProperty(globalThis, 'matchMedia');
+    }
+  }
+
+  it('reports a mouse when the browser says there is one', () => {
+    asked.length = 0;
+    expect(withPointer(true, hasFinePointer)).toBe(true);
+    expect(asked).toEqual(['(pointer: fine)']);
+  });
+
+  it('reports touch when the browser says the primary pointer is coarse', () => {
+    asked.length = 0;
+    expect(withPointer(false, hasFinePointer)).toBe(false);
+    expect(asked).toEqual(['(pointer: fine)']);
+  });
+
+  it('does not throw where matchMedia is missing, and answers touch', () => {
+    // FAULT INJECTED: `globalThis.matchMedia?.(...)` changed to
+    // `globalThis.matchMedia(...)`. Observed: TypeError —
+    // "globalThis.matchMedia is not a function", exit 1. The safe default
+    // matters: a newline can be deleted, a message sent early cannot be
+    // unsent.
+    expect(withPointer(null, hasFinePointer)).toBe(false);
+  });
+
+  it('is not the platform table wearing a media query', () => {
+    // The whole point. The SAME platform answers both ways depending on the
+    // hardware in front of it, which is why no row could ever have held this.
+    platform.id = 'electron';
+    try {
+      expect(withPointer(false, hasFinePointer)).toBe(false);
+      expect(withPointer(true, hasFinePointer)).toBe(true);
+      // And the table is unmoved by any of it.
+      expect(capabilities().modelStore).toBe('filesystem');
+    } finally {
+      platform.id = 'web';
+    }
   });
 });

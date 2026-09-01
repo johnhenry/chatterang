@@ -48,6 +48,31 @@
  * table, and `download.ts` must NEVER ask `isPluginAvailable('Filesystem')` —
  * doing so would reinstate on the web target the exact bug eb3a279 fixed.
  *
+ * VIEWPORT AND INPUT ARE NOT PLATFORM QUESTIONS. This is the rule that keeps
+ * the seam from becoming the boolean again under a new name. `capabilities()`
+ * answers what the HOST can do — which sink, which handoff, whether a store
+ * exists. It does not answer how wide the window is, whether there is a mouse,
+ * or whether a physical keyboard is attached, and it must never be asked to:
+ *
+ *   An Electron window can be 400 px wide. An iPad can be 1200 px and driven
+ *   by a trackpad. A phone can have a Bluetooth keyboard. A desktop browser
+ *   can be a touchscreen laptop.
+ *
+ * So `if (capabilities().id === 'electron')` for "desktop chrome" is WRONG ON
+ * THE MERITS as well as being identity branching — it is the same
+ * `isNativePlatform()` mistake with a better-looking spelling, and it would
+ * be wrong on the four counts above the day it is written. The right question
+ * is a media query, asked of the browser at the moment it matters:
+ *
+ *   `hasFinePointer()`                   is there a mouse or trackpad?
+ *   `matchMedia('(min-width: …)')`        how much room is there?
+ *   `matchMedia('(any-hover: hover)')`    can anything hover?
+ *
+ * `tests/layering.test.ts` enforces this: `capabilities().id` — and its
+ * destructured spelling — may appear in `src/` only in this file. The `id`
+ * field exists so a diagnostic can NAME the host, not so a component can
+ * branch on it.
+ *
  * NOT MEMOISED. `getPlatform()` is a property read against a global the shell
  * sets before the bundle loads, and it cannot change while the app is running.
  * Caching it would save nothing measurable and would make the seam a thing
@@ -89,6 +114,15 @@ export type FileHandoff =
   | 'browser-download';
 
 export interface PlatformCapabilities {
+  /**
+   * Which host this is, for DIAGNOSTICS — a support banner, a bug report, a
+   * log line.
+   *
+   * NOT A BRANCH. `capabilities().id === 'electron'` is banned in `src/` by
+   * `tests/layering.test.ts`, because every question anyone has wanted to ask
+   * it has turned out to be a question about the sink, the handoff, the store,
+   * or the viewport. See the header: viewport and input are media queries.
+   */
   readonly id: PlatformId;
   /** Which sink a model download writes to. NEVER ask a plugin this. */
   readonly modelStore: ModelStore;
@@ -176,4 +210,34 @@ function unknownPlatform(id: string): PlatformCapabilities {
 export function capabilities(): PlatformCapabilities {
   const id = Capacitor.getPlatform();
   return PLATFORMS[id as PlatformId] ?? unknownPlatform(id);
+}
+
+/**
+ * Is there a mouse or a trackpad?
+ *
+ * THIS IS NOT A PLATFORM QUESTION, which is exactly why it lives beside the
+ * table rather than in it. A table row is a static claim about a host; this
+ * changes when a user plugs in a mouse, drags an Electron window onto a touch
+ * display, or picks up an iPad with a Magic Keyboard. `capabilities()` is
+ * resolved from a global fixed before the bundle loads and could never track
+ * that.
+ *
+ * It is here so there is ONE place to ask, rather than the two hand-rolled
+ * `matchMedia('(pointer: fine)')` calls this replaces — `Composer` (does Enter
+ * send, or insert a newline?) and `ShellSheet` (does clicking the transcript
+ * focus the input, or dismiss the keyboard?). Both were already asking the
+ * RIGHT question; they were just asking it twice, which is how the second copy
+ * ends up being the one someone rewrites as a platform check.
+ *
+ * `pointer` describes the PRIMARY pointing device. A phone with a Bluetooth
+ * mouse reports `coarse` for `pointer` and `fine` for `any-pointer`; the two
+ * callers here both want the primary one, because both are asking about the
+ * input the user is most likely reaching for.
+ *
+ * Defaults to FALSE where `matchMedia` is missing (jsdom without a stub, an
+ * SSR pass): the touch behaviour is the safe one — a newline can be deleted,
+ * a message sent early cannot be unsent.
+ */
+export function hasFinePointer(): boolean {
+  return globalThis.matchMedia?.('(pointer: fine)').matches ?? false;
 }

@@ -6,6 +6,7 @@ import { putBlob } from '@/lib/blobs';
 import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
+import { hasFinePointer } from '@/lib/platform';
 import { startDictation, type DictationHandle } from '@/lib/voice';
 import { ensureSession, releaseSessions } from '@/lib/voice';
 
@@ -220,7 +221,7 @@ export function Composer({
             // Enter sends on a physical keyboard; on touch it inserts a
             // newline, because there is no comfortable way to type Shift+Enter
             // on a phone.
-            if (event.key === 'Enter' && !event.shiftKey && matchMedia('(pointer: fine)').matches) {
+            if (event.key === 'Enter' && !event.shiftKey && hasFinePointer()) {
               event.preventDefault();
               send();
             }
