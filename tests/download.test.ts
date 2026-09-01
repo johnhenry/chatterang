@@ -276,10 +276,10 @@ interface ServerPlan {
    * Answer a resume with `content-range: bytes N-M/*` — a range whose TOTAL is
    * unknown — and serve exactly this many bytes, ending cleanly.
    *
-   * A perfectly legal response, and the one blind spot the per-response length
-   * check has: with no total there is nothing for that check to compare
-   * against, so `consume` returns 'done' on a body that is only part of the
-   * file. It is what the FINAL check exists for.
+   * A perfectly legal response, and the blind spot the per-response length
+   * check has: the response keeps every promise it made, and only the
+   * DOWNLOAD is short. What answers it is the size the FIRST response stated,
+   * which the intake holds and the loop will not stop short of.
    */
   starRange?: (attempt: number) => number | null;
   /**
@@ -620,9 +620,10 @@ describe('a model is streamed to disk, not assembled in memory first', () => {
      * of body, so a write can only be observed if it happened DURING the
      * transfer.
      *
-     * FAULT INJECTED: the in-loop `while (pendingBytes >= FLUSH_BYTES)` flush
-     * removed, leaving only the flush after the loop. Observed: no append in
-     * three seconds, the race resolved 'nothing-written-in-3s', exit 1.
+     * FAULT INJECTED: the in-loop `while (this.queuedBytes >= FLUSH_BYTES)`
+     * flush removed from `Intake.accept`, leaving only the flush in `end()`.
+     * Observed: no append in three seconds, the race resolved
+     * 'nothing-written-in-3s', exit 1.
      */
     let release = (): void => {};
     const gate = new Promise<void>((resolve) => {
@@ -784,9 +785,18 @@ describe('a transfer that dies mid-stream resumes instead of restarting', () => 
      * A 200 answering a `Range` request means the bytes on disk are a prefix
      * of something we can no longer vouch for. The sink is truncated first.
      *
-     * FAULT INJECTED: `restart()` no longer calls `sink.reset()`. Observed:
+     * FAULT INJECTED (in the structure this replaced, where the reset was a
+     * free function): `restart()` no longer calls `sink.reset()`. Observed:
      * 13,987,273 bytes on disk instead of 9,449,529 — the partial prefix with
-     * a whole file appended after it. Exit 1.
+     * a whole file appended after it.
+     *
+     * RE-MEASURED AGAINST THE NEW STRUCTURE, by deleting the `intake.reset()`
+     * from the arm that handles a 200 answering a `Range`: the run does not
+     * produce a longer file, it throws `Error: the size of a file already
+     * being written cannot be restated` out of `Intake.declare()` before a
+     * byte is read. The guard that reads as a pedantic assertion is what
+     * turns this particular future edit into a crash instead of a 14 MB
+     * "model". Exit 1 either way.
      */
     const server = await start({
       ignoreRange: true,
@@ -1047,10 +1057,15 @@ describe('a server whose length does not match its body', () => {
      * WITHOUT lying about the size. The old shape is asserted below, under
      * its own name.
      *
-     * FAULT INJECTED: the `received > mustDeliver` arm changed to fall
-     * through to `IncompleteTransfer`. Observed: retried instead of refused,
-     * and the run ended on the attempt ceiling with a message naming a
-     * truncated transfer rather than an over-long one. Exit 1.
+     * FAULT INJECTED: the `received > mustDeliver` arm deleted, so an
+     * over-long body falls through to `IncompleteTransfer`. Observed: the
+     * download RESOLVED with `totalBytes: 9449529` — the right file, reached
+     * by writing the over-long body, failing the completeness check, being
+     * answered 416 on the next resume and re-fetching from zero. Exit 1 on
+     * `rejects`. So the refusal is not what keeps the over-delivery out of
+     * the installed file; the completeness check is. What the refusal decides
+     * is that a server which sends more than it declared is not asked twice,
+     * and the assertion here is on that decision.
      */
     const server = await start({
       overDeliver: 3_000_000,
@@ -1077,11 +1092,21 @@ describe('a server whose length does not match its body', () => {
      * a continuation of this download, so the sink is emptied and the file is
      * fetched again.
      *
+     * STATED AT ITS REAL WEIGHT, because the revert-check said so.
+     *
      * FAULT INJECTED: the `!intake.agrees(stated)` clause removed from the
-     * continuation arm. Observed: the download RESOLVED — 6,449,529 bytes of
-     * a 9,449,529-byte model on disk, sha256 matching a prefix rather than the
-     * file, recorded as a complete install, because the resume's `/total` had
-     * moved the goalposts to exactly where the body stopped. Exit 1.
+     * continuation arm. Observed: the download RESOLVED IN TWO REQUESTS WITH
+     * THE RIGHT BYTES — `totalBytes` and the sha256 both passed, and what
+     * failed was the request COUNT (`expected 2 to be greater than 2`). So
+     * this clause is not what stops a shrunken `/total` installing a
+     * truncated file: the size on record is immutable (`declare()` throws
+     * over a non-empty sink) and each response is held to its own
+     * `content-range` extent, and between them the contradicting total moves
+     * nothing. What the clause adds is that a response describing a different
+     * file is not stitched onto this one on the strength of 64 overlapping
+     * bytes alone. Written down at that weight rather than as the guard it is
+     * not — the narrowing-claim failure this file has already had three times
+     * in prose is just as available in a test comment.
      */
     const server = await start({
       rangeTotalDelta: -3_000_000,
@@ -1109,12 +1134,16 @@ describe('a server whose length does not match its body', () => {
      * The right outcome is not a refusal — it is another attempt, which
      * eventually gets the whole file from zero and lands the right bytes.
      *
-     * FAULT INJECTED: the `IncompleteTransfer` arm removed, so a clean short
-     * delivery returned 'done'. Observed: the loop broke, the final check
-     * compared 9,449,529 written against 9,453,625 declared and the download
-     * was REFUSED — a working file turned into an error. Exit 1 on the hash
-     * assertion. Both halves matter: without the arm it refuses a file it
-     * could have had, and without the final check it would install a short one.
+     * HOW IT RECOVERS CHANGED THIS ROUND, and the note is rewritten rather
+     * than left to read as current. In the previous structure the resume was
+     * consumed, came up 4 KiB short, and `IncompleteTransfer` sent the loop
+     * round again. Now the contradiction is caught before the body is read —
+     * a `/total` 4 KiB from the one already on record is not this file's — so
+     * the sink is emptied and the next request fetches the whole thing. The
+     * outcome asserted below is the same one, and it is the outcome that
+     * matters: the right bytes, from more than the two requests a
+     * well-behaved resume would have taken. The revert-check for the arm that
+     * now does the work is on `agrees(stated)`, in the test above.
      */
     const server = await start({
       rangeTotalDelta: 4096,
@@ -1147,9 +1176,12 @@ describe('a download is over when the file is whole, not when a response is', ()
      * and lands it byte for byte.
      *
      * FAULT INJECTED: the loop's exit changed back to `if (outcome ===
-     * 'ended') break`. Observed: the download RESOLVED with `totalBytes:
-     * 6291520` — a fraction of the model, recorded as a complete install.
-     * Exit 1 on the length assertion.
+     * 'ended') break`. Observed: NOT an install — `commit()` refused with
+     * "The download ended with 6291392 bytes where the server said 9449529",
+     * because the loop and `commit()` consult the same predicate and the
+     * second one is still standing when the first is gone. Exit 1 on the
+     * download resolving at all, which is the point: the user gets an error
+     * where the file was available.
      */
     const server = await start({
       dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
@@ -1210,9 +1242,14 @@ describe('a download is over when the file is whole, not when a response is', ()
      * 9 MB model.
      *
      * FAULT INJECTED: `if (outcome === 'ended' && intake.satisfied) break`
-     * reduced to `if (outcome === 'ended') break`. Observed: RESOLVED with
-     * `totalBytes: 1048576` and 1 MiB on disk under the model's name, one
-     * request. Exit 1.
+     * reduced to `if (outcome === 'ended') break`. Observed: the loop stopped
+     * after the first megabyte and `commit()` refused — "The download ended
+     * with 1048576 bytes where the server said 9449529" — so the truncation
+     * became an error rather than an install. That is the two layers doing
+     * what they are for, and it is also why this test asserts the file lands
+     * rather than only that nothing bad does: the SECOND fault, deleting
+     * `satisfied` itself, takes both out at once and is caught by the shape
+     * assertion in the docs block. Exit 1.
      */
     const server = await start({ capBytes: 1024 * 1024 });
     const m = withUrl(server.url);
@@ -1253,8 +1290,11 @@ describe('a download is over when the file is whole, not when a response is', ()
      * and the download ends with nothing installed.
      *
      * FAULT INJECTED: `stated` computed as `declaredLength(response)` for a
-     * 206 as well. Observed: RESOLVED — 9,449,529 bytes recorded as the
-     * complete file the server had described as 9,453,625. Exit 1.
+     * 206 as well — the old shape, where a `content-range` on a first
+     * response was read for its start and nothing else. Observed: the
+     * download RESOLVED with `totalBytes: 9449529`, installed as the complete
+     * file the server itself had described as 9,453,625 bytes long. Exit 1 on
+     * `rejects`.
      */
     const server = await start({ capBytes: PAYLOAD_BYTES, rangeTotalDelta: 4096 });
     const m = withUrl(server.url);
@@ -1292,9 +1332,9 @@ describe('nothing reaches the sink before the transfer is identified', () => {
      * the WHOLE file and identifies what comes back.
      *
      * FAULT INJECTED: `abandon()` changed to move `held` into `queue` before
-     * flushing — the old behaviour, one line. Observed: the download RESOLVED
-     * with 91 bytes of HTML on disk under `model.gguf`, `state:'installed'`,
-     * and the second request carrying `Range: bytes=2-`. Exit 1.
+     * flushing — the old behaviour, two lines. Observed: the download
+     * RESOLVED, `totalBytes: 91` — the login page, whole, recorded under
+     * `model.gguf` as the model. Exit 1 on `rejects`.
      */
     const server = await start({
       body: PAGE,
@@ -1353,10 +1393,13 @@ describe('nothing reaches the sink before the transfer is identified', () => {
      *
      * ASSERTED ON SHA256, because length and magic both agree with the splice.
      *
-     * FAULT INJECTED: `expectContinuation()` replaced by leaving the intake
-     * open (no overlap comparison) and the resume offset set to
-     * `intake.written`. Observed: the download RESOLVED, 9,449,529 bytes —
-     * exactly the right length — whose sha256 matched NEITHER build. Exit 1.
+     * FAULT INJECTED: the byte comparison in `Intake.overlap()` short-
+     * circuited to `false &&`, so a continuation is accepted without being
+     * checked. Observed: the download RESOLVED in two requests and installed
+     * a file whose sha256 matched NEITHER build — the fixtures are random per
+     * run, so the digests are not quoted here; what is stable is that the
+     * installed file was neither of the two the server ever served. Exit 1 on
+     * the hash, the only assertion here that can tell a splice from a model.
      */
     const second = Buffer.concat([
       Buffer.from('GGUF', 'latin1'),
@@ -1371,18 +1414,23 @@ describe('nothing reaches the sink before the transfer is identified', () => {
 
     const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
 
-    // The resume WAS attempted with the validator the server offered.
+    /*
+     * THE HASH FIRST, deliberately. A splice has the right length and the
+     * right magic; the only assertion that can tell one from the file is this
+     * one, so it is the one that fails first when the stitch is gone.
+     */
+    const written = readFileSync(modelPath(m));
+    expect(sha(written)).toBe(sha(second));
+    expect(sha(written)).not.toBe(sha(payload));
+    expect(written.length).toBe(PAYLOAD_BYTES);
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+
+    // The resume WAS attempted, with the validator the server offered.
     expect(server.requests[1]!.range).toMatch(/^bytes=\d+-$/);
     expect(server.requests[1]!.ifRange).toBe('"v1"');
     // And when its bytes did not follow on, the prefix was dropped rather
     // than built on: the third request asks for the whole file.
     expect(server.requests[2]!.range).toBeUndefined();
-
-    const written = readFileSync(modelPath(m));
-    expect(written.length).toBe(PAYLOAD_BYTES);
-    expect(sha(written)).toBe(sha(second));
-    expect(sha(written)).not.toBe(sha(payload));
-    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
   }, 20000);
 });
 
@@ -1808,14 +1856,20 @@ describe('the downloader documents what it does and nothing more', () => {
      * THE SHAPE THE INVARIANT RESTS ON, asserted here because it cannot be
      * driven from a server.
      *
-     * Three of the guards below are ASSERTIONS, not checks: removing one
-     * changes no behaviour today, because the only caller already satisfies
-     * it. `declare()` is called on an empty sink, `expectWholeFile()` is
-     * called after a reset, and the loop cannot reach `commit()` unsatisfied.
-     * A revert-check on all three came back MISSED against the fault servers,
-     * which is the honest reason they are pinned here instead: what they
-     * defend against is a FUTURE caller, and this is the test that would have
-     * to be deleted to add one.
+     * Three of the guards below are ASSERTIONS, not checks: removing one on
+     * its own changes no behaviour today, because the only caller already
+     * satisfies it. `declare()` is called on an empty sink, `expectWholeFile()`
+     * is called after a reset, and the loop cannot reach `commit()`
+     * unsatisfied. A revert-check on all three came back MISSED against the
+     * fault servers, which is the honest reason they are pinned here.
+     *
+     * They are not idle, and both halves were measured. Delete the
+     * `intake.reset()` from the arm that handles a 200 answering a `Range`
+     * and `declare()` throws before a byte is read, where the old code wrote
+     * a whole file onto a partial one. Reduce the loop's exit to `outcome ===
+     * 'ended'` and `commit()` refuses a truncated download the loop was
+     * willing to install. What they defend against is a FUTURE caller, and
+     * this is the test that would have to be deleted to add one.
      */
     // One call site for the sink's write, and it is inside the intake.
     expect([...code.matchAll(/sink\.write\(/g)]).toHaveLength(1);

@@ -771,12 +771,18 @@ class Intake {
    * sink, so "recorded as installed without being complete" has nowhere to
    * happen: the caller cannot name the file it would record.
    *
-   * The refusal here is an ASSERTION, not a path a server can drive: the loop
-   * breaks on the same `satisfied`, so it should be unreachable, and a
-   * revert-check confirms deleting it fails no fault-server test. It is kept
-   * because it is what makes the property structural rather than a property
-   * of one loop — and it is pinned by a shape assertion in the test file
-   * instead, which says so in as many words.
+   * The refusal here cannot be reached by any server WHILE THE LOOP IS
+   * CORRECT: the loop breaks on the same `satisfied`, so deleting this line
+   * fails no fault-server test (revert-checked; it is pinned by a shape
+   * assertion in the test file instead, which says so in as many words).
+   *
+   * It is not decoration. MEASURED: with the loop's exit reduced back to
+   * `if (outcome === 'ended') break`, a server capping every response at a
+   * megabyte stopped after the first one and THIS line refused it — "The
+   * download ended with 1048576 bytes where the server said 9449529" —
+   * instead of installing a ninth of a model. One predicate, consulted where
+   * the loop ends and again where the path is produced, is what makes a
+   * mistake in one of them an error message rather than a corrupt install.
    */
   async commit(): Promise<{ path: string; bytes: number }> {
     if (!this.satisfied) throw new DownloadRefused(this.shortfall());
