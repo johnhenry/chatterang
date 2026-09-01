@@ -107,7 +107,7 @@ import { Directory, Filesystem } from '@capacitor/filesystem';
 
 import type { CompanionRole, ModelManifest } from '@/domain/manifest';
 import { resolveSourceUrl } from '@/domain/manifest';
-import { capabilities } from '@/lib/platform';
+import { capabilities, unreachable } from '@/lib/platform';
 
 export interface DownloadProgress {
   modelId: string;
@@ -284,10 +284,26 @@ interface Sink {
   close(): Promise<string>;
 }
 
+/**
+ * EXHAUSTIVE, NOT A TERNARY.
+ *
+ * This was `modelStore === 'filesystem' ? fs : opfs`, which means every value
+ * that is not `'filesystem'` gets the WEB sink. That is how model weights
+ * reached IndexedDB in the first place, and a row added to the capability
+ * table without an arm here would have done it again — silently, on the one
+ * platform nobody was testing. A fifth `ModelStore` is now a build failure on
+ * this line.
+ */
 async function openSink(directory: string, filename: string): Promise<Sink> {
-  return capabilities().modelStore === 'filesystem'
-    ? openFilesystemSink(directory, filename)
-    : openOpfsSink(directory, filename);
+  const store = capabilities().modelStore;
+  switch (store) {
+    case 'filesystem':
+      return openFilesystemSink(directory, filename);
+    case 'opfs':
+      return openOpfsSink(directory, filename);
+    default:
+      return unreachable(store, 'model store');
+  }
 }
 
 async function openFilesystemSink(directory: string, filename: string): Promise<Sink> {
@@ -978,30 +994,67 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/** The other half of the same dispatch, and exhaustive for the same reason. */
 export async function deleteModelFiles(manifest: ModelManifest): Promise<void> {
   const directory = modelDirectory(manifest);
-  if (capabilities().modelStore === 'filesystem') {
-    await Filesystem.rmdir({
-      path: directory,
-      directory: Directory.Data,
-      recursive: true,
-    }).catch(() => undefined);
-    return;
-  }
-
-  try {
-    const parent = await opfsDirectory(`${MODEL_DIR}/${manifest.engine}`);
-    await parent.removeEntry(manifest.id, { recursive: true });
-  } catch {
-    // Already gone.
+  const store = capabilities().modelStore;
+  switch (store) {
+    case 'filesystem':
+      await Filesystem.rmdir({
+        path: directory,
+        directory: Directory.Data,
+        recursive: true,
+      }).catch(() => undefined);
+      return;
+    case 'opfs':
+      try {
+        const parent = await opfsDirectory(`${MODEL_DIR}/${manifest.engine}`);
+        await parent.removeEntry(manifest.id, { recursive: true });
+      } catch {
+        // Already gone.
+      }
+      return;
+    default:
+      return unreachable(store, 'model store');
   }
 }
 
-/** Bytes currently used by downloaded models, and what the device can spare. */
-export async function storageEstimate(): Promise<{ used: number; quota: number }> {
-  if (navigator.storage?.estimate) {
-    const estimate = await navigator.storage.estimate();
-    return { used: estimate.usage ?? 0, quota: estimate.quota ?? 0 };
+/**
+ * Bytes used by downloaded models, and what the device can spare.
+ *
+ * THE FIFTH PLATFORM-BLIND SITE. This called `navigator.storage.estimate()`
+ * unconditionally, and the layering guard could not see it because it names no
+ * platform. `estimate()` describes the ORIGIN'S QUOTA — the browser's storage
+ * bucket — which on the web is exactly where OPFS models live and on every
+ * packaged platform is somewhere the models are NOT. In a WKWebView or an
+ * Android WebView it reports the webview's own allowance while gigabytes of
+ * weights sit in `Directory.Data` outside it, so the meter read a number that
+ * had nothing to do with the models it was labelled for. Three platforms out
+ * of four.
+ *
+ * `knownBytes` is what the caller already knows it downloaded, and on a real
+ * filesystem it is the ONLY honest number available: `@capacitor/filesystem`
+ * exposes no free-space call, and the desktop shell REFUSES `stat` by name
+ * (`FILESYSTEM_REFUSED` in `apps/desktop/src/fs/filesystem.ts`). A quota of 0
+ * means "not known" and the UI shows a plain figure instead of a meter with a
+ * fabricated denominator — a bar against a made-up maximum is worse than no
+ * bar.
+ */
+export async function storageEstimate(
+  knownBytes: number,
+): Promise<{ used: number; quota: number }> {
+  const store = capabilities().modelStore;
+  switch (store) {
+    case 'opfs': {
+      // The browser's bucket IS where OPFS models are, so its numbers are the
+      // right ones — including other origins' overhead, which is real too.
+      if (!navigator.storage?.estimate) return { used: knownBytes, quota: 0 };
+      const estimate = await navigator.storage.estimate();
+      return { used: estimate.usage ?? knownBytes, quota: estimate.quota ?? 0 };
+    }
+    case 'filesystem':
+      return { used: knownBytes, quota: 0 };
+    default:
+      return unreachable(store, 'model store');
   }
-  return { used: 0, quota: 0 };
 }

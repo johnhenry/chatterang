@@ -18,6 +18,11 @@
  * of the bug that started all this.
  */
 
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 const platform = vi.hoisted(() => ({ id: 'web' }));
@@ -56,7 +61,8 @@ vi.mock('@capacitor/core', async (importActual) => {
 
 const billing = vi.hoisted(() => ({ available: true, calls: [] as string[] }));
 
-const { capabilities, hasFinePointer } = await import('@/lib/platform');
+const { capabilities, hasFinePointer, unreachable } = await import('@/lib/platform');
+const { canAcquire } = await import('@/features/personas/Marketplace');
 const { billingAvailable, restorePurchases } = await import('@/lib/billing');
 
 function on<T>(id: string, work: () => T): T {
@@ -253,5 +259,186 @@ describe('viewport and input are asked of the browser, not of the table', () => 
     } finally {
       platform.id = 'web';
     }
+  });
+});
+
+/**
+ * The compile error, proved by actually compiling.
+ *
+ * A test that has already been compiled cannot assert on the compiler, so this
+ * runs `tsc` for real and reads its EXIT CODE. Both directions are checked:
+ * the exhaustive switch must compile clean, and the same switch with one more
+ * union member must FAIL — otherwise the `never` parameter is decoration and a
+ * fifth `ModelStore` would reach users as a silent fallback rather than a
+ * broken build, which is exactly what the ternary it replaced did.
+ */
+describe('an unhandled capability is a build failure, not a fallback', () => {
+  function compile(source: string): { code: number; output: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'chatterang-exhaustive-'));
+    const file = join(dir, 'case.ts');
+    writeFileSync(file, source, 'utf8');
+    try {
+      execFileSync(
+        'npx',
+        ['tsc', '--noEmit', '--strict', '--target', 'es2022', '--moduleResolution', 'bundler', '--module', 'esnext', file],
+        { cwd: process.cwd(), stdio: 'pipe' },
+      );
+      return { code: 0, output: '' };
+    } catch (error) {
+      const e = error as { status?: number; stdout?: Buffer; stderr?: Buffer };
+      return {
+        code: e.status ?? 1,
+        output: `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`,
+      };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * The REAL `unreachable`, lifted out of `src/lib/platform.ts` as text.
+   *
+   * NOT A COPY. This started as a hand-written duplicate of the helper and was
+   * revert-checked: widening the real signature from `value: never` to
+   * `value: unknown` — which removes the entire compile-time guarantee — left
+   * this test GREEN, because it was compiling its own copy. That is the
+   * byte-identical-duplicate failure this repo has now hit twice, committed
+   * inside the guard against it. Reading the shipped source is the fix.
+   */
+  const seam = readFileSync(join(process.cwd(), 'src/lib/platform.ts'), 'utf8');
+  const helperMatch = /export function unreachable\([\s\S]*?\n}/.exec(seam);
+  const HELPER = (helperMatch?.[0] ?? '').replace(/^export /, '');
+
+  const dispatch = (union: string, cases: string) => `${HELPER}
+type ModelStore = ${union};
+declare const store: ModelStore;
+function openSink(): string {
+  switch (store) {
+${cases}
+    default:
+      return unreachable(store, 'model store');
+  }
+}
+void openSink;
+`;
+
+  it('lifts the real helper rather than a copy of it', () => {
+    // If the extraction ever silently fails, both compile tests below become
+    // assertions about an empty string — green, and meaningless.
+    expect(helperMatch, 'unreachable() not found in src/lib/platform.ts').not.toBeNull();
+    expect(HELPER).toContain('value: never');
+    expect(HELPER).toContain('throw new Error');
+  });
+
+  it('compiles while every member of the union is handled', () => {
+    const { code, output } = compile(
+      dispatch("'filesystem' | 'opfs'", "    case 'filesystem':\n      return 'fs';\n    case 'opfs':\n      return 'opfs';"),
+    );
+    expect(output).toBe('');
+    expect(code).toBe(0);
+  }, 60000);
+
+  it('FAILS to compile the moment a member has no arm', () => {
+    // A fifth platform's sink — A9's headless server is the concrete case.
+    const { code, output } = compile(
+      dispatch(
+        "'filesystem' | 'opfs' | 'object-store'",
+        "    case 'filesystem':\n      return 'fs';\n    case 'opfs':\n      return 'opfs';",
+      ),
+    );
+    expect(code).not.toBe(0);
+    // And it fails FOR THE RIGHT REASON, naming the member nobody handled.
+    expect(output).toContain('object-store');
+    expect(output).toMatch(/not assignable to parameter of type 'never'/);
+  }, 60000);
+
+  it('throws at runtime too, because the compiler only sees this build', () => {
+    // `capabilities()` resolves a string from a shell this build has never
+    // heard of, so exhaustiveness over the SOURCE is not exhaustiveness over
+    // the VALUE. Refusing loudly beats defaulting to the web.
+    expect(() => unreachable('object-store' as never, 'model store')).toThrow(
+      /Unhandled model store: object-store/,
+    );
+  });
+});
+
+/**
+ * The marketplace's SECOND purchase entry point.
+ *
+ * `storeReady` gated the card's button and the Restore button. It did not gate
+ * the detail sheet's "Get for …", which is an equal route to the same
+ * `acquire()` — so on the web and in the desktop shell one button was
+ * correctly disabled and an identical one, a single tap further in, was live
+ * and ended at the Billing stub's throw. `billingAvailable()` had the answer
+ * the whole time; one of the two callers was never asked to consult it.
+ */
+describe('every route into a purchase asks the seam', () => {
+  const marketplace = readFileSync(
+    join(process.cwd(), 'src/features/personas/Marketplace.tsx'),
+    'utf8',
+  );
+
+  it('gates exactly as many purchase entry points as it has', () => {
+    /*
+     * A COUNT, not a spot check, because the defect was an entry point nobody
+     * had counted. There is no React renderer in this repo, so the assertion
+     * is on the source — and a count is the shape of assertion that survives a
+     * THIRD button being added, which a test naming the two existing ones
+     * would not.
+     *
+     * FAULT INJECTED: `!canAcquire(listing, storeReady)` removed from the
+     * sheet's `disabled`. Observed: 2 acquire sites against 1 gate, exit 1.
+     */
+    const acquires = [...marketplace.matchAll(/\.acquire\(/g)];
+    expect(acquires.length).toBeGreaterThan(1);
+
+    /*
+     * TIED TO THE `disabled` ATTRIBUTE, not merely present in the file.
+     *
+     * REVERT-CHECKED AND MISSED FIRST TIME: a version of this counted
+     * `canAcquire(listing, storeReady)` anywhere in the source, so deleting
+     * the gate from the sheet's `disabled={owned || needsStore}` left the
+     * binding `const needsStore = …` behind — the count still matched and the
+     * test stayed green while the button was live again. The gate has to be
+     * found where it actually disables something.
+     */
+    for (const site of acquires) {
+      const before = marketplace.slice(Math.max(0, site.index - 600), site.index);
+      const at = before.lastIndexOf('disabled={');
+      expect(at, `no disabled= before .acquire( at ${site.index}`).toBeGreaterThan(-1);
+
+      let depth = 0;
+      let end = at + 'disabled={'.length - 1;
+      for (let i = at + 'disabled={'.length - 1; i < before.length; i += 1) {
+        if (before[i] === '{') depth += 1;
+        else if (before[i] === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
+        }
+      }
+      const expression = before.slice(at, end + 1);
+      expect(expression, `ungated purchase button: ${expression}`).toContain('canAcquire');
+    }
+  });
+
+  it('passes the answer to the sheet rather than leaving it behind', () => {
+    // The sheet is a separate component and simply was not given the prop.
+    expect(marketplace).toMatch(/<ListingSheet[\s\S]{0,400}storeReady=\{storeReady\}/);
+    expect(marketplace).toMatch(/storeReady: boolean;/);
+  });
+
+  it('lets a free persona through wherever it is, and a paid one only with a store', () => {
+    // The gate itself, which is the one piece of this that is testable as a
+    // function rather than as text.
+    const free = { price: 0 } as Parameters<typeof canAcquire>[0];
+    const paid = { price: 4.99 } as Parameters<typeof canAcquire>[0];
+
+    expect(canAcquire(free, false)).toBe(true);
+    expect(canAcquire(free, true)).toBe(true);
+    expect(canAcquire(paid, false)).toBe(false);
+    expect(canAcquire(paid, true)).toBe(true);
   });
 });

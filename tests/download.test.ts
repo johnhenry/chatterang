@@ -139,7 +139,8 @@ vi.mock('@/state/app', () => ({
   },
 }));
 
-const { DownloadCancelled, deleteModelFiles, downloadModel } = await import('@/lib/download');
+const { DownloadCancelled, deleteModelFiles, downloadModel, storageEstimate } =
+  await import('@/lib/download');
 const { useModels } = await import('@/state/models');
 
 /* ── An in-memory OPFS, for the web row ──────────────────────────────── */
@@ -1323,6 +1324,83 @@ describe('the sink is chosen by capability, never by plugin availability', () =>
   });
 });
 
+/* ── The storage meter ───────────────────────────────────────────────── */
+
+/**
+ * THE FIFTH PLATFORM-BLIND SITE.
+ *
+ * `storageEstimate()` called `navigator.storage.estimate()` unconditionally,
+ * and the layering guard could not see it because it names no platform — it
+ * names a BROWSER API, which is the same mistake in a different disguise. The
+ * origin's storage bucket is where OPFS models live and is emphatically not
+ * where `Directory.Data` is: on iOS, Android and the desktop shell the meter
+ * reported the webview's own allowance while gigabytes of weights sat outside
+ * it. Wrong on three platforms out of four.
+ */
+describe('the storage meter reports the storage the models are actually in', () => {
+  function stubEstimate(usage: number | undefined, quota: number | undefined): void {
+    Object.defineProperty(navigator, 'storage', {
+      value: { estimate: async () => ({ usage, quota }) },
+      configurable: true,
+    });
+  }
+
+  it('asks the browser on the web, where OPFS is the browser bucket', async () => {
+    platform.id = 'web';
+    stubEstimate(1_500_000, 40_000_000);
+    // The known figure is IGNORED here on purpose: the bucket total includes
+    // overhead this app does not track, and it is the real constraint.
+    expect(await storageEstimate(7)).toEqual({ used: 1_500_000, quota: 40_000_000 });
+  });
+
+  it('never asks the browser on a platform with a real filesystem', async () => {
+    /*
+     * FAULT INJECTED: `storageEstimate` reverted to its unconditional
+     * `navigator.storage?.estimate` form. Observed: `{used: 1500000, quota:
+     * 40000000}` on 'electron', 'ios' and 'android' — a meter reading "1.5 MB
+     * of 40 MB" for a device holding a 2 GB model. Exit 1 on all three.
+     */
+    let asked = 0;
+    Object.defineProperty(navigator, 'storage', {
+      value: {
+        estimate: async () => {
+          asked += 1;
+          return { usage: 1_500_000, quota: 40_000_000 };
+        },
+      },
+      configurable: true,
+    });
+
+    for (const id of ['electron', 'ios', 'android']) {
+      platform.id = id;
+      expect(await storageEstimate(2_019_377_696), id).toEqual({
+        used: 2_019_377_696,
+        quota: 0,
+      });
+    }
+    expect(asked).toBe(0);
+  });
+
+  it('reports a quota of zero rather than a made-up one', async () => {
+    /*
+     * `quota: 0` is what `ModelsScreen` reads as "not known", and it draws a
+     * plain figure instead of a bar. There IS no honest denominator here:
+     * `@capacitor/filesystem` exposes no free-space call and the desktop shell
+     * refuses `stat` by name (`FILESYSTEM_REFUSED`). A bar against an invented
+     * maximum is worse than no bar.
+     */
+    platform.id = 'electron';
+    const { quota } = await storageEstimate(1);
+    expect(quota).toBe(0);
+  });
+
+  it('falls back to what it knows when the browser has no estimate at all', async () => {
+    platform.id = 'web';
+    Object.defineProperty(navigator, 'storage', { value: {}, configurable: true });
+    expect(await storageEstimate(4096)).toEqual({ used: 4096, quota: 0 });
+  });
+});
+
 /* ── The claim the docstring makes ───────────────────────────────────── */
 
 describe('the downloader documents what it does and nothing more', () => {
@@ -1368,6 +1446,39 @@ describe('the downloader documents what it does and nothing more', () => {
     // The one capability question that must not be delegated: the answer is
     // TRUE on plain web and means IndexedDB.
     expect(code).not.toContain('isPluginAvailable');
-    expect(code).toContain("capabilities().modelStore === 'filesystem'");
+    expect(code).toContain('capabilities().modelStore');
+  });
+
+  it('dispatches on the sink EXHAUSTIVELY, never with a ternary', () => {
+    /*
+     * `modelStore === 'filesystem' ? fs : opfs` gives WEB behaviour to every
+     * value that is not `'filesystem'` — which is how weights reached
+     * IndexedDB. A fifth `ModelStore` must be a compile error on the dispatch,
+     * not a silent fallback in production.
+     *
+     * Asserted on the SHAPE because the compiler cannot be asserted on from
+     * inside a test that has already compiled: a ternary reintroduced here
+     * would typecheck perfectly and this is what notices. The `never` half is
+     * proved by an actual `tsc` run in tests/platform.test.ts.
+     */
+    expect(code).not.toMatch(/modelStore\s*===\s*'filesystem'\s*\n?\s*\?/);
+    // Both dispatches — the sink and the delete — reach the same helper.
+    expect([...code.matchAll(/unreachable\(store, 'model store'\)/g)]).toHaveLength(3);
+    expect([...code.matchAll(/switch \(store\)/g)]).toHaveLength(3);
+  });
+
+  it('does not ask the browser for a quota where the models are not in it', () => {
+    /*
+     * THE FIFTH PLATFORM-BLIND SITE. `navigator.storage.estimate()` was called
+     * unconditionally, and the layering guard could not see it because it
+     * names no platform. It describes the ORIGIN'S bucket — where OPFS models
+     * live, and where packaged-platform models emphatically do not.
+     */
+    expect(code).toMatch(/case 'opfs':[\s\S]{0,400}navigator\.storage/);
+    // And the filesystem arm never reaches it.
+    const filesystemArm = code.slice(
+      code.indexOf("case 'filesystem':", code.indexOf('storageEstimate')),
+    );
+    expect(filesystemArm.slice(0, 120)).not.toContain('navigator.storage');
   });
 });

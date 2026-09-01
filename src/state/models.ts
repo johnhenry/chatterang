@@ -62,7 +62,7 @@ export const useModels = create<ModelState>((set, get) => ({
       loaded: true,
       installed,
       activeModelId,
-      storage: await storageEstimate(),
+      storage: await storageEstimate(downloadedBytes(installed)),
     });
   },
 
@@ -226,9 +226,26 @@ export const useModels = create<ModelState>((set, get) => ({
   },
 
   async refreshStorage() {
-    set({ storage: await storageEstimate() });
+    set({ storage: await storageEstimate(downloadedBytes(get().installed)) });
   },
 }));
+
+/**
+ * What this app knows it put on disk.
+ *
+ * The only honest "used" figure on a packaged platform: `estimate()` describes
+ * the browser's storage bucket, and on iOS, Android and the desktop shell the
+ * models are not in it. `@capacitor/filesystem` offers no free-space call and
+ * the desktop shell refuses `stat` by name, so the records are the source.
+ * Only INSTALLED models count — a failed or in-flight record has no complete
+ * file behind it.
+ */
+function downloadedBytes(installed: Record<string, InstalledModel>): number {
+  return Object.values(installed).reduce(
+    (total, record) => total + (record.state === 'installed' ? record.downloadedBytes : 0),
+    0,
+  );
+}
 
 async function persist(
   record: InstalledModel,

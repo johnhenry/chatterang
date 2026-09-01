@@ -19,6 +19,26 @@ import type { Persona } from '@/domain/persona';
 const CATEGORIES = ['All', 'Writing', 'Roleplay', 'Study', 'Work', 'Play'] as const;
 type Category = (typeof CATEGORIES)[number];
 
+/**
+ * Can this listing be acquired here, right now?
+ *
+ * ONE GATE, because there turned out to be TWO purchase entry points. The card
+ * button consulted `storeReady`; the detail sheet's "Get for …" did not — it
+ * was passed `priceLabel` and `owned` and nothing about whether a store
+ * exists. On the web and in the desktop shell that left one route correctly
+ * disabled and an identical one, one tap further in, enabled and ending at the
+ * Billing stub's throw.
+ *
+ * Both sites call this now, and `tests/platform.test.ts` holds the count of
+ * `acquire` call sites equal to the count of gates — so a third entry point
+ * cannot be added without one.
+ *
+ * Free personas are data and work everywhere; only a PAID one needs a store.
+ */
+export function canAcquire(listing: MarketplaceListing, storeReady: boolean): boolean {
+  return listing.price === 0 || storeReady;
+}
+
 export function Marketplace(): ReactNode {
   const [category, setCategory] = useState<Category>('All');
   const [detail, setDetail] = useState<MarketplaceListing | null>(null);
@@ -123,7 +143,7 @@ export function Marketplace(): ReactNode {
                 <button
                   type="button"
                   className="btn btn--primary btn--sm grow"
-                  disabled={has || purchasing === listing.id || (listing.price > 0 && !storeReady)}
+                  disabled={has || purchasing === listing.id || !canAcquire(listing, storeReady)}
                   onClick={() => void usePersonas.getState().acquire(listing)}
                 >
                   {purchasing === listing.id ? <span className="spinner" /> : null}
@@ -162,10 +182,18 @@ export function Marketplace(): ReactNode {
         </button>
       ) : null}
 
+      {/*
+        `storeReady` reaches the SHEET as well as the card. It did not, and the
+        sheet is a second, equal purchase entry point: the card's button asked
+        the seam and the sheet's "Get for …" did not, so on the web and in the
+        desktop shell one route was correctly disabled while the other sat one
+        tap further in, enabled, ending at a Billing stub that throws.
+      */}
       <ListingSheet
         listing={detail}
         priceLabel={detail ? priceLabel(detail) : ''}
         owned={detail ? ownsListing(usePersonas.getState(), detail) : false}
+        storeReady={storeReady}
         onClose={() => setDetail(null)}
       />
     </>
@@ -176,11 +204,14 @@ function ListingSheet({
   listing,
   priceLabel,
   owned,
+  storeReady,
   onClose,
 }: {
   listing: MarketplaceListing | null;
   priceLabel: string;
   owned: boolean;
+  /** Whether a store exists here AND is answering. Same question the card asks. */
+  storeReady: boolean;
   onClose: () => void;
 }): ReactNode {
   if (!listing) return null;
@@ -195,13 +226,17 @@ function ListingSheet({
         <button
           type="button"
           className="btn btn--primary btn--block"
-          disabled={owned}
+          disabled={owned || !canAcquire(listing, storeReady)}
           onClick={() => {
             void usePersonas.getState().acquire(listing);
             onClose();
           }}
         >
-          {owned ? 'Already in your personas' : `Get for ${priceLabel}`}
+          {owned
+            ? 'Already in your personas'
+            : !canAcquire(listing, storeReady)
+              ? 'Only in the iOS and Android apps'
+              : `Get for ${priceLabel}`}
         </button>
       }
     >

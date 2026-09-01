@@ -241,3 +241,30 @@ export function capabilities(): PlatformCapabilities {
 export function hasFinePointer(): boolean {
   return globalThis.matchMedia?.('(pointer: fine)').matches ?? false;
 }
+
+/**
+ * The compile error a new row is supposed to cause.
+ *
+ * THE DEFECT THIS CLOSES. Both capability dispatches were TERNARIES —
+ * `modelStore === 'filesystem' ? fs : opfs` — so any value that was not
+ * `'filesystem'` silently got WEB behaviour. That is not a hypothetical
+ * failure mode: writing model weights into a web sink on a platform that has a
+ * real disk is the original bug of this milestone, and a ternary is the exact
+ * shape that produced it. A row added to the table without a matching arm
+ * would have reinstated it silently.
+ *
+ * Called from the `default` of an exhaustive switch, this makes that a
+ * COMPILE error. TypeScript narrows the scrutinee to `never` once every member
+ * is handled; add a member and the narrowing leaves that member's type behind,
+ * which is not assignable to `never`, and the build stops on the dispatch that
+ * has not been updated — not on a user's machine, months later, with a model
+ * in the wrong place.
+ *
+ * The runtime throw is the second half and is not decoration: `capabilities()`
+ * resolves a string from a shell this build has never seen, so the compiler's
+ * exhaustiveness is a claim about the SOURCE, not about the value. If one
+ * arrives anyway, refusing loudly beats defaulting to the web.
+ */
+export function unreachable(value: never, what: string): never {
+  throw new Error(`Unhandled ${what}: ${String(value)}`);
+}

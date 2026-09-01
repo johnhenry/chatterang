@@ -214,6 +214,15 @@ function InstalledView({
                 </span>
               ))}
             </div>
+            {/*
+              A meter needs a real maximum. The browser's quota is one only
+              where the models are IN the browser's storage — on the web, where
+              they go to OPFS. On iOS, Android and the desktop shell they are
+              in a real directory outside it, `@capacitor/filesystem` offers no
+              free-space call, and the shell refuses `stat`, so there is no
+              denominator to draw against. The figure is shown without one
+              rather than against a fabricated maximum.
+            */}
             {storage.quota > 0 ? (
               <Meter
                 label="Storage"
@@ -222,6 +231,11 @@ function InstalledView({
                 detail={`${formatBytes(storage.used)} of ${formatBytes(storage.quota)}`}
                 tone={storage.used / storage.quota > 0.85 ? 'warn' : 'ember'}
               />
+            ) : storage.used > 0 ? (
+              <div className="row" style={{ gap: 'var(--s-2)' }}>
+                <span className="label">Storage</span>
+                <span className="readout">{formatBytes(storage.used)} of models on disk</span>
+              </div>
             ) : null}
           </>
         ) : (
