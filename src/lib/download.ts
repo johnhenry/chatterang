@@ -7,57 +7,102 @@
  * "sandboxed, not in the user's photo roll" property; on a packaged platform
  * they go to a real directory the inference host can open.
  *
- * RESUME, STATED PRECISELY, ON THE THIRD ATTEMPT AT SAYING IT. Within one
- * download, a transfer that dies mid-stream is resumed with a `Range` request
- * from the byte count already written — AND ONLY WHEN the first response
- * carried an `ETag` or a `Last-Modified` to hand back as `If-Range`. A server
- * that offers neither gives us nothing to detect a republish with, so there is
- * no resume at all: the sink is truncated and the file is fetched again from
- * zero. It does NOT survive the app being closed either; nothing persists a
- * partial byte count.
+ * THE ONE PROPERTY THIS FILE EXISTS TO HOLD:
  *
- * THAT REFUSAL IS THE POINT, not a limitation to work around. Splicing the
- * head of one build onto the tail of another is the one corruption nothing
- * downstream catches: the magic check below passes, because the prefix really
- * IS a valid GGUF header, and the engine fails much later with an error that
- * names the model rather than the download. Re-fetching costs bandwidth
- * against a rare kind of server. Guessing costs a corrupt model that looks
- * installed.
+ *   Nothing reaches the sink until the transfer has been identified as the
+ *   file that was asked for, and nothing is recorded as installed until the
+ *   sink holds exactly that file.
  *
- * This paragraph has now been wrong twice, which is why it is written this
- * carefully. Version one claimed downloads were "resumable where the server
- * allows it" while the file contained no `Range` header, no `206` handling and
- * no `Accept-Ranges` check anywhere. Version two claimed resume was "guarded
- * by `If-Range` against the file changing underneath it. That is the whole
- * claim." — while the code sent `If-Range` only `if (state.validator)` and
- * resumed UNGUARDED when the server had sent no validator, which is precisely
- * the splice the sentence promised to prevent. A narrower false claim is still
- * a false claim.
+ * THREE ROUNDS OF REVIEW EACH ADDED A CHECK FOR ONE HALF OF THAT SENTENCE,
+ * and each round found a path around the previous one — a content-type
+ * refusal, a document probe, GGUF magic, a per-response declared length, a
+ * final written-versus-declared comparison. All correct; none of them
+ * structural. The last one found: the probe refused to run once `written > 0`
+ * and the failure arm of the read loop flushed what it was holding BEFORE
+ * anything had identified it, so a connection dying inside the first sixteen
+ * bytes put an unidentified prefix on disk and every later attempt inherited
+ * "already identified" from it.
+ *
+ * SO IT IS NO LONGER A CHECK. `Intake` below owns the sink — nothing else in
+ * this file holds one — and holds unidentified bytes in a queue that has no
+ * path to it. The only code that empties that queue either identifies what is
+ * in it and moves it to the outgoing queue, or DROPS it. "Wrote an
+ * unidentified byte" is not a check a future edit can route around; there is
+ * no expression in this file that performs it. The same object owns the byte
+ * count and the length the server stated, and it is the only thing that can
+ * produce the path a download is recorded under — `commit()`, which hands one
+ * back only when those two numbers agree.
+ *
+ * RESUME, AND WHAT MAKES A CONTINUATION BELIEVABLE. Within one download, a
+ * transfer that dies mid-stream is resumed with a `Range` request — and the
+ * range asked for starts `OVERLAP_BYTES` BEFORE the end of what is on disk,
+ * so the server re-sends bytes this code already has. They are compared
+ * against the tail the sink was handed, byte for byte, and not one new byte
+ * is queued until they match. A body that does not overlap what it claims to
+ * continue is dropped and the file is fetched again from zero. That is what a
+ * continuation is identified BY, and it is the same mechanism as the magic
+ * check on the head: a byte reaches the sink only after something proved it
+ * belongs to the file already being written.
+ *
+ * `If-Range` is still sent, and a server offering neither `ETag` nor
+ * `Last-Modified` gets no `Range` request at all — but the guarantee does not
+ * rest on the server honouring it. A server that ignores `If-Range` answers a
+ * resume across a republish with a splice: the head of one build and the tail
+ * of another, valid magic, exactly the right length, garbage inside. The
+ * overlap is what notices that. What the overlap CANNOT notice is a
+ * republished file that is byte-identical across the sixty-four bytes at that
+ * one offset; there is no checksum in the catalogue, and that residue is
+ * stated here rather than described away.
+ *
+ * Resume does NOT survive the app being closed: nothing persists a partial
+ * byte count, the validator, or the tail a continuation would be checked
+ * against.
+ *
+ * THIS PARAGRAPH HAS BEEN WRONG THREE TIMES, in narrowing ways, which is why
+ * the version above describes a mechanism rather than a promise. Version one
+ * claimed downloads were "resumable where the server allows it" while the
+ * file contained no `Range` header, no `206` handling and no `Accept-Ranges`
+ * check anywhere. Version two claimed the resume was "guarded by `If-Range`
+ * against the file changing underneath it. That is the whole claim." — while
+ * the code sent `If-Range` only `if (state.validator)` and resumed UNGUARDED
+ * otherwise. Version three fixed that and claimed "NO VALIDATOR, NO RESUME.
+ * THIS IS THE WHOLE GUARD.", which was false in the remaining direction: a
+ * validator the SERVER ignores guards nothing, and nothing downstream caught
+ * the splice. That sentence is deleted rather than narrowed a fourth time.
  *
  * WHAT IS CHECKED WHEN THE BYTES STOP — AND WHAT IS NOT.
  *
  * Any 200 used to be installed AS THE MODEL. An HTML "please log in" page, a
  * transfer cut short by a proxy, a CDN error document: all were written to the
  * sink, recorded as an installed model, and surfaced days later as a GGUF
- * format error pointing nowhere near the cause. Three things are checked now,
- * and each one is checked against something the SERVER said rather than
- * something this app assumed:
+ * format error pointing nowhere near the cause. What is checked now, and each
+ * one against something the SERVER said rather than something this app
+ * assumed:
  *
- *   CONTENT-TYPE  `text/html` is refused outright. No model file is a web
- *                 page, and the CDN interstitial is the common case.
+ *   CONTENT-TYPE  `text/html` is refused outright, before the body is read.
+ *                 No model file is a web page, and the CDN interstitial is
+ *                 the common case.
  *   THE FIRST BYTES  A body that opens `<!DOCTYPE`/`<html`/`<?xml` is a
  *                 document, whatever the content-type claimed. And where the
  *                 manifest names a format with documented magic — GGUF — the
  *                 file must start with it. This is the check that turns "the
  *                 engine says bad GGUF" into "the server sent a web page".
- *   LENGTH        What arrived must equal what the response declared. Short
- *                 is a truncated transfer and is retried from the offset
- *                 reached; longer is refused, because no `Range` request can
- *                 un-write bytes already in the sink.
+ *   THE OVERLAP   A continuation must re-deliver the last bytes on disk and
+ *                 match them, as above.
+ *   ONE SIZE      The size of the file is taken from the first response that
+ *                 states one and is never restated. A later response that
+ *                 contradicts it is not a continuation of this file: the sink
+ *                 is emptied and the download starts again. A server cannot
+ *                 shrink the target to match a truncated delivery.
+ *   COMPLETENESS  The loop does not end because a response ended. It ends
+ *                 when the sink holds `declared` bytes — so a server that
+ *                 caps every response at a megabyte is resumed until the file
+ *                 is whole, or runs out of attempts, and never resolves with
+ *                 a fraction of it. `commit()` asserts the same thing at the
+ *                 only point where a path is produced.
  *
- * THE LENGTH CHECK, MEASURED RATHER THAN ASSUMED. Which half of it can fire
- * depends on what the HTTP client does first, so both were driven against a
- * real `node:http` server before this was written:
+ * WHICH HALF OF THE LENGTH CHECK CAN FIRE, MEASURED RATHER THAN ASSUMED. Both
+ * were driven against a real `node:http` server before this was written:
  *
  *   body SHORTER than `content-length`   the client rejects the stream itself.
  *     MEASURED: `TypeError: terminated`, cause `UND_ERR_RES_CONTENT_LENGTH_MISMATCH`
@@ -69,22 +114,22 @@
  *     length. MEASURED: 500 bytes sent under `content-length: 100`, 100
  *     delivered. It cannot over-write the sink through this door.
  *
- * What is left, and what the check therefore exists for, is `content-range`,
- * which no client validates against the body: a `206` declaring
- * `bytes 0-99/1000` and delivering 100 bytes arrives CLEAN and complete
- * (MEASURED), and a `206` declaring `bytes 0-99/100` under `content-length:
- * 500` delivers 500 bytes for a 100-byte file. Those are the two the code
- * below actually stops.
+ * What is left, and what the per-response check therefore exists for, is
+ * `content-range`, which no client validates against the body: a `206`
+ * declaring `bytes 0-99/1000` and delivering 100 bytes arrives CLEAN and
+ * complete (MEASURED), and a `206` declaring `bytes 0-99/100` under
+ * `content-length: 500` delivers 500 bytes for a 100-byte file. Those are the
+ * two the code below actually stops.
  *
  * NOT CHECKED, deliberately and stated so nobody assumes otherwise:
  *
  *   There is NO CHECKSUM. The catalogue carries no digest, so a server that
  *   delivers exactly as many bytes as it promised, starting with the right
- *   magic, is believed.
+ *   magic and continuing from the right ones, is believed.
  *
  *   A server that declares NO length at all — chunked, no `content-length`,
  *   no `content-range` — leaves nothing to compare against, and that transfer
- *   is accepted on the magic alone. Hugging Face always declares one.
+ *   is accepted when its body ends cleanly. Hugging Face always declares one.
  *
  *   `manifest.sizeBytes` IS NOT THE CHECK, and cannot be. It is the sum over
  *   every file in the download (`2_489_757_856 + 851_251_104` in the
@@ -92,7 +137,7 @@
  *   against a single file it would fail every vision model, and rounded it
  *   would fail SD-Turbo. It is a PROGRESS HINT — a number to draw a bar
  *   against until the server states a real one — and it is passed under that
- *   name.
+ *   name. It never reaches the `Intake`.
  *
  * WHY THIS FILE ASKS `capabilities()` AND NEVER A PLUGIN. The sink is the one
  * capability that must not be discovered at runtime:
@@ -166,6 +211,26 @@ class IncompleteTransfer extends Error {
   }
 }
 
+/**
+ * A continuation that does not continue what is on disk.
+ *
+ * The server answered a resume with bytes that disagree with the ones the
+ * sink was already handed at that offset — a republished file behind a `Range`
+ * request the server did not check `If-Range` against, which is the splice
+ * with the right magic and the right length. `transfer` answers it by
+ * truncating and fetching the file again from zero.
+ *
+ * A `DownloadRefused` on purpose: if a future edit ever lets one escape the
+ * one place that handles it, the download FAILS rather than being retried
+ * into the sink. Nothing that is not a whole file gets installed by default.
+ */
+class Spliced extends DownloadRefused {
+  constructor(message: string) {
+    super(message);
+    this.name = 'Spliced';
+  }
+}
+
 const MODEL_DIR = 'models';
 
 /**
@@ -204,14 +269,36 @@ const CONSECUTIVE_ATTEMPTS = 3;
 const TOTAL_ATTEMPTS = 40;
 
 /**
- * How many leading bytes are held back to identify what arrived.
+ * How many leading bytes are HELD BACK — not peeked at — to identify what
+ * arrived.
  *
  * Sixteen, which is more than any magic here needs and enough to recognise a
- * document opening. It is a peek, not a buffer: the bytes stay in the pending
- * queue and are flushed with everything else, so this costs nothing against
- * the memory bound `FLUSH_BYTES` sets.
+ * document opening. It was a peek in the previous round: the bytes sat in the
+ * outgoing queue while a boolean recorded whether anyone had looked, and the
+ * failure arm flushed the queue without asking. They are now in a queue the
+ * sink cannot be reached from, which costs the same sixteen bytes and removes
+ * the path. Nothing here grows with the file, so the memory bound is still
+ * the one `FLUSH_BYTES` sets.
  */
 const PROBE_BYTES = 16;
+
+/**
+ * How much of what is already on disk a resume asks for AGAIN.
+ *
+ * The last sixty-four bytes handed to the sink are re-requested and compared,
+ * byte for byte, before a continuation is allowed to add anything — the only
+ * thing in this file that can tell a genuine continuation from the tail of a
+ * DIFFERENT build of the same model, which otherwise arrives with the right
+ * magic (it is not at the head), the right length, and nothing wrong with it
+ * anywhere a length or a format check can see.
+ *
+ * Sixty-four, because it is small enough to cost nothing on a resume — one
+ * extra flush's worth of comparison, never a re-download — and wide enough
+ * that two different builds agreeing across it is not a thing that happens to
+ * compressed weights. It is not a proof: a republished file identical at that
+ * offset passes, and the header says so.
+ */
+const OVERLAP_BYTES = 64;
 
 /**
  * The first bytes of a file, by format, where the format documents them.
@@ -448,150 +535,463 @@ interface FetchOptions {
   onProgress: (received: number, total: number, bytesPerSecond: number) => void;
 }
 
-/** What one HTTP attempt did. */
-type Attempt = 'done' | 'restart';
+/** What one HTTP attempt did with the body it was handed. */
+type Attempt = 'ended' | 'restart';
 
+/**
+ * Everything about a transfer that is NOT about the bytes on disk.
+ *
+ * The byte count, the length the server stated and whether the file has been
+ * identified are deliberately NOT here: those three decide whether a download
+ * becomes an installed model, and they live inside the `Intake`, where the
+ * only code that can move them is the code that writes.
+ */
 interface TransferState {
-  /** Bytes confirmed written to the sink. The resume offset. */
-  written: number;
   /** Best known total FOR THE PROGRESS BAR. May be the manifest's guess. */
   total: number;
   /**
-   * The full size of this file AS THE SERVER STATED IT — `content-length` on a
-   * fresh 200, or the `/total` of a `content-range` on a 206. Null when the
-   * server declared nothing.
+   * `ETag`/`Last-Modified` from the response THE BYTES ON DISK CAME FROM.
    *
-   * Kept apart from `total` on purpose. `total` is allowed to be a guess
-   * because it only draws a bar; this one decides whether a download is
-   * INSTALLED, so it must never be contaminated by the manifest.
+   * Overwritten by every response that starts the file from zero and left
+   * alone by a continuation, so it always describes the sink's current
+   * contents rather than some earlier response's. A resume is only ever
+   * attempted when this is non-null.
    */
-  declared: number | null;
-  /** `ETag`/`Last-Modified` from the first response, for `If-Range`. */
   validator: string | null;
   rate: number;
-  /** Have the first bytes of the current file been identified yet? */
-  probed: boolean;
+}
+
+/* ── The intake: one place that decides, one place that writes ───────── */
+
+/**
+ * THE ONLY THING IN THIS FILE THAT CAN PUT A BYTE IN A SINK.
+ *
+ * `fetchToStorage` opens the sink and hands it here; nothing else keeps a
+ * reference, and no method returns one. That is the first half of the
+ * structure. The second half is that the bytes on their way to it are held in
+ * TWO queues:
+ *
+ *   `held`   arrived, NOT identified. Nothing drains this to the sink. The
+ *            only code that empties it is `identify()`, which throws or moves
+ *            it to `queue`, and `abandon()`, which drops it on the floor.
+ *   `queue`  identified, on its way out. `flush()` — the one method that
+ *            calls `sink.write` — reads this queue and no other.
+ *
+ * So "an unidentified byte reached the sink" is not a check that a later edit
+ * can bypass by adding a path: there is no path. The catch arm of the read
+ * loop calls `abandon()`, and `abandon()` cannot write `held` even though it
+ * flushes — it does not have a route from one queue to the other. That is the
+ * exact bug it replaces: `flush(Infinity)` in the failure arm used to write
+ * bytes that `identify()` had never seen, because `identify()` was gated on a
+ * counter and the flush ran first.
+ *
+ * A CONTINUATION IS IDENTIFIED TOO, just not by its opening — those bytes are
+ * in the middle of a model. `expectContinuation()` puts the intake in
+ * `stitch`, where the response must re-deliver the last `OVERLAP_BYTES` the
+ * sink was given and match them byte for byte before anything new is queued.
+ * A resume across a republished file — the splice that has the right magic
+ * and the right length and is wrong inside — dies there.
+ *
+ * And the file's SIZE lives here rather than beside the loop, because
+ * `commit()` is the only method that produces a path, and it produces one
+ * only when the sink holds exactly the number of bytes the server stated.
+ */
+class Intake {
+  /** Arrived, not identified. NO METHOD MOVES THIS TO THE SINK. */
+  private held: Uint8Array[] = [];
+  private heldBytes = 0;
+
+  /** Identified, on the way out. The only queue `flush` can see. */
+  private queue: Uint8Array[] = [];
+  private queuedBytes = 0;
+
+  private phase: 'head' | 'stitch' | 'open' = 'head';
+
+  /** What a continuation has to re-deliver before it is believed. */
+  private expected: Uint8Array = new Uint8Array(0);
+  private matched = 0;
+
+  private writtenBytes = 0;
+  private declaredBytes: number | null = null;
+  /** The last `OVERLAP_BYTES` the sink was handed. */
+  private tail: Uint8Array = new Uint8Array(0);
+
+  constructor(
+    private readonly sink: Sink,
+    /** ASCII the file must begin with, where the format documents it. */
+    private readonly magic: string | undefined,
+  ) {}
+
+  /** Bytes the sink holds. The offset a resume continues from. */
+  get written(): number {
+    return this.writtenBytes;
+  }
+
+  /** The size of the whole file AS THE SERVER STATED IT, or null. */
+  get declared(): number | null {
+    return this.declaredBytes;
+  }
+
+  /** Everything accounted for, flushed or not. For the progress bar only. */
+  get received(): number {
+    return this.writtenBytes + this.queuedBytes + this.heldBytes;
+  }
+
+  /**
+   * Does the sink hold exactly the file the server described?
+   *
+   * The loop breaks on this and `commit()` refuses without it — one
+   * predicate, so "finished" and "installable" cannot drift apart.
+   */
+  get satisfied(): boolean {
+    if (this.writtenBytes === 0) return false;
+    return this.declaredBytes === null || this.writtenBytes === this.declaredBytes;
+  }
+
+  /** Why it is not satisfied, in the sentence the user reads. */
+  shortfall(): string {
+    if (this.writtenBytes === 0) {
+      return 'The server sent an empty file. Nothing was installed.';
+    }
+    return `The download ended with ${this.writtenBytes} bytes where the server said ${this.declaredBytes}. Nothing was installed.`;
+  }
+
+  /**
+   * State the size of the file. ONLY LEGAL ON AN EMPTY SINK.
+   *
+   * A size that could be restated mid-download is a size a server can shrink
+   * to match a body it truncated, and the completeness check would then agree
+   * with it. Restating one is a bug in this file, not a bad server, so it
+   * throws rather than refusing the download.
+   */
+  declare(bytes: number | null): void {
+    if (this.writtenBytes !== 0) {
+      throw new Error('the size of a file already being written cannot be restated');
+    }
+    this.declaredBytes = bytes;
+  }
+
+  /** Is `bytes` the size this file has already been said to be? */
+  agrees(bytes: number | null): boolean {
+    return bytes === null || this.declaredBytes === null || bytes === this.declaredBytes;
+  }
+
+  /** Where a resume must start, so the sink's last bytes come back for checking. */
+  resumeFrom(): number {
+    return this.writtenBytes - this.tail.byteLength;
+  }
+
+  /**
+   * The next bytes are the WHOLE FILE, to be identified by their opening.
+   *
+   * Only legal on an empty sink: appending a whole body to a partial one is
+   * the corruption the `restart` arms exist to prevent, and this is where
+   * that is unrepresentable rather than remembered.
+   */
+  expectWholeFile(): void {
+    if (this.writtenBytes !== 0) {
+      throw new Error('a whole file cannot be written onto a partial one');
+    }
+    this.phase = 'head';
+    this.held = [];
+    this.heldBytes = 0;
+  }
+
+  /** The next bytes CONTINUE what is on disk, and have to prove it. */
+  expectContinuation(): void {
+    this.phase = 'stitch';
+    this.expected = this.tail;
+    this.matched = 0;
+    this.held = [];
+    this.heldBytes = 0;
+  }
+
+  /** Take one chunk off the wire. Throws rather than admit a wrong byte. */
+  async accept(chunk: Uint8Array): Promise<void> {
+    let bytes = chunk;
+    if (this.phase === 'stitch') bytes = this.overlap(bytes);
+    if (bytes.byteLength === 0) return;
+
+    if (this.phase === 'head') {
+      this.held.push(bytes);
+      this.heldBytes += bytes.byteLength;
+      // Not enough to decide on yet, and nothing decides without enough.
+      if (this.heldBytes < PROBE_BYTES) return;
+      this.identify();
+    } else {
+      this.queue.push(bytes);
+      this.queuedBytes += bytes.byteLength;
+    }
+
+    while (this.queuedBytes >= FLUSH_BYTES) await this.flush(FLUSH_BYTES);
+  }
+
+  /**
+   * The body ended cleanly: what is held is all there will ever be.
+   *
+   * A body shorter than the probe window still gets a verdict here — without
+   * that, a two-byte 200 was identified by nothing and installed.
+   */
+  async end(): Promise<void> {
+    if (this.phase === 'head') this.identify();
+    await this.flush(Infinity);
+  }
+
+  /**
+   * The transfer failed part way through.
+   *
+   * Identified bytes are kept — that is what the next attempt resumes from —
+   * and unidentified ones are DROPPED, so the next attempt starts from zero
+   * and identifies the file properly instead of inheriting a verdict that was
+   * never reached.
+   */
+  async abandon(): Promise<void> {
+    this.held = [];
+    this.heldBytes = 0;
+    await this.flush(Infinity);
+  }
+
+  /** Truncate to empty and forget everything said about what was in it. */
+  async reset(): Promise<void> {
+    await this.sink.reset();
+    this.held = [];
+    this.heldBytes = 0;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.writtenBytes = 0;
+    this.declaredBytes = null;
+    this.tail = new Uint8Array(0);
+    this.phase = 'head';
+  }
+
+  /**
+   * Close the sink and hand back the path — THE ONLY WAY TO GET ONE.
+   *
+   * There is no other method that returns a path and no accessor for the
+   * sink, so "recorded as installed without being complete" has nowhere to
+   * happen: the caller cannot name the file it would record.
+   *
+   * The refusal here is an ASSERTION, not a path a server can drive: the loop
+   * breaks on the same `satisfied`, so it should be unreachable, and a
+   * revert-check confirms deleting it fails no fault-server test. It is kept
+   * because it is what makes the property structural rather than a property
+   * of one loop — and it is pinned by a shape assertion in the test file
+   * instead, which says so in as many words.
+   */
+  async commit(): Promise<{ path: string; bytes: number }> {
+    if (!this.satisfied) throw new DownloadRefused(this.shortfall());
+    const path = await this.sink.close();
+    return { path, bytes: this.writtenBytes };
+  }
+
+  /** Release the OS handle without producing a path. */
+  async abort(): Promise<void> {
+    await this.sink.close().catch(() => undefined);
+  }
+
+  /**
+   * Compare a continuation against the tail it claims to follow.
+   *
+   * Returns whatever is left of the chunk once the overlap is accounted for.
+   * The overlap itself is NOT written again — the sink already has those
+   * bytes — so this is the one place bytes are dropped on purpose.
+   */
+  private overlap(chunk: Uint8Array): Uint8Array {
+    const want = this.expected.byteLength - this.matched;
+    const have = Math.min(want, chunk.byteLength);
+    for (let at = 0; at < have; at += 1) {
+      if (chunk[at] !== this.expected[this.matched + at]) {
+        throw new Spliced(
+          'The server continued this download with bytes that do not follow on from what it had already sent. The file may have been replaced mid-download.',
+        );
+      }
+    }
+    this.matched += have;
+    if (this.matched === this.expected.byteLength) this.phase = 'open';
+    return chunk.subarray(have);
+  }
+
+  /**
+   * Decide what arrived, from its opening bytes, and release them.
+   *
+   * The `held` queue is emptied INTO `queue` here and nowhere else. Throwing
+   * leaves it held and unwritten, and `abandon()` drops it.
+   */
+  private identify(): void {
+    const head = ascii(peek(this.held, Math.min(this.heldBytes, PROBE_BYTES)));
+    const lower = head.toLowerCase();
+    if (DOCUMENT_OPENINGS.some((opening) => lower.startsWith(opening))) {
+      throw new DownloadRefused(
+        'The server returned a web page instead of the model file. The link may have expired, or the repository may need a token.',
+      );
+    }
+    if (this.magic !== undefined && !head.startsWith(this.magic)) {
+      throw new DownloadRefused(
+        `The file the server sent is not a ${this.magic} model. Nothing was installed.`,
+      );
+    }
+    this.phase = 'open';
+    for (const part of this.held) this.queue.push(part);
+    this.queuedBytes += this.heldBytes;
+    this.held = [];
+    this.heldBytes = 0;
+  }
+
+  /**
+   * Hand the sink exactly `bytes`, or everything queued if `bytes` is
+   * Infinity. THE ONLY CALL TO `sink.write` IN THIS FILE.
+   *
+   * EXACTLY, because the block size is the memory bound and a bound the
+   * NETWORK gets to choose is not a bound. Chunk sizes from `fetch` are not
+   * 64 KiB just because that is what the socket read: MEASURED against a local
+   * server, undici coalesced them into blocks that overshot the flush
+   * threshold enough to turn four appends into three. Taking a fixed block and
+   * keeping the remainder makes the write size a property of this file.
+   */
+  private async flush(bytes: number): Promise<void> {
+    const size = Math.min(bytes, this.queuedBytes);
+    if (size === 0) return;
+    const block = take(this.queue, size);
+    this.queuedBytes -= size;
+    await this.sink.write(block);
+    this.writtenBytes += size;
+    this.tail = keepTail(this.tail, block);
+  }
+}
+
+/** The last `OVERLAP_BYTES` of `tail` followed by `block`, copied out. */
+function keepTail(tail: Uint8Array, block: Uint8Array): Uint8Array {
+  if (block.byteLength >= OVERLAP_BYTES) {
+    return block.slice(block.byteLength - OVERLAP_BYTES);
+  }
+  const keep = Math.min(tail.byteLength, OVERLAP_BYTES - block.byteLength);
+  const out = new Uint8Array(keep + block.byteLength);
+  out.set(tail.subarray(tail.byteLength - keep), 0);
+  out.set(block, keep);
+  return out;
 }
 
 async function fetchToStorage(options: FetchOptions): Promise<{ path: string; bytes: number }> {
-  const sink = await openSink(options.directory, options.filename);
+  const intake = new Intake(await openSink(options.directory, options.filename), options.magic);
   const state: TransferState = {
-    written: 0,
     total: options.progressHint,
-    declared: null,
     validator: null,
     rate: 0,
-    probed: false,
   };
 
   let consecutive = 0;
   let attempts = 0;
 
+  /**
+   * Score one attempt and say whether the budget is gone.
+   *
+   * Progress refunds it: an attempt that moved bytes earns the budget back,
+   * so a flaky connection makes headway instead of burning three tries near
+   * the end of a 6 GB file. `TOTAL_ATTEMPTS` bounds what that refund makes
+   * possible — a server that sends a kilobyte and hangs up, every time.
+   */
+  const spent = (before: number): boolean => {
+    consecutive = intake.written > before ? 0 : consecutive + 1;
+    return consecutive >= CONSECUTIVE_ATTEMPTS || attempts >= TOTAL_ATTEMPTS;
+  };
+
   try {
     for (;;) {
       throwIfCancelled(options.signal);
       attempts += 1;
-      const before = state.written;
-      try {
-        if ((await transfer(options, sink, state)) === 'done') break;
+      const before = intake.written;
 
+      let outcome: Attempt;
+      try {
+        outcome = await transfer(options, intake, state);
+      } catch (error) {
+        throwIfCancelled(options.signal);
+        if (!isRetryable(error)) throw error;
+        if (spent(before)) throw error;
+        await pause(options.retryDelayMs ?? 1000, options.signal);
+        continue;
+      }
+
+      /*
+       * THE LOOP DOES NOT END BECAUSE A RESPONSE ENDED.
+       *
+       * It ends when the sink holds the file. A server that answers every
+       * request with at most a megabyte — honest `content-range`, clean end
+       * of body, nothing to complain about per response — used to break this
+       * loop on the first one and install a megabyte AS THE MODEL. There is
+       * no per-response check that catches that, because no response
+       * misbehaves; only the whole download does. So the exit condition is
+       * the whole download's: `satisfied`, the same predicate `commit()`
+       * refuses without.
+       */
+      if (outcome === 'ended' && intake.satisfied) break;
+
+      const progressed = intake.written > before;
+      if (spent(before)) {
         /*
          * A RESTART IS NOT A FAILURE, BUT IT IS NOT FREE EITHER.
          *
          * This arm used to be `consecutive = 0; continue;` — no budget, no
          * backoff, no ceiling. A server that answers 416 to EVERY request
          * (including the one with no `Range` header, which the restart just
-         * made it) sends this loop round forever: `restart()` puts `written`
-         * back to zero, the next request therefore carries no range, and the
-         * next 416 restarts it again. `attempts` was being incremented at the
-         * top of the loop and never read on this path.
-         *
-         * So a restart is now scored exactly like a failed attempt: it earns
-         * the budget back only if it actually moved bytes, it is capped by
-         * both ceilings, and it sleeps before trying again. A server that will
-         * not cooperate is a bounded wait ending in an error, not a spinner.
+         * made it) sent this loop round forever.
          */
-        consecutive = state.written > before ? 0 : consecutive + 1;
-        if (consecutive >= CONSECUTIVE_ATTEMPTS || attempts >= TOTAL_ATTEMPTS) {
-          throw new DownloadRefused(
-            'The server kept restarting this download instead of continuing it. Try again later.',
-          );
-        }
-        await pause(options.retryDelayMs ?? 1000, options.signal);
-        continue;
-      } catch (error) {
-        throwIfCancelled(options.signal);
-        if (!isRetryable(error)) throw error;
-        consecutive = state.written > before ? 0 : consecutive + 1;
-        if (consecutive >= CONSECUTIVE_ATTEMPTS || attempts >= TOTAL_ATTEMPTS) throw error;
-        await pause(options.retryDelayMs ?? 1000, options.signal);
+        throw new DownloadRefused(
+          outcome === 'restart'
+            ? 'The server kept restarting this download instead of continuing it. Try again later.'
+            : intake.shortfall(),
+        );
       }
+      // A response that ended short but MOVED is a transfer in progress, not
+      // a server to back off from; only a stalled one is slept on.
+      if (progressed) continue;
+      await pause(options.retryDelayMs ?? 1000, options.signal);
     }
 
-    /*
-     * THE CHECK THAT DECIDES WHETHER THIS IS A MODEL.
-     *
-     * Everything above can succeed on a body that is not the file: the length
-     * check inside `consume` covers one RESPONSE, and a download made of a
-     * restart plus a resume is more than one. This is the invariant stated
-     * once, at the only point where it is finally knowable — and it is stated
-     * against `declared`, which only ever comes from the server, never from
-     * `progressHint`.
-     */
-    if (state.declared !== null && state.written !== state.declared) {
-      throw new DownloadRefused(
-        `The download ended with ${state.written} bytes where the server said ${state.declared}. Nothing was installed.`,
-      );
-    }
-    if (state.written === 0) {
-      throw new DownloadRefused('The server sent an empty file. Nothing was installed.');
-    }
-
-    options.onProgress(state.written, state.total || state.written, state.rate);
-    const path = await sink.close();
-    return { path, bytes: state.written };
+    options.onProgress(intake.written, state.total || intake.written, state.rate);
+    return await intake.commit();
   } catch (error) {
     // The sink holds an OS handle; leaving it open would leak it and, on OPFS,
     // leave the file locked against the retry the user is about to press.
-    await sink.close().catch(() => undefined);
+    await intake.abort();
     throw error;
   }
 }
 
 /**
- * One HTTP request, streamed into the sink.
+ * One HTTP request, streamed into the intake.
  *
- * Mutates `state` as it goes, so a failure half way through leaves behind the
- * byte count the next attempt resumes from.
+ * Every path through this function does exactly one of three things with the
+ * body: cancels it unread, hands it to `consume` after telling the intake
+ * WHICH KIND of bytes to expect, or throws. There is no fourth.
  */
 async function transfer(
   options: FetchOptions,
-  sink: Sink,
+  intake: Intake,
   state: TransferState,
 ): Promise<Attempt> {
   const headers: Record<string, string> = {};
   if (options.hfToken) headers.Authorization = `Bearer ${options.hfToken}`;
 
   /*
-   * NO VALIDATOR, NO RESUME. THIS IS THE WHOLE GUARD.
+   * NO VALIDATOR, NO RESUME.
    *
-   * `If-Range` is what makes a resume safe: the server compares it and, if the
-   * file has been republished, answers 200 with the whole new body instead of
-   * splicing a new tail onto our old head. `ETag` and `Last-Modified` are both
-   * OPTIONAL, so a server can leave us with nothing to send — and this code
-   * used to send the `Range` anyway, under a docstring claiming the resume was
-   * guarded. An unguarded resume across a republish is a file whose first
-   * megabytes come from one build and whose rest comes from another: valid
-   * GGUF magic, valid length, and garbage inside.
+   * `If-Range` is what lets a server notice that the file has been
+   * republished since the prefix on disk was fetched and answer 200 with the
+   * whole new body instead of a tail that does not belong to it. `ETag` and
+   * `Last-Modified` are both OPTIONAL, so a server can leave nothing to send
+   * — and this code used to send the `Range` anyway. Dropping what is on disk
+   * and re-fetching costs bandwidth against a rare kind of server.
    *
-   * Dropping what is on disk and re-fetching costs bandwidth against a rare
-   * kind of server. It is the only alternative that cannot produce that file.
+   * It is not the whole guard, and the docstring above no longer says it is:
+   * a server can ignore `If-Range` as easily as it can omit an `ETag`. What
+   * catches THAT is the overlap the request below asks for.
    */
-  if (state.written > 0 && state.validator === null) await restart(sink, state);
+  if (intake.written > 0 && state.validator === null) await intake.reset();
 
-  const resuming = state.written > 0;
-  if (resuming) {
-    headers.Range = `bytes=${state.written}-`;
+  const resumeAt = intake.written > 0 ? intake.resumeFrom() : null;
+  if (resumeAt !== null) {
+    headers.Range = `bytes=${resumeAt}-`;
     headers['If-Range'] = state.validator!;
   }
 
@@ -606,8 +1006,8 @@ async function transfer(
     // The range we asked for is not satisfiable — the file shrank, or was
     // replaced by a shorter one. Start again rather than keep a prefix of
     // something that no longer exists.
-    await response.body?.cancel().catch(() => undefined);
-    await restart(sink, state);
+    await discard(response);
+    await intake.reset();
     return 'restart';
   }
   if (!response.ok) {
@@ -629,9 +1029,9 @@ async function transfer(
    */
   const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
   if (/^\s*(text\/html|application\/xhtml\+xml)\b/.test(contentType)) {
-    await response.body.cancel().catch(() => undefined);
+    await discard(response);
     // The declared type is IN THE MESSAGE, and not for decoration. Without it
-    // this refusal and the first-bytes one below read identically, and a
+    // this refusal and the first-bytes one read identically, and a
     // revert-check could not tell which had fired — measured: deleting this
     // whole block left the suite green, because the probe caught the same page
     // and said the same sentence. It also happens to be the single most useful
@@ -641,14 +1041,75 @@ async function transfer(
     );
   }
 
-  if (!state.validator) {
-    state.validator = response.headers.get('etag') ?? response.headers.get('last-modified');
+  const range = parseContentRange(response.headers.get('content-range'));
+  /**
+   * The size of the WHOLE FILE as this response states it, or null.
+   *
+   * On a 206 that is the `/total` of the `content-range` — on the first
+   * response as much as on a resumed one. It used to be parsed and thrown
+   * away unless we were resuming, so a single unsolicited `206 bytes
+   * 0-99/1000` carrying 100 bytes installed a fragment as the whole file:
+   * `content-length` honestly described the fragment, and nothing else was
+   * consulted.
+   */
+  const stated =
+    response.status === 206
+      ? range !== null && range.total > 0
+        ? range.total
+        : null
+      : declaredLength(response);
+
+  if (resumeAt !== null && response.status === 206) {
+    /*
+     * A 206 ANSWERING A RANGE NOBODY ASKED FOR, or describing a different
+     * file than the one being downloaded.
+     *
+     * A range that starts elsewhere used to fall in with the 200 case and its
+     * body was consumed AS THE WHOLE FILE — a slice from the middle of a
+     * model, written from offset zero, with a `content-length` that honestly
+     * describes the slice so every length check agrees. And a `/total` that
+     * disagrees with the size already stated describes some other file: a
+     * smaller one lets a server shrink the target to match a truncation, a
+     * larger one is a republish. Neither is a continuation of this download.
+     */
+    if (range === null || range.start !== resumeAt || !intake.agrees(stated)) {
+      await discard(response);
+      await intake.reset();
+      return 'restart';
+    }
+    if (stated !== null) state.total = stated;
+    intake.expectContinuation();
+    /*
+     * WHAT THIS RESPONSE PROMISED, AND ONLY THAT.
+     *
+     * The extent of its own `content-range` — not "the rest of the file",
+     * which is the DOWNLOAD's business and is settled by `satisfied` in the
+     * loop. Holding one response to the whole remainder collapses the two
+     * questions into one number, and then a server that answers honestly with
+     * a megabyte at a time looks like a broken response instead of a short
+     * download. Answering them separately is what lets this file resume such
+     * a server to the end and still refuse a fraction of it.
+     */
+    const mustDeliver = range.end - range.start + 1;
+    try {
+      return await consume(options, intake, state, response, mustDeliver);
+    } catch (error) {
+      // The overlap did not match: these bytes are not this file's. Nothing
+      // of them was written — the intake queues nothing until the overlap is
+      // through — so this drops the prefix and starts the download again
+      // rather than keeping a head that a later tail will not fit.
+      if (!(error instanceof Spliced)) throw error;
+      await intake.reset();
+      return 'restart';
+    }
   }
 
-  /** How many bytes THIS response promised to deliver, if it said. */
-  let mustDeliver: number | null = null;
-
-  if (!resuming && response.status === 206) {
+  if (resumeAt !== null) {
+    // The server ignored `Range`, or `If-Range` failed and it sent the whole
+    // CURRENT file. Either way the prefix on disk belongs to a file we can no
+    // longer vouch for, and the body in hand is a complete one.
+    await intake.reset();
+  } else if (response.status === 206 && (range === null || range.start !== 0)) {
     /*
      * A 206 TO A REQUEST THAT CARRIED NO RANGE.
      *
@@ -658,61 +1119,35 @@ async function transfer(
      * starting at 0 is harmless (it is the whole file with extra ceremony);
      * anything else is a slice of a model presented as the model.
      */
-    const range = parseContentRange(response.headers.get('content-range'));
-    if (range !== null && range.start !== 0) {
-      await response.body.cancel().catch(() => undefined);
-      throw new DownloadRefused(
-        'The server answered with part of the file when the whole one was asked for. Nothing was installed.',
-      );
-    }
+    await discard(response);
+    throw new DownloadRefused(
+      'The server answered with part of the file when the whole one was asked for. Nothing was installed.',
+    );
   }
 
-  if (resuming) {
-    if (response.status !== 206) {
-      // The server ignored `Range`, or `If-Range` failed and it sent the whole
-      // CURRENT file. Either way the prefix on disk belongs to a file we can
-      // no longer vouch for, and the body in hand is a complete one.
-      await restart(sink, state);
-      state.declared = declaredLength(response);
-      state.total = state.declared ?? state.total;
-      return await consume(options, sink, state, response, state.declared);
-    }
+  /*
+   * FROM ZERO. The validator is taken from THIS response, because these are
+   * the bytes that will be on disk — a resume must be checked against the
+   * response its prefix came from, not against whichever one answered first.
+   */
+  state.validator = response.headers.get('etag') ?? response.headers.get('last-modified');
+  intake.declare(stated);
+  state.total = stated ?? (state.total || options.progressHint);
+  intake.expectWholeFile();
+  // Again: what THIS response promised. A 206 starting at zero promises its
+  // own extent, which is not necessarily the file — see above.
+  return await consume(
+    options,
+    intake,
+    state,
+    response,
+    range !== null && response.status === 206 ? range.end - range.start + 1 : stated,
+  );
+}
 
-    const range = parseContentRange(response.headers.get('content-range'));
-    if (range === null || range.start !== state.written) {
-      /*
-       * A 206 ANSWERING A RANGE NOBODY ASKED FOR.
-       *
-       * This used to fall in with the 200 case and its body was consumed AS
-       * THE WHOLE FILE — a slice from the middle of a model, written from
-       * offset zero, with a `content-length` that honestly describes the slice
-       * so every length check agrees. For a GGUF the magic probe catches it;
-       * for a companion, which has no magic, nothing did.
-       *
-       * A slice of unknown provenance is not a file. Drop it, truncate, and
-       * let the bounded restart arm decide whether to try again.
-       */
-      await response.body.cancel().catch(() => undefined);
-      await restart(sink, state);
-      return 'restart';
-    }
-
-    if (range.total > 0) {
-      state.total = range.total;
-      state.declared = range.total;
-      // The rest of the file, which is what `bytes=N-` asked for. A server
-      // that answers with less is not wrong — it is a short attempt, and the
-      // loop resumes from wherever it stopped.
-      mustDeliver = range.total - range.start;
-    }
-  } else {
-    state.declared = declaredLength(response);
-    mustDeliver = state.declared;
-    if (state.declared !== null) state.total = state.declared;
-    else if (state.total === 0) state.total = options.progressHint;
-  }
-
-  return await consume(options, sink, state, response, mustDeliver);
+/** Read a body nobody is going to keep, so the socket can be reused. */
+async function discard(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => undefined);
 }
 
 /** `content-length`, or null when the server declared none. */
@@ -723,92 +1158,23 @@ function declaredLength(response: Response): number | null {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-/** Reset both the sink and the bookkeeping that describes it. */
-async function restart(sink: Sink, state: TransferState): Promise<void> {
-  await sink.reset();
-  state.written = 0;
-  state.validator = null;
-  state.declared = null;
-  // The file being fetched may be a different file now, so its first bytes
-  // have to be identified again rather than inherited from the one discarded.
-  state.probed = false;
-}
-
 /**
- * Drain the body into the sink, a flush at a time.
+ * Drain the body into the intake.
  *
- * `pending` never holds more than one flush, and the references are dropped as
- * soon as the write is awaited — that is the entire memory story.
+ * This function does not know how to write to a sink and cannot be made to:
+ * it hands chunks to `accept` and asks for the tally afterwards.
  */
 async function consume(
   options: FetchOptions,
-  sink: Sink,
+  intake: Intake,
   state: TransferState,
   response: Response,
   mustDeliver: number | null,
 ): Promise<Attempt> {
   const reader = response.body!.getReader();
-  const pending: Uint8Array[] = [];
-  let pendingBytes = 0;
+  let received = 0;
   let windowStart = performance.now();
   let windowBytes = 0;
-  const startedAt = state.written;
-
-  /**
-   * Hand the sink exactly `bytes`, or everything held if `bytes` is Infinity.
-   *
-   * EXACTLY, because the block size is the memory bound and a bound the
-   * NETWORK gets to choose is not a bound. Chunk sizes from `fetch` are not
-   * 64 KiB just because that is what the socket read: MEASURED against a local
-   * server, undici coalesced them into blocks that overshot the flush
-   * threshold enough to turn four appends into three. Taking a fixed block and
-   * keeping the remainder makes the write size a property of this file.
-   */
-  const flush = async (bytes: number): Promise<void> => {
-    const size = Math.min(bytes, pendingBytes);
-    if (size === 0) return;
-    const block = take(pending, size);
-    pendingBytes -= size;
-    await sink.write(block);
-    state.written += size;
-  };
-
-  /**
-   * Identify the file from its opening bytes, once, before any of it is kept.
-   *
-   * Held in `pending` rather than copied out: this is a peek at bytes that are
-   * on their way to the sink anyway, so it adds nothing to the memory bound.
-   * It runs only while `written` is still zero — after the first flush the
-   * head is on disk and no longer available, and after a successful 206 the
-   * head was identified on the attempt that fetched it.
-   */
-  const identify = (atEnd: boolean): void => {
-    if (state.probed || state.written > 0) return;
-    /*
-     * Wait for enough bytes to decide — UNLESS the body has ended, in which
-     * case these are all the bytes there will ever be.
-     *
-     * Without that second clause a body SHORTER than the probe window never
-     * got a verdict at all: `identify()` returned early every time round the
-     * loop and again after it, and a two-byte 200 was written to the sink and
-     * RESOLVED as an installed model. Caught by the fault server, not by
-     * reading the code.
-     */
-    if (!atEnd && pendingBytes < PROBE_BYTES) return;
-    state.probed = true;
-    const head = ascii(peek(pending, Math.min(pendingBytes, PROBE_BYTES)));
-    const lower = head.toLowerCase();
-    if (DOCUMENT_OPENINGS.some((opening) => lower.startsWith(opening))) {
-      throw new DownloadRefused(
-        'The server returned a web page instead of the model file. The link may have expired, or the repository may need a token.',
-      );
-    }
-    if (options.magic && !head.startsWith(options.magic)) {
-      throw new DownloadRefused(
-        `The file the server sent is not a ${options.magic} model. Nothing was installed.`,
-      );
-    }
-  };
 
   try {
     for (;;) {
@@ -822,10 +1188,8 @@ async function consume(
       if (done) break;
       if (!value) continue;
 
-      pending.push(value);
-      pendingBytes += value.byteLength;
-      identify(false);
-      while (pendingBytes >= FLUSH_BYTES) await flush(FLUSH_BYTES);
+      received += value.byteLength;
+      await intake.accept(value);
 
       windowBytes += value.byteLength;
       const elapsed = performance.now() - windowStart;
@@ -835,16 +1199,18 @@ async function consume(
         windowBytes = 0;
         // Reported from the wire, not from the sink, so the number moves
         // between flushes.
-        options.onProgress(state.written + pendingBytes, state.total, state.rate);
+        options.onProgress(intake.received, state.total, state.rate);
       }
     }
-    // End of body: whatever is held is the whole file, however short.
-    identify(true);
-    await flush(Infinity);
+    // End of body: whatever is held is the whole of what arrived, however
+    // short, and it still has to be identified before it counts.
+    await intake.end();
   } catch (error) {
-    // Whatever arrived before the failure is already on disk and counted, so
-    // the retry resumes from there rather than from zero.
-    await flush(Infinity).catch(() => undefined);
+    // Whatever was IDENTIFIED before the failure is kept and counted, so the
+    // retry resumes from there. Whatever was not is dropped — `abandon()` has
+    // no route from the held queue to the sink, which is the difference
+    // between this and the `flush(Infinity)` that used to be here.
+    await intake.abandon().catch(() => undefined);
     await reader.cancel().catch(() => undefined);
     throw error;
   }
@@ -852,30 +1218,30 @@ async function consume(
   /*
    * WHAT ARRIVED VERSUS WHAT WAS PROMISED, FOR THIS RESPONSE.
    *
-   * `fetch` resolves the stream cleanly when a proxy ends a body early with a
-   * `content-length` still claiming more, so "the loop finished" is not
-   * "the file is here". Nothing compared the two before, and the short body
-   * was written to the sink and recorded as an installed model.
+   * Counted on the WIRE rather than at the sink: a continuation re-sends the
+   * overlap, which the sink already has and does not write again, and a
+   * response is answerable for the bytes it sent.
    *
-   * SHORT is retryable — it is a truncated transfer, and the resume above is
-   * exactly the machinery for it. LONGER is refused outright: the extra bytes
-   * are already in the sink, no `Range` request can un-write them, and a
-   * server sending more than it declared is not one to take a second answer
-   * from.
+   * `fetch` resolves the stream cleanly when a proxy ends a body early with a
+   * `content-length` still claiming more, so "the loop finished" is not "the
+   * file is here". SHORT is retryable — it is a truncated transfer, and the
+   * resume above is exactly the machinery for it. LONGER is refused outright:
+   * the extra bytes are already in the sink, no `Range` request can un-write
+   * them, and a server sending more than it declared is not one to take a
+   * second answer from.
    */
-  const delivered = state.written - startedAt;
-  if (mustDeliver !== null && delivered !== mustDeliver) {
-    if (delivered > mustDeliver) {
+  if (mustDeliver !== null && received !== mustDeliver) {
+    if (received > mustDeliver) {
       throw new DownloadRefused(
-        `The server sent ${delivered} bytes where it declared ${mustDeliver}. Nothing was installed.`,
+        `The server sent ${received} bytes where it declared ${mustDeliver}. Nothing was installed.`,
       );
     }
     throw new IncompleteTransfer(
-      `The transfer ended after ${delivered} of ${mustDeliver} bytes.`,
+      `The transfer ended after ${received} of ${mustDeliver} bytes.`,
     );
   }
 
-  return 'done';
+  return 'ended';
 }
 
 /**
@@ -907,8 +1273,9 @@ function take(parts: Uint8Array[], bytes: number): Uint8Array {
  * The first `bytes` of `parts`, WITHOUT removing them.
  *
  * `take` is destructive because the block it returns is handed straight to the
- * sink. The probe must not consume what it looks at — those bytes are part of
- * the file.
+ * sink. Identification must not consume what it looks at — those bytes are the
+ * start of the file, and they are still in the queue that has no route to the
+ * sink until the verdict releases them.
  */
 function peek(parts: Uint8Array[], bytes: number): Uint8Array {
   const out = new Uint8Array(bytes);
@@ -929,11 +1296,25 @@ function ascii(bytes: Uint8Array): string {
   return out;
 }
 
-/** `bytes 1048576-1048591/436806912` -> `{start, total}`. */
-function parseContentRange(header: string | null): { start: number; total: number } | null {
+/**
+ * `bytes 1048576-1048591/436806912` -> `{start, end, total}`.
+ *
+ * All three matter and they answer different questions. `start` says whether
+ * this is the part that was asked for, `end` says how much THIS RESPONSE
+ * promises, and `total` says how big the file is. Conflating the last two is
+ * how a server that answers every request with an honest megabyte of a nine
+ * megabyte model got its first megabyte installed as the whole thing.
+ */
+function parseContentRange(
+  header: string | null,
+): { start: number; end: number; total: number } | null {
   const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec((header ?? '').trim());
   if (!match) return null;
-  return { start: Number(match[1]), total: match[3] === '*' ? 0 : Number(match[3]) };
+  return {
+    start: Number(match[1]),
+    end: Number(match[2]),
+    total: match[3] === '*' ? 0 : Number(match[3]),
+  };
 }
 
 /**

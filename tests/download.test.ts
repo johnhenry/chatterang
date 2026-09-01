@@ -216,6 +216,8 @@ interface ServerPlan {
   /** A body that changes between attempts — a file republished mid-download. */
   bodyAt?: (attempt: number) => Buffer;
   etag?: string;
+  /** A validator that CHANGES between attempts — a file republished mid-download. */
+  etagAt?: (attempt: number) => string;
   /** The other validator. `If-Range` accepts either, so both are exercised. */
   lastModified?: string;
   /** Bytes to send before destroying the socket, per 0-based request index. */
@@ -280,6 +282,33 @@ interface ServerPlan {
    * file. It is what the FINAL check exists for.
    */
   starRange?: (attempt: number) => number | null;
+  /**
+   * Answer EVERY request — ranged or not — with a 206 carrying at most this
+   * many bytes and an honest `content-range`.
+   *
+   * The truncation that no per-response check can see: every response is
+   * well-formed, ends cleanly, and delivers exactly what its own headers
+   * promise. Only the download as a whole is a fraction of the file.
+   */
+  capBytes?: number;
+  /**
+   * Append this many bytes to a ranged response and declare them in
+   * `content-length`, leaving `content-range` honest.
+   *
+   * The over-delivery no client clamps: undici truncates a body longer than
+   * `content-length`, so the only way to get more bytes into the sink than
+   * the file has room for is to declare them and contradict `content-range`.
+   */
+  overDeliver?: number;
+  /**
+   * Write the FIRST KILOBYTE of each body in pieces this size.
+   *
+   * A connection can only die inside the probe window if the server writes
+   * inside it, and 64 KiB chunks step straight over sixteen bytes. Only the
+   * first kilobyte is written this finely: a whole 9 MB model at one byte per
+   * event-loop turn is a test that never finishes (MEASURED — it did not).
+   */
+  chunkBytes?: number;
 }
 
 interface Harness {
@@ -325,6 +354,7 @@ async function serve(plan: ServerPlan): Promise<Harness> {
     }
 
     const body = plan.bodyAt?.(index) ?? plan.body;
+    const etag = plan.etagAt?.(index) ?? plan.etag;
     const rangeHeader = plan.ignoreRange ? undefined : req.headers.range;
     const match = /^bytes=(\d+)-$/.exec(rangeHeader ?? '');
     let start = 0;
@@ -337,13 +367,42 @@ async function serve(plan: ServerPlan): Promise<Harness> {
       }
     }
 
+    /*
+     * A SERVER THAT CAPS EVERY RESPONSE, and is honest about it.
+     *
+     * `content-range: bytes START-(START+CAP-1)/TOTAL` with a `content-length`
+     * that matches, ending cleanly. Every per-response check agrees with it —
+     * because the response is not the thing that is wrong. Only the DOWNLOAD
+     * is short, and only something that looks at the whole download can say
+     * so. Answered to a request with no `Range` as well, which is legal for a
+     * 206 starting at zero and is how the first megabyte arrives.
+     */
+    if (plan.capBytes !== undefined) {
+      const part = body.subarray(start, start + plan.capBytes);
+      const total = body.length + (plan.rangeTotalDelta ?? 0);
+      res.writeHead(206, {
+        'content-length': String(part.length),
+        'accept-ranges': 'bytes',
+        'content-type': 'application/octet-stream',
+        'content-range': `bytes ${start}-${start + part.length - 1}/${total}`,
+        ...(etag ? { etag } : {}),
+      });
+      res.end(part);
+      return;
+    }
+
     const slice = body.subarray(start);
+    /** The body actually written, which is not always the slice asked for. */
+    const outgoing =
+      match && plan.overDeliver
+        ? Buffer.concat([slice, Buffer.alloc(plan.overDeliver, 7)])
+        : slice;
     const headers: Record<string, string> = {
-      'content-length': String(slice.length + (plan.lengthDelta ?? 0)),
+      'content-length': String(outgoing.length + (plan.lengthDelta ?? 0)),
       'accept-ranges': 'bytes',
       'content-type': 'application/octet-stream',
     };
-    if (plan.etag) headers.etag = plan.etag;
+    if (etag) headers.etag = etag;
     if (plan.lastModified) headers['last-modified'] = plan.lastModified;
     const starBytes = match ? (plan.starRange?.(index) ?? null) : null;
     if (starBytes !== null) {
@@ -353,7 +412,7 @@ async function serve(plan: ServerPlan): Promise<Harness> {
         'accept-ranges': 'bytes',
         'content-type': 'application/octet-stream',
         'content-range': `bytes ${start}-${start + part.length - 1}/*`,
-        ...(plan.etag ? { etag: plan.etag } : {}),
+        ...(etag ? { etag } : {}),
       });
       res.end(part);
       return;
@@ -371,17 +430,18 @@ async function serve(plan: ServerPlan): Promise<Harness> {
     }
 
     const limit = plan.dropAfter?.(index) ?? null;
+    const chunk = plan.chunkBytes ?? CHUNK;
     let sent = 0;
     let first = true;
     let gated = false;
-    for (let at = 0; at < slice.length; at += CHUNK) {
+    for (let at = 0; at < outgoing.length; at += at < 1024 ? chunk : CHUNK) {
       if (limit !== null && sent >= limit) {
         // A connection that dies mid-body: no FIN, no trailer, exactly what a
         // dropped Wi-Fi link looks like to `fetch`.
         res.destroy();
         return;
       }
-      const piece = slice.subarray(at, at + CHUNK);
+      const piece = outgoing.subarray(at, at + (at < 1024 ? chunk : CHUNK));
       res.write(piece);
       sent += piece.length;
       if (first) {
@@ -965,31 +1025,78 @@ describe('a server whose length does not match its body', () => {
     expect(useModels.getState().installed[m.id]).toBeUndefined();
   }, 30000);
 
-  it('refuses a 206 that delivers more than the file it claims to be part of', async () => {
+  it('refuses a 206 that delivers more bytes than the range it answered', async () => {
     /*
      * The one over-delivery no client clamps. `content-length` longer than the
      * body is truncated by undici (MEASURED: 500 sent under `content-length:
      * 100`, 100 delivered), but nothing validates a body against
-     * `content-range`. Here the resume answers `bytes N-…/TOTAL` with a TOTAL
-     * three megabytes short of what it then sends.
+     * `content-range`. Here the resume answers `bytes N-…/TOTAL` — an HONEST
+     * total, so the size on record is not contradicted and the restart arm
+     * does not fire — and then sends 3 MB more than that range contains,
+     * declaring them in `content-length` so the client hands them over.
      *
      * It is refused rather than retried: the extra bytes are already in the
      * sink and no `Range` request can un-write them.
      *
-     * FAULT INJECTED: the `delivered > mustDeliver` arm changed to fall
+     * REWRITTEN THIS ROUND, and the reason matters. It used to reach this arm
+     * with `rangeTotalDelta: -3_000_000` — a resume whose `/total` was three
+     * megabytes SHORT of the file — which now trips the earlier rule that a
+     * size stated twice must be stated the same way, and restarts. That rule
+     * exists precisely so a server cannot shrink the target to match a
+     * truncation, so the test was moved onto a server that over-delivers
+     * WITHOUT lying about the size. The old shape is asserted below, under
+     * its own name.
+     *
+     * FAULT INJECTED: the `received > mustDeliver` arm changed to fall
      * through to `IncompleteTransfer`. Observed: retried instead of refused,
-     * 40 requests, and the final message named a truncated transfer rather
-     * than an over-long one. Exit 1.
+     * and the run ended on the attempt ceiling with a message naming a
+     * truncated transfer rather than an over-long one. Exit 1.
+     */
+    const server = await start({
+      overDeliver: 3_000_000,
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
+      /where it declared/,
+    );
+    expect(useModels.getState().installed[m.id]).toBeUndefined();
+  });
+
+  it('starts over when a resume states a different size than the download began with', async () => {
+    /*
+     * A SIZE STATED TWICE MUST BE STATED THE SAME WAY.
+     *
+     * `state.declared` used to be overwritten by every 206 that carried a
+     * `/total`, which hands a server the completeness check itself: answer the
+     * resume with a total that matches what you have already sent, and
+     * `written === declared` agrees that a truncated file is the whole file.
+     * The size is now taken from the first response that states one and never
+     * restated while bytes are on disk; a response that contradicts it is not
+     * a continuation of this download, so the sink is emptied and the file is
+     * fetched again.
+     *
+     * FAULT INJECTED: the `!intake.agrees(stated)` clause removed from the
+     * continuation arm. Observed: the download RESOLVED — 6,449,529 bytes of
+     * a 9,449,529-byte model on disk, sha256 matching a prefix rather than the
+     * file, recorded as a complete install, because the resume's `/total` had
+     * moved the goalposts to exactly where the body stopped. Exit 1.
      */
     const server = await start({
       rangeTotalDelta: -3_000_000,
       dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
     });
+    const m = withUrl(server.url);
 
-    await expect(
-      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
-    ).rejects.toThrow(/where it declared/);
-  });
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    // Restarted, then fetched whole: the file on disk is the whole model, not
+    // the shorter one the resume claimed to be part of.
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+    expect(server.requests.length).toBeGreaterThan(2);
+  }, 15000);
 
   it('recovers from a 206 that overstates how much file is left', async () => {
     /*
@@ -1021,28 +1128,28 @@ describe('a server whose length does not match its body', () => {
   }, 15000);
 });
 
-describe('a resume whose range declares no total at all', () => {
-  it('refuses a download that ends short of the length the server first stated', async () => {
+describe('a download is over when the file is whole, not when a response is', () => {
+  it('keeps resuming a server that answers with a megabyte at a time', async () => {
     /*
-     * THE BLIND SPOT IN THE PER-RESPONSE CHECK, and the only thing the final
-     * one catches that nothing else does.
+     * THE BLIND SPOT IN EVERY PER-RESPONSE CHECK.
      *
      * `content-range: bytes N-M/*` is legal — the server is saying "here is
      * this much, I will not tell you how big the whole thing is". With no
      * total there is nothing for `consume` to compare its delivery against, so
-     * it returns 'done' on a body that is a fraction of the file, the loop
-     * breaks, and the download looks complete to every per-response check. The
-     * FIRST response did state a length, and that is what the final check
-     * still holds it to.
+     * the response ends cleanly having kept every promise it made. The old
+     * loop broke on that and the download was 6 MiB of a 9.4 MB model.
      *
-     * REVERT-CHECKED AND MISSED FIRST TIME: this test did not exist, and
-     * deleting the final check left the whole suite green. The check had
-     * shipped unguarded — exactly the defect this milestone exists to close.
+     * A final `written === declared` check turned that into a REFUSAL, which
+     * was the previous round's answer and was only half right: the file was
+     * available, one megabyte at a time, and the machinery for asking again is
+     * sitting right there. The loop now ends when the sink holds the length
+     * the first response stated — so this walks the file to the end instead,
+     * and lands it byte for byte.
      *
-     * FAULT INJECTED: the `state.declared !== null && written !== declared`
-     * arm removed. Observed: the download RESOLVED with `totalBytes: 6291456`
-     * — 6 MiB of a 9,449,529-byte model — recorded as a complete install.
-     * Exit 1.
+     * FAULT INJECTED: the loop's exit changed back to `if (outcome ===
+     * 'ended') break`. Observed: the download RESOLVED with `totalBytes:
+     * 6291520` — a fraction of the model, recorded as a complete install.
+     * Exit 1 on the length assertion.
      */
     const server = await start({
       dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
@@ -1050,10 +1157,232 @@ describe('a resume whose range declares no total at all', () => {
     });
     const m = withUrl(server.url);
 
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+    expect(server.requests.length).toBeGreaterThan(4);
+  }, 20000);
+
+  it('installs nothing when a capped server stops advancing', async () => {
+    /*
+     * THE SAME SERVER, STUCK. Every response is a legal `bytes N-M/*` and
+     * every one of them re-sends only the overlap the resume asked for, so
+     * the download makes no progress at all. Nothing per-response is wrong;
+     * the DOWNLOAD is what is short, and the message says so.
+     *
+     * Every response here keeps its own promise — `bytes N-M/*` delivering
+     * exactly M-N+1 bytes — so the per-response check has nothing to say and
+     * the attempt ends 'ended'. What ends the download is the retry budget,
+     * and the sentence it ends with is the DOWNLOAD's: the sink holds less
+     * than the length the first response stated. That sentence and the one
+     * `commit()` refuses with are the same string from the same predicate,
+     * which is what keeps "finished" and "installable" from drifting apart.
+     *
+     * FAULT INJECTED: the ceiling arm's `intake.shortfall()` replaced by the
+     * restart sentence. Observed: still rejected, but naming a server that
+     * "kept restarting" a download it had never restarted — the message a
+     * user would file a bug against. Exit 1 on the regex.
+     */
+    const server = await start({
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+      // Exactly `OVERLAP_BYTES`: the resume's own overlap comes back and not
+      // one byte more.
+      starRange: (attempt) => (attempt > 0 ? 64 : null),
+    });
+    const m = withUrl(server.url);
+
     await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
       /where the server said/,
     );
     expect(useModels.getState().installed[m.id]).toBeUndefined();
+    const written = readFileSync(modelPath(m));
+    expect(sha(written)).not.toBe(sha(payload));
+  }, 20000);
+
+  it('finishes a server that caps every response at a megabyte, honestly', async () => {
+    /*
+     * THE TRUNCATION THAT RESOLVED SUCCESSFULLY. Every response is a 206 with
+     * an honest `content-range` — `bytes 0-1048575/9449529` — an honest
+     * `content-length`, and a clean end of body. There is nothing wrong with
+     * any single response, which is why no per-response check ever fired: the
+     * first one arrived, the loop broke, and one megabyte was installed as a
+     * 9 MB model.
+     *
+     * FAULT INJECTED: `if (outcome === 'ended' && intake.satisfied) break`
+     * reduced to `if (outcome === 'ended') break`. Observed: RESOLVED with
+     * `totalBytes: 1048576` and 1 MiB on disk under the model's name, one
+     * request. Exit 1.
+     */
+    const server = await start({ capBytes: 1024 * 1024 });
+    const m = withUrl(server.url);
+
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+    // Ten megabyte-sized answers, give or take the overlap each one re-sends.
+    expect(server.requests.length).toBeGreaterThanOrEqual(9);
+    expect(server.requests.length).toBeLessThanOrEqual(40);
+
+    /*
+     * THE OVERLAP, IN ARITHMETIC. Every response here ends cleanly, so the
+     * byte count after the first one is exactly a megabyte and the second
+     * request is the only place the resume offset can be read from the
+     * outside: 64 bytes BEFORE the end of what is on disk.
+     *
+     * And the file is still exactly the model, so those 64 bytes were
+     * compared and dropped rather than written a second time — the two halves
+     * of the stitch, asserted together.
+     */
+    expect(server.requests[1]!.range).toBe(`bytes=${1024 * 1024 - 64}-`);
+  }, 20000);
+
+  it('installs nothing when the first response claims more file than it has', async () => {
+    /*
+     * A `/total` ON THE FIRST RESPONSE, PARSED AND THROWN AWAY. The 206 arm
+     * only looked at `content-range` when it was resuming; on a first
+     * response it checked that the range started at zero and dropped the
+     * total on the floor. So `bytes 0-9449528/9453625` — a total 4 KiB larger
+     * than the body it then sent — was measured against `content-length`
+     * instead, agreed with itself, and installed a file the server itself
+     * said was incomplete.
+     *
+     * The size now comes from the `/total` on a 206 whether or not the
+     * request carried a `Range`, so what arrived is short of what was stated
+     * and the download ends with nothing installed.
+     *
+     * FAULT INJECTED: `stated` computed as `declaredLength(response)` for a
+     * 206 as well. Observed: RESOLVED — 9,449,529 bytes recorded as the
+     * complete file the server had described as 9,453,625. Exit 1.
+     */
+    const server = await start({ capBytes: PAYLOAD_BYTES, rangeTotalDelta: 4096 });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow();
+    expect(useModels.getState().installed[m.id]).toBeUndefined();
+    expect(server.requests.length).toBeLessThanOrEqual(40);
+  }, 20000);
+});
+
+/* ── The intake ──────────────────────────────────────────────────────── */
+
+describe('nothing reaches the sink before the transfer is identified', () => {
+  const PAGE = Buffer.from(
+    '<!DOCTYPE html>\n<html><head><title>Sign in</title></head><body>Please log in.</body></html>',
+    'utf8',
+  );
+
+  it('drops a prefix the connection died inside, and identifies the retry', async () => {
+    /*
+     * THE PROBE BYPASS, AND THE REASON THIS ROUND RESTRUCTURED RATHER THAN
+     * ADDING A FIFTH CHECK.
+     *
+     * `identify()` was gated on `written > 0` and the failure arm of the read
+     * loop flushed whatever it was holding BEFORE anything identified it. So
+     * a connection dying inside the first sixteen bytes put those bytes on
+     * disk unidentified, and every later attempt skipped identification
+     * because the counter it was gated on had already moved. Two bytes of a
+     * login page, resumed from, completed, and INSTALLED — with the
+     * content-type check dodged by serving it as `application/octet-stream`
+     * and the magic check dodged by never running.
+     *
+     * The bytes now sit in a queue the sink cannot be reached from, so the
+     * failure arm has nothing to flush: it drops them, and the retry asks for
+     * the WHOLE file and identifies what comes back.
+     *
+     * FAULT INJECTED: `abandon()` changed to move `held` into `queue` before
+     * flushing — the old behaviour, one line. Observed: the download RESOLVED
+     * with 91 bytes of HTML on disk under `model.gguf`, `state:'installed'`,
+     * and the second request carrying `Range: bytes=2-`. Exit 1.
+     */
+    const server = await start({
+      body: PAGE,
+      // One byte at a time, so the socket can die INSIDE the probe window
+      // rather than between chunks of it.
+      chunkBytes: 1,
+      dropAfter: (attempt) => (attempt === 0 ? 2 : null),
+    });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
+      /web page instead of the model file/,
+    );
+
+    // The retry asked for the whole file: two unidentified bytes are not a
+    // resume offset.
+    expect(server.requests.length).toBeGreaterThan(1);
+    expect(server.requests[1]!.range).toBeUndefined();
+    expect(readFileSync(modelPath(m)).length).toBe(0);
+    expect(useModels.getState().installed[m.id]).toBeUndefined();
+  }, 15000);
+
+  it('refetches from zero when a real model dies inside the probe window', async () => {
+    // The same path with nothing wrong at the end of it: dropping an
+    // unidentified prefix must cost a re-fetch, not the download.
+    const server = await start({
+      chunkBytes: 1,
+      dropAfter: (attempt) => (attempt === 0 ? 3 : null),
+    });
+    const m = withUrl(server.url);
+
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    expect(server.requests[1]!.range).toBeUndefined();
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+  }, 15000);
+
+  it('will not stitch a continuation from a different build of the model', async () => {
+    /*
+     * THE SPLICE, WITH EVERY OTHER CHECK PASSING.
+     *
+     * The file is republished between the two requests and the server keeps
+     * the SAME `ETag` — a stale CDN, or any server that does not compare
+     * `If-Range` — so the resume is answered 206 with the new build's tail at
+     * the offset asked for. The result has the right magic (it is not at the
+     * head), the right length, an honest `content-range`, and comes apart
+     * only in the middle: valid GGUF, wrong weights, and the engine reports it
+     * days later as a bad model.
+     *
+     * This is what the docstring's "NO VALIDATOR, NO RESUME. THIS IS THE WHOLE
+     * GUARD." was false about: the validator was sent and the server ignored
+     * it. What catches it is the overlap — the resume asks for the last 64
+     * bytes on disk again, and the new build does not have the old build's
+     * bytes there.
+     *
+     * ASSERTED ON SHA256, because length and magic both agree with the splice.
+     *
+     * FAULT INJECTED: `expectContinuation()` replaced by leaving the intake
+     * open (no overlap comparison) and the resume offset set to
+     * `intake.written`. Observed: the download RESOLVED, 9,449,529 bytes —
+     * exactly the right length — whose sha256 matched NEITHER build. Exit 1.
+     */
+    const second = Buffer.concat([
+      Buffer.from('GGUF', 'latin1'),
+      randomBytes(PAYLOAD_BYTES - 4),
+    ]);
+    const server = await start({
+      etag: '"v1"',
+      bodyAt: (attempt) => (attempt === 0 ? payload : second),
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    const m = withUrl(server.url);
+
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    // The resume WAS attempted with the validator the server offered.
+    expect(server.requests[1]!.range).toMatch(/^bytes=\d+-$/);
+    expect(server.requests[1]!.ifRange).toBe('"v1"');
+    // And when its bytes did not follow on, the prefix was dropped rather
+    // than built on: the third request asks for the whole file.
+    expect(server.requests[2]!.range).toBeUndefined();
+
+    const written = readFileSync(modelPath(m));
+    expect(written.length).toBe(PAYLOAD_BYTES);
+    expect(sha(written)).toBe(sha(second));
+    expect(sha(written)).not.toBe(sha(payload));
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
   }, 20000);
 });
 
@@ -1117,6 +1446,38 @@ describe('a server that offers no validator to resume against', () => {
     expect(server.requests[1]!.range).toMatch(/^bytes=\d+-$/);
     expect(server.requests[1]!.ifRange).toBe('"v1"');
   });
+
+  it('resumes against the validator of the response the bytes on disk came from', async () => {
+    /*
+     * A VALIDATOR IS ABOUT A PARTICULAR BODY, and the one on disk is not
+     * always the first one that arrived.
+     *
+     * This server ignores `Range` and answers every request with the whole
+     * file — under a NEW `ETag` each time, which is what a republish looks
+     * like. The prefix on disk is therefore replaced on the second attempt,
+     * and the `If-Range` sent with the third must be the validator of the
+     * response that replaced it. Kept as `state.validator ??= …` — set once,
+     * on the first response ever seen — it describes bytes that were thrown
+     * away two attempts ago, and the server is asked to compare our resume
+     * against a version of the file we are no longer holding.
+     *
+     * FAULT INJECTED: the assignment changed back to `??=`. Observed: the
+     * third request carried `If-Range: "v1"` while the disk held the body
+     * that arrived under `"v2"`. Exit 1.
+     */
+    const server = await start({
+      ignoreRange: true,
+      etagAt: (attempt) => (attempt === 0 ? '"v1"' : '"v2"'),
+      dropAfter: (attempt) => (attempt < 2 ? 2 * 1024 * 1024 : null),
+    });
+    const m = withUrl(server.url);
+
+    await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    expect(server.requests[1]!.ifRange).toBe('"v1"');
+    expect(server.requests[2]!.ifRange).toBe('"v2"');
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+  }, 15000);
 
   it('resumes on Last-Modified alone, which is also a validator', async () => {
     const server = await start({
@@ -1440,6 +1801,40 @@ describe('the downloader documents what it does and nothing more', () => {
     expect(code).toContain('headers.Range');
     expect(code).toContain("headers['If-Range']");
     expect(code).toContain('206');
+  });
+
+  it('has one place that writes and one place that decides', () => {
+    /*
+     * THE SHAPE THE INVARIANT RESTS ON, asserted here because it cannot be
+     * driven from a server.
+     *
+     * Three of the guards below are ASSERTIONS, not checks: removing one
+     * changes no behaviour today, because the only caller already satisfies
+     * it. `declare()` is called on an empty sink, `expectWholeFile()` is
+     * called after a reset, and the loop cannot reach `commit()` unsatisfied.
+     * A revert-check on all three came back MISSED against the fault servers,
+     * which is the honest reason they are pinned here instead: what they
+     * defend against is a FUTURE caller, and this is the test that would have
+     * to be deleted to add one.
+     */
+    // One call site for the sink's write, and it is inside the intake.
+    expect([...code.matchAll(/sink\.write\(/g)]).toHaveLength(1);
+
+    // One way to get a path, and it consults the completeness predicate.
+    expect([...code.matchAll(/async commit\(/g)]).toHaveLength(1);
+    const commit = code.slice(code.indexOf('async commit('), code.indexOf('async abort('));
+    expect(commit).toContain('if (!this.satisfied)');
+    expect(commit).toContain('await this.sink.close()');
+
+    // A size cannot be restated over bytes already on disk, and a whole file
+    // cannot be written onto a partial one.
+    const declare = code.slice(code.indexOf('declare(bytes'), code.indexOf('agrees(bytes'));
+    expect(declare).toContain('this.writtenBytes !== 0');
+    const whole = code.slice(
+      code.indexOf('expectWholeFile()'),
+      code.indexOf('expectContinuation()'),
+    );
+    expect(whole).toContain('this.writtenBytes !== 0');
   });
 
   it('never asks whether the Filesystem plugin is available', () => {
