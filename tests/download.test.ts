@@ -215,6 +215,8 @@ interface ServerPlan {
   /** A body that changes between attempts — a file republished mid-download. */
   bodyAt?: (attempt: number) => Buffer;
   etag?: string;
+  /** The other validator. `If-Range` accepts either, so both are exercised. */
+  lastModified?: string;
   /** Bytes to send before destroying the socket, per 0-based request index. */
   dropAfter?: (attempt: number) => number | null;
   /** Answer a `Range` request with the whole body and a 200. */
@@ -227,6 +229,56 @@ interface ServerPlan {
   gateAfter?: number;
   /** Awaited mid-body, so the response can be held open on purpose. */
   gate?: Promise<void>;
+
+  /* ── Ways to misbehave ─────────────────────────────────────────────── */
+
+  /**
+   * Answer with this instead of the model — a CDN interstitial, an error
+   * document, a "please log in" page. A well-formed 200 with an honest
+   * `content-length`, which is what makes it dangerous.
+   */
+  instead?: { body: Buffer; contentType?: string };
+  /**
+   * 416 to EVERY request, including one carrying no `Range` at all.
+   *
+   * This is the infinite-restart case and it is not hypothetical arithmetic:
+   * the 416 arm truncates the sink and puts `written` back to zero, so the
+   * next request carries no range, so the next answer is another 416.
+   */
+  always416?: boolean;
+  /**
+   * Add this to the declared `content-length`, so the header lies.
+   *
+   * The socket is DESTROYED after the short body rather than left open.
+   * MEASURED with `res.end()` instead: Node holds the connection waiting for
+   * the bytes it promised and the client gives up after its own timeout — six
+   * seconds per attempt, so a forty-attempt ceiling takes four minutes to
+   * prove. A truncating proxy closes; this models that.
+   */
+  lengthDelta?: number;
+  /**
+   * Add this to the `/total` of a `content-range`. Negative makes the response
+   * deliver MORE than the file it claims to be part of — the one over-delivery
+   * an HTTP client does not clamp, because no client validates a body against
+   * `content-range`.
+   */
+  rangeTotalDelta?: number;
+  /**
+   * Answer with a 206 whose `content-range` starts 4 KiB from where it should,
+   * while the body is still the slice actually asked for. Attempt-aware, so a
+   * server can behave until the resume and then not.
+   */
+  mismatchRange?: (attempt: number) => boolean;
+  /**
+   * Answer a resume with `content-range: bytes N-M/*` — a range whose TOTAL is
+   * unknown — and serve exactly this many bytes, ending cleanly.
+   *
+   * A perfectly legal response, and the one blind spot the per-response length
+   * check has: with no total there is nothing for that check to compare
+   * against, so `consume` returns 'done' on a body that is only part of the
+   * file. It is what the FINAL check exists for.
+   */
+  starRange?: (attempt: number) => number | null;
 }
 
 interface Harness {
@@ -256,6 +308,21 @@ async function serve(plan: ServerPlan): Promise<Harness> {
       return;
     }
 
+    if (plan.always416) {
+      res.writeHead(416, { 'content-range': `bytes */${plan.body.length}` });
+      res.end();
+      return;
+    }
+
+    if (plan.instead) {
+      res.writeHead(200, {
+        'content-length': String(plan.instead.body.length),
+        'content-type': plan.instead.contentType ?? 'application/octet-stream',
+      });
+      res.end(plan.instead.body);
+      return;
+    }
+
     const body = plan.bodyAt?.(index) ?? plan.body;
     const rangeHeader = plan.ignoreRange ? undefined : req.headers.range;
     const match = /^bytes=(\d+)-$/.exec(rangeHeader ?? '');
@@ -271,12 +338,32 @@ async function serve(plan: ServerPlan): Promise<Harness> {
 
     const slice = body.subarray(start);
     const headers: Record<string, string> = {
-      'content-length': String(slice.length),
+      'content-length': String(slice.length + (plan.lengthDelta ?? 0)),
       'accept-ranges': 'bytes',
+      'content-type': 'application/octet-stream',
     };
     if (plan.etag) headers.etag = plan.etag;
-    if (match) {
-      headers['content-range'] = `bytes ${start}-${body.length - 1}/${body.length}`;
+    if (plan.lastModified) headers['last-modified'] = plan.lastModified;
+    const starBytes = match ? (plan.starRange?.(index) ?? null) : null;
+    if (starBytes !== null) {
+      const part = slice.subarray(0, starBytes);
+      res.writeHead(206, {
+        'content-length': String(part.length),
+        'accept-ranges': 'bytes',
+        'content-type': 'application/octet-stream',
+        'content-range': `bytes ${start}-${start + part.length - 1}/*`,
+        ...(plan.etag ? { etag: plan.etag } : {}),
+      });
+      res.end(part);
+      return;
+    }
+
+    const mismatched = plan.mismatchRange?.(index) ?? false;
+    if (match || mismatched) {
+      const total = body.length + (plan.rangeTotalDelta ?? 0);
+      // 4 KiB off: a range nobody asked for, with the body of the one they did.
+      const from = mismatched ? start + 4096 : start;
+      headers['content-range'] = `bytes ${from}-${body.length - 1}/${total}`;
       res.writeHead(206, headers);
     } else {
       res.writeHead(200, headers);
@@ -308,6 +395,10 @@ async function serve(plan: ServerPlan): Promise<Harness> {
       // receiving one buffered blob at the end.
       await new Promise((resolve) => setImmediate(resolve));
     }
+    if (plan.lengthDelta) {
+      res.destroy();
+      return;
+    }
     res.end();
   };
 
@@ -333,6 +424,14 @@ async function serve(plan: ServerPlan): Promise<Harness> {
 const FLUSH = 3 * 1024 * 1024;
 /** Three whole flushes and a partial tail — the shape a real file has. */
 const PAYLOAD_BYTES = 3 * FLUSH + 12_345;
+/**
+ * `CONSECUTIVE_ATTEMPTS` from `lib/download.ts`, as a request count.
+ *
+ * Named here rather than written as a bare `3`, because these assertions exist
+ * to prove a loop TERMINATES: a ceiling nobody can trace back to the constant
+ * it mirrors is a ceiling that drifts.
+ */
+const CONSECUTIVE_CEILING = 3;
 
 let base: string;
 let dataRoot: string;
@@ -382,7 +481,11 @@ beforeEach(() => {
   store.settings.clear();
   store.toasts = [];
   platform.id = 'electron';
-  payload = randomBytes(PAYLOAD_BYTES);
+  // A GGUF FILE, not just bytes of the right length. The downloader now
+  // identifies what arrived from its first four bytes — that is how a CDN
+  // interstitial is caught at download time instead of surfacing days later as
+  // "bad GGUF" — so a fixture of pure noise would be refused, correctly.
+  payload = Buffer.concat([Buffer.from('GGUF', 'latin1'), randomBytes(PAYLOAD_BYTES - 4)]);
   servers = [];
   useModels.setState({ installed: {}, progress: {}, activeModelId: null });
 });
@@ -712,6 +815,463 @@ describe('a transfer that dies mid-stream resumes instead of restarting', () => 
     );
     expect(server.requests).toHaveLength(1);
   });
+});
+
+/* ── Servers that misbehave ──────────────────────────────────────────── */
+
+/**
+ * THE SECTION THE REVIEW SAID WAS MISSING.
+ *
+ * Seventeen of eighteen revert-checks came back MISSED on the milestone this
+ * closes, and the reason was uniform: every existing test drove a WELL-BEHAVED
+ * server. A server that answers 200 and sends the bytes it promised exercises
+ * almost none of the code that decides whether a download becomes an installed
+ * model.
+ *
+ * Each server below misbehaves in exactly one way, and each test asserts the
+ * same two things: the download does not SUCCEED, and it TERMINATES. Where it
+ * matters, the assertion goes through `useModels.install()` as well, because
+ * "did not throw" and "was not recorded as installed" are different claims and
+ * only the second one is what the user lives with.
+ */
+describe('a server that sends something other than the model', () => {
+  const HTML = Buffer.from(
+    '<!DOCTYPE html>\n<html><head><title>Sign in</title></head><body>Please log in to continue.</body></html>',
+    'utf8',
+  );
+
+  it('refuses an HTML error page served as text/html, and installs nothing', async () => {
+    /*
+     * THE CASE THAT MOTIVATED THE WHOLE SECTION. A CDN interstitial is a
+     * well-formed 200 with an honest `content-length`. Before this, it was
+     * written to the sink and RECORDED AS AN INSTALLED MODEL; the user found
+     * out days later when the engine reported a GGUF format error naming the
+     * model rather than the download.
+     *
+     * FAULT INJECTED: the `content-type` refusal in `transfer` removed, so
+     * only the first-bytes probe remained. Observed: still refused, but with
+     * the probe's message — which is why BOTH are asserted, below and here.
+     * FAULT INJECTED: content-type refusal AND the probe removed. Observed:
+     * the download RESOLVED, 102 bytes on disk, and the store recorded
+     * `state:'installed'` — the exact defect. Exit 1.
+     */
+    const server = await start({ instead: { body: HTML, contentType: 'text/html' } });
+    const m = withUrl(server.url);
+
+    // The DECLARED TYPE is asserted, not just the sentence. REVERT-CHECKED
+    // and it mattered: with the content-type block deleted the first-bytes
+    // probe caught the same page and produced the same sentence, so a test
+    // matching only the sentence stayed GREEN — an unguarded check, which is
+    // the whole failure mode this milestone is about. Naming `text/html` in
+    // the message is what makes the two distinguishable.
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
+      /web page \(text\/html\) instead of the model file/,
+    );
+    // Not retried: asking a login page again produces a login page.
+    expect(server.requests).toHaveLength(1);
+
+    await useModels.getState().install(m);
+    expect(useModels.getState().installed[m.id]?.state).toBe('failed');
+    expect(useModels.getState().installed[m.id]?.state).not.toBe('installed');
+  });
+
+  it('refuses the same page dressed as application/octet-stream', async () => {
+    /*
+     * The content-type check alone is not enough, and this is why. A CDN that
+     * labels its error document `application/octet-stream` passes the header
+     * check, passes `response.ok`, and passes the length check — its
+     * `content-length` is honest about the HTML. Only the first bytes give it
+     * away.
+     *
+     * FAULT INJECTED: `DOCUMENT_OPENINGS` emptied. Observed: refused instead
+     * by the GGUF magic arm, so the test was re-run with `magic` ALSO removed
+     * from `downloadModel` — the download then RESOLVED with 102 bytes on
+     * disk. Exit 1 on the length assertion.
+     */
+    const server = await start({
+      instead: { body: HTML, contentType: 'application/octet-stream' },
+    });
+    // No parenthesised type here: this is the OTHER refusal, reached from the
+    // bytes rather than the header, and the assertion says which.
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/web page instead of the model file/);
+  });
+
+  it('refuses a body that is binary but is not a GGUF', async () => {
+    /*
+     * A JSON error envelope, a tarball, the wrong file from the repo. Not a
+     * document, so the opening check does not fire; the manifest says `gguf`,
+     * and a GGUF starts with `GGUF`.
+     *
+     * FAULT INJECTED: `FORMAT_MAGIC` emptied to `{}`. Observed: 9,449,529
+     * bytes of non-GGUF written to disk and the promise RESOLVED. Exit 1.
+     */
+    const notAModel = Buffer.concat([
+      Buffer.from('{"error":"Repository not found"}', 'utf8'),
+      randomBytes(4096),
+    ]);
+    const server = await start({ instead: { body: notAModel } });
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/not a GGUF model/);
+  });
+
+  it('refuses a file too short to even carry the magic', async () => {
+    // A zero-length or two-byte 200. The probe runs after the loop as well as
+    // inside it, so a body that never reaches `PROBE_BYTES` still gets a
+    // verdict rather than being installed by default.
+    const server = await start({ instead: { body: Buffer.from('GG', 'latin1') } });
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/not a GGUF model/);
+  });
+
+  it('refuses an empty 200', async () => {
+    const server = await start({ instead: { body: Buffer.alloc(0) } });
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/empty file|not a GGUF/);
+    const written = readFileSync(modelPath(withUrl(server.url)));
+    expect(written.length).toBe(0);
+  });
+});
+
+describe('a server whose length does not match its body', () => {
+  it('does not install a body shorter than the content-length it declared', async () => {
+    /*
+     * MEASURED FIRST, then asserted. A body short of its `content-length` is
+     * rejected by the HTTP CLIENT — `TypeError: terminated`, cause
+     * `UND_ERR_RES_CONTENT_LENGTH_MISMATCH` — so it arrives here as a
+     * retryable transport failure rather than as a clean short read. That is
+     * the honest description of which check fires, and the outcome is what
+     * matters either way: bounded retries, then a refusal, and NOTHING
+     * RECORDED AS INSTALLED.
+     */
+    // A SMALL body for this one. The loop is bounded at 40 attempts and each
+    // attempt re-transfers the whole file, so at the 9 MB fixture size this
+    // test spends 29 seconds moving 378 MB over loopback to prove a ceiling
+    // that 200 KB proves just as well. The SHAPE is what matters here — a
+    // declared length the body does not honour — not the size.
+    const small = Buffer.concat([Buffer.from('GGUF', 'latin1'), randomBytes(200_000)]);
+    const server = await start({ body: small, lengthDelta: 4096 });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow();
+    expect(server.requests.length).toBeLessThanOrEqual(40);
+    expect(server.requests.length).toBeGreaterThan(1);
+    // Nothing was left behind claiming to be the model.
+    expect(useModels.getState().installed[m.id]).toBeUndefined();
+  }, 30000);
+
+  it('refuses a 206 that delivers more than the file it claims to be part of', async () => {
+    /*
+     * The one over-delivery no client clamps. `content-length` longer than the
+     * body is truncated by undici (MEASURED: 500 sent under `content-length:
+     * 100`, 100 delivered), but nothing validates a body against
+     * `content-range`. Here the resume answers `bytes N-…/TOTAL` with a TOTAL
+     * three megabytes short of what it then sends.
+     *
+     * It is refused rather than retried: the extra bytes are already in the
+     * sink and no `Range` request can un-write them.
+     *
+     * FAULT INJECTED: the `delivered > mustDeliver` arm changed to fall
+     * through to `IncompleteTransfer`. Observed: retried instead of refused,
+     * 40 requests, and the final message named a truncated transfer rather
+     * than an over-long one. Exit 1.
+     */
+    const server = await start({
+      rangeTotalDelta: -3_000_000,
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/where it declared/);
+  });
+
+  it('recovers from a 206 that overstates how much file is left', async () => {
+    /*
+     * THE ONE SHORT DELIVERY THAT ARRIVES CLEAN, and therefore the one the
+     * check here actually catches. The resume answers `content-range: bytes
+     * N-…/TOTAL` with a TOTAL 4 KiB larger than the file it then sends, so the
+     * body ends normally, `fetch` resolves, and the read loop finishes with
+     * less than was promised. Nothing rejected; nothing was going to.
+     *
+     * The right outcome is not a refusal — it is another attempt, which
+     * eventually gets the whole file from zero and lands the right bytes.
+     *
+     * FAULT INJECTED: the `IncompleteTransfer` arm removed, so a clean short
+     * delivery returned 'done'. Observed: the loop broke, the final check
+     * compared 9,449,529 written against 9,453,625 declared and the download
+     * was REFUSED — a working file turned into an error. Exit 1 on the hash
+     * assertion. Both halves matter: without the arm it refuses a file it
+     * could have had, and without the final check it would install a short one.
+     */
+    const server = await start({
+      rangeTotalDelta: 4096,
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    const result = await downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 });
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(withUrl(server.url))))).toBe(sha(payload));
+    // More than the two a well-behaved resume would have needed.
+    expect(server.requests.length).toBeGreaterThan(2);
+  }, 15000);
+});
+
+describe('a resume whose range declares no total at all', () => {
+  it('refuses a download that ends short of the length the server first stated', async () => {
+    /*
+     * THE BLIND SPOT IN THE PER-RESPONSE CHECK, and the only thing the final
+     * one catches that nothing else does.
+     *
+     * `content-range: bytes N-M/*` is legal — the server is saying "here is
+     * this much, I will not tell you how big the whole thing is". With no
+     * total there is nothing for `consume` to compare its delivery against, so
+     * it returns 'done' on a body that is a fraction of the file, the loop
+     * breaks, and the download looks complete to every per-response check. The
+     * FIRST response did state a length, and that is what the final check
+     * still holds it to.
+     *
+     * REVERT-CHECKED AND MISSED FIRST TIME: this test did not exist, and
+     * deleting the final check left the whole suite green. The check had
+     * shipped unguarded — exactly the defect this milestone exists to close.
+     *
+     * FAULT INJECTED: the `state.declared !== null && written !== declared`
+     * arm removed. Observed: the download RESOLVED with `totalBytes: 6291456`
+     * — 6 MiB of a 9,449,529-byte model — recorded as a complete install.
+     * Exit 1.
+     */
+    const server = await start({
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+      starRange: (attempt) => (attempt > 0 ? 1024 * 1024 : null),
+    });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
+      /where the server said/,
+    );
+    expect(useModels.getState().installed[m.id]).toBeUndefined();
+  }, 20000);
+});
+
+describe('a server that offers no validator to resume against', () => {
+  it('refetches from zero rather than splicing two builds together', async () => {
+    /*
+     * THE DEFECT THIS TEST EXISTS FOR, AND THE ONE THE DOCSTRING LIED ABOUT.
+     *
+     * `ETag` and `Last-Modified` are both OPTIONAL. With neither, there is
+     * nothing to send as `If-Range`, so a resumed `Range` request cannot
+     * detect that the file was republished between attempts — and the code
+     * sent the `Range` anyway, under a docstring reading "guarded by
+     * `If-Range` against the file changing underneath it. That is the whole
+     * claim."
+     *
+     * This server offers no validator AND serves DIFFERENT BYTES on the
+     * retry. The correct outcome is the second body, whole. The outcome the
+     * old code produced is the first body's head with the second body's tail:
+     * a file with valid GGUF magic, the exactly right length, and garbage
+     * inside — which is why this asserts on the HASH and why the magic check
+     * added alongside it would not have caught it.
+     *
+     * FAULT INJECTED: the `state.written > 0 && state.validator === null`
+     * restart removed, restoring `if (state.validator) headers['If-Range']`.
+     * Observed: request 2 carried `Range: bytes=5242880-` and no `If-Range`;
+     * the file on disk was 9,449,529 bytes — the right LENGTH — and its
+     * sha256 matched NEITHER body. Exit 1 on the hash comparison.
+     */
+    const second = Buffer.concat([
+      Buffer.from('GGUF', 'latin1'),
+      randomBytes(PAYLOAD_BYTES - 4),
+    ]);
+    const server = await start({
+      etag: undefined,
+      bodyAt: (attempt) => (attempt === 0 ? payload : second),
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+
+    const result = await downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 });
+
+    // The retry asked for the WHOLE file, not for a continuation.
+    expect(server.requests).toHaveLength(2);
+    expect(server.requests[1]!.range).toBeUndefined();
+    expect(server.requests[1]!.ifRange).toBeUndefined();
+
+    const written = readFileSync(modelPath(withUrl(server.url)));
+    expect(written.length).toBe(second.length);
+    expect(sha(written)).toBe(sha(second));
+    expect(sha(written)).not.toBe(sha(payload));
+    expect(result.totalBytes).toBe(second.length);
+  });
+
+  it('still resumes where the server DOES offer one', async () => {
+    // The control. The refusal above must be about the missing validator and
+    // not about resume having quietly stopped working.
+    const server = await start({
+      etag: '"v1"',
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    await downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 });
+    expect(server.requests[1]!.range).toMatch(/^bytes=\d+-$/);
+    expect(server.requests[1]!.ifRange).toBe('"v1"');
+  });
+
+  it('resumes on Last-Modified alone, which is also a validator', async () => {
+    const server = await start({
+      etag: undefined,
+      lastModified: 'Wed, 21 Oct 2026 07:28:00 GMT',
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    await downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 });
+    expect(server.requests[1]!.ifRange).toBe('Wed, 21 Oct 2026 07:28:00 GMT');
+  });
+});
+
+describe('a server that will not let the download make progress', () => {
+  it('bounds a server that answers 416 to everything', async () => {
+    /*
+     * THE INFINITE LOOP, EXACTLY AS IT WAS.
+     *
+     * The 416 arm truncates the sink and sets `written` back to zero, so the
+     * next request carries no `Range`, so the next answer is another 416. The
+     * restart arm was `consecutive = 0; continue;` — no budget consulted, no
+     * sleep, no ceiling — and `attempts` was incremented at the top of the
+     * loop and never read on this path.
+     *
+     * FAULT INJECTED: the restart arm restored to `consecutive = 0;
+     * continue;`. Observed: the test did not fail, it HUNG — vitest killed it
+     * at the 5s timeout with the server having recorded 41,000+ requests and
+     * still climbing. A hang is what an unbounded loop looks like from the
+     * outside, which is why this test has a request-count ceiling and not only
+     * a rejects assertion. Exit 1.
+     */
+    const server = await start({ always416: true });
+    const m = withUrl(server.url);
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow(
+      /kept restarting this download/,
+    );
+    expect(server.requests.length).toBeLessThanOrEqual(CONSECUTIVE_CEILING);
+    expect(server.requests.length).toBeGreaterThan(1);
+
+    await useModels.getState().install(m);
+    expect(useModels.getState().installed[m.id]?.state).toBe('failed');
+  }, 5000);
+
+  it('backs off between restarts instead of spinning', async () => {
+    /*
+     * The other half of the same defect: the restart arm never slept, so even
+     * a bounded version would hammer a struggling server as fast as the event
+     * loop allows. `retryDelayMs` is the seam the tests use to avoid sleeping;
+     * here it is deliberately NOT zero, so the pause is observable.
+     *
+     * FAULT INJECTED: the `await pause(...)` removed from the restart arm.
+     * Observed: elapsed 3 ms against a 60 ms floor. Exit 1.
+     */
+    const server = await start({ always416: true });
+    const began = Date.now();
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 30 }),
+    ).rejects.toThrow();
+    // Two sleeps before the third strike ends it.
+    expect(Date.now() - began).toBeGreaterThanOrEqual(50);
+  }, 5000);
+
+  it('bounds a server that answers a resume with a range nobody asked for', async () => {
+    /*
+     * A 206 whose `content-range` starts somewhere else. This used to fall in
+     * with the "server sent the whole file" case and its body was consumed AS
+     * THE WHOLE FILE — a slice from the middle of a model written from offset
+     * zero, with a `content-length` honestly describing the slice, so every
+     * length check agreed with it.
+     *
+     * FAULT INJECTED: the mismatched-range arm restored to `restart(); return
+     * consume(...)`. Observed: for the GGUF the magic probe refused it — so
+     * the test was re-run with `magic` removed to model a COMPANION file,
+     * which has none, and the download then resolved with a mid-file slice
+     * recorded as the installed file. Exit 1.
+     */
+    /*
+     * DRIVEN AS A FORMAT WITH NO MAGIC, on purpose. REVERT-CHECKED against the
+     * GGUF fixture first and it came back MISSED: the mid-file slice does not
+     * start with `GGUF`, so the probe refused it and the test stayed green
+     * while the range arm it was written for was gone. A companion — an
+     * mmproj, a tokenizer, a vae — has no magic at all, and that is the file
+     * this arm is the only guard for.
+     */
+    const server = await start({
+      mismatchRange: (attempt) => attempt > 0,
+      dropAfter: (attempt) => (attempt === 0 ? 5 * 1024 * 1024 : null),
+    });
+    const m = withUrl(server.url, { format: 'onnx' });
+
+    await expect(downloadModel({ manifest: m, retryDelayMs: 0 })).rejects.toThrow();
+    expect(server.requests.length).toBeLessThanOrEqual(CONSECUTIVE_CEILING + 1);
+    // And nothing that is merely a slice of the model was left behind as one.
+    const written = readFileSync(modelPath(m));
+    expect(sha(written)).not.toBe(sha(payload.subarray(5 * 1024 * 1024)));
+  }, 10000);
+
+  it('refuses a 206 fragment sent to a request that carried no Range', async () => {
+    /*
+     * The same slice, one step earlier. RFC 9110 makes 206 an ANSWER to a
+     * range request, so an unsolicited one is a broken server and its body is
+     * a fragment — which the resume checks never saw, because they only run
+     * when `resuming` is true. A first request answered `206 content-range:
+     * bytes 4096-…` had its tail written from offset zero and called the file.
+     *
+     * FAULT INJECTED: the unsolicited-206 arm removed. Observed: the download
+     * RESOLVED, with a body starting 4096 bytes into the model recorded as the
+     * installed file — and it passed the length check, because the
+     * `content-length` honestly described the fragment. Exit 1.
+     */
+    const server = await start({ mismatchRange: () => true });
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow(/part of the file when the whole one was asked for/);
+    expect(server.requests).toHaveLength(1);
+  }, 10000);
+
+  it('survives a connection that dies mid-body every single time, byte for byte', async () => {
+    /*
+     * MY OWN PREMISE WAS WRONG HERE, and the fault server said so. This was
+     * first written asserting `state:'failed'`, on the assumption that a
+     * connection dying on every attempt could not finish. It CAN: progress
+     * refunds the retry budget by design, so twenty deaths at 512 KiB apiece
+     * still walk a 9 MB file to the end. The test asserted the wrong outcome
+     * and the code was right.
+     *
+     * So this asserts what actually matters about that path — a download
+     * stitched together from twenty partial responses is BYTE FOR BYTE the
+     * file the server holds, and it is stitched with resume rather than
+     * restarts. A test "fixed" by lowering it to `rejects` would have removed
+     * the only assertion here worth having.
+     */
+    const server = await start({ dropAfter: () => 512 * 1024 });
+    const m = withUrl(server.url);
+
+    const result = await downloadModel({ manifest: m, retryDelayMs: 0 });
+
+    expect(result.totalBytes).toBe(PAYLOAD_BYTES);
+    expect(sha(readFileSync(modelPath(m)))).toBe(sha(payload));
+    expect(server.requests.length).toBeGreaterThan(10);
+    expect(server.requests.length).toBeLessThanOrEqual(40);
+    // Resumed, not restarted: every request after the first carried a Range.
+    expect(server.requests.slice(1).every((r) => /^bytes=\d+-$/.test(r.range ?? ''))).toBe(true);
+  }, 30000);
+
+  it('bounds a server that ignores Range and restarts from zero every time', async () => {
+    // It never resumes and never finishes, and the ceiling is what ends it.
+    const server = await start({
+      ignoreRange: true,
+      dropAfter: () => 2 * 1024 * 1024,
+    });
+    await expect(
+      downloadModel({ manifest: withUrl(server.url), retryDelayMs: 0 }),
+    ).rejects.toThrow();
+    expect(server.requests.length).toBeLessThanOrEqual(40);
+  }, 20000);
 });
 
 /* ── The platform branch ─────────────────────────────────────────────── */
