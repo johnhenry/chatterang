@@ -15,6 +15,7 @@
 export { assertCloneable, NotCloneableError } from './clone.js';
 export {
   BOOTSTRAP_CHANNEL,
+  COMMAND_CHANNEL,
   EVENT_CHANNEL,
   LISTENER_ADD_CHANNEL,
   LISTENER_REMOVE_ALL_CHANNEL,

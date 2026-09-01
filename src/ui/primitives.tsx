@@ -15,7 +15,81 @@ import {
 import { createPortal } from 'react-dom';
 
 import { Icon, type IconName } from '@/ui/Icon';
-import { registerCommand } from '@/lib/keys';
+import { pushModalLayer, registerCommand } from '@/lib/keys';
+
+/**
+ * What Tab may land on inside a dialog.
+ *
+ * `:not(:disabled)` ON EVERY ONE THAT CAN CARRY IT, which is the whole point
+ * of writing this out rather than leaving the four-selector version inline.
+ * A disabled control matches `button` and is returned by `querySelectorAll`,
+ * but `focus()` on it does NOTHING — so when the panel's LAST focusable was
+ * disabled, `last` was an element that could never become `document
+ * .activeElement`, the "are we at the end?" test never fired, and Tab walked
+ * straight out of an `aria-modal` dialog into the page behind it. It is not a
+ * hypothetical: the chat settings sheet disables its export button while an
+ * export is running, and that button is the last control in the panel.
+ *
+ * `[hidden]` and `[aria-hidden="true"]` are excluded for the same reason under
+ * a different name: they are in the list and cannot take focus.
+ *
+ * Not exhaustive, and deliberately: `contenteditable`, `audio[controls]`,
+ * `summary` and friends are not in this app, and a selector that lists things
+ * nobody renders is a selector nobody can check.
+ */
+export const FOCUSABLE = [
+  'button:not(:disabled)',
+  '[href]',
+  'input:not(:disabled)',
+  'select:not(:disabled)',
+  'textarea:not(:disabled)',
+  '[tabindex]:not([tabindex="-1"])',
+]
+  .map((selector) => `${selector}:not([hidden]):not([aria-hidden="true"])`)
+  .join(', ');
+
+/** Every element inside `root` that Tab can land on, in tab order. */
+export function focusableWithin(root: ParentNode): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)];
+}
+
+/**
+ * Keep Tab inside a dialog. Returns where focus was moved, or `null`.
+ *
+ * A FUNCTION RATHER THAN A CLOSURE IN AN EFFECT, so the behaviour can be
+ * driven directly. The defect it exists to close only shows up for a
+ * particular ARRANGEMENT of controls — the last focusable is disabled — and a
+ * test that could only reach it by mounting a dialog and synthesising Tab
+ * would not have been written, which is why the bug shipped.
+ *
+ * @param panel - the dialog's own element.
+ * @param event - the keydown, or anything with the two fields read here.
+ * @param active - what currently has focus, normally `document.activeElement`.
+ * @returns the element focus was moved to, or `null` when nothing was done.
+ */
+export function containTab(
+  panel: ParentNode,
+  event: { key: string; shiftKey: boolean; preventDefault: () => void },
+  active: Element | null,
+): HTMLElement | null {
+  if (event.key !== 'Tab') return null;
+  const focusable = focusableWithin(panel);
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (!first || !last) return null;
+
+  if (event.shiftKey && active === first) {
+    event.preventDefault();
+    last.focus();
+    return last;
+  }
+  if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+    return first;
+  }
+  return null;
+}
 
 /* ── Sheet ──────────────────────────────────────────────────────────── */
 
@@ -65,31 +139,36 @@ export function Sheet({ open, title, onClose, children, footer }: SheetProps): R
     });
   }, [open]);
 
+  /*
+   * `aria-modal="true"` is a PROMISE that the page behind is inert, and until
+   * this line it was only a promise to a screen reader. Declaring the layer
+   * makes the dispatch layer keep it for everyone: with a sheet open, Mod+N no
+   * longer creates a chat behind it and no menu accelerator reaches past it.
+   *
+   * Its own effect, keyed only on `open`, so it is pushed exactly once per
+   * opening and released on close or unmount — the same lifetime the dialog
+   * has, not the lifetime of whatever `onClose` the parent last rendered.
+   */
+  useEffect(() => {
+    if (!open) return undefined;
+    return pushModalLayer();
+  }, [open]);
+
   useEffect(() => {
     if (!open) return undefined;
 
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== 'Tab' || !panel.current) return;
-
-      const focusable = panel.current.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
+      if (!panel.current) return;
+      containTab(panel.current, event, document.activeElement);
     };
 
     document.addEventListener('keydown', onKeyDown);
     const previous = document.activeElement as HTMLElement | null;
-    panel.current?.querySelector<HTMLElement>('button, input, textarea')?.focus();
+    // The SAME list the trap uses. It was `'button, input, textarea'`, which
+    // has the identical disabled bug one move earlier: a dialog whose first
+    // control is disabled opened with focus nowhere, and the first Tab then
+    // started from the page behind it.
+    if (panel.current) focusableWithin(panel.current)[0]?.focus();
 
     return () => {
       document.removeEventListener('keydown', onKeyDown);

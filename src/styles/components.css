@@ -92,18 +92,25 @@
   grid-template-areas: 'history main';
   grid-template-columns: var(--history-w) minmax(0, 1fr);
   /*
-   * THE ROW IS DECLARED, and `minmax(0, 1fr)` rather than `1fr`.
+   * THE ROW IS DECLARED, and `minmax(0, 1fr)` rather than `1fr` — but it is
+   * NOT what made the session column reachable, and saying otherwise would be
+   * the same kind of guess that produced the bug.
    *
-   * The single implicit row this grid had was `auto`. An auto row stretches to
-   * the container when the content is short, which is why the layout looked
-   * right — but its MINIMUM is the content's, so a tall enough column would
-   * have pushed the row past the body and been clipped by `.app`'s
-   * `overflow: hidden` instead of scrolling. `minmax(0, 1fr)` says the row is
-   * exactly the body's height whatever is in it, which is the precondition for
-   * `.history__body` to be the scroller rather than the overflow.
+   * WHAT WAS MEASURED. Reverting this line alone, with 200 chats seeded in a
+   * real engine at 1208 and 1440, changes NOTHING: the column still scrolls
+   * and the 200th chat is still hittable. The single implicit row was `auto`,
+   * and an auto row's minimum is its content's — but both children carry
+   * `min-height: 0`, so their min-content contribution is zero and the row
+   * never grew. The actual defect was one level down and is described at
+   * `.history__body > *` below.
    *
-   * Measured with 200 seeded chats in a real engine at 1184 and 1440 —
-   * tests/layout-engine.test.ts — which is the only place this is visible.
+   * WHAT IT DOES GUARD, also measured, because a declaration that guards
+   * nothing should be deleted rather than explained. With this line removed
+   * AND `.history`'s `min-height: 0` removed, the column stops scrolling and
+   * the 200th chat is unreachable again; with this line present and that
+   * `min-height` removed, it holds. So the row makes the scroller's existence
+   * independent of a `min-height` on a sibling rule — which is exactly the
+   * kind of coupling that is invisible until someone tidies the sibling away.
    */
   grid-template-rows: minmax(0, 1fr);
 }
@@ -169,17 +176,24 @@
 /*
  * WHY A SCROLL CONTAINER'S CHILDREN MUST NOT SHRINK.
  *
- * This is the rule that made A7's headline feature reachable, and its absence
- * is invisible to a static reading of the sheet: `.history__body` already had
- * `overflow-y: auto` and `min-height: 0`, which is everything the recipe asks
- * for. But it is also a FLEX COLUMN, and a flex item's default is
- * `flex-shrink: 1` — so `.card--flush`, which holds every row, was shrunk to
- * whatever height was left instead of overflowing. It clips (`overflow:
- * hidden`, for the rounded corners), so the rows past the fold were laid out
- * and then cut off: `scrollHeight === clientHeight`, nothing to scroll, and
- * the 191st of 200 chats sat at y=14016 in a box 617px tall.
+ * THIS IS THE RULE THAT MADE A7'S HEADLINE FEATURE REACHABLE. Its absence is
+ * invisible to a static reading of the sheet, because every declaration around
+ * it is right: `.history__body` already had `overflow-y: auto` and
+ * `min-height: 0`, which is the whole recipe as it is usually written down.
  *
- * Measured in a real engine, before and after — tests/layout-engine.test.ts.
+ * But `.history__body` is also a FLEX COLUMN, and a flex item's default is
+ * `flex-shrink: 1` — so `.card--flush`, the single child that holds every row,
+ * was shrunk to whatever height was left instead of overflowing its parent.
+ * The card clips (`overflow: hidden`, for the rounded corners), so the rows
+ * past the fold were laid out and then cut off. The scroller had nothing to
+ * scroll: `scrollHeight === clientHeight`, exactly, and about nine chats of a
+ * list of 200 were reachable by mouse, touch or keyboard.
+ *
+ * Measured in a real engine with 200 chats, before and after, in BOTH
+ * containers — tests/layout-engine.test.ts. Removing this rule today fails
+ * four assertions in that file: the column at 1208 and at 1440, and the sheet
+ * at 390 and at 900.
+ *
  * `flex-shrink` rather than `flex: none`, so a child that legitimately asks to
  * grow into spare room still can.
  */
@@ -251,7 +265,7 @@
  * piece of ambient motion in the app, and it encodes real state.
  */
 .thermal {
-  height: 2px;
+  height: var(--g-hair);
   background: var(--line);
   overflow: hidden;
   position: relative;
@@ -344,8 +358,8 @@
   top: 0;
   left: 50%;
   transform: translateX(-50%);
-  width: 22px;
-  height: 2px;
+  width: var(--g-mark);
+  height: var(--g-hair);
   background: var(--ember);
   border-radius: 0 0 var(--r-full) var(--r-full);
 }
@@ -481,6 +495,17 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /*
+   * ZERO, BECAUSE THIS IS SOMETIMES A <button>.
+   *
+   * base.css resets a button's font, colour, background and border and does
+   * not reset its PADDING, so Chrome's user-agent `padding: 1px 6px` survived
+   * — but only where the row's main area is a button. `SettingRow` renders it
+   * as a <div> and `ChatList` as a <button>, so the same row was 12px narrower
+   * and 6px out of alignment on one screen and not the other. Measured in the
+   * session column: the title box was 134px where the derivation said 146.
+   */
+  padding: 0;
 }
 
 .list__title {
@@ -653,8 +678,8 @@
 }
 
 .dot {
-  width: 6px;
-  height: 6px;
+  width: var(--g-dot);
+  height: var(--g-dot);
   border-radius: var(--r-full);
   background: currentColor;
   flex: none;
@@ -742,7 +767,7 @@
 
 .textarea {
   resize: vertical;
-  min-height: 88px;
+  min-height: var(--field-min);
   line-height: var(--lh-body);
 }
 
@@ -761,16 +786,24 @@
 }
 
 /* Range slider — used heavily by the sampler panel, so it earns real care. */
+/*
+ * The slider, sized by its THUMB rather than by a number.
+ *
+ * `--ctl-thumb` is a pointer target on the density axis; the rail it runs on
+ * is a graphic. The input's own height only has to contain the thumb, so one
+ * token does both and the drag target cannot drift away from the box that
+ * receives the drag.
+ */
 .slider {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
-  height: 22px;
+  height: var(--ctl-thumb);
   background: transparent;
 }
 
 .slider::-webkit-slider-runnable-track {
-  height: 3px;
+  height: var(--g-track);
   background: var(--line-strong);
   border-radius: var(--r-full);
 }
@@ -778,8 +811,8 @@
 .slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 18px;
-  height: 18px;
+  width: var(--ctl-thumb);
+  height: var(--ctl-thumb);
   margin-top: -7.5px;
   border-radius: var(--r-full);
   background: var(--surface);
@@ -789,14 +822,14 @@
 }
 
 .slider::-moz-range-track {
-  height: 3px;
+  height: var(--g-track);
   background: var(--line-strong);
   border-radius: var(--r-full);
 }
 
 .slider::-moz-range-thumb {
-  width: 18px;
-  height: 18px;
+  width: var(--ctl-thumb);
+  height: var(--ctl-thumb);
   border-radius: var(--r-full);
   background: var(--surface);
   border: 2px solid var(--ember);
@@ -1065,10 +1098,15 @@
   margin-inline: auto;
 }
 
+/*
+ * An attached image. NOT A CONTROL — it is what a pointer target sits on top
+ * of, and putting it in the density axis would resize the picture rather than
+ * anything anyone taps.
+ */
 .attachment {
   position: relative;
-  width: 56px;
-  height: 56px;
+  width: var(--g-thumbnail);
+  height: var(--g-thumbnail);
   border-radius: var(--r-sm);
   overflow: hidden;
   border: var(--hairline) solid var(--line);
@@ -1081,12 +1119,23 @@
   object-fit: cover;
 }
 
+/*
+ * The remove badge, at 18px — under WCAG 2.5.8's 24px, and allowed to be.
+ *
+ * The spacing exception applies here and is checked rather than assumed: the
+ * exception is available when no other target's 24px circle intersects this
+ * one's, and the nearest other target is the remove badge on the next
+ * thumbnail, `--g-thumbnail` + `--s-2` = 64px away. That is the opposite of
+ * the situation in the rail and the list rows, where targets sit 4px and 12px
+ * apart and the exception is unavailable — which is why those are on the
+ * density axis and this is a graphic.
+ */
 .attachment__remove {
   position: absolute;
   top: 2px;
   right: 2px;
-  width: 18px;
-  height: 18px;
+  width: var(--g-glyph);
+  height: var(--g-glyph);
   border-radius: var(--r-full);
   background: var(--overlay);
   color: #fff;
@@ -1292,7 +1341,7 @@
   font-size: var(--t-xs);
   line-height: 1.65;
   max-height: 44dvh;
-  min-height: 140px;
+  min-height: var(--term-min);
   overflow-y: auto;
   overscroll-behavior: contain;
   display: flex;
@@ -1419,7 +1468,7 @@
 }
 
 .meter__track {
-  height: 5px;
+  height: var(--g-track-lg);
   border-radius: var(--r-full);
   background: var(--surface-3);
   overflow: hidden;
@@ -1573,8 +1622,8 @@
 }
 
 .sheet__grip {
-  width: 34px;
-  height: 4px;
+  width: var(--g-grip-w);
+  height: var(--g-grip);
   border-radius: var(--r-full);
   background: var(--line-strong);
   margin: var(--s-2) auto var(--s-1);
@@ -1702,8 +1751,8 @@
 }
 
 .spinner {
-  width: 14px;
-  height: 14px;
+  width: var(--g-spinner);
+  height: var(--g-spinner);
   border-radius: var(--r-full);
   border: 2px solid currentColor;
   border-top-color: transparent;
@@ -1757,8 +1806,8 @@
     top: 50%;
     left: 0;
     transform: translateY(-50%);
-    width: 2px;
-    height: 18px;
+    width: var(--g-hair);
+    height: var(--g-glyph);
     border-radius: 0 var(--r-full) var(--r-full) 0;
   }
 
@@ -1805,7 +1854,7 @@
  * number — because the number (`--history-w`) already moved in the token
  * layer, and the grid that consumes it is written unconditionally above.
  */
-@media (min-width: 1184px) {
+@media (min-width: 1208px) {
   .history {
     display: flex;
   }

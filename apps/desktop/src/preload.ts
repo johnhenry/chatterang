@@ -4,12 +4,15 @@
  * Runs before any page script, in an isolated world with `ipcRenderer` in
  * scope. It does exactly two things:
  *
- *   1. publishes five functions through `contextBridge` — no `ipcRenderer`, no
+ *   1. publishes six functions through `contextBridge` — no `ipcRenderer`, no
  *      `require`, no `process`, and no way for the page to name a channel the
- *      boot manifest does not contain;
+ *      boot manifest does not contain. The sixth, `onCommand`, is a
+ *      SUBSCRIPTION rather than a call: it is how a menu accelerator reaches
+ *      `src/lib/keys.ts` now that the main-world `__chatterangCommand`
+ *      dispatcher has been removed;
  *   2. evaluates `capacitor-shim.ts`'s own source in the MAIN world, which is
  *      what makes the app bundle's `registerPlugin('LlamaCpp', …)` resolve to
- *      those five functions with no change to `src/`.
+ *      the five plugin functions with no change to `src/`.
  *
  * Step 2 cannot be done through `contextBridge`: it publishes frozen objects,
  * and `@capacitor/core`'s `createCapacitor` writes to `window.Capacitor`
@@ -40,8 +43,8 @@ const ipc: RendererIpc = {
 const bridge = createRendererBridge(ipc);
 
 // Exposed key by key from the shared allowlist rather than as one object, so
-// the five names in `BRIDGE_KEYS` are the five names the page can see, and a
-// sixth property added to the bridge object later does not silently ship.
+// the names in `BRIDGE_KEYS` are the names the page can see, and a property
+// added to the bridge object later does not silently ship.
 const exposed = Object.fromEntries(
   BRIDGE_KEYS.map((key) => [key, (bridge as unknown as Record<string, unknown>)[key]]),
 ) as unknown as PreloadBridge;

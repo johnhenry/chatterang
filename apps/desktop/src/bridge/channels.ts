@@ -24,8 +24,20 @@ import type { BootManifest, PluginDefinition } from './protocol.js';
 /** Renderer -> main, once, at preload time. Answers with the boot manifest. */
 export const BOOTSTRAP_CHANNEL = 'chatterang:bootstrap';
 
-/** Main -> renderer. The ONLY inbound channel; carries every plugin event. */
+/** Main -> renderer. Carries every plugin event. */
 export const EVENT_CHANNEL = 'chatterang:event';
+
+/**
+ * Main -> renderer. Carries a menu accelerator's command id, and nothing else.
+ *
+ * INBOUND ONLY, like `EVENT_CHANNEL`, and for a sharper reason. This is the
+ * external door into the app's command dispatcher, so a renderer that could
+ * SEND on it would be able to drive the app from the page — which is precisely
+ * the property the main-world `__chatterangCommand` global had and the reason
+ * it was removed. `allowedChannels` therefore omits it, and the preload
+ * exposes only a subscription: the page can ask to be told, never to tell.
+ */
+export const COMMAND_CHANNEL = 'chatterang:command';
 
 /** Renderer -> main. Subscription lifecycle, plugin named in the payload. */
 export const LISTENER_ADD_CHANNEL = 'chatterang:listener:add';
@@ -40,8 +52,8 @@ export function methodChannel(plugin: string, method: string): string {
 /**
  * Every channel a renderer may legitimately name, given this manifest.
  *
- * `EVENT_CHANNEL` is not in the set: it is inbound only, and a renderer has no
- * business sending on it.
+ * `EVENT_CHANNEL` and `COMMAND_CHANNEL` are not in the set: both are inbound
+ * only, and a renderer has no business sending on either.
  */
 export function allowedChannels(manifest: BootManifest): ReadonlySet<string> {
   const channels = new Set<string>([
@@ -68,6 +80,7 @@ export function channelCollisions(plugins: readonly PluginDefinition[]): string[
   const seen = new Set<string>([
     BOOTSTRAP_CHANNEL,
     EVENT_CHANNEL,
+    COMMAND_CHANNEL,
     LISTENER_ADD_CHANNEL,
     LISTENER_REMOVE_CHANNEL,
     LISTENER_REMOVE_ALL_CHANNEL,

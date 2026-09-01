@@ -47,6 +47,7 @@ import {
   DEFAULT_POLICY,
   DSH_METHODS,
   DSH_PLUGIN,
+  COMMAND_CHANNEL,
   EVENT_CHANNEL,
   HANDLE_LOST,
   HOST_TIMEOUT,
@@ -412,6 +413,8 @@ interface Harness {
   readonly hosts: LinkPair[];
   killHost(reason?: string): void;
   destroyRenderer(): void;
+  /** Deliver on the inbound command channel, as a menu accelerator would. */
+  fireCommand(payload: unknown): void;
 }
 
 interface HarnessOptions {
@@ -428,6 +431,7 @@ function harness(
   const hosts: LinkPair[] = [];
 
   let eventListener: ((payload: unknown) => void) | null = null;
+  let commandListener: ((payload: unknown) => void) | null = null;
   let rendererAlive = true;
 
   const host = new PluginHost((_senderId, payload) => {
@@ -481,6 +485,7 @@ function harness(
     },
     on(channel, listener) {
       if (channel === EVENT_CHANNEL) eventListener = listener;
+      if (channel === COMMAND_CHANNEL) commandListener = listener;
     },
   };
 
@@ -497,6 +502,9 @@ function harness(
     channels,
     hosts,
     killHost: (reason = 'SIGKILL') => hosts[hosts.length - 1]?.kill(reason),
+    // What `main.ts` does when a menu accelerator fires: one send, inbound
+    // only, carrying a command id and nothing else.
+    fireCommand: (payload: unknown) => commandListener?.(payload),
     destroyRenderer: () => {
       rendererAlive = false;
       // Through the same dispatcher `main.ts` uses, rather than a copy of what
@@ -1028,7 +1036,7 @@ describe('values that cannot cross are refused, not silently mangled', () => {
 /* ══ The channel allowlist ══════════════════════════════════════════════ */
 
 describe('the renderer can only ever name a channel from the manifest', () => {
-  it('exposes exactly the five allowlisted functions', () => {
+  it('exposes exactly the allowlisted functions and nothing else', () => {
     const h = harness(scripted(async (o) => endEvent(o.requestId, 'stop')));
     // Asserted against the PRELOAD object, which is the one `contextBridge`
     // actually publishes — the page's view is built from it by the shim and
@@ -1043,6 +1051,46 @@ describe('the renderer can only ever name a channel from the manifest', () => {
     for (const key of BRIDGE_KEYS) expect(typeof exposed[key]).toBe('function');
     expect((h.preload as unknown as Record<string, unknown>)['ipcRenderer']).toBeUndefined();
     expect((h.preload as unknown as Record<string, unknown>)['require']).toBeUndefined();
+  });
+
+  it('carries a menu accelerator to a page listener, and only inbound', () => {
+    /*
+     * THE SECOND DOOR, END TO END THROUGH THE REAL BRIDGE.
+     *
+     * `src/lib/keys.ts` used to publish `globalThis.__chatterangCommand` — a
+     * command dispatcher in the MAIN world, callable by anything running in
+     * the renderer. The replacement is this: main SENDS, the page LISTENS, and
+     * `COMMAND_CHANNEL` is absent from `allowedChannels` so the renderer
+     * bridge would refuse to build the string even if a page asked for it.
+     */
+    const h = harness(scripted(async (o) => endEvent(o.requestId, 'stop')));
+    const seen: string[] = [];
+    const off = h.exposed.onCommand((id) => seen.push(id));
+
+    h.fireCommand('chat.new');
+    expect(seen).toEqual(['chat.new']);
+
+    // Not a string: dropped rather than delivered as whatever it is.
+    h.fireCommand({ id: 'chat.new' });
+    h.fireCommand(undefined);
+    expect(seen).toEqual(['chat.new']);
+
+    off();
+    h.fireCommand('chat.new');
+    expect(seen).toEqual(['chat.new']);
+
+    // And the page cannot SEND on it: the channel is not in the allowlist.
+    const manifest = h.preload.getBootstrap();
+    expect([...allowedChannels(manifest)]).not.toContain(COMMAND_CHANNEL);
+    expect(h.channels).not.toContain(COMMAND_CHANNEL);
+  });
+
+  it('keeps the command channel out of the collision namespace by name', () => {
+    // A plugin that declared a method whose channel collided with the command
+    // channel would silently replace this handler. `channelCollisions` seeds
+    // its set with every inbound name for exactly that reason.
+    expect(COMMAND_CHANNEL).not.toBe(EVENT_CHANNEL);
+    expect(COMMAND_CHANNEL.startsWith('chatterang:')).toBe(true);
   });
 
   it('touches no channel outside the allowlist during a whole session', async () => {

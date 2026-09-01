@@ -69,6 +69,32 @@
 
   --hairline: 1px;
 
+  /* ---- Graphic scale ----------------------------------------------------
+   * Dimensions that are MARKS rather than TARGETS: rules, tracks, dots,
+   * grips, spinners, thumbnails. Named so the component sheet holds no bare
+   * pixel heights at all — tests/layout.test.ts asserts that, and asserts it
+   * as zero offenders rather than as a list of exemptions, because a list of
+   * exemptions is where the next control hides.
+   *
+   * DELIBERATELY OUTSIDE THE DENSITY AXIS, which is the distinction the axis
+   * is for. A 2px rule is 2px whether it is pointed at with a finger or a
+   * mouse; scaling it would not make anything easier to hit, it would just
+   * make the drawing wrong. Everything a pointer actually lands on is in the
+   * block above.
+   */
+  --g-hair: 2px; /* the thermal strip; the tab bar's current-page mark */
+  --g-track: 3px; /* the slider's rail */
+  --g-grip: 4px; /* the sheet's drag grip, thickness */
+  --g-track-lg: 5px; /* the meter's track */
+  --g-dot: 6px; /* a status dot */
+  --g-spinner: 14px;
+  --g-glyph: 18px; /* a glyph-sized square: the wide tab mark, the remove badge */
+  --g-mark: 22px; /* the narrow tab bar's current-page mark, long axis */
+  --g-grip-w: 34px; /* the sheet's drag grip, length */
+  --g-thumbnail: 56px; /* an attached image. Not a control: see components.css */
+  --field-min: 88px; /* a textarea's opening height — about four lines */
+  --term-min: 140px; /* the shell's transcript, before it has any output */
+
   /* ---- Density axis -----------------------------------------------------
    * --tap is a TOUCH minimum — 44px, WCAG 2.5.5 (AAA) — and it does not move.
    * A finger has a contact patch; a mouse cursor is a point. So the control
@@ -98,6 +124,18 @@
    * 32, because those are aimed at rather than fallen into on the way past.
    */
   --tap: 44px; /* touch minimum, WCAG 2.5.5 (AAA) — never scaled down */
+  /*
+   * The slider's thumb, which is a DRAG target and was a bare 18px.
+   *
+   * 18 fails WCAG 2.5.8 (24px, AA) for every pointer, and the spacing
+   * exception is unavailable: a sampler panel stacks sliders --s-3 apart. It
+   * is in the density axis because a finger and a mouse want different things
+   * from a thing you drag — but its fine-pointer value is 24 rather than the
+   * 28 the tap-target floor uses, and that is a decision rather than an
+   * oversight: 28px of thumb on a 3px rail reads as a bug, and 24 is the
+   * standard's own number for a target you aim at with a cursor.
+   */
+  --ctl-thumb: 28px;
   --ctl-row: var(--tap); /* full-width rows: list items, tab bar items */
   --ctl-rail: 46px; /* the two strips of the instrument rail */
   --ctl-lg: 40px; /* composer field, send button, composer icon buttons */
@@ -117,8 +155,20 @@
    * adds its own padding on top, so the thread and the composer align to the
    * same text edge rather than the same box edge.
    *
-   * `ch` is the advance of "0", not the average glyph. Archivo's digit is
-   * ~0.57em, so 66ch is roughly 64 rendered characters at --t-base.
+   * `ch` is the advance of "0", not the average glyph — so 66ch is not 66
+   * characters, and it is not 64 either, which is what this comment used to
+   * say. MEASURED in a real engine at --t-base, and asserted rather than
+   * quoted (tests/layout-engine.test.ts):
+   *
+   *   Archivo         1ch = 8.590px    average prose advance = 6.637px
+   *   fallback face   1ch = 9.448px    average prose advance = 6.946px
+   *
+   * so 66ch is 566.97px of Archivo, which is 85 rendered characters of
+   * ordinary prose — a THIRD MORE than the old figure, because the digit is
+   * ~29% wider than the average letter rather than narrower than it. 85 sits
+   * inside the 45-to-90 band typography asks for; 64 would have been an
+   * argument for widening the measure, which is why getting it wrong mattered.
+   * The sentence the advance is measured from lives in the probe.
    */
   --measure: 66ch;
   --content-wide: 100%;
@@ -207,7 +257,7 @@
  * Workbench: wide enough to keep the session list OPEN, beside the thread,
  * instead of behind a modal.
  *
- * WHERE 1152 COMES FROM. It is a sum of three widths this app already had, not
+ * WHERE 1208 COMES FROM. It is a sum of three widths this app already had, not
  * a device and not a round number. Above 920 the shell is `rail | body`, and
  * both columns are spoken for; the reading column stops growing at the measure
  * and everything past that is gutter. The workbench tier spends that gutter on
@@ -216,41 +266,72 @@
  * the window gets wider, which is the exact defect the 920 tier exists to fix
  * (see the note above, and the invariant in tests/layout.test.ts).
  *
- *   --rail-w                                     232
- *   --history-w                                  304
- *   --measure (66ch)                             594
- *   2 × --pad-screen (the thread's own gutters)   48
- *                                               ————
- *                                              1178
+ *   --rail-w                                      232
+ *   --history-w                                   304
+ *   --measure (66ch, MEASURED at 9.448px/ch)   623.58
+ *   2 × --pad-screen (the thread's own gutters)    48
+ *                                              ———————
+ *                                              1207.58
  *
- * 1184 is the next multiple of 8 above that floor. At 1183 the thread sits at
- * its cap with ~150px of dead gutter either side; at 1184 the thread is
- * exactly as wide as it was and the gutter has become the session list.
+ * 1208 is the next multiple of 8 above that floor. At 1207 the thread sits at
+ * its cap with dead gutter either side; at 1208 the thread is exactly as wide
+ * as it was and the gutter has become the session list.
  *
- * WHY 594 AND NOT 564 FOR THE MEASURE. `ch` is the advance of "0" IN THE FONT
- * THAT ACTUALLY RENDERED, measured live — not in the font we hope loaded.
- * Archivo's digit is ~0.57em, which puts 66ch at 564px and the sum at 1148;
- * the rest of the declared stack (system-ui / SF Pro, Segoe UI, the generic
- * sans) runs up to ~0.60em, which puts 66ch at 594px and the sum at 1178. The
- * tier is sized for the wider end, because the narrower end is not the case
- * that breaks: a threshold tuned to 1148 would be correct once Archivo is
- * resident and would narrow the reading column during the font swap, on the
- * first paint of a cold load, and for anyone who blocks web fonts.
- * tests/layout.test.ts checks the fit at both ratios for this reason.
+ * IT WAS 1184, AND 1184 WAS TOO NARROW. The old sum reasoned about a ~594px
+ * fallback measure, from an assumed 0.60em digit. The digit was never
+ * measured. Driven in a real engine with the web font removed from the stack,
+ * `1ch` resolves to 9.448px on this machine — 0.630em — which puts 66ch at
+ * 623.58px and the floor 24px above where 1184 sat. The consequence was not
+ * theoretical and is recorded in the probe's own sweep: with Archivo absent
+ * the reading measure was 623.58px at 920px of viewport and 615px at 1199px.
+ * The window got 279px wider and the text column got 8.6px NARROWER, which is
+ * precisely the defect this tier's arithmetic exists to prevent.
+ *
+ * WHY THE WIDER FACE DECIDES. `ch` is the advance of "0" IN THE FONT THAT
+ * ACTUALLY RENDERED. With Archivo resident the sum is 232 + 304 + 566.97 + 48
+ * = 1150.97 and a threshold of 1152 would be correct — while the font is
+ * resident. It is not resident offline, it is not resident on the first paint
+ * of a cold load, and it is never resident for someone who blocks web fonts.
+ * A threshold tuned to the narrow face is a threshold that breaks in exactly
+ * those three cases, so the tier is sized for the wide one. Both are measured
+ * live and both are asserted, in tests/layout-engine.test.ts.
  *
  * WHY 304 FOR THE HISTORY COLUMN. A row in that list is
- * `[title + preview] [pin] [delete]`, and it is measured, not guessed:
- * `.list__item` contributes 2 × --s-4 of padding (32) and two --s-3 gaps (24),
- * and the two icon buttons are --icon-btn each (2 × 36 = 72). That is 128px
- * before a single character of title. The remaining 176px carries ~23
- * characters at --t-base, which is the point where two chats opened from
- * similar prompts stop looking identical in the list. 128 + 176 = 304.
+ * `[title + preview] [pin] [delete]`, and the width left for the title is
+ * MEASURED rather than derived — the derivation that used to sit here said
+ * "the remaining 176px carries ~23 characters" and was wrong twice over. It
+ * counted `.list__item`'s own padding (2 × --s-4 = 32) and its two --s-3 gaps
+ * (24) and the two --icon-btn buttons, and stopped there. It omitted
+ * `.history__body`'s 12px of padding on each side, the card's two 1px borders,
+ * `.history`'s own right border, and — once the list is long enough to need
+ * one, which is the whole point of the column — the scrollbar. It also counted
+ * characters with the advance of "0", which is 29% wider than a letter.
+ *
+ * Measured at 1208 with 200 chats seeded and a fine pointer:
+ *
+ *   --history-w                                   304
+ *   .history__body padding-inline (2 × 12)        -24
+ *   .card border (2 × 1)                           -2
+ *   .history border-right                          -1
+ *   the scrollbar the 200 rows summon              -11
+ *   .list__item padding-inline (2 × --s-4)        -32
+ *   .list__item gaps (2 × --s-3)                  -24
+ *   pin + delete (2 × --icon-btn, fine pointer)   -64
+ *                                                 ————
+ *   the title box                                  146
+ *
+ * which is 22 characters of prose at --t-base (146 / 6.637). Twenty is enough
+ * for two chats opened from similar prompts to stop looking different in the
+ * list, so 304 holds with two characters in hand — and the old claim of 23 was
+ * never available at any width. tests/layout-engine.test.ts measures this
+ * rather than restating it, because four of the eight rows above are things a
+ * static reading of the sheet cannot see.
  *
  * A tier is a statement about CONTENT, so nothing here mentions a device: an
  * Electron window at 800px gets the modal, and a tablet in landscape at 1194px
- * gets the column.
+ * gets the modal too, because 1194 is not enough room for three columns.
  */
-@media (min-width: 1184px) {
+@media (min-width: 1208px) {
   :root {
     --history-w: 304px;
   }
@@ -267,6 +348,7 @@
  */
 @media (pointer: fine) {
   :root {
+    --ctl-thumb: 24px; /* WCAG 2.5.8's own floor; see the note above */
     --ctl-row: 34px;
     --ctl-rail: 38px;
     --ctl-lg: 34px;

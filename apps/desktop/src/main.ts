@@ -49,11 +49,12 @@ import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
-import { BrowserWindow, app, ipcMain, protocol, shell, utilityProcess } from 'electron';
-import type { WebContents } from 'electron';
+import { BrowserWindow, Menu, app, ipcMain, protocol, shell, utilityProcess } from 'electron';
+import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
   BOOTSTRAP_CHANNEL,
+  COMMAND_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
   FILESYSTEM_PLUGIN,
@@ -82,6 +83,8 @@ import {
   resolveBundleUrl,
 } from './security.js';
 import { createFilesystemPlugin } from './fs/filesystem.js';
+import { buildMenuTemplate } from './menu.js';
+import type { MenuTemplateItem } from './menu.js';
 
 /** Set only in development; a packaged build must never carry one. */
 const DEV_SERVER_URL = process.env['CHATTERANG_DEV_SERVER_URL'] ?? '';
@@ -312,6 +315,58 @@ function spawnInferenceHost(engineName: string): HostHandle {
   };
 }
 
+/* ── The menu, and the second door into the dispatch layer ────────────── */
+
+/**
+ * Turn the template's `command` markers into Electron `click` handlers.
+ *
+ * THIS IS THE WHOLE OF DOOR 2, and until now nothing stood at it: `src/lib/
+ * keys.ts` published a command dispatcher with a documented external entrance
+ * and `apps/desktop` registered no menu item, no accelerator and no global
+ * shortcut, so the seam connected the app to nobody.
+ *
+ * It sends DOWN THE PRELOAD BRIDGE — one inbound-only channel, picked up by
+ * `createRendererBridge` and handed to whoever called `onCommand` — and NOT by
+ * executing script in the main world. `webContents.executeJavaScript` would
+ * have been one line and would have reached for exactly the main-world global
+ * this milestone removed.
+ *
+ * FIRE AND FORGET, deliberately. A `send` has no return value, so main cannot
+ * learn whether a handler claimed the command and cannot grey the item out on
+ * that basis. That is affordable now and was not before: `App.tsx` registers
+ * an app-level fallback for every chat command, so a menu item is claimable on
+ * all five tabs rather than only while the chat screen is mounted.
+ *
+ * The FOCUSED window, not a captured one. On macOS the app outlives its
+ * windows and `activate` makes another; a menu item bound to the window that
+ * happened to exist at boot would fire into a destroyed renderer.
+ */
+function toElectronMenu(
+  template: readonly MenuTemplateItem[],
+): MenuItemConstructorOptions[] {
+  return template.map((entry) => {
+    const { command, submenu, ...rest } = entry;
+    const built = { ...rest } as MenuItemConstructorOptions;
+    if (submenu) built.submenu = toElectronMenu(submenu);
+    if (command) {
+      built.click = () => {
+        const target = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+        if (target === undefined || target.isDestroyed()) return;
+        target.webContents.send(COMMAND_CHANNEL, command);
+      };
+    }
+    return built;
+  });
+}
+
+function installMenu(): void {
+  const template = buildMenuTemplate({
+    appName: app.getName(),
+    isMac: process.platform === 'darwin',
+  });
+  Menu.setApplicationMenu(Menu.buildFromTemplate(toElectronMenu(template)));
+}
+
 /* ── Sender trust ─────────────────────────────────────────────────────── */
 
 function isTrusted(event: { senderFrame: unknown; sender: WebContents }): boolean {
@@ -460,6 +515,12 @@ function start(): void {
   // EITHER host. `dispose` over the whole fleet, from the fleet, so a host
   // added later cannot be forgotten here.
   app.once('will-quit', () => fleet.dispose());
+
+  // Before the first window, so the menu is up by the time it can be used.
+  // `setApplicationMenu` REPLACES Electron's default, which on macOS is what
+  // gives a sandboxed renderer Cmd+C, Cmd+V and Cmd+Q at all — so the template
+  // carries the standard roles as well as ours. See `./menu.ts`.
+  installMenu();
 
   createWindow(pluginHost, fleet, senders);
   app.on('activate', () => {

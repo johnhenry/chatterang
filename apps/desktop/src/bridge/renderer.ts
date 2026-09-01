@@ -5,13 +5,14 @@
  *
  *   `createRendererBridge` runs in the PRELOAD. It is the only thing with an
  *   `ipcRenderer` in scope, it owns the callback table, and it derives every
- *   channel name from the boot manifest. Five functions are exposed through
+ *   channel name from the boot manifest. Six functions are exposed through
  *   `contextBridge`; the page gets no `ipcRenderer`, no `require`, no
  *   `process`, and no way to name a channel the manifest does not contain.
+ *   Five of them CALL INTO main; the sixth only subscribes to it.
  *
  *   `capacitor-shim.ts` runs in the PAGE. It seeds the two globals the real
  *   `@capacitor/core` reads at load, so `registerPlugin('LlamaCpp', …)` in
- *   `src/` resolves to these five functions and `src/` needs no change at all.
+ *   `src/` resolves to those five functions and `src/` needs no change at all.
  *   Reproducing Capacitor's proxy ourselves would have been the obvious move
  *   and the wrong one: the semantics that matter — `addListener` resolving to
  *   a `ListenerHandle`, the callback-id round trip, `removeAllListeners` — are
@@ -41,6 +42,7 @@
 
 import {
   BOOTSTRAP_CHANNEL,
+  COMMAND_CHANNEL,
   EVENT_CHANNEL,
   LISTENER_ADD_CHANNEL,
   LISTENER_REMOVE_ALL_CHANNEL,
@@ -75,10 +77,10 @@ export type InvokeResult =
 /**
  * The object `contextBridge.exposeInMainWorld` publishes.
  *
- * Five functions. The page's entire reachable surface. `BRIDGE_KEYS` below is
+ * Six functions. The page's entire reachable surface. `BRIDGE_KEYS` below is
  * the same list as data so the preload and the test assert one thing.
  *
- * Four of the five resolve an {@link InvokeResult} and NEVER reject — see the
+ * Four of the six resolve an {@link InvokeResult} and NEVER reject — see the
  * note at the top of this file. The page-facing ergonomics (a value, or a
  * throw carrying `code`) are restored in the main world by
  * `installCapacitorShim`, on the near side of nothing.
@@ -94,6 +96,24 @@ export interface PreloadBridge {
   ): Promise<InvokeResult>;
   removeListener(subscriptionId: number): Promise<InvokeResult>;
   removeAllListeners(pluginName: string): Promise<InvokeResult>;
+  /**
+   * Be told when a menu accelerator fires. Returns the unsubscribe.
+   *
+   * THE SIXTH FUNCTION, AND THE ONLY ONE THAT IS NOT A CALL INTO MAIN. It
+   * exists so `src/lib/keys.ts` can hear an accelerator without the page
+   * publishing a dispatcher of its own: the previous design installed
+   * `globalThis.__chatterangCommand(id)` in the MAIN world, which is an
+   * unauthenticated way for anything running in the renderer to drive the
+   * app. Here the page can only LISTEN. The command id is sent by
+   * `main.ts` and nothing in the page can put one on this channel —
+   * `allowedChannels` does not contain it, so the renderer bridge would
+   * refuse to build the string even if something asked.
+   *
+   * The id is passed through as an opaque string and validated on the far
+   * side by `isCommandId`, for the same reason a plugin name is re-checked
+   * on arrival: this layer's job is delivery, not meaning.
+   */
+  onCommand(listener: (commandId: string) => void): () => void;
 }
 
 /** The exact allowlist, as data. Nothing else is exposed to the page. */
@@ -103,6 +123,7 @@ export const BRIDGE_KEYS: readonly string[] = Object.freeze([
   'addListener',
   'removeListener',
   'removeAllListeners',
+  'onCommand',
 ]);
 
 /** The global the preload publishes the bridge on. */
@@ -122,12 +143,26 @@ interface CallbackRecord {
  * find a platform already present.
  *
  * @param ipc - the `ipcRenderer` slice.
- * @returns the five functions, and nothing else.
+ * @returns the six functions, and nothing else.
  */
 export function createRendererBridge(ipc: RendererIpc): PreloadBridge {
   const manifest = ipc.sendSync(BOOTSTRAP_CHANNEL) as BootManifest;
   const callbacks = new Map<number, CallbackRecord>();
   let nextSubscriptionId = 1;
+
+  /*
+   * Menu-accelerator listeners.
+   *
+   * A set rather than a single slot: `installKeyboard` is idempotent but a
+   * page can reload its React root in development, and a second subscription
+   * that replaced the first would leave the first one's teardown deleting
+   * somebody else's.
+   */
+  const commandListeners = new Set<(commandId: string) => void>();
+  ipc.on(COMMAND_CHANNEL, (raw: unknown) => {
+    if (typeof raw !== 'string') return;
+    for (const listener of commandListeners) listener(raw);
+  });
 
   const plugin = (pluginName: string): BootManifest['plugins'][number] => {
     const found = manifest.plugins.find((it) => it.name === pluginName);
@@ -226,6 +261,13 @@ export function createRendererBridge(ipc: RendererIpc): PreloadBridge {
         if (record.pluginName === pluginName) callbacks.delete(id);
       }
       return (await ipc.invoke(LISTENER_REMOVE_ALL_CHANNEL, { pluginName })) as InvokeResult;
+    },
+
+    onCommand(listener: (commandId: string) => void): () => void {
+      commandListeners.add(listener);
+      return () => {
+        commandListeners.delete(listener);
+      };
     },
   };
 

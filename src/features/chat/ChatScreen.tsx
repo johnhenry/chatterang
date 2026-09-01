@@ -218,12 +218,28 @@ export function ChatScreen(): ReactNode {
             disabled={!hasTarget}
             generating={generating}
             acceptsImages={acceptsImages}
+            /*
+             * THE FIRST-RUN STRING HAS TO FIT THE FIRST-RUN SCREEN.
+             *
+             * It was "Install a model or connect a provider first" — 265px of
+             * text measured in Archivo at --t-control, in a field that offers
+             * 245px at 390px of viewport. A placeholder that does not fit does
+             * not ellipsize: it wraps, and the composer's field is 38px tall
+             * with a 21.6px line box, so the second line was cut in half. The
+             * only sentence in the app that a brand-new user is guaranteed to
+             * read was the one that was clipped.
+             *
+             * The replacement is 33 characters and measures 208px in Archivo
+             * and 218px in the fallback face — both inside 245 with room for a
+             * wider face than either. tests/layout-engine.test.ts measures it
+             * at 390px rather than trusting this note.
+             */
             placeholder={
               hasTarget
                 ? chat?.mode === 'task'
                   ? 'Describe the one-off task…'
                   : 'Message'
-                : 'Install a model or connect a provider first'
+                : 'Install a model or add a provider'
             }
             onSend={send}
             onStop={() => useChats.getState().stop()}

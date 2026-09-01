@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 import { Icon, type IconName } from '@/ui/Icon';
 import { useApp } from '@/state/app';
@@ -18,7 +18,7 @@ import { SettingsScreen } from '@/features/settings/SettingsScreen';
 import { Toasts } from '@/features/shell/Toasts';
 import { ShimNotice } from '@/features/shell/ShimNotice';
 import { ApprovalGate } from '@/features/shell/ApprovalGate';
-import { installKeyboard } from '@/lib/keys';
+import { installKeyboard, registerCommand, runCommand, type CommandId } from '@/lib/keys';
 
 export type Tab = 'chat' | 'models' | 'personas' | 'studio' | 'settings';
 
@@ -62,6 +62,67 @@ export function App(): ReactNode {
    * development does not stack two listeners and fire every command twice.
    */
   useEffect(() => installKeyboard(), []);
+
+  /*
+   * THE CHAT COMMANDS, MADE TRUE ON EVERY TAB.
+   *
+   * `ChatScreen` is the only registrant of `chat.new`, `chat.next` and
+   * `chat.previous`, and `Composer` the only registrant of
+   * `chat.focusComposer` — and `App` renders `{tab === 'chat' ? <ChatScreen />
+   * : null}`, so all four UNREGISTER the moment the user opens Models,
+   * Personas, Studio or Settings. A "New Chat ⌘N" menu item was therefore
+   * inert on four of the app's five tabs: the accelerator fired, the command
+   * reached the dispatcher, no handler claimed it, and nothing happened. A
+   * menu item that silently does nothing four times out of five is worse than
+   * one that is greyed out.
+   *
+   * So this registers a FALLBACK for each of them, at the app level, where the
+   * lifetime is the app's. What a menu item means from the Models screen is
+   * now decided rather than left to whichever component happens to be mounted:
+   * it MOVES YOU TO THE CHAT and then does the thing. That is what a user
+   * asking for a new chat from a settings screen means, and it is the only
+   * answer that is the same on all five tabs.
+   *
+   * `tabRef` rather than `tab` in the deps, on purpose: re-registering on
+   * every tab change would move these to the TOP of each handler stack, above
+   * the screens' own. They must stay a fallback.
+   *
+   * The re-dispatch is a bounded retry rather than a single `requestAnimation
+   * Frame`, because the screen that will claim the command mounts on React's
+   * schedule and not the compositor's — one frame is usually enough and is not
+   * a guarantee. Each attempt calls back into `runCommand`, where THIS handler
+   * declines (the tab is now 'chat') and the real one below it answers; when
+   * nothing ever mounts, the retries run out and the command is simply
+   * unhandled, which is where it started.
+   */
+  const tabRef = useRef<Tab>(tab);
+  useEffect(() => {
+    tabRef.current = tab;
+  });
+
+  useEffect(() => {
+    const FORWARDED: readonly CommandId[] = [
+      'chat.new',
+      'chat.focusComposer',
+      'chat.next',
+      'chat.previous',
+    ];
+    const forward = (id: CommandId) => (): boolean => {
+      // On the chat tab the screen's own handler owns this outright.
+      if (tabRef.current === 'chat') return false;
+      setTab('chat');
+      const retry = (attempts: number): void => {
+        if (attempts <= 0 || runCommand(id)) return;
+        requestAnimationFrame(() => retry(attempts - 1));
+      };
+      requestAnimationFrame(() => retry(10));
+      return true;
+    };
+    const offs = FORWARDED.map((id) => registerCommand(id, forward(id)));
+    return () => {
+      for (const off of offs) off();
+    };
+  }, []);
 
   // The rail's thermal readout is only meaningful if it is actually sampled.
   useEffect(() => {

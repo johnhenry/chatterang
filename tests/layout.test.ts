@@ -39,12 +39,20 @@ function block(selector: string): string {
  * `1ch` in pixels at `--t-base`.
  *
  * `ch` is the advance of "0" in the font that actually rendered, so it is a
- * RANGE rather than a number: Archivo's digit is ~0.57em and the rest of the
- * declared fallback stack runs to ~0.60em. Every width computed below is
- * checked at both ends, because a ladder that only holds once the web font is
- * resident is a ladder that breaks on every cold load.
+ * RANGE rather than a number. Every width computed below is checked at both
+ * ends, because a ladder that only holds once the web font is resident is a
+ * ladder that breaks on every cold load.
+ *
+ * BOTH NUMBERS ARE MEASURED NOW, AND THE UPPER ONE WAS WRONG. It was 0.60,
+ * assumed rather than measured; the real fallback face resolves `1ch` to
+ * 9.4482px at 15px, which is 0.6299em. That is 30px of reading column, and it
+ * is exactly what put the workbench tier 24px too low and made the text
+ * column NARROW as the window crossed it. The live measurement is in
+ * tests/layout-engine.test.ts, which asserts the tier against whatever the
+ * running engine reports; these two are the design's written-down assumption,
+ * and the engine test is what stops them drifting from the truth again.
  */
-const CH_RATIOS = { archivo: 0.57, widestFallback: 0.6 } as const;
+const CH_RATIOS = { archivo: 0.5727, widestFallback: 0.6299 } as const;
 const BASE_FONT_PX = 15;
 const lengths = (ratio: number) => ({ rem: 16, ch: ratio * BASE_FONT_PX });
 
@@ -196,6 +204,30 @@ describe('the workbench tier', () => {
     expect(token('--history-w', at(WORKBENCH_TIER - 1))).toBe(0);
   });
 
+  it('bounds the chat body\'s grid row instead of letting it size to content', () => {
+    /*
+     * A SHAPE ASSERTION, AND THE ONLY HONEST PLACE FOR ONE.
+     *
+     * `.app__body--split` declares `grid-template-areas` and
+     * `grid-template-columns`; its single row was implicit and therefore
+     * `auto`. Reverting the explicit row TODAY changes nothing measurable —
+     * driven with 200 chats in a real engine at 1208 and 1440, the column
+     * still scrolls — because both children carry `min-height: 0` and so
+     * contribute nothing to an auto row's minimum. It is redundant, and it is
+     * redundant with a rule in a different block.
+     *
+     * What it actually guards was measured too: with this row removed AND
+     * `.history`'s `min-height: 0` removed, the column stops scrolling and the
+     * 200th chat becomes unreachable; with the row present and that
+     * `min-height` gone, it holds. So the assertion is here, as shape, rather
+     * than in the engine suite as behaviour — because the behaviour it
+     * protects is a second failure away, and a test that can only see the
+     * second failure would let the first one back in.
+     */
+    const block = declaredValue(SHEETS, '.app__body--split', 'grid-template-rows', at(1440));
+    expect(block).toBe('minmax(0, 1fr)');
+  });
+
   it('gives the chat body a real second column at the tier and none below it', () => {
     const columns = (width: number): string =>
       substitute(
@@ -211,6 +243,11 @@ describe('the workbench tier', () => {
     // history + the full measure must fit, or the reading column NARROWS as
     // the window widens. Checked at both ends of the `ch` range because the
     // measure is 66ch and `ch` is whatever font actually rendered.
+    //
+    // THIS IS THE ASSERTION THAT SHOULD HAVE CAUGHT THE 1184 TIER AND DID NOT.
+    // It was already the right shape; it was fed a fallback ratio of 0.60 that
+    // nobody had measured, and at 0.60 a 1184 tier fits with 30px to spare. At
+    // the measured 0.6299 it does not fit at all.
     for (const ratio of Object.values(CH_RATIOS)) {
       const viewport = at(WORKBENCH_TIER);
       const needed =
@@ -273,16 +310,19 @@ describe('the workbench tier', () => {
     const medium = thresholds(tokens)[0]!;
     expect(medium).toBe(600);
 
+    // 14.97px, not the 12.3px that used to be written here. The magnitude did
+    // not change; the `ch` ratio it is computed from did, from an assumed 0.57
+    // to a measured 0.5727. Restating it is the point of the assertion.
     const before = readingWidth(medium - 1, CH_RATIOS.archivo);
     const worst = readingWidth(medium, CH_RATIOS.archivo);
-    expect(before - worst).toBeCloseTo(12.3, 1);
+    expect(before - worst).toBeCloseTo(14.97, 1);
 
     // And it is a band, not a cliff: find where it recovers and hold that.
     let recovered = medium;
     while (readingWidth(recovered, CH_RATIOS.archivo) < before && recovered < medium + 200) {
       recovered += 1;
     }
-    expect(recovered - medium).toBe(13);
+    expect(recovered - medium).toBe(15);
   });
 
   it('spends only the gutter: the reading column is identical either side', () => {
@@ -295,21 +335,70 @@ describe('the workbench tier', () => {
   });
 
   it('gives the session column enough width for the row it has to hold', () => {
-    // The derivation in tokens.css, checked against the rule it is derived
-    // from: a row is [title][pin][delete] inside .list__item's own padding and
-    // gaps, and what is left over is the title.
+    /*
+     * THE DERIVATION, WITH THE THREE THINGS IT USED TO LEAVE OUT.
+     *
+     * A row is [title + preview][pin][delete], and the old sum counted
+     * `.list__item`'s padding, its two gaps and its two icon buttons — and
+     * stopped. It omitted `.history__body`'s 12px of padding on each side and
+     * the card's two 1px borders, and so claimed 176px for the title where
+     * there are 146. It then divided by the advance of "0" and called the
+     * answer characters, which the width of a digit is not.
+     *
+     * TWO MORE ARE STILL MISSING HERE AND CANNOT BE ADDED. `.history`'s own
+     * 1px right border is on a different element than this sum walks, and —
+     * once the list is long enough to scroll, which is the entire reason the
+     * column exists — the scrollbar takes its own width out of the same
+     * budget. No static reading of a stylesheet knows how wide a scrollbar is.
+     * So this arrives at 158 and the engine measures 146 with 200 chats in it,
+     * and the 12px between them is those two. The measurement is in
+     * tests/layout-engine.test.ts, which is the assertion this one defers to.
+     */
     const viewport = at(WORKBENCH_TIER, true);
     const props = rootProperties(SHEETS, viewport);
-    const padding = declaredValue(SHEETS, '.list__item', 'padding', viewport) ?? '';
-    const inline = substitute(padding.trim().split(/\s+/)[1] ?? '', props);
-    const gap = substitute(declaredValue(SHEETS, '.list__item', 'gap', viewport) ?? '', props);
+    const px = (value: string): number => toPx(substitute(value, props), lengths(CH_RATIOS.archivo));
+    const inline = (selector: string): number => {
+      const padding = declaredValue(SHEETS, selector, 'padding', viewport) ?? '';
+      const parts = padding.trim().split(/\s+/);
+      return px(parts[1] ?? parts[0] ?? '0');
+    };
+    const gap = px(declaredValue(SHEETS, '.list__item', 'gap', viewport) ?? '0');
     const iconButton = token('--icon-btn', viewport);
+    const hairline = px(declaredValue(SHEETS, '.card', 'border', viewport)?.split(/\s+/)[0] ?? '0');
 
-    const chrome = 2 * toPx(inline, lengths(0.57)) + 2 * toPx(gap, lengths(0.57)) + 2 * iconButton;
+    const chrome =
+      2 * inline('.history__body') +
+      2 * hairline +
+      2 * inline('.list__item') +
+      2 * gap +
+      2 * iconButton;
     const forTitle = token('--history-w', viewport) - chrome;
+    expect(forTitle).toBe(158);
+
+    /*
+     * CHARACTERS ARE COUNTED WITH THE PROSE ADVANCE, NOT WITH `ch`.
+     *
+     * Archivo's "0" is 8.59px and its average prose advance is 6.637px — the
+     * digit is 29% wider than the average letter — so dividing a title box by
+     * `ch` undercounts by a third. Both are measured in the engine test; this
+     * uses the ratio it reports.
+     */
+    const proseAdvance = 6.637;
     // ~20 characters at --t-base is where two chats opened from similar
-    // prompts stop looking identical in the list.
-    expect(forTitle / (0.57 * BASE_FONT_PX)).toBeGreaterThanOrEqual(20);
+    // prompts stop looking identical in the list. Checked against the number
+    // the engine actually measures, not against this one, so the two things
+    // the sum cannot see are inside the budget rather than outside it.
+    const measuredWithScrollbar = 146;
+    expect(forTitle).toBeGreaterThanOrEqual(measuredWithScrollbar);
+    expect(measuredWithScrollbar / proseAdvance).toBeGreaterThanOrEqual(20);
+  });
+
+  it('has no button padding silently eating the row', () => {
+    // `.list__main` is a <div> in SettingRow and a <button> in ChatList, and
+    // base.css resets a button's font, colour, background and border but not
+    // its PADDING — so Chrome's UA `padding: 1px 6px` survived on one of the
+    // two and the same row was 12px narrower on one screen than the other.
+    expect(block('.list__main')).toContain('padding: 0');
   });
 });
 
@@ -374,24 +463,57 @@ describe('density', () => {
     }
   });
 
-  it('leaves no control height in the component sheet as a bare number', () => {
-    // The 26 hardcoded pixel heights this milestone inherited. Anything left
-    // in the range a pointer target occupies is a control that the density
-    // axis cannot reach.
+  it('leaves NO pixel height in the component sheet as a bare number', () => {
+    /*
+     * ZERO OFFENDERS, NOT A LIST OF THEM.
+     *
+     * This started at 26 bare pixel heights, was cut to 16, and the check that
+     * guarded the remainder only looked at 24-64px — the band a pointer target
+     * occupies. That let `.slider` sit at 22px and its thumb at 18px, both of
+     * them real drag targets, both under WCAG 2.5.8's 24px floor, and both
+     * invisible to this test BY CONSTRUCTION. A window that excludes the
+     * failures it is looking for is not a check.
+     *
+     * So: every height and width in the sheet resolves through a token. The
+     * distinction the density axis is FOR is made in tokens.css instead —
+     * `--ctl-*` for anything a pointer lands on, `--g-*` for marks, tracks,
+     * grips and thumbnails, which are the same size for a finger and a mouse
+     * because they are drawings rather than targets.
+     */
     const offenders: string[] = [];
     for (const rule of parseRules(css)) {
-      for (const property of ['height', 'min-height'] as const) {
+      for (const property of ['height', 'min-height', 'max-height', 'width'] as const) {
         const value = rule.decls.get(property);
-        const literal = /^(\d+(?:\.\d+)?)px$/.exec(value ?? '');
-        if (!literal) continue;
-        const px = Number(literal[1]);
-        if (px >= 24 && px <= 64) offenders.push(`${rule.selectors.join(', ')} { ${property}: ${value} }`);
+        if (/^\d+(?:\.\d+)?px$/.test(value ?? '')) {
+          offenders.push(`${rule.selectors.join(', ')} { ${property}: ${value} }`);
+        }
       }
     }
-    // `.attachment` (56px) is an image thumbnail, not a control: it is what a
-    // pointer target sits ON TOP of, and scaling it with density would resize
-    // the picture rather than the button.
-    expect(offenders).toEqual(['.attachment { height: 56px }']);
+    expect(offenders).toEqual([]);
+  });
+
+  it('keeps the slider thumb at WCAG 2.5.8 for both pointers', () => {
+    // The two heights the old 24-64px window could not see. A slider thumb is
+    // a drag target; 18px failed the standard for every pointer there is.
+    for (const finePointer of [false, true]) {
+      const thumb = token('--ctl-thumb', at(1440, finePointer));
+      expect(thumb, `thumb at fine=${finePointer}`).toBeGreaterThanOrEqual(WCAG_MINIMUM);
+    }
+    // And it is on the axis: a finger gets more of it than a cursor does.
+    expect(token('--ctl-thumb', at(1440, false))).toBeGreaterThan(
+      token('--ctl-thumb', at(1440, true)),
+    );
+    // The input's own box is the thumb's box, so the drag target cannot drift
+    // away from the element that receives the drag.
+    expect(block('.slider')).toContain('height: var(--ctl-thumb)');
+  });
+
+  it('keeps the graphic scale OUT of the density axis, on purpose', () => {
+    // A 2px rule is 2px for a finger and for a mouse. If these ever started
+    // responding to the pointer, the drawings would change size for no gain.
+    for (const name of ['--g-hair', '--g-track', '--g-dot', '--g-thumbnail'] as const) {
+      expect(token(name, at(1440, false)), name).toBe(token(name, at(1440, true)));
+    }
   });
 
   it('keeps the 16px text-entry floor out of the density axis', () => {

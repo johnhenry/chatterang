@@ -27,12 +27,24 @@
  *   1. `installKeyboard()` puts one listener on the document. A chord in the
  *      table resolves to a CommandId, and the topmost handler registered for
  *      it runs.
- *   2. `globalThis.__chatterangCommand(id)` — installed by the same call — is
- *      the door for anything that is not a key press in this page. An Electron
- *      menu accelerator fires in the MAIN process, where there is no DOM and
- *      no focus; it reaches the app by sending its command id down to the
- *      renderer, and this is what it lands on. The name matches the shell's
- *      existing `__chatterangDesktop` bridge global.
+ *   2. `__chatterangDesktop.onCommand(listener)` — subscribed to by the same
+ *      call — is the door for anything that is not a key press in this page.
+ *      An Electron menu accelerator fires in the MAIN process, where there is
+ *      no DOM and no focus; it reaches the app down the preload bridge every
+ *      other desktop feature already uses, and lands on that listener.
+ *
+ *      IT IS A SUBSCRIPTION AND NOT A GLOBAL FUNCTION, which is the whole
+ *      difference. This used to be `globalThis.__chatterangCommand(id)` — an
+ *      unauthenticated dispatcher published into the MAIN world, callable by
+ *      any script running in the renderer, and installed on the web build as
+ *      well, where nothing could ever legitimately call it. Now the only
+ *      caller lives in the main process, on the far side of `contextIsolation`,
+ *      and the most a page script can do with the bridge is listen.
+ *
+ * A THIRD WAY IN THAT IS NOT ONE. Every window command is refused while an
+ * `aria-modal` dialog is open — see {@link commandAllowed}. Both doors go
+ * through {@link runCommand}, so the rule is written once and an accelerator
+ * cannot reach the page behind a sheet any more than a key press can.
  *
  * WHY THE PAGE STILL BINDS CHORDS A BROWSER WILL EAT. `Mod+N` is "new window"
  * in every browser and there is nothing a page can do about that. It is in the
@@ -173,6 +185,68 @@ export type CommandHandler = () => boolean | void;
  */
 const handlers = new Map<CommandId, CommandHandler[]>();
 
+/* ── Modal layers ───────────────────────────────────────────────────── */
+
+/**
+ * How many `aria-modal` dialogs are open.
+ *
+ * THE DEFECT THIS CLOSES. `aria-modal="true"` is a promise that everything
+ * behind the dialog is inert. The dispatch layer made a liar of it: with a
+ * sheet open, Mod+N still created a chat behind it, Mod+L still moved focus
+ * into a composer the user could not see, and Mod+Alt+Down still switched the
+ * conversation under the panel — driven live at 1440 and confirmed for every
+ * window-scoped command there is. A trap that holds Tab inside the dialog and
+ * a dispatcher that lets four accelerators reach past it are not a modal.
+ *
+ * A COUNT AND NOT A FLAG, for the same reason the handler table is a stack: a
+ * Confirm opens over a Sheet, and the page must not become live again when the
+ * inner one closes.
+ *
+ * NOT A DOM QUERY. Asking `document.querySelector('[aria-modal="true"]')`
+ * would have worked and would have tied the dispatcher to the markup of the
+ * thing it is protecting — and would have answered wrongly for a dialog that
+ * is mounted but closed. Whoever renders the dialog declares the layer.
+ */
+let modalDepth = 0;
+
+/**
+ * Declare that a modal layer is open. Returns the release; call it on close.
+ *
+ * Idempotent in the direction that matters: releasing twice does not
+ * double-decrement, so a component that releases in both a cleanup and a
+ * handler cannot make the page live while a dialog is still up.
+ */
+export function pushModalLayer(): () => void {
+  modalDepth += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    modalDepth -= 1;
+  };
+}
+
+/** Whether a modal layer is open. Exported for the tests and for a menu. */
+export function modalLayerOpen(): boolean {
+  return modalDepth > 0;
+}
+
+/**
+ * Whether a command may run right now.
+ *
+ * `layer.close` is the exemption and the only one: it is what the dialog is
+ * FOR. Field-scoped commands are exempt too, because a field-scoped command is
+ * dispatched by the field that owns focus — and while a dialog is open, focus
+ * is inside it. The shell's terminal lives in a sheet and walks its history
+ * with the bare arrows; gating those would break the panel rather than protect
+ * the page behind it.
+ */
+export function commandAllowed(id: CommandId): boolean {
+  if (!modalLayerOpen()) return true;
+  if (id === 'layer.close') return true;
+  return COMMANDS[id].scope === 'field';
+}
+
 /** Register a handler. Returns the unregister function; call it on unmount. */
 export function registerCommand(id: CommandId, run: CommandHandler): () => void {
   let stack = handlers.get(id);
@@ -198,6 +272,10 @@ export function registerCommand(id: CommandId, run: CommandHandler): () => void 
  * its browser default rather than being swallowed by a dispatcher that exists.
  */
 export function runCommand(id: CommandId): boolean {
+  // The choke point, deliberately: BOTH doors — the key listener and the
+  // desktop bridge — arrive here, so the modal rule is written once and a
+  // menu accelerator cannot reach past a dialog either.
+  if (!commandAllowed(id)) return false;
   const stack = handlers.get(id);
   if (!stack) return false;
   for (let i = stack.length - 1; i >= 0; i -= 1) {
@@ -244,6 +322,23 @@ export function commandFor(event: KeyLike): CommandId | null {
   return null;
 }
 
+/**
+ * The desktop preload bridge, as much of it as this file needs.
+ *
+ * Named as a literal rather than imported: `tests/layering.test.ts` makes it a
+ * rule that nothing under `src/` imports `apps/desktop`, and it is the right
+ * rule — this bundle is also the web app and the two Capacitor apps, none of
+ * which have a preload. The string is asserted against
+ * `apps/desktop/src/bridge/renderer.ts`'s own `BRIDGE_GLOBAL` in
+ * `tests/keys.test.ts`, so the two spellings cannot drift.
+ */
+const BRIDGE_GLOBAL = '__chatterangDesktop';
+
+interface DesktopCommandBridge {
+  /** Subscribe to menu accelerators. Returns the unsubscribe. */
+  onCommand?: (listener: (id: string) => void) => () => void;
+}
+
 let uninstall: (() => void) | null = null;
 
 /**
@@ -270,26 +365,44 @@ export function installKeyboard(target: EventTarget | undefined = globalThis.doc
   target.addEventListener('keydown', onKeyDown);
 
   /*
-   * The door for everything that is not a key press in this page.
+   * DOOR 2: the desktop bridge, and NOT a global in the main world.
    *
-   * An Electron accelerator fires in the main process. It reaches the app the
-   * same way every other desktop feature does — down the existing bridge — and
-   * lands here. Returns whether a handler claimed it so the shell can grey out
-   * a menu item that would do nothing.
+   * What this used to be: `globalThis.__chatterangCommand = (id) => …`, a
+   * function any script in the renderer could call to drive the app. That is
+   * an unauthenticated command dispatcher published into the world the page's
+   * own scripts run in — including, on the day markdown rendering or a
+   * dependency lets something through, a script that is not ours. It was
+   * installed on the web build too, where there is no accelerator to serve and
+   * so no reason for it to exist at all.
+   *
+   * It is gone. The external door is now a SUBSCRIPTION on the preload bridge:
+   * `onCommand` lets this page ASK TO BE TOLD when the main process fires a
+   * menu accelerator. Nothing page-reachable dispatches a command any more —
+   * the only caller is `apps/desktop/src/main.ts`, across the context
+   * boundary, and a page script that grabs `onCommand` can at most watch.
+   *
+   * The subscription is guarded rather than assumed: on the web, and on a
+   * desktop build older than this one, there is no bridge and this is a no-op.
    */
-  const globals = globalThis as { __chatterangCommand?: (id: string) => boolean };
-  globals.__chatterangCommand = (id: string): boolean => (isCommandId(id) ? runCommand(id) : false);
+  const desktop = (globalThis as { [BRIDGE_GLOBAL]?: DesktopCommandBridge })[BRIDGE_GLOBAL];
+  const unsubscribe =
+    typeof desktop?.onCommand === 'function'
+      ? desktop.onCommand((id: string) => {
+          if (isCommandId(id)) runCommand(id);
+        })
+      : undefined;
 
   uninstall = () => {
     target.removeEventListener('keydown', onKeyDown);
-    delete globals.__chatterangCommand;
+    unsubscribe?.();
     uninstall = null;
   };
   return uninstall;
 }
 
-/** Test seam: forget every handler and listener. Not used by the app. */
+/** Test seam: forget every handler, listener and modal layer. Not the app's. */
 export function resetKeyboardForTests(): void {
   handlers.clear();
+  modalDepth = 0;
   uninstall?.();
 }
