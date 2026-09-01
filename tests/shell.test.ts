@@ -5,11 +5,15 @@
 // when it writes its default filesystem layout. The shell is platform-agnostic
 // logic with no DOM dependency, and in the app it runs in a real browser where
 // there is only one realm, so the node environment is the representative one.
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ChatterangShell, bundledCommandNames, type ShellStores } from '@/shell';
+import { ChatterangShell, assertConfinedBuild, bundledCommandNames, type ShellStores } from '@/shell';
 import { chatterangCommands, renderTranscript, table } from '@/shell/commands';
-import { buildVfs, slug } from '@/shell/vfs';
+import { normalizePath } from '@/shell/fs';
+import { PROJECTED_PATHS, buildVfs, isProjectedPath, slug } from '@/shell/vfs';
 
 /**
  * The shell is a sandbox with a model on the other end of it, so the tests
@@ -138,6 +142,515 @@ describe('sandbox boundaries', () => {
     const result = await shell('user').exec('chatterang');
     expect(result.stdout).toContain('sandbox, not your device');
     expect(result.stdout).toContain('Network access is not available');
+  });
+});
+
+/* ── The desktop invariant ───────────────────────────────────────────── */
+
+/**
+ * On a phone the sandbox was a property of the runtime: `InMemoryFs` was the
+ * only filesystem in existence and `fetch` was the page's, under CSP. On
+ * desktop that argument does not transfer, so it must not be ported — the
+ * shell now sits in a process beside a real filesystem, a real socket, and a
+ * real environment.
+ *
+ * These tests are run in exactly such a process. Vitest's node environment
+ * has `node:fs`, `process.env` and a global `fetch`, and this file runs the
+ * real `ChatterangShell` inside it. That is the point: every negative below
+ * is measured somewhere the positive is demonstrably available, which is what
+ * the webview-era tests could not do. Each one writes the canary first and
+ * asserts this process can see it, so a passing test cannot be a test that
+ * looked for nothing.
+ */
+describe('desktop invariant: a real filesystem in the same process', () => {
+  it('cannot read a file this very process just wrote to the real disk', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'chatterang-shell-'));
+    const canaryPath = join(dir, 'canary.txt');
+    writeFileSync(canaryPath, 'CANARY-REAL-FS-8f21');
+
+    try {
+      // Fault injection: prove the canary is real and readable from here.
+      // Observed: the file exists on disk and this process reads it back.
+      expect(existsSync(canaryPath)).toBe(true);
+      expect(readFileSync(canaryPath, 'utf8')).toContain('CANARY-REAL-FS-8f21');
+
+      const sh = shell('model');
+      for (const command of [
+        `cat ${canaryPath}`,
+        `ls ${dir}`,
+        'cat /etc/passwd',
+        'cat ../../../../../../etc/hosts',
+        'ls /Users',
+        'find / -name "canary.txt"',
+      ]) {
+        const result = await sh.exec(command);
+        // Observed: exit 1 or 2 with "No such file or directory" for each —
+        // the paths do not exist in the VFS, and the VFS is all there is.
+        expect(result.stdout).not.toContain('CANARY-REAL-FS-8f21');
+        if (!command.startsWith('find')) expect(result.exitCode).not.toBe(0);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('cannot read an environment variable this process holds', async () => {
+    process.env.CHATTERANG_SHELL_CANARY = 'CANARY-ENV-4c07';
+
+    try {
+      // Fault injection: the variable really is set in this process.
+      expect(process.env.CHATTERANG_SHELL_CANARY).toBe('CANARY-ENV-4c07');
+
+      const sh = shell('model');
+      for (const command of [
+        'env',
+        'printenv CHATTERANG_SHELL_CANARY',
+        'echo $CHATTERANG_SHELL_CANARY',
+        'set',
+        'awk \'BEGIN { print ENVIRON["CHATTERANG_SHELL_CANARY"] }\'',
+      ]) {
+        const result = await sh.exec(command);
+        // Observed: `env` prints 12 fabricated variables (HOME=/, PATH=/usr/bin:/bin,
+        // HOSTNAME=localhost …); the expansions are empty strings, exit 0.
+        expect(result.stdout).not.toContain('CANARY-ENV-4c07');
+      }
+      const env = await sh.exec('env');
+      expect(env.exitCode).toBe(0);
+      expect(env.stdout).toContain('HOME=/');
+
+      // Positive control: the shell does surface a canary it can actually
+      // reach, so the absences above are absences and not a mute shell.
+      const control = await sh.exec('echo CANARY-ENV-4c07 > /workspace/c && cat /workspace/c');
+      expect(control.exitCode).toBe(0);
+      expect(control.stdout).toContain('CANARY-ENV-4c07');
+    } finally {
+      delete process.env.CHATTERANG_SHELL_CANARY;
+    }
+  });
+
+  it('cannot spawn a subprocess to do any of it for them', async () => {
+    const sh = shell('model');
+    const attempts = [
+      'awk \'BEGIN { system("echo CANARY-EXEC-9a13") }\'',
+      'node -e "console.log(1)"',
+      'python3 -c "print(1)"',
+      'sh -c "cat /etc/passwd"',
+    ];
+
+    for (const command of attempts) {
+      const result = await sh.exec(command);
+      // Observed: awk exits 2 — "system() is not supported - shell execution
+      // not allowed in sandboxed environment"; node/python3 exit 127; `sh -c`
+      // exists but only recurses into the same sandbox, so the cat fails.
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).not.toContain('CANARY-EXEC-9a13');
+    }
+
+    // Positive control: `echo` of the same string works, so the assertions
+    // above are about execution and not about the canary being unprintable.
+    const control = await sh.exec('echo CANARY-EXEC-9a13');
+    expect(control.exitCode).toBe(0);
+    expect(control.stdout).toContain('CANARY-EXEC-9a13');
+  });
+
+  it('refuses to start on a build that can address a real filesystem', async () => {
+    const browser = (await import('just-bash/browser')) as unknown as Parameters<
+      typeof assertConfinedBuild
+    >[0];
+    // The build actually in use passes. Without this the test below proves
+    // only that the assertion throws at something.
+    expect(() => assertConfinedBuild(browser)).not.toThrow();
+
+    // Fault injection with the real alternative, not a mock: the default
+    // `just-bash` entry point is one import specifier away and is what a
+    // desktop bundler reaches for by default.
+    const node = (await import('just-bash')) as unknown as Parameters<
+      typeof assertConfinedBuild
+    >[0] & { getCommandNames: () => string[] };
+    // Observed: 83 commands against the browser build's 79 — the extras are
+    // tar, yq, xan and sqlite3 — and it exports ReadWriteFs, a filesystem
+    // rooted at a real directory.
+    expect(node.getCommandNames().length).toBeGreaterThan(browser.getCommandNames().length);
+    expect(() => assertConfinedBuild(node)).toThrow(/ReadWriteFs/);
+  });
+
+  it('refuses to start if a network command is ever registered', () => {
+    // Fault injection: the shape the shell would have if `new Bash` were
+    // given a `network` option, or if curl were registered by hand.
+    expect(() =>
+      assertConfinedBuild({
+        getCommandNames: () => ['cat', 'curl'],
+        getNetworkCommandNames: () => ['curl'],
+      }),
+    ).toThrow(/exfiltration/);
+
+    // And the same module shape without the registration is fine — so the
+    // throw above is about the registration, not about the option existing.
+    expect(() =>
+      assertConfinedBuild({
+        getCommandNames: () => ['cat'],
+        getNetworkCommandNames: () => ['curl'],
+      }),
+    ).not.toThrow();
+  });
+
+  it('never reaches the Electron main process, where a real fs is in scope', () => {
+    // The renderer is sandboxed, so the shell's reach there is what it is on a
+    // phone. `apps/desktop/src/host` is not: it is a Node process with real
+    // `fs`, real `fetch` and a native addon. And the pipe already exists —
+    // `host/llama-backend.ts` bundles `@/ai/prompt` out of `src/` into an
+    // esbuild `platform: "node"` bundle. Nothing stops the same import from
+    // naming `@/shell` one day, and the confinement argument does not survive
+    // the shell arriving in that process: `assertConfinedBuild` would still
+    // pass, because a Node bundler resolving `just-bash/browser` gets the
+    // browser build — while `ctx.fs` would be handed whatever the host wired
+    // up, and `curl` would be a `network` option away rather than a rewrite.
+    const roots = ['apps/desktop/src', 'apps/desktop/scripts'];
+    const sources: string[] = [];
+    const walk = (dir: string): void => {
+      if (!existsSync(dir)) return;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+          walk(full);
+        } else if (/\.(ts|tsx|mjs)$/.test(entry.name)) {
+          sources.push(full);
+        }
+      }
+    };
+    for (const root of roots) walk(root);
+
+    // A scan that found nothing would pass this test for the wrong reason.
+    expect(sources.length).toBeGreaterThan(5);
+    expect(sources.some((file) => file.includes('llama-backend'))).toBe(true);
+
+    // Deliberately not global: `RegExp.test` on a `/g` pattern carries
+    // `lastIndex` between calls, so a shared one inside a `filter` skips every
+    // other file — a scanner that finds half of what it looks for.
+    const banned = /(?:from|import|require)\s*\(?\s*['"`](?:@\/shell|just-bash)[^'"`]*['"`]/;
+    const offenders = sources.filter((file) => banned.test(readFileSync(file, 'utf8')));
+    expect(offenders).toEqual([]);
+
+    // Positive control: the matcher does recognise the import it is looking
+    // for, in each of the three forms a file could write it.
+    for (const form of [
+      "import { ChatterangShell } from '@/shell';",
+      "await import('@/shell/tool')",
+      "const { Bash } = require('just-bash')",
+    ]) {
+      expect(banned.test(form)).toBe(true);
+    }
+  });
+
+  it('withholds the network capability, not merely the command name', async () => {
+    interface Ctx {
+      fetch?: unknown;
+      invokeTool?: unknown;
+      fs?: unknown;
+    }
+    const module = (await import('just-bash/browser')) as unknown as {
+      Bash: new (options: Record<string, unknown>) => { exec(line: string): Promise<unknown> };
+      InMemoryFs: new () => object;
+      defineCommand: (
+        name: string,
+        run: (args: string[], ctx: Ctx) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
+      ) => unknown;
+      getNetworkCommandNames: () => string[];
+    };
+
+    // curl exists in the package — it is opt-in, not absent. So `command not
+    // found` is a decision this app made, not a library that never shipped it.
+    expect(module.getNetworkCommandNames()).toContain('curl');
+    expect(await bundledCommandNames()).not.toContain('curl');
+
+    let seen: Ctx | null = null;
+    const probe = module.defineCommand('probe', async (_args, ctx) => {
+      seen = ctx;
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    // Constructed exactly as `ChatterangShell.#start` does: no `network` option.
+    const bash = new module.Bash({
+      fs: new module.InMemoryFs(),
+      customCommands: [probe],
+      cwd: '/',
+    });
+    await bash.exec('probe');
+
+    const context = seen as Ctx | null;
+    expect(context).not.toBeNull();
+    // `fetch` is a declared property of the context every custom command
+    // receives — 23 of them, including exec, fs and limits. It is undefined
+    // because the Bash was built without `network`, so a command author
+    // cannot pick up egress from a parameter they already have.
+    expect(context && 'fetch' in context).toBe(true);
+    expect(context?.fetch).toBeUndefined();
+    expect(context?.invokeTool).toBeUndefined();
+    // `fs`, by contrast, is live — a custom command can read and write the
+    // whole VFS directly. That is the InMemoryFs and nothing else.
+    expect(context?.fs).toBeDefined();
+  });
+});
+
+/* ── The projection is read-only, and now that is enforced ───────────── */
+
+describe('the projection refuses writes', () => {
+  const forgeries = [
+    'echo FORGED > /chats/planted.md',
+    'echo FORGED | tee /chats/planted.md',
+    'touch /chats/planted.md',
+    'mkdir -p /chats/subdir',
+    'cp /README.md /chats/planted.md',
+    'mv /README.md /chats/planted.md',
+    'rm /chats/quantisation-notes.md',
+    'echo FORGED > /chats/quantisation-notes.md',
+    // The sharpest one: an in-place edit leaves a file that still looks like
+    // the transcript it used to be. Measured unguarded: exit 0, one
+    // `writeFile`, and the conversation now says something else.
+    "sed -i 's/quantisation/FORGED/g' /chats/quantisation-notes.md",
+    "sed 's/quantisation/FORGED/' /chats/quantisation-notes.md > /chats/out.md",
+    'echo FORGED > /models/planted.json',
+    'echo FORGED > /personas/planted.json',
+    'echo FORGED > /README.md',
+    'echo FORGED > /device.json',
+    // Path traversal: the string never names /chats.
+    'echo FORGED > /workspace/../chats/planted.md',
+    // Symlink laundering: the parent directory is the lie, not the leaf. The
+    // guard resolves the parent through realpath before deciding. Measured:
+    // today's InMemoryFs does not follow a symlinked parent either, so this
+    // one is refused twice over — which is the point, since only one of the
+    // two refusals belongs to this repository.
+    'ln -s /chats /workspace/link && echo FORGED > /workspace/link/planted.md',
+  ];
+
+  it.each(forgeries)('refuses: %s', async (command) => {
+    const sh = shell('model');
+    const result = await sh.exec(command);
+    // Observed: exit 1 for a redirection (the EROFS throw aborts the line)
+    // and exit 1 with "cannot touch/create/remove … EROFS" for the commands
+    // that report errors themselves.
+    expect(result.exitCode).not.toBe(0);
+
+    const planted = await sh.exec('grep -rl FORGED /chats /models /personas /README.md /device.json');
+    expect(planted.exitCode).not.toBe(0);
+    expect(planted.stdout).not.toContain('FORGED');
+
+    // And the real data is still there, unchanged.
+    const chat = await sh.exec('cat /chats/quantisation-notes.md');
+    expect(chat.exitCode).toBe(0);
+    expect(chat.stdout).toContain('What does quantisation do?');
+  });
+
+  it('survives `rm -rf /`, which names no projected path at all', async () => {
+    const sh = shell('model');
+    // Measured, and the measurement changed what this test asserts: `rm -f`
+    // swallows the error it is given, so the guard's refusal comes back as
+    // exit 0 with nothing deleted. Asserting a non-zero exit here would have
+    // been asserting a property of `rm`, not of the guard — so the assertion
+    // is the one that matters, which is that the data is still there.
+    for (const command of ['rm -rf /', 'rm -rf /chats', 'rm -rf /chats/*', 'rm -f /device.json']) {
+      await sh.exec(command);
+    }
+
+    const chat = await sh.exec('cat /chats/quantisation-notes.md');
+    expect(chat.exitCode).toBe(0);
+    expect(chat.stdout).toContain('What does quantisation do?');
+    expect((await sh.exec('cat /device.json')).exitCode).toBe(0);
+    expect((await sh.exec('ls /models')).stdout).toContain('qwen.json');
+
+    // Fault injection: the same `rm -rf` one directory over does delete, so
+    // the survival above is the guard and not an `rm` that never works.
+    expect((await sh.exec('echo x > /workspace/doomed.txt')).exitCode).toBe(0);
+    await sh.exec('rm -rf /workspace/doomed.txt');
+    expect((await sh.exec('cat /workspace/doomed.txt')).exitCode).not.toBe(0);
+  });
+
+  it('still writes freely in /workspace — the refusal is the guard, not a broken shell', async () => {
+    const sh = shell('model');
+    // Fault injection in the other direction: the identical command one
+    // directory over must succeed, or the tests above prove nothing.
+    const write = await sh.exec('echo FORGED > /workspace/planted.md');
+    expect(write.exitCode).toBe(0);
+    const read = await sh.exec('cat /workspace/planted.md');
+    expect(read.exitCode).toBe(0);
+    expect(read.stdout).toContain('FORGED');
+
+    // `sed -i` too, which is the one that rewrites in place: it works where
+    // writing is allowed, so its refusal above is the guard and not a `sed -i`
+    // that never edits anything.
+    const edited = await sh.exec("sed -i 's/FORGED/EDITED/' /workspace/planted.md && cat /workspace/planted.md");
+    expect(edited.exitCode).toBe(0);
+    expect(edited.stdout).toContain('EDITED');
+
+    // Scratch outside the projection is fine too: it is not mistakable for
+    // the user's data.
+    expect((await sh.exec('mkdir -p /tmp/scratch && echo x > /tmp/scratch/f')).exitCode).toBe(0);
+  });
+
+  it('says why, in words the model can act on', async () => {
+    const result = await shell('model').exec('touch /chats/planted.md');
+    expect(result.exitCode).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/read-only file system/i);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/workspace/i);
+  });
+
+  it('rebuilds the projection on mount instead of overlaying it', async () => {
+    const sh = shell('user');
+    await sh.mount({ '/chats/one.md': 'first\n', '/workspace/.keep': '' });
+    expect((await sh.exec('cat /chats/one.md')).stdout).toContain('first');
+
+    // `createBashTool` mounts before every command, so a projection that only
+    // ever wrote meant anything that reached /chats once stayed forever.
+    await sh.mount({ '/chats/two.md': 'second\n', '/workspace/.keep': '' });
+    const gone = await sh.exec('cat /chats/one.md');
+    expect(gone.exitCode).not.toBe(0);
+    const listing = await sh.exec('ls /chats');
+    expect(listing.stdout).toContain('two.md');
+    expect(listing.stdout).not.toContain('one.md');
+  });
+
+  it('protects every path buildVfs emits, and only those', async () => {
+    // The guard reads a list; `buildVfs` writes files. This is the seam where
+    // a projection added tomorrow would quietly land in writable space.
+    for (const path of Object.keys(await buildVfs(stores()))) {
+      const workspace = path === '/workspace' || path.startsWith('/workspace/');
+      expect(workspace || isProjectedPath(path)).toBe(true);
+    }
+    expect(isProjectedPath('/workspace/notes.md')).toBe(false);
+    expect(isProjectedPath('/tmp/x')).toBe(false);
+    // An ancestor of a projection is protected too, or `rm -rf /` walks in.
+    expect(isProjectedPath('/')).toBe(true);
+    for (const projected of PROJECTED_PATHS) expect(isProjectedPath(projected)).toBe(true);
+  });
+
+  it('normalises before it decides', () => {
+    expect(normalizePath('/chats/../chats/x.md')).toBe('/chats/x.md');
+    expect(normalizePath('chats/x.md')).toBe('/chats/x.md');
+    expect(normalizePath('//chats//./x.md')).toBe('/chats/x.md');
+    expect(normalizePath('/workspace/../../../chats/x.md')).toBe('/chats/x.md');
+  });
+});
+
+/* ── The gate, on the branch that did not have one ───────────────────── */
+
+describe('chat open is gated like every other mutation', () => {
+  function spied(): { open: ReturnType<typeof vi.fn>; stores: ShellStores } {
+    const open = vi.fn(async () => undefined);
+    const base = stores();
+    return { open, stores: { ...base, chats: () => ({ ...base.chats(), open }) } };
+  }
+
+  it('does not steer the user’s screen on the model’s say-so', async () => {
+    const { open, stores: withSpy } = spied();
+    const confirm = vi.fn(async () => false);
+    const result = await new ChatterangShell({ stores: withSpy, actor: 'model', confirm }).exec(
+      'chat open chat_2',
+    );
+
+    // Observed before the fix: exit 0, `chats.open` called, nothing prompted —
+    // on a command declared `mutating: true`.
+    expect(result.exitCode).toBe(130);
+    expect(result.stderr).toContain('cancelled');
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('open the conversation'));
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it('opens it when the user says yes — the gate is a question, not a wall', async () => {
+    const { open, stores: withSpy } = spied();
+    const result = await new ChatterangShell({
+      stores: withSpy,
+      actor: 'model',
+      confirm: vi.fn(async () => true),
+    }).exec('chat open chat_2');
+
+    expect(result.exitCode).toBe(0);
+    expect(open).toHaveBeenCalledWith('chat_2');
+  });
+
+  it('does not interrupt a person who typed it themselves', async () => {
+    const { open, stores: withSpy } = spied();
+    const confirm = vi.fn(async () => true);
+    const result = await new ChatterangShell({ stores: withSpy, actor: 'user', confirm }).exec(
+      'chat open chat_2',
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith('chat_2');
+  });
+});
+
+/* ── Credentials: the same grep, with its teeth shown ────────────────── */
+
+describe('credentials', () => {
+  const CREDENTIAL = /apiKey|api_key|sk-|Bearer/i;
+
+  it('has a live grep — an injected key in a projected field does match it', async () => {
+    // The existing test greps a `buildVfs` dump for this pattern, and
+    // `buildVfs` never touches the provider store — so on its own it asserts
+    // over a path the credential cannot take. This is the fault injection
+    // that shows the pattern fires at all: `device.chipset` IS projected.
+    const poisoned = stores({
+      device: () => ({
+        chipset: 'sk-live-CANARY-999',
+        totalMemory: 1,
+        cpuCores: 1,
+        backends: [],
+        simulated: false,
+        engineVersion: 'x',
+      }),
+    });
+    expect(JSON.stringify(await buildVfs(poisoned))).toMatch(CREDENTIAL);
+  });
+
+  it('keeps a real provider key out of the shell entirely', async () => {
+    // The store shape the app actually holds: `ProviderConnection.apiKey`
+    // lives beside the fields the shell projects. The projection is a
+    // whitelist, so the key has to be absent by construction rather than
+    // stripped on the way past.
+    const base = stores();
+    const withKey: ShellStores = {
+      ...base,
+      providers: () => ({
+        toggle: vi.fn(async () => undefined),
+        list: [
+          {
+            id: 'conn_1',
+            label: 'OpenAI',
+            enabled: true,
+            defaultModel: 'gpt-4o',
+            apiKey: 'sk-live-CANARY-999',
+          } as unknown as { id: string; label: string; enabled: boolean; defaultModel: string },
+        ],
+      }),
+    };
+
+    const sh = new ChatterangShell({
+      stores: withKey,
+      actor: 'model',
+      confirm: vi.fn(async () => true),
+    });
+
+    const list = await sh.exec('provider list');
+    // Observed: "ID LABEL MODEL STATE / conn_1 OpenAI gpt-4o on" — the key is
+    // not in the projection, so it is not in the output.
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toContain('OpenAI');
+    expect(list.stdout).not.toMatch(CREDENTIAL);
+
+    const swept = await sh.exec('grep -ril "sk-" /');
+    expect(swept.exitCode).not.toBe(0);
+    expect(swept.stdout).not.toContain('CANARY');
+
+    const privacy = await sh.exec('privacy');
+    expect(privacy.stdout).not.toMatch(CREDENTIAL);
+
+    // Positive control: a string the shell CAN see is found by that same
+    // sweep, so `grep -ril` returning nothing means nothing was there.
+    await sh.exec('echo sk-live-CONTROL > /workspace/control.txt');
+    const control = await sh.exec('grep -ril "sk-" /');
+    expect(control.exitCode).toBe(0);
+    expect(control.stdout).toContain('/workspace/control.txt');
   });
 });
 

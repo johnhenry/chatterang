@@ -6,19 +6,55 @@
  * the Shell sheet for the person holding the phone, and a `bash` tool for the
  * model.
  *
- * ## It is a sandbox, not the device
+ * ## It is a sandbox, and that has to be this file's doing
  *
- * There is no real shell in a webview, and this deliberately does not pretend
- * otherwise. The filesystem is synthetic: a writable `/workspace`, plus
- * read-only views of the app's own data. Nothing here can read your photos,
- * your keychain, or another app's files, because none of that is mounted.
+ * The old version of this comment said there is no real shell in a webview,
+ * and that was true — but it was an observation about the runtime, not a
+ * guarantee made by this code. On desktop the app runs in Electron, in a
+ * process that has a real filesystem and a real socket. Measured in the
+ * shipped renderer, `require`, `process`, `Buffer` and `__dirname` are all
+ * undefined, and `just-bash` still sees only what it is handed — but that is
+ * Electron's `sandbox: true` and `contextIsolation: true` doing the work, in
+ * a file this one does not own. A capability the shell lacks by luck is a
+ * capability it will have the first time someone changes the luck.
  *
- * ## Network is off
+ * So the three things that actually confine this shell are named here, and
+ * two of them are now enforced rather than assumed:
  *
- * `just-bash` ships `curl` as an opt-in command and this never registers it.
- * A shell with a filesystem, a model, and network access is an exfiltration
- * path; without the third leg it is a workspace. That is the trade this app
- * exists to make, so it is not configurable from inside the shell.
+ *  1. **The entry point.** `just-bash/browser` ships 79 commands and no class
+ *     that can address a real filesystem. `just-bash` — the default entry —
+ *     ships 83 — `tar`, `yq`, `xan`, `sqlite3` — plus the CPython the browser
+ *     build tells you to go and find, and `ReadWriteFs`, a filesystem rooted
+ *     at a real directory. Nothing but an import specifier separated the two,
+ *     and `apps/desktop` already bundles files out of `src/` into a Node
+ *     process, so the pipe exists and is already used for something else.
+ *     {@link assertConfinedBuild} refuses to start a shell whose module can
+ *     address a real filesystem, rather than trusting the specifier to stay
+ *     put.
+ *
+ *  2. **No network, as a capability rather than a missing command.**
+ *     `just-bash` ships `curl` as opt-in and this never registers it — and
+ *     because the `Bash` is constructed with no `network` option, `ctx.fetch`
+ *     on the context handed to every custom command is `undefined` too. A
+ *     shell with a filesystem, a model, and a socket is an exfiltration path,
+ *     and this is the one surface in the app where model output is executed
+ *     rather than displayed: one `curl` turns every byte the shell can read
+ *     into a byte it can send, composably, with nobody in the loop. That is
+ *     the trade this app exists to make, so it is not configurable from
+ *     inside the shell. If network is ever wanted, `just-bash` offers an
+ *     origin-and-prefix allow-list with a private-IP check — that shape, not
+ *     a switch.
+ *
+ *  3. **The projection is read-only.** Enforced in `shell/fs.ts`, because it
+ *     was not before and four places said it was. Writing into `/chats` lets
+ *     a model manufacture the user's own words and quote them back; that is
+ *     the model-driven risk that does not need a socket at all.
+ *
+ * What is deliberately allowed, and stays allowed: reading every projection
+ * of the user's own data and computing over it with the full Unix set,
+ * writing freely in `/workspace`, and asking for a state change — which the
+ * user may refuse. `grep -ril "quantisation" /chats` is the point of the
+ * whole thing, and it costs nothing the model did not already have.
  *
  * ## The bundle
  *
@@ -28,6 +64,7 @@
 
 import type { ShellCommand, ShellContext, ShellOutput, ShellStores } from '@/shell/commands';
 import { chatterangCommands, table } from '@/shell/commands';
+import { guardProjection, type GuardedFs } from '@/shell/fs';
 import { buildVfs, type VfsSnapshot } from '@/shell/vfs';
 
 export type { ShellCommand, ShellContext, ShellOutput, ShellStores } from '@/shell/commands';
@@ -71,7 +108,7 @@ interface JustBashModule {
     /** Starting directory. Defaults to /home/user, which this VFS does not mount. */
     cwd?: string;
   }) => BashInstance;
-  InMemoryFs: new () => unknown;
+  InMemoryFs: new () => object;
   defineCommand: (
     name: string,
     execute: (
@@ -80,6 +117,10 @@ interface JustBashModule {
     ) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
   ) => unknown;
   getCommandNames: () => string[];
+  /** Commands that can leave the device. Registered only with a `network` option. */
+  getNetworkCommandNames?: () => string[];
+  /** Present only in the Node entry point: a filesystem rooted at a real directory. */
+  ReadWriteFs?: unknown;
 }
 
 let modulePromise: Promise<JustBashModule> | null = null;
@@ -93,6 +134,9 @@ function loadJustBash(): Promise<JustBashModule> {
 export class ChatterangShell {
   #options: ShellOptions;
   #bash: BashInstance | null = null;
+  #fs: GuardedFs | null = null;
+  /** Paths the last mount projected, so a stale one can be removed rather than left. */
+  #projected = new Set<string>();
   #commands: ShellCommand[];
   #starting: Promise<void> | null = null;
 
@@ -112,7 +156,9 @@ export class ChatterangShell {
   }
 
   async #start(): Promise<void> {
-    const { Bash, InMemoryFs, defineCommand } = await loadJustBash();
+    const module = await loadJustBash();
+    assertConfinedBuild(module);
+    const { Bash, InMemoryFs, defineCommand } = module;
 
     // `just-bash` hands a command its argv and expects stdout/stderr and an
     // exit code back — the same contract as a real binary, which is why pipes
@@ -135,10 +181,17 @@ export class ChatterangShell {
     // it reported success while showing nothing. The mounts are all at root
     // and the help text advertises /chats, /models and /personas, so root is
     // where the prompt belongs.
-    const bash = new Bash({ fs: new InMemoryFs(), customCommands, cwd: '/' });
+    //
+    // The projection guard goes between the shell and its filesystem rather
+    // than inside any command, so it holds for every route into the FS — a
+    // redirection, `cp`, `mv`, a symlink whose parent points somewhere else,
+    // and any command a future version of this file registers.
+    const guarded = guardProjection(new InMemoryFs());
+    const bash = new Bash({ fs: guarded.fs, customCommands, cwd: '/' });
 
+    this.#fs = guarded;
     this.#bash = bash;
-    await this.mount();
+    await this.#project();
   }
 
   /**
@@ -148,11 +201,29 @@ export class ChatterangShell {
    * /chats` searches every conversation, which the chat list cannot do.
    */
   async mount(snapshot?: VfsSnapshot): Promise<void> {
-    if (!this.#bash) return;
+    // Starting the shell mounts, so a mount before it has started used to be
+    // a silent no-op that dropped the snapshot it was handed.
+    await this.ready();
+    await this.#project(snapshot);
+  }
+
+  async #project(snapshot?: VfsSnapshot): Promise<void> {
+    const fs = this.#fs;
+    if (!fs) return;
     const files = snapshot ?? (await buildVfs(this.#options.stores));
-    for (const [path, content] of Object.entries(files)) {
-      await this.#bash.writeFile(path, content);
+
+    // Rebuild, do not overlay. A mount that only ever wrote left deleted
+    // chats visible and renamed ones duplicated, and it was the reason a file
+    // written into `/chats` used to outlive every remount — `createBashTool`
+    // mounts before every single command, so "until the next mount" was never
+    // a bound on anything.
+    for (const path of this.#projected) {
+      if (!(path in files)) await fs.unproject(path);
     }
+    for (const [path, content] of Object.entries(files)) {
+      await fs.project(path, content);
+    }
+    this.#projected = new Set(Object.keys(files));
   }
 
   async exec(commandLine: string, signal?: AbortSignal): Promise<ShellResult> {
@@ -231,11 +302,53 @@ export class ChatterangShell {
             '  /models      installed model manifests, read-only',
             '  /personas    personas as JSON, read-only',
             '',
+            'Everything outside /workspace is read-only: the filesystem refuses',
+            'the write, so nothing here can invent a conversation and quote it back.',
+            '',
             'Standard tools are available: grep, sed, awk, jq, find, sort, wc, diff …',
             'Network access is not available, by design.',
           ].join('\n'),
         }) satisfies ShellOutput,
     };
+  }
+}
+
+/**
+ * Refuse to start on a build that can reach further than this one.
+ *
+ * Measured, not assumed: `just-bash/browser` exports no `ReadWriteFs` and
+ * registers 79 commands; the default `just-bash` entry exports `ReadWriteFs`
+ * — a filesystem rooted at a real directory — and registers 83, the extra
+ * four being `tar`, `yq`, `xan` and `sqlite3`. `getNetworkCommandNames()`
+ * returns `["curl"]` on both, and `getCommandNames()` contains it on neither,
+ * which is what "curl is opt-in" means in practice.
+ *
+ * So the check is not a style rule about import specifiers. It is the one
+ * place that notices if the shell is ever handed a module that can address a
+ * disk or dial out, and it fails loudly at boot instead of quietly at the
+ * moment a prompt-injected model finds it.
+ */
+export function assertConfinedBuild(module: {
+  getCommandNames: () => string[];
+  getNetworkCommandNames?: () => string[];
+  ReadWriteFs?: unknown;
+}): void {
+  if (module.ReadWriteFs !== undefined) {
+    throw new Error(
+      'shell: refusing to start — this just-bash build exports ReadWriteFs, ' +
+        'which addresses a real filesystem. The shell requires the browser entry point.',
+    );
+  }
+
+  const registered = new Set(module.getCommandNames());
+  const networked = (module.getNetworkCommandNames?.() ?? []).filter((name) =>
+    registered.has(name),
+  );
+  if (networked.length > 0) {
+    throw new Error(
+      `shell: refusing to start — network commands are registered (${networked.join(', ')}). ` +
+        'A shell with this filesystem and a socket is an exfiltration path.',
+    );
   }
 }
 

@@ -1,10 +1,12 @@
 /**
  * The shell's filesystem.
  *
- * A projection of app state into files, rebuilt on each mount. Read-only by
- * convention — writes land in the in-memory FS and are discarded, which is
- * the right default: a shell that could rewrite your conversations by
- * accident is not a feature.
+ * A projection of app state into files, rebuilt on each mount and read-only
+ * to everything inside the shell. "Read-only by convention" is what this said
+ * before, and the convention was not true: writes reached the in-memory FS
+ * and survived, so a model could plant `/chats/notes.md` and read it back as
+ * a transcript. The convention is now a guard — see `shell/fs.ts` — and
+ * {@link PROJECTED_PATHS} is the list it enforces.
  *
  * Everything here is data the user already owns and can already see in the
  * UI. Nothing is mounted that the app itself does not hold: no device
@@ -18,6 +20,38 @@ import type { ShellStores } from '@/shell/commands';
 import { renderTranscript } from '@/shell/commands';
 
 export type VfsSnapshot = Record<string, string>;
+
+/**
+ * Everything `buildVfs` writes lives at or under one of these.
+ *
+ * `/workspace` is deliberately absent: it is scratch space, the one part of
+ * the tree the shell owns rather than borrows. Adding a projection means
+ * adding it here too, or the guard will not know to protect it — which is why
+ * `tests/shell.test.ts` checks the two lists against each other rather than
+ * trusting them to stay in step.
+ */
+export const PROJECTED_PATHS = [
+  '/chats',
+  '/models',
+  '/personas',
+  '/README.md',
+  '/device.json',
+] as const;
+
+/**
+ * Is this path part of the projection — or an ancestor of it?
+ *
+ * The ancestor half matters: `rm -rf /` names none of the projected paths and
+ * would take all of them.
+ */
+export function isProjectedPath(path: string): boolean {
+  return PROJECTED_PATHS.some(
+    (projected) =>
+      path === projected ||
+      path.startsWith(`${projected}/`) ||
+      projected.startsWith(path === '/' ? '/' : `${path}/`),
+  );
+}
 
 /** Filesystem-safe slug, stable enough to be predictable between mounts. */
 export function slug(text: string, fallback: string): string {
@@ -46,6 +80,9 @@ export async function buildVfs(stores: ShellStores): Promise<VfsSnapshot> {
     '- `/chats` — conversations as Markdown, read-only',
     '- `/models` — installed model manifests, read-only',
     '- `/personas` — personas as JSON, read-only',
+    '',
+    'Read-only here means the filesystem refuses the write, not that writing is',
+    'discouraged. A shell that could invent a conversation could quote it back.',
     '',
     'Run `chatterang` for the app commands, or use the standard tools:',
     '',

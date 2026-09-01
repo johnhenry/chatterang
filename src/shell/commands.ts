@@ -303,6 +303,15 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
         case 'open': {
           if (!id) return fail('usage: chat open <id>');
           if (!store.list.some((c) => c.id === id)) return fail(`no chat "${id}"`);
+          // This was the one mutating branch with no gate, on a command
+          // declared `mutating: true` — so the rule at the top of this file
+          // was false as written. The blast radius is small: it navigates the
+          // app. That is also exactly the problem. A model that can change
+          // what is on the user's screen without an interruption can change
+          // what the user is looking at while they answer the next prompt.
+          if (!(await context.confirm(`open the conversation ${id}`))) {
+            return fail('cancelled', 130);
+          }
           await store.open(id);
           return ok(`opened ${id}`);
         }
