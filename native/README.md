@@ -55,7 +55,7 @@ layers, 262144-token vocabulary), CPU, 1024-token context:
 | load | 3.0 s warm / 28.9 s cold, mmap |
 | decode | ~2.6 tok/s (`benchmark`), 0.57 tok/s end-to-end on a 6-token answer |
 | prefill | ~2.6 tok/s |
-| resident | 7.6 GB peak footprint |
+| resident | 7.6 GB `phys_footprint` — a CURRENT reading, not a peak; see "Numbers, and what they are numbers of" |
 
 ### What "runs" means here, and what it does not
 
@@ -157,11 +157,22 @@ Measured against `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` (398 MB, `qwen2` arch,
 | load | 0.9 s, mmap |
 | decode | 0.31 tok/s (`benchmark`), 0.087 tok/s end-to-end on a 2-token answer |
 | prefill | 1.37 tok/s |
-| resident | 670 MB peak footprint |
+| resident | 670 MB while the model was loaded — a CURRENT reading, not a peak |
 | cache reuse | 20 of 21 prompt tokens on an identical re-ask |
 
 Those throughput numbers are a **one-core emulator's** and say nothing about a
-phone.
+phone. They are not even stable across sessions on that emulator: the same
+model, the same prompt and the same APK later measured 0.33 tok/s of prefill
+and 0.14 tok/s of decode with a build running beside it, and 1.35 / 0.28 once
+the machine was quiet — a 4x spread that is the host's, not the engine's. Read
+them for scale.
+
+The `resident` row is a current reading because that is what the plugin used to
+report under the name `peakMemoryBytes`. Measured after the fix, in one run:
+982 MB observed peak against 180 MB resident once both models were unloaded —
+the same instant reported as 5.4x apart depending on which number you take.
+`decode` names both readings for the same reason; `generate` no longer reports
+the end-to-end one. Both are in "Numbers, and what they are numbers of".
 
 ### What "runs" means here, and what it does not
 
@@ -348,6 +359,169 @@ Capacitor 8: the generated `SceneDelegate.swift` hardcodes
 `window?.rootViewController = CAPBridgeViewController()`, so the storyboard's
 view controller is never instantiated.
 
+## Numbers, and what they are numbers of
+
+`getCapabilities`, `generate` and `benchmark` hand the UI numbers, and the UI
+plots them beside each other — the chat rail's "tok/s" next to the bench
+screen's "Generation tok/s", a memory figure next to a model's declared size. A
+number with the wrong name is worse than a missing one, because it gets read
+and compared instead of ignored.
+
+Three of them did not mean what they said. All three were measured, none was
+fabricated, and all three were mislabelled — which is its own failure, and a
+quieter one.
+
+### Fixed here, on Android
+
+**`peakMemoryBytes` was not a peak.** `footprint()` read `/proc/self/statm`
+field 2 — this process's resident pages RIGHT NOW — and the plugin reported it
+under a name that promises a maximum. The gap is not academic: `unload` hands
+~400 MB of mapped GGUF straight back to the kernel, so a reading taken after an
+unload came back BELOW the reading before it, under a field that cannot fall.
+
+It now reads `VmHWM` from `/proc/self/status`, the watermark the kernel keeps
+itself — **and keeps a running maximum of it**, which is the part that was not
+obvious and that only the device showed.
+
+`VmHWM` alone still failed. The harness collects every `peakMemoryBytes` a run
+reports — one while BOTH models are resident, one after the 398 MB model has
+been unloaded — and fails if the sequence falls. Reading the kernel watermark
+directly, it fell anyway:
+
+    "step":"memory.peakNeverFalls","ok":false,
+    "error":"generate.afterUnloadOfOtherHandle reported 946122752,
+             below the previous reading",
+    "readings":[{"generate.greedy":681275392},{"benchmark":942243840},
+                {"generate.bothLoaded":1338576896},
+                {"generate.afterUnloadOfOtherHandle":946122752}]
+
+Sampling `/proc/<pid>/status` every two seconds beside that same run says why:
+the watermark itself is reset, three times inside one process, each time down
+to the resident size of that moment.
+
+    14:28:45  VmHWM  671640 ->  664232 kB
+    14:35:20  VmHWM 1200832 ->  920160 kB
+    14:36:50  VmHWM 1307204 ->  923948 kB   (immediately after the unload)
+
+AOSP resets it after sampling RSS itself — the same write to
+`/proc/<pid>/clear_refs` this code declines to make. So on Android `VmHWM` is
+"the high-water mark since someone else last cleared it", which is better than
+an instantaneous sample and still not what `peakMemoryBytes` promises. The JNI
+therefore keeps the maximum across every reading, which makes the number
+monotone by construction; the harness check is what holds it to that.
+
+With the running maximum the same check passes on the same device —
+`"step":"memory.peakNeverFalls","ok":true` over readings `686522368,
+686522368, 1005846528, 1005846528`, the reading after the unload holding
+instead of falling. And it did real work inside that run rather than merely
+surviving it: `generate.greedy` reported 670432 kB, the platform reset `VmHWM`
+to 660288 kB about thirty seconds later, and by `benchmark` the raw watermark
+was 662740 kB — BELOW a number already reported. The running maximum reported
+670432 kB again, which is the whole job.
+
+Read it as **process-wide and process-lifetime**: it counts the WebView and
+everything else in the app and is not scoped to the request that reports it, so
+it is an upper bound rather than that request's own peak. It can still miss a
+spike that both rises and is cleared between two readings — readings happen at
+the end of every `generate` and every `benchmark`, so what is covered is every
+interval the engine was working in.
+
+**`tokensPerSecond` on `generate` included prefill.** It was
+`completionTokens * 1000.0 / totalMs` — every token over the whole wall clock,
+prompt processing included — while `benchmark` reports decode throughput under
+a near-identical name. Measured in one run on emulator-5554, on the same model
+in the same session:
+
+    [PROVE] {"step":"generate.greedy","text":"Canberra","completionTokens":2,
+             "tokensPerSecond":0.0240,"ttftMs":69273,"totalMs":83266}
+
+`0.0240` is exactly `2 * 1000 / 83266` — the end-to-end reading. The decode
+window is the 13993 ms after the first token and carries one token, which is
+0.0715 tok/s: a **3.0x understatement produced by the divisor alone**, on a run
+where nothing was wrong with the engine. The verify phase measured the same
+shape against `benchmark` on a faster run — 0.0867 tok/s from `generate` beside
+0.3051 tok/s of decode from `benchmark`, 3.5x, same cause.
+
+The first token is produced BY prefill and arrives at `ttftMs`, so the decode
+window is what follows it and carries `completionTokens - 1` tokens.
+`generate` now divides by that window. Below two completion tokens there is no
+decode window at all and it reports `0.0` rather than inventing a rate out of a
+single prefill.
+
+The harness checks the DEFINITION rather than a plausibility bound: the device
+already carries `completionTokens`, `ttftMs` and `totalMs`, so
+`generate.throughputDefinition` recomputes both readings and names which one
+the reported number is. A bound like "within 4x of `benchmark`" would have
+passed the bug.
+
+**`backends` always contained the literal `"cpu"`.** `availableBackends()`
+opened with an unconditional `add("cpu")`. The other three entries ask the ggml
+registry through `nativeHasVulkan` and friends, so they carry information;
+`"cpu"` was the one element of that list a stub with no engine at all produced
+identically to a working build. It is `backend_registered("CPU")` now, the same
+question as the other three, and an empty list is a possible answer meaning
+"the engine registered no backend".
+
+### Also audited, and left as they are — with reasons
+
+**`supportsVision` is a constant.** It returns false and ignores the handle it
+is given, which is the honest answer for a build with `LLAMA_BUILD_MTMD` OFF:
+there is no projector to load, no session can hold one, and reporting true
+would be a lie the UI repeats to the user. What was wrong is that its
+correctness depended on a fact in a different file that nothing connected it
+to. `CMakeLists.txt` now passes that option through as `CHATTERANG_MTMD`, and
+the JNI turns a `1` into a compile error — so linking mtmd in breaks the build
+rather than shipping a vision-capable engine that swears it has no vision.
+
+**The thermal `level` float is invented, and says so.**
+`PowerManager.currentThermalStatus` is measured; the mapping of its seven
+values onto 0.10 / 0.30 / 0.50 / 0.75 / 0.88 / 0.97 is not. There is no
+temperature behind 0.88 — it is "between severe and critical" written as a
+number because the contract asks for one, on the scale points iOS's four-value
+`ProcessInfo.thermalState` uses so both platforms drive the same UI. The
+numbers are unchanged (changing them would break that parity for no gain); what
+changed is that the source now says plainly what they are, and a guard holds
+them to being one distinct, strictly increasing value per status, so the table
+cannot quietly collapse into a constant.
+
+### Three implementations, one contract: what still disagrees
+
+Android is the half this workflow owns. Both fields above are wrong the same
+way in the other implementations, and fixing them means editing `src/` and
+`packages/`, which this workflow does not. So this is a handoff, and each entry
+is paired against its source by
+`tests/native-registration.test.ts` → "the implementations Android cannot fix
+from here stay named". That guard fails BOTH ways: leaving an entry here after
+the fix lands is as red as fixing nothing and deleting it.
+
+The contract itself needs a sentence per field in
+`packages/contracts/src/llama-cpp.ts` (`tokensPerSecond`, `peakMemoryBytes`),
+saying what the number is a number of. Neither has a doc comment today, which
+is how three implementations agreed on the same wrong thing without anyone
+disagreeing.
+
+#### `tokensPerSecond` — the other three divide by total wall time
+
+| file | what it does now | the fix |
+| --- | --- | --- |
+| `native/plugin-llama-cpp/ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift` | `Double(completionTokens) / (Double(totalMs) / 1000.0)` | it already computes `ttftMs` one line above; divide `completionTokens - 1` by `totalMs - ttftMs` |
+| `packages/inference-node/src/llama-cpp.ts` | `((completionTokens / totalMs) * 1000)` in `build()` | same, from the `firstTokenAt` it already tracks |
+| `src/plugins/llama-cpp/web.ts` | `((completionTokens / totalMs) * 1000)` | same; the shim's numbers are fake but its ARITHMETIC is what the adapter tests exercise |
+
+#### `peakMemoryBytes` — the other three report an instantaneous sample
+
+| file | what it does now | the fix |
+| --- | --- | --- |
+| `native/plugin-llama-cpp/ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift` | `LlamaContext.footprint()`, which returns `task_vm_info.phys_footprint` — current, not peak | the same `task_info(TASK_VM_INFO)` call already returns `ledger_phys_footprint_peak` in the struct it fills; read that field instead. Verified to compile and to be populated on Darwin (`count` came back 93, well past the revision that added it) — but NOT verified inside the app, so it needs one run of `prove-ios.sh` |
+| `packages/inference-node/src/llama-cpp.ts` | `process.memoryUsage.rss()` — current RSS | `process.resourceUsage().maxRSS`, which is `ru_maxrss` and IS a peak (kilobytes on Linux and on macOS returns bytes — check the platform before multiplying) |
+| `src/plugins/llama-cpp/web.ts` | `peakMemoryBytes: 512 * 1024 * 1024` — a hardcoded constant, not a sample at all | the shim cannot measure it; report `performance.memory?.usedJSHeapSize` where it exists, or drop the field, which the contract marks optional |
+
+The other option was to rename the contract field to what every implementation
+was actually reporting. It is defensible and it was not taken, because reading
+the real peak costs one line per platform and needs no change to
+`packages/contracts`, the web shim, or any of `src/` — where a rename would
+have touched all three.
+
 ## What remains, per plugin
 
 ### `plugin-llama-cpp`
@@ -437,6 +611,21 @@ view controller is never instantiated.
    (`proguard-android-optimize.txt`, which drops `-dontoptimize`), and a real
    `release` build, which needs a signing identity. All three were out of reach
    here; the debug build type was minified instead.
+
+7. **The numbers, and the half of them this workflow could not reach.**
+   `peakMemoryBytes`, `tokensPerSecond` and `backends` are fixed here and
+   proven on the device; see "Numbers, and what they are numbers of". Three
+   things are open. (a) iOS, `packages/inference-node` and the web shim still
+   report the old readings for the first two fields — the handoff table there
+   names the file and the change for each, and a guard fails when one is fixed
+   and its entry is left behind. (b) `packages/contracts/src/llama-cpp.ts`
+   documents neither field; a sentence each saying what the number is a number
+   of is what would have stopped three implementations agreeing on the same
+   wrong thing. (c) The `VmHWM` reset is measured but its cause is not
+   confirmed from source — it is consistent with AOSP clearing the watermark
+   after sampling RSS. The fix does not depend on the mechanism, only on the
+   observation that the watermark falls, but a kernel or platform that never
+   reset it would make the running maximum redundant rather than wrong.
 
 ### `plugin-onnx-runtime`
 

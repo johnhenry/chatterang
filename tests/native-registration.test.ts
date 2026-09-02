@@ -720,3 +720,281 @@ describe('R8 cannot rename the Java the JNI looks up by name', () => {
     );
   });
 });
+
+
+/* ── Three reported values that did not mean what their names said ───────
+ *
+ * `getCapabilities`, `generate` and `benchmark` hand the UI numbers, and a
+ * number with the wrong name is worse than a missing one: it is read, plotted
+ * and compared. Each block below is a value that was measured but mislabelled,
+ * or asserted where it could have been asked.
+ */
+
+const HARNESS = readFileSync(resolve(PLUGIN_DIR, 'tools/prove-android.js'), 'utf8');
+const CMAKE = readFileSync(resolve(ANDROID, 'src/main/cpp/CMakeLists.txt'), 'utf8');
+
+describe('peakMemoryBytes is a high-water mark, not a sample', () => {
+  /**
+   * `footprint()` read `/proc/self/statm` field 2 — the resident page count
+   * RIGHT NOW — and the plugin put it in a field the contract calls
+   * `peakMemoryBytes`. Sampled, not fabricated, and still a mislabel: a peak
+   * cannot fall, and this one could. `unload` munmaps ~400 MB of GGUF, so the
+   * reading taken after it came back SMALLER than the reading before it.
+   *
+   * `VmHWM` in `/proc/self/status` is the kernel's own watermark for the
+   * process and never falls. It is process-wide and process-lifetime, so it is
+   * an upper bound on any one request rather than that request's own peak —
+   * documented as exactly that, in the JNI, in `LlamaBridge` and in the README.
+   */
+  it('reads the kernel watermark, not the current resident size', () => {
+    expect(JNI_CODE).toMatch(/\/proc\/self\/status/);
+    expect(JNI_CODE).toMatch(/VmHWM:/);
+    expect(JNI_CODE).not.toMatch(/statm/);
+  });
+
+  it('names the exported symbol after the thing it returns', () => {
+    // The rename is load-bearing, not cosmetic: `footprint()` is what the old
+    // reading honestly was, so leaving the name would leave the next caller
+    // free to reintroduce the mislabel by using it for `peakMemoryBytes`.
+    expect(JNI_CODE).toMatch(/Java_app_chatterang_llama_LlamaBridge_peakFootprint/);
+    expect(JNI_CODE).not.toMatch(/Java_app_chatterang_llama_LlamaBridge_footprint\b/);
+    expect(BRIDGE_CODE).toMatch(/external fun peakFootprint\(\): Long/);
+    expect(BRIDGE_CODE).not.toMatch(/external fun footprint\(\)/);
+  });
+
+  it('fills every peakMemoryBytes the plugin reports from it', () => {
+    const lines = PLUGIN_CODE.split('\n').filter((line) => line.includes('"peakMemoryBytes"'));
+    // `generate` and `benchmark`. Asserting the count as well as the shape so
+    // a third reporter cannot be added with the old reading.
+    expect(lines).toHaveLength(2);
+    for (const line of lines) expect(line).toMatch(/LlamaBridge\.peakFootprint\(\)/);
+  });
+
+  it('keeps its own maximum, because Android resets the kernel watermark', () => {
+    // Found by the harness, not by reading the kernel docs. `VmHWM` alone
+    // still failed `memory.peakNeverFalls` on emulator-5554 — 1338576896 bytes
+    // with both models resident, 946122752 after unloading one — and sampling
+    // `/proc/<pid>/status` alongside the run showed the watermark itself being
+    // reset three times inside one process, each time down to the resident
+    // size of that moment. So the monotonicity this field promises has to be
+    // maintained here; the kernel does not maintain it for us.
+    expect(JNI_CODE).toMatch(/std::atomic<long> observed_peak_kb/);
+    expect(JNI_CODE).toMatch(/compare_exchange_weak\(seen, kilobytes/);
+    const start = JNI_CODE.indexOf('Java_app_chatterang_llama_LlamaBridge_peakFootprint');
+    const body = JNI_CODE.slice(start, JNI_CODE.indexOf('JNIEXPORT', start + 1));
+    // The returned value is the running maximum, never the fresh reading.
+    expect(body).toMatch(/return static_cast<jlong>\(observed_peak_kb\.load/);
+    expect(body).not.toMatch(/return static_cast<jlong>\(kilobytes\)/);
+  });
+
+  it('is proven on the device across the unload, where a sample must fall', () => {
+    // The source shape above cannot tell a peak from a sample; only the device
+    // can. The harness collects every `peakMemoryBytes` the run reports — one
+    // while BOTH models are resident, one after 400 MB has gone back to the
+    // kernel — and fails if the sequence ever falls.
+    expect(HARNESS).toMatch(/memory\.peakNeverFalls/);
+    expect(HARNESS).toMatch(/peaks\.push\(\{ at: 'generate\.bothLoaded'/);
+    expect(HARNESS).toMatch(/peaks\.push\(\{ at: 'generate\.afterUnloadOfOtherHandle'/);
+  });
+});
+
+describe('tokensPerSecond is decode throughput, not tokens over wall time', () => {
+  /**
+   * `completionTokens * 1000.0 / totalMs` divides the tokens by the WHOLE wall
+   * clock, prefill included. Measured on emulator-5554: `generate` reported
+   * 0.0867 tok/s while `benchmark` reported 0.3051 tok/s of decode for the
+   * same model in the same run — a 3.5x gap produced entirely by the divisor.
+   *
+   * Both numbers reach the user as "tok/s" (the chat rail's readout and the
+   * bench screen's "Generation" stat), so the disagreement reads as a
+   * regression in the engine rather than a difference in arithmetic.
+   */
+  it('divides by the decode window, not by the whole wall clock', () => {
+    expect(PLUGIN_CODE).toMatch(/val decodeMs = max\(1L, totalMs - ttftMs\)/);
+    expect(PLUGIN_CODE).toMatch(/decodedTokens \* 1000\.0 \/ decodeMs/);
+    expect(PLUGIN_CODE).not.toMatch(/completionTokens \* 1000\.0 \/ totalMs/);
+  });
+
+  it('excludes the token that prefill produced', () => {
+    // The first token arrives AT `ttftMs` and is the output of prefill, so the
+    // window after it carries `completionTokens - 1` tokens. Counting all of
+    // them over the decode window would overstate the rate on short answers,
+    // which is most answers.
+    expect(PLUGIN_CODE).toMatch(/val decodedTokens = result\.completionTokens - 1/);
+  });
+
+  it('reports 0 rather than inventing a rate out of one prefill', () => {
+    expect(PLUGIN_CODE).toMatch(
+      /if \(decodedTokens > 0\) decodedTokens \* 1000\.0 \/ decodeMs else 0\.0/,
+    );
+  });
+
+  it('is checked on the device as a definition, not as a plausibility bound', () => {
+    // The device carries `completionTokens`, `ttftMs` and `totalMs`, so the
+    // harness recomputes BOTH readings and says which one the reported number
+    // is. A bound like "within 4x of benchmark" would have passed the bug.
+    expect(HARNESS).toMatch(/generate\.throughputDefinition/);
+    expect(HARNESS).toMatch(/const decodeOnly =/);
+    expect(HARNESS).toMatch(/const endToEnd =/);
+  });
+});
+
+describe('the implementations Android cannot fix from here stay named', () => {
+  /**
+   * Three implementations satisfy one contract, and on both of these fields
+   * the other two — plus the web shim — still do what Android used to. Fixing
+   * them means editing `src/` and `packages/`, which this workflow does not
+   * own, so what ships here is a handoff.
+   *
+   * A handoff rots. This pairs each claim in the README against the source it
+   * describes: the entry must be there while the source still has the old
+   * shape, and gone once it does not. It goes red both ways — when someone
+   * fixes an implementation and leaves the note, and when someone deletes the
+   * note without fixing anything.
+   */
+  const README = readFileSync(resolve(ROOT, 'native/README.md'), 'utf8');
+  const IOS_PLUGIN = readFileSync(
+    resolve(PLUGIN_DIR, 'ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift'),
+    'utf8',
+  );
+  const NODE = readFileSync(resolve(ROOT, 'packages/inference-node/src/llama-cpp.ts'), 'utf8');
+  const WEB = readFileSync(resolve(ROOT, 'src/plugins/llama-cpp/web.ts'), 'utf8');
+
+  /** The README block under one `####` heading, so the two lists cannot cover
+   *  for each other — the same three files appear in both. */
+  const section = (heading: string): string => {
+    const start = README.indexOf(heading);
+    expect(start, `native/README.md has no "${heading}" heading`).toBeGreaterThan(-1);
+    const rest = README.slice(start + heading.length);
+    const end = rest.search(/\n#### |\n## /);
+    return end === -1 ? rest : rest.slice(0, end);
+  };
+
+  const check = (heading: string, rows: [string, boolean][]): void => {
+    const block = section(heading);
+    for (const [path, unfixed] of rows) {
+      expect(
+        block.includes(path),
+        unfixed
+          ? `${path} still has the old shape but "${heading}" does not name it`
+          : `${path} no longer has the old shape — delete it from "${heading}"`,
+      ).toBe(unfixed);
+    }
+  };
+
+  it('lists exactly the implementations still reporting end-to-end throughput', () => {
+    check('#### `tokensPerSecond`', [
+      [
+        'native/plugin-llama-cpp/ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift',
+        /Double\(completionTokens\) \/ \(Double\(totalMs\) \/ 1000\.0\)/.test(IOS_PLUGIN),
+      ],
+      [
+        'packages/inference-node/src/llama-cpp.ts',
+        /\(\(completionTokens \/ totalMs\) \* 1000\)/.test(NODE),
+      ],
+      ['src/plugins/llama-cpp/web.ts', /\(\(completionTokens \/ totalMs\) \* 1000\)/.test(WEB)],
+    ]);
+  });
+
+  it('lists exactly the implementations still sampling current memory', () => {
+    check('#### `peakMemoryBytes`', [
+      [
+        'native/plugin-llama-cpp/ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift',
+        /info\.phys_footprint/.test(
+          readFileSync(resolve(PLUGIN_DIR, 'ios/Sources/LlamaCppPlugin/LlamaContext.swift'), 'utf8'),
+        ),
+      ],
+      ['packages/inference-node/src/llama-cpp.ts', /process\.memoryUsage\.rss\(\)/.test(NODE)],
+      // Not a sample at all: a hardcoded 512 MB. Named here because the shim
+      // is what the adapter tests run against.
+      ['src/plugins/llama-cpp/web.ts', /peakMemoryBytes: 512 \* 1024 \* 1024/.test(WEB)],
+    ]);
+  });
+});
+
+describe('every backend in the list is a question, not a literal', () => {
+  /**
+   * `availableBackends()` opened with an unconditional `add("cpu")`. The other
+   * three entries ask the ggml registry, so they carry information; "cpu" was
+   * the one element of that list a stub with no engine at all produced
+   * identically to a working build.
+   */
+  it('gates all four entries on a registry query', () => {
+    const start = PLUGIN_CODE.indexOf('private fun availableBackends');
+    expect(start).toBeGreaterThan(-1);
+    const body = PLUGIN_CODE.slice(start, PLUGIN_CODE.indexOf('\n    }', start));
+    const adds = body.split('\n').filter((line) => /\badd\(/.test(line));
+    expect(adds).toHaveLength(4);
+    for (const line of adds) {
+      expect(line.trim()).toMatch(/^if \(LlamaBridge\.has\w+\(\)\) add\("[\w-]+"\)$/);
+    }
+  });
+
+  it('asks ggml for the CPU backend by name, like the other three', () => {
+    const start = JNI_CODE.indexOf('Java_app_chatterang_llama_LlamaBridge_nativeHasCpu');
+    expect(start).toBeGreaterThan(-1);
+    const body = JNI_CODE.slice(start, JNI_CODE.indexOf('JNIEXPORT', start + 1));
+    expect(body).toMatch(/ensure_backend\(\);/);
+    expect(body).toMatch(/backend_registered\("CPU"\)/);
+    expect(BRIDGE_CODE).toMatch(/fun hasCpu\(\): Boolean = isAvailable && nativeHasCpu\(\)/);
+  });
+});
+
+describe('supportsVision cannot outlive the build it is true for', () => {
+  /**
+   * It returns `JNI_FALSE` and ignores its handle. That is correct — and only
+   * correct while `LLAMA_BUILD_MTMD` is OFF, which is a fact in a different
+   * file that nothing connected it to. A constant that is right today and
+   * silently wrong after a build-flag change is the shape this whole audit is
+   * about, so the flag now reaches the C++ and breaks the build instead.
+   */
+  it('turns a multimodal build into a compile error, not a false', () => {
+    const start = JNI.indexOf('Java_app_chatterang_llama_LlamaBridge_supportsVision');
+    expect(start).toBeGreaterThan(-1);
+    const body = JNI.slice(start, JNI.indexOf('JNIEXPORT', start + 1));
+    expect(body).toMatch(/#if CHATTERANG_MTMD/);
+    expect(body).toMatch(/#error/);
+    expect(body).toMatch(/return JNI_FALSE;/);
+  });
+
+  it('derives the flag from the option instead of writing it down twice', () => {
+    expect(CMAKE).toMatch(/set\(LLAMA_BUILD_MTMD\s+OFF/);
+    expect(CMAKE).toMatch(/CHATTERANG_MTMD=\$<BOOL:\$\{LLAMA_BUILD_MTMD\}>/);
+  });
+});
+
+describe('the thermal level stays a faithful mapping of a measured ordinal', () => {
+  /**
+   * `PowerManager.currentThermalStatus` is measured. The float is not: it is a
+   * fixed table mapping seven OS statuses onto the contract's 0..1, on the same
+   * scale points iOS's four-value `ProcessInfo.thermalState` uses. There is no
+   * temperature behind 0.88.
+   *
+   * That is defensible — the contract asks for a normalised number and the
+   * platform gives an ordinal — as long as it stays an order-preserving
+   * mapping of the measurement. What it must never become is a constant, or a
+   * table that ranks two different statuses the same.
+   */
+  it('gives every status its own strictly increasing level', () => {
+    const start = PLUGIN_CODE.indexOf('val (level, name) = when (status)');
+    expect(start).toBeGreaterThan(-1);
+    const body = PLUGIN_CODE.slice(start, PLUGIN_CODE.indexOf('\n        }', start));
+    const levels = [...body.matchAll(/->\s*(\d\.\d+) to "/g)].map((m) => Number(m[1]!));
+    expect(levels).toHaveLength(6);
+    expect(new Set(levels).size).toBe(levels.length);
+    expect([...levels].sort((a, b) => a - b)).toEqual(levels);
+    expect(Math.min(...levels)).toBeGreaterThan(0);
+    expect(Math.max(...levels)).toBeLessThanOrEqual(1);
+  });
+
+  it('says in the source that the float is a mapping and not a measurement', () => {
+    // Read from the file WITH its comments: the claim being fenced is the
+    // disclosure itself. A number this arbitrary is honest only if it says so
+    // where the next reader will look.
+    expect(PLUGIN_KT).toMatch(/The STATUS is measured\. The FLOAT IS NOT\./);
+  });
+
+  it('derives throttled from the status rather than from the float', () => {
+    expect(PLUGIN_CODE).toMatch(/"throttled", status >= PowerManager\.THERMAL_STATUS_SEVERE/);
+  });
+});

@@ -140,6 +140,21 @@ class LlamaCppPlugin : Plugin() {
             PowerManager.THERMAL_STATUS_NONE
         }
 
+        // The STATUS is measured. The FLOAT IS NOT.
+        //
+        // `level` is a fixed presentation mapping of a seven-value OS ordinal
+        // onto the contract's 0..1, chosen to land on the same scale points
+        // iOS's four-value `ProcessInfo.thermalState` uses so the two
+        // platforms drive the same UI. There is no temperature behind 0.88;
+        // it is "between severe and critical" written as a number because the
+        // contract asks for one. Read it as an ordinal, never as a physical
+        // quantity, and never diff two of them for a rate.
+        //
+        // What it must stay is faithful to the ordinal it came from: one
+        // distinct, strictly increasing value per status, which is what the
+        // guard in `tests/native-registration.test.ts` holds it to. Collapsing
+        // it to a constant would be the invented-value failure this comment
+        // exists to prevent.
         val (level, name) = when (status) {
             PowerManager.THERMAL_STATUS_NONE -> 0.10 to "nominal"
             PowerManager.THERMAL_STATUS_LIGHT -> 0.30 to "nominal"
@@ -486,6 +501,33 @@ class LlamaCppPlugin : Plugin() {
                 val totalMs = max(1L, System.currentTimeMillis() - started)
                 val ttftMs = if (firstTokenAt > 0) firstTokenAt - started else totalMs
 
+                // DECODE throughput, over the decode window alone.
+                //
+                // This was `completionTokens * 1000.0 / totalMs` — every token
+                // divided by the whole wall clock, prefill included.
+                //
+                // Measured on emulator-5554 with the old formula: a 2-token
+                // answer with ttft 69273 ms inside a 83266 ms total reported
+                // 0.0240 tok/s, where the 13993 ms decode window that produced
+                // the second token is 0.0715 — 3.0x, from the divisor alone.
+                // The verify phase measured the same shape against the other
+                // reading: 0.0867 tok/s from `generate` beside 0.3051 tok/s of
+                // decode from `benchmark`, same model, same run.
+                //
+                // Both numbers reach the UI as "tok/s" — the chat rail's
+                // readout and the bench screen's "Generation" stat — so the
+                // disagreement reads as a regression in the engine.
+                //
+                // The first token is produced BY prefill and arrives at
+                // `ttftMs`, so the decode window is what follows it and
+                // carries `completionTokens - 1` tokens. Below two completion
+                // tokens there is no decode window at all, and 0.0 says so
+                // rather than inventing a rate from one prefill.
+                val decodeMs = max(1L, totalMs - ttftMs)
+                val decodedTokens = result.completionTokens - 1
+                val tokensPerSecond =
+                    if (decodedTokens > 0) decodedTokens * 1000.0 / decodeMs else 0.0
+
                 val payload = JSObject()
                     .put("requestId", requestId)
                     .put("text", result.text)
@@ -494,12 +536,12 @@ class LlamaCppPlugin : Plugin() {
                     .put("completionTokens", result.completionTokens)
                     .put("ttftMs", ttftMs)
                     .put("totalMs", totalMs)
-                    .put("tokensPerSecond", result.completionTokens * 1000.0 / totalMs)
+                    .put("tokensPerSecond", tokensPerSecond)
                     .put(
                         "stopReason",
                         if (cancelled.contains(requestId)) "cancelled" else result.stopReason,
                     )
-                    .put("peakMemoryBytes", LlamaBridge.footprint())
+                    .put("peakMemoryBytes", LlamaBridge.peakFootprint())
 
                 if (result.draftAcceptance >= 0) {
                     payload.put("draftAcceptance", result.draftAcceptance)
@@ -593,7 +635,7 @@ class LlamaCppPlugin : Plugin() {
                 JSObject()
                     .put("promptTokensPerSecond", prefill.average())
                     .put("generateTokensPerSecond", decode.average())
-                    .put("peakMemoryBytes", LlamaBridge.footprint())
+                    .put("peakMemoryBytes", LlamaBridge.peakFootprint())
                     .put("thermalBefore", before)
                     .put("thermalAfter", thermalPayload())
                     .put("backend", contextInfo[id]?.backend ?: "cpu")
@@ -686,12 +728,17 @@ class LlamaCppPlugin : Plugin() {
     /**
      * Backends this build was compiled with AND this device supports.
      *
-     * Asked of the engine, not asserted: `nativeHasVulkan` and friends query
-     * the ggml backend registry, so this list shrinks and grows with what was
-     * actually linked in.
+     * Asked of the engine, not asserted: every entry queries the ggml backend
+     * registry, so this list shrinks and grows with what was actually linked
+     * in. `cpu` used to be an unconditional `add("cpu")` — the one element a
+     * stub and a working engine produced identically, and so the one element
+     * that said nothing. It is a registry question now like the rest.
+     *
+     * An empty list is therefore possible, and it means what it says: the
+     * engine registered no backend at all.
      */
     private fun availableBackends(): List<String> = buildList {
-        add("cpu")
+        if (LlamaBridge.hasCpu()) add("cpu")
         if (LlamaBridge.hasOpenCl()) add("gpu-opencl")
         if (LlamaBridge.hasVulkan()) add("gpu-vulkan")
         if (LlamaBridge.hasHexagon()) add("npu-hexagon")

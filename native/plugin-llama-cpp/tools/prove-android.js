@@ -68,6 +68,14 @@
     tokensByRequest.set(e.requestId, seen);
   });
 
+  /* Every `peakMemoryBytes` the device reports, in the order it reported it.
+   * The field is named for a HIGH-WATER MARK, so the sequence must never fall
+   * — not even across `unload`, which hands ~400 MB of mapped GGUF back to the
+   * kernel and drops the process's CURRENT resident size by that much. That
+   * drop is the whole discriminator: a current-RSS sample cannot survive it,
+   * and a real peak cannot fail it. */
+  const peaks = [];
+
   const settle = async (requestId) => {
     for (let i = 0; i < 100 && !endsByRequest.has(requestId); i++) {
       await new Promise((r) => setTimeout(r, 50));
@@ -272,8 +280,21 @@
 
     const r1 = 'prove-greedy-1';
     const g1 = await Llama.generate({ handle, prompt, requestId: r1, sampler });
+    const streamed1 = (tokensByRequest.get(r1) || []).join('');
+    // `ok` was hardcoded true here, so a broken stream showed in the line and
+    // still exited 0. The two facts this step exists to establish are that the
+    // model produced something and that the `llamaToken` events reassemble
+    // into exactly the text the promise resolved with.
+    const streamMatchesText = streamed1 === g1.text;
+    const produced = (g1.completionTokens || 0) > 0;
     out('generate.greedy', {
-      ok: true,
+      ok: streamMatchesText && produced,
+      error:
+        streamMatchesText && produced
+          ? undefined
+          : !produced
+            ? 'no completion tokens'
+            : `streamed ${JSON.stringify(streamed1)} != text ${JSON.stringify(g1.text)}`,
       text: g1.text,
       promptTokens: g1.promptTokens,
       cachedTokens: g1.cachedTokens,
@@ -281,9 +302,45 @@
       stopReason: g1.stopReason,
       tokensPerSecond: g1.tokensPerSecond,
       ttftMs: g1.ttftMs,
-      streamed: (tokensByRequest.get(r1) || []).join(''),
-      streamMatchesText: (tokensByRequest.get(r1) || []).join('') === g1.text,
+      totalMs: g1.totalMs,
+      peakMemoryBytes: g1.peakMemoryBytes,
+      streamed: streamed1,
+      streamMatchesText,
       llamaEndCount: await settle(r1),
+    });
+    peaks.push({ at: 'generate.greedy', bytes: g1.peakMemoryBytes });
+
+    /* ── what `tokensPerSecond` MEANS ─────────────────────────────────────
+     * Not a plausibility bound — a definition check. `benchmark` reports
+     * `generateTokensPerSecond` as decode throughput, and `generate` reports a
+     * field with almost the same name, so the two are read side by side (the
+     * chat rail's "tok/s" and the bench screen's "Generation tok/s"). If one
+     * divides by decode time and the other by total wall time, the same engine
+     * looks 3.5x slower in chat than in the benchmark, and nothing says why.
+     *
+     * The device carries every term, so the harness recomputes both readings
+     * from `completionTokens`, `ttftMs` and `totalMs` and says which one the
+     * reported number actually is. The first token is produced BY prefill, so
+     * the decode window is `totalMs - ttftMs` and it carries
+     * `completionTokens - 1` tokens. */
+    const decodeMs = Math.max(1, (g1.totalMs || 0) - (g1.ttftMs || 0));
+    const decodeOnly =
+      (g1.completionTokens || 0) < 2 ? 0 : ((g1.completionTokens - 1) * 1000) / decodeMs;
+    const endToEnd = ((g1.completionTokens || 0) * 1000) / Math.max(1, g1.totalMs || 0);
+    const near = (a, b) => Math.abs(a - b) <= Math.max(0.005, Math.abs(b) * 0.02);
+    out('generate.throughputDefinition', {
+      ok: near(g1.tokensPerSecond, decodeOnly),
+      error: near(g1.tokensPerSecond, decodeOnly)
+        ? undefined
+        : `tokensPerSecond ${g1.tokensPerSecond} is ${
+            near(g1.tokensPerSecond, endToEnd) ? 'end-to-end' : 'neither reading'
+          }, expected decode-only ${decodeOnly}`,
+      reported: g1.tokensPerSecond,
+      decodeOnly,
+      endToEnd,
+      ttftMs: g1.ttftMs,
+      totalMs: g1.totalMs,
+      completionTokens: g1.completionTokens,
     });
 
     /* ── cache reuse ──────────────────────────────────────────────────────
@@ -379,6 +436,7 @@
         repetitions: 1,
       });
       out('benchmark', { ok: true, ...bench });
+      peaks.push({ at: 'benchmark', bytes: bench.peakMemoryBytes });
     } catch (e) {
       fail('benchmark', e);
     }
@@ -398,6 +456,23 @@
     handleB = loadedB.handle;
     out('load.second', { ok: true, handle: handleB, ...(await Llama.listLoaded()) });
 
+    /* Both models resident: this is the run's high-water mark, and the last
+     * reading taken before ~400 MB goes back to the kernel. */
+    const rBoth = 'prove-both-loaded';
+    const gBoth = await Llama.generate({
+      handle: handleB,
+      prompt,
+      requestId: rBoth,
+      sampler: { ...sampler, maxTokens: 2 },
+    });
+    out('generate.bothLoaded', {
+      ok: true,
+      completionTokens: gBoth.completionTokens,
+      peakMemoryBytes: gBoth.peakMemoryBytes,
+      llamaEndCount: await settle(rBoth),
+    });
+    peaks.push({ at: 'generate.bothLoaded', bytes: gBoth.peakMemoryBytes });
+
     await Llama.unload({ handle });
     out('unload.first', { ok: true, ...(await Llama.listLoaded()) });
     handle = null;
@@ -414,7 +489,27 @@
       text: g5.text,
       completionTokens: g5.completionTokens,
       survived: (g5.completionTokens || 0) > 0,
+      peakMemoryBytes: g5.peakMemoryBytes,
       llamaEndCount: await settle(r5),
+    });
+    peaks.push({ at: 'generate.afterUnloadOfOtherHandle', bytes: g5.peakMemoryBytes });
+
+    /* ── peakMemoryBytes is a peak, or it is misnamed ─────────────────────
+     * Read the comment on `peaks` above: the only way this sequence falls is
+     * if the reading is an instantaneous sample of current residency wearing
+     * the name of a high-water mark. */
+    const fell = peaks.filter((p, i) => i > 0 && p.bytes < peaks[i - 1].bytes);
+    out('memory.peakNeverFalls', {
+      ok: fell.length === 0 && peaks.every((p) => p.bytes > 0),
+      error:
+        fell.length === 0
+          ? peaks.every((p) => p.bytes > 0)
+            ? undefined
+            : 'a peakMemoryBytes reading was 0'
+          : fell
+              .map((p) => `${p.at} reported ${p.bytes}, below the previous reading`)
+              .join('; '),
+      readings: peaks,
     });
 
     await Llama.unload({ handle: handleB });

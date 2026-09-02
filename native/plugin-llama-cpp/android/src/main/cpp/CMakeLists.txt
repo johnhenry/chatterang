@@ -64,6 +64,13 @@ add_library(chatterang-llama-cpu SHARED llama-jni.cpp)
 target_compile_definitions(chatterang-llama-cpu PRIVATE
     # What this was BUILT AGAINST, reported alongside — never instead of —
     # the engine's own `llama_print_system_info()`. See `engineVersion`.
-    CHATTERANG_LLAMA_TAG="${CHATTERANG_LLAMA_TAG}")
+    CHATTERANG_LLAMA_TAG="${CHATTERANG_LLAMA_TAG}"
+
+    # Whether multimodal is linked in, derived from the option set above rather
+    # than written down twice. `supportsVision` in `llama-jni.cpp` answers from
+    # a constant, which is correct only while this is 0; the JNI turns a 1 into
+    # a compile error so that turning mtmd on cannot leave a vision-capable
+    # build reporting `supportsVision: false` forever.
+    CHATTERANG_MTMD=$<BOOL:${LLAMA_BUILD_MTMD}>)
 
 target_link_libraries(chatterang-llama-cpu PRIVATE llama ggml android log)

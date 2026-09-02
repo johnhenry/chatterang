@@ -94,6 +94,14 @@ object LlamaBridge {
             names.joinToString(", ") + ". (" + reasons.joinToString("; ") + ")"
     }
 
+    /**
+     * Whether a CPU backend is REGISTERED, asked of ggml like the other three.
+     *
+     * No `loadedLibrary` suffix test, unlike the two below: every variant links
+     * the CPU backend, so the question is only whether the engine came up.
+     */
+    fun hasCpu(): Boolean = isAvailable && nativeHasCpu()
+
     fun hasVulkan(): Boolean =
         isAvailable && loadedLibrary.endsWith("vulkan") && nativeHasVulkan()
 
@@ -186,9 +194,21 @@ object LlamaBridge {
 
     external fun benchmark(handle: Long, promptTokens: Int, generateTokens: Int): BenchmarkResult
 
-    /** Resident set size of this process, in bytes. */
-    external fun footprint(): Long
+    /**
+     * The largest resident set this process has been OBSERVED holding, bytes.
+     *
+     * A running maximum of `VmHWM`, the kernel's own high-water mark — not the
+     * current resident size, which is what this read before and which falls
+     * the moment a model is unloaded. The maximum is ours to keep because
+     * Android resets `VmHWM` underneath us; three resets were measured inside
+     * a single `prove-android.sh` run. Process-wide (the WebView is in there
+     * too) and process-lifetime, so it is an upper bound on any one request
+     * rather than that request's own peak. See `peakFootprint` in
+     * `llama-jni.cpp` for the measurements.
+     */
+    external fun peakFootprint(): Long
 
+    private external fun nativeHasCpu(): Boolean
     private external fun nativeHasVulkan(): Boolean
     private external fun nativeHasOpenCl(): Boolean
     private external fun nativeHasHexagon(): Boolean

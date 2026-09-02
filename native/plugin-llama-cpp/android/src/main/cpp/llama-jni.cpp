@@ -14,9 +14,8 @@
 #include <jni.h>
 #include <android/log.h>
 
-#include <unistd.h>
-
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -394,6 +393,50 @@ bool backend_registered(const char *name) {
     return false;
 }
 
+/** `VmHWM` in kilobytes, or -1. The kernel's high-water mark for this process. */
+long current_hwm_kb() {
+    FILE *file = std::fopen("/proc/self/status", "r");
+    if (file == nullptr) return -1;
+    char line[256];
+    long kilobytes = -1;
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::strncmp(line, "VmHWM:", 6) == 0 &&
+            std::sscanf(line + 6, "%ld", &kilobytes) == 1) {
+            break;
+        }
+        kilobytes = -1;
+    }
+    std::fclose(file);
+    return kilobytes;
+}
+
+/**
+ * The largest `VmHWM` this process has ever been SEEN holding.
+ *
+ * A running maximum is not paranoia. `VmHWM` is documented as a high-water
+ * mark, and on Android it is one only until the platform resets it — measured
+ * on emulator-5554, sampling `/proc/<pid>/status` every two seconds through one
+ * `prove-android.sh` run, the watermark fell three times inside a single
+ * process, each time to whatever the resident size was at that moment:
+ *
+ *     14:28:45  VmHWM 671640 -> 664232 kB
+ *     14:35:20  VmHWM 1200832 -> 920160 kB
+ *     14:36:50  VmHWM 1307204 -> 923948 kB
+ *
+ * AOSP resets it after sampling RSS itself, which is exactly the write to
+ * `/proc/<pid>/clear_refs` this file declines to make. So `VmHWM` alone is a
+ * high-water mark since some other process last cleared it — better than the
+ * instantaneous sample this used to report, and still not what
+ * `peakMemoryBytes` promises. Keeping the maximum across every reading is what
+ * makes the reported number monotone, and `memory.peakNeverFalls` in the
+ * harness is what proves it on the device rather than here.
+ *
+ * What it can still miss: a spike that both rises and is cleared between two
+ * readings. Readings happen at the end of every `generate` and every
+ * `benchmark`, so what is covered is every interval the engine was working in.
+ */
+std::atomic<long> observed_peak_kb{0};
+
 } // namespace
 
 /* ── Exported ─────────────────────────────────────────────────────────────
@@ -506,9 +549,19 @@ Java_app_chatterang_llama_LlamaBridge_contextLength(JNIEnv *, jobject, jlong han
 
 JNIEXPORT jboolean JNICALL
 Java_app_chatterang_llama_LlamaBridge_supportsVision(JNIEnv *, jobject, jlong) {
-    // `LLAMA_BUILD_MTMD` is OFF in `CMakeLists.txt`, so there is no projector
-    // to load and no honest answer but false. Reporting true and then ignoring
-    // the images would be a lie the UI would repeat to the user.
+#if CHATTERANG_MTMD
+#error "LLAMA_BUILD_MTMD is ON now, so supportsVision must ask the session whether it holds a projector instead of returning this constant."
+#endif
+    // A CONSTANT, and it ignores the handle it is given. That is the honest
+    // answer for this build and only for this build: `LLAMA_BUILD_MTMD` is OFF
+    // in `CMakeLists.txt`, so there is no projector to load, no session can
+    // hold one, and reporting true would be a lie the UI repeats to the user.
+    //
+    // What it must not do is keep saying false after someone links mtmd in.
+    // `CMakeLists.txt` passes the value of that option through as
+    // `CHATTERANG_MTMD`, so the day the build gains multimodal support this
+    // file stops compiling with the message above, rather than shipping a
+    // vision-capable engine that swears it has no vision.
     return JNI_FALSE;
 }
 
@@ -871,19 +924,56 @@ Java_app_chatterang_llama_LlamaBridge_benchmark(JNIEnv *env, jobject, jlong hand
 }
 
 JNIEXPORT jlong JNICALL
-Java_app_chatterang_llama_LlamaBridge_footprint(JNIEnv *, jobject) {
-    // Resident set size, from the kernel. `/proc/self/statm` field 2 is the
-    // resident page count. `Runtime.totalMemory()` would have been the easy
-    // answer and the wrong one: it measures the Java heap, and every byte of a
-    // GGUF is mapped outside it.
-    FILE *file = std::fopen("/proc/self/statm", "r");
-    if (file == nullptr) return 0;
-    long total_pages = 0;
-    long resident_pages = 0;
-    const int read = std::fscanf(file, "%ld %ld", &total_pages, &resident_pages);
-    std::fclose(file);
-    if (read != 2) return 0;
-    return static_cast<jlong>(resident_pages) * static_cast<jlong>(sysconf(_SC_PAGESIZE));
+Java_app_chatterang_llama_LlamaBridge_peakFootprint(JNIEnv *, jobject) {
+    // The largest resident set this process has been observed holding, which
+    // is what the contract field `peakMemoryBytes` is named for.
+    //
+    // Two things had to be true for that name to be earned, and only the
+    // second one is obvious.
+    //
+    // 1. Read a watermark, not a sample. This used to read `/proc/self/statm`
+    //    field 2 — the resident page count RIGHT NOW. `unload` hands ~400 MB
+    //    of mapped GGUF straight back to the kernel, so the reading after it
+    //    came back BELOW the reading before it, under a name that promises it
+    //    cannot. `VmHWM` in `/proc/self/status` is the kernel's own watermark.
+    //
+    // 2. Keep our own maximum over those watermarks, because on Android
+    //    `VmHWM` gets RESET — see `observed_peak_kb` above for the three
+    //    resets measured inside one run. Reading `VmHWM` alone still failed
+    //    `memory.peakNeverFalls` on the device: 1338576896 bytes while both
+    //    models were resident, then 946122752 after unloading one.
+    //
+    // Process-wide and process-LIFETIME, deliberately and documented as such:
+    // it covers the WebView and everything else in this app, and it is not
+    // scoped to one request, so it is an upper bound on any single request
+    // rather than that request's own peak. Scoping it would mean writing to
+    // `/proc/self/clear_refs`, the same process-global side effect that makes
+    // the kernel's own number unreliable here.
+    //
+    // `Runtime.totalMemory()` would have been the easy answer and the wrong
+    // one: it measures the Java heap, and every byte of a GGUF is mapped
+    // outside it.
+    const long kilobytes = current_hwm_kb();
+    long seen = observed_peak_kb.load(std::memory_order_relaxed);
+    while (kilobytes > seen &&
+           !observed_peak_kb.compare_exchange_weak(seen, kilobytes, std::memory_order_relaxed)) {
+        // `compare_exchange_weak` reloads `seen` on failure; the condition is
+        // rechecked because another thread may have raised it past ours.
+    }
+    return static_cast<jlong>(observed_peak_kb.load(std::memory_order_relaxed)) * 1024;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_app_chatterang_llama_LlamaBridge_nativeHasCpu(JNIEnv *, jobject) {
+    // The one entry of `backends` that used to be a literal. Kotlin opened the
+    // list with an unconditional `add("cpu")`, so a stub that had loaded no
+    // engine at all produced the same first element as a working one — the
+    // single element of that list carrying no information. It is now the same
+    // registry question as the other three, and it is a question this build
+    // can actually answer wrong: nothing else in the process registers a
+    // backend called "CPU".
+    ensure_backend();
+    return backend_registered("CPU") ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
