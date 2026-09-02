@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
+import android.util.Log
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -14,6 +15,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import kotlin.math.max
 
 /**
@@ -46,45 +48,79 @@ class LlamaCppPlugin : Plugin() {
 
     // ── Capabilities ────────────────────────────────────────────────────
 
+    /**
+     * The only plugin method that reaches the native library on Capacitor's
+     * own handler thread, which is why its body is wrapped and the others'
+     * are not.
+     *
+     * `LlamaBridge.loadFailure` answers ONE question — did any `.so` load —
+     * and a null answer is not a promise that the library is complete. A
+     * library that dlopens but is missing a symbol passes every gate here and
+     * then throws `UnsatisfiedLinkError` at the call site. Measured, by
+     * renaming `Java_app_chatterang_llama_LlamaBridge_engineVersion` in
+     * `llama-jni.cpp` and rebuilding: the `.so` still built, still loaded,
+     * `loadFailure` was still null, and the first `getCapabilities` killed the
+     * app —
+     *
+     *     FATAL EXCEPTION: CapacitorPlugins
+     *     Caused by: java.lang.UnsatisfiedLinkError: No implementation found
+     *       for java.lang.String app.chatterang.llama.LlamaBridge.engineVersion()
+     *       at app.chatterang.llama.LlamaCppPlugin.getCapabilities(LlamaCppPlugin.kt:86)
+     *
+     * — with `prove-android.sh` reporting zero `[PROVE]` lines and no pid.
+     * The nine other methods survive the same injection already: five reach
+     * native only inside `executor.execute { rejectOnThrow(call) { … } }`,
+     * `generate` has its own `catch (Throwable)`, and three touch no native
+     * at all. This one was the documented exception to the rule in
+     * `LlamaBridge`'s header; now it is not.
+     */
     @PluginMethod
     fun getCapabilities(call: PluginCall) {
-        // Refuse honestly rather than describe an engine that is not there.
-        // Every caller of this method in the web layer already treats a
-        // rejection as "no on-device inference here" (`src/state/app.ts`,
-        // `src/ai/middleware/resilience.ts`, `LlamaCppBackend.healthCheck`),
-        // so refusing degrades the app instead of killing it.
-        val unavailable = LlamaBridge.loadFailure
-        if (unavailable != null) {
-            call.reject(unavailable, ENGINE_UNAVAILABLE)
-            return
+        rejectOnThrow(call) {
+            // Refuse honestly rather than describe an engine that is not
+            // there. Every caller of this method in the web layer already
+            // treats a rejection as "no on-device inference here"
+            // (`src/state/app.ts`, `src/ai/middleware/resilience.ts`,
+            // `LlamaCppBackend.healthCheck`), so refusing degrades the app
+            // instead of killing it.
+            //
+            // Inside the guard, not before it: `LlamaBridge` is an `object`,
+            // so this read is what runs its `<clinit>` — and a `<clinit>`
+            // that threw is the exact crash f5c7c24 fixed.
+            val unavailable = LlamaBridge.loadFailure
+            if (unavailable != null) {
+                call.reject(unavailable, ENGINE_UNAVAILABLE)
+                return@rejectOnThrow
+            }
+
+            val activityManager =
+                context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }
+
+            val backends = JSArray(availableBackends())
+
+            // Preferred backend follows the tier order in the PRD: NPU, then
+            // GPU, then CPU. The engine still falls back at load time if the
+            // chosen backend refuses the model.
+            val preferred = when {
+                LlamaBridge.hasHexagon() -> "npu-hexagon"
+                LlamaBridge.hasVulkan() -> "gpu-vulkan"
+                LlamaBridge.hasOpenCl() -> "gpu-opencl"
+                else -> "cpu"
+            }
+
+            call.resolve(
+                JSObject()
+                    .put("totalMemory", memoryInfo.totalMem)
+                    .put("availableMemory", memoryInfo.availMem)
+                    .put("backends", backends)
+                    .put("preferredBackend", preferred)
+                    .put("cpuCores", Runtime.getRuntime().availableProcessors())
+                    .put("chipset", chipset())
+                    .put("simulated", false)
+                    .put("engineVersion", LlamaBridge.engineVersion()),
+            )
         }
-
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }
-
-        val backends = JSArray(availableBackends())
-
-        // Preferred backend follows the tier order in the PRD: NPU, then GPU,
-        // then CPU. The engine still falls back at load time if the chosen
-        // backend refuses the model.
-        val preferred = when {
-            LlamaBridge.hasHexagon() -> "npu-hexagon"
-            LlamaBridge.hasVulkan() -> "gpu-vulkan"
-            LlamaBridge.hasOpenCl() -> "gpu-opencl"
-            else -> "cpu"
-        }
-
-        call.resolve(
-            JSObject()
-                .put("totalMemory", memoryInfo.totalMem)
-                .put("availableMemory", memoryInfo.availMem)
-                .put("backends", backends)
-                .put("preferredBackend", preferred)
-                .put("cpuCores", Runtime.getRuntime().availableProcessors())
-                .put("chipset", chipset())
-                .put("simulated", false)
-                .put("engineVersion", LlamaBridge.engineVersion()),
-        )
     }
 
     @PluginMethod
@@ -346,8 +382,18 @@ class LlamaCppPlugin : Plugin() {
             call.reject(message, payload)
         }
 
-        LlamaBridge.loadFailure?.let {
-            refuse(it)
+        // Guarded for the same reason as `rejectIfUnavailable`, and refusing
+        // rather than rejecting for the reason above: this is the caller
+        // thread, and a `<clinit>` failure here would take the process AND
+        // leave the stream without its terminal event.
+        val unavailable = try {
+            LlamaBridge.loadFailure
+        } catch (error: Throwable) {
+            refuse(describe(error))
+            return
+        }
+        if (unavailable != null) {
+            refuse(unavailable)
             return
         }
 
@@ -571,12 +617,18 @@ class LlamaCppPlugin : Plugin() {
     }
 
     /**
-     * Turns anything thrown on the worker thread into a rejection.
+     * Turns anything thrown into a rejection, on the worker thread and on
+     * Capacitor's own.
      *
-     * Two failures at once without it: the call never settles, so the promise
-     * in the web layer hangs forever; and the exception escapes a plain
-     * `Executor` worker, which kills the single thread every later call is
-     * queued on.
+     * Two failures at once without it on the worker: the call never settles,
+     * so the promise in the web layer hangs forever; and the exception escapes
+     * a plain `Executor` worker, which kills the single thread every later
+     * call is queued on. On the Capacitor handler thread the cost is higher
+     * still — `Bridge.callPluginMethod` rethrows as an uncaught
+     * `RuntimeException` and the process dies.
+     *
+     * `Throwable`, not `Exception`, deliberately: the failures worth catching
+     * here are `Error`s. See `rejectThrown`.
      *
      * `inline` so `return@execute` inside `body` still means what it reads as.
      */
@@ -584,9 +636,42 @@ class LlamaCppPlugin : Plugin() {
         try {
             body()
         } catch (error: Throwable) {
-            call.reject(error.message ?: "The engine call failed.", error as? Exception)
+            rejectThrown(call, error)
         }
     }
+
+    /**
+     * Rejects with the honest cause, and names a broken native surface as one.
+     *
+     * `LinkageError` is the family that means the `.so` and the `external fun`
+     * declarations in `LlamaBridge` disagree: `UnsatisfiedLinkError` for a
+     * missing JNI symbol, `NoSuchMethodError` / `NoSuchFieldError` for a Java
+     * member the C++ looks up by name and no longer finds,
+     * `ExceptionInInitializerError` for a class that failed to initialise. It
+     * is exactly as fatal to this engine as "no library loaded at all" and
+     * gets the same code, so the web layer's existing `ENGINE_UNAVAILABLE`
+     * handling covers it without a new branch.
+     *
+     * `error as? Exception` is null for every `Error`, which is why the raw
+     * text is folded into the message rather than left to the cause slot.
+     */
+    private fun rejectThrown(call: PluginCall, error: Throwable) {
+        if (error is LinkageError) {
+            call.reject(describe(error), ENGINE_UNAVAILABLE)
+            return
+        }
+        call.reject(describe(error), error as? Exception)
+    }
+
+    /** The user-facing sentence for a thrown failure. See `rejectThrown`. */
+    private fun describe(error: Throwable): String =
+        if (error is LinkageError) {
+            "On-device inference is not available on this device: the llama.cpp backend " +
+                "library loaded, but this app could not call into it. (" +
+                (error.message ?: error.javaClass.name) + ")"
+        } else {
+            error.message ?: "The engine call failed."
+        }
 
     /**
      * Rejects with the honest reason when there is no engine, and reports
@@ -613,7 +698,18 @@ class LlamaCppPlugin : Plugin() {
     }
 
     private fun rejectIfUnavailable(call: PluginCall): Boolean {
-        val reason = LlamaBridge.loadFailure ?: return false
+        // The `try` is around the READ, because reading it is what runs
+        // `LlamaBridge`'s `<clinit>`. This runs on Capacitor's handler thread
+        // — `load` and `withHandle` both call it before handing off to the
+        // executor — so an `Error` escaping here is a process kill, which is
+        // the crash f5c7c24 fixed. The init block does not throw today; this
+        // is what stops a future one from being fatal again.
+        val reason = try {
+            LlamaBridge.loadFailure
+        } catch (error: Throwable) {
+            rejectThrown(call, error)
+            return true
+        } ?: return false
         call.reject(reason, ENGINE_UNAVAILABLE)
         return true
     }
@@ -640,14 +736,50 @@ class LlamaCppPlugin : Plugin() {
     private companion object {
         /** Error code the web layer can match on, distinct from a load failure. */
         const val ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
+
+        /** Matches the JNI's `LOG_TAG`, so one logcat filter shows both sides. */
+        const val TAG = "chatterang-llama"
     }
 
+    /**
+     * Frees every loaded context without letting the teardown kill the app.
+     *
+     * Two escape routes here, and neither has a `PluginCall` to reject to.
+     *
+     * `LlamaBridge.freeModel` is a native call like any other, so the
+     * broken-symbol failure `getCapabilities` documents reaches it too — and
+     * an exception that escapes a plain `Executor`'s runnable goes to the
+     * thread's default uncaught handler, which is a process kill. Dying while
+     * being destroyed still shows the user a crash dialog.
+     *
+     * And `executor.execute` on an executor that has already been shut down
+     * throws `RejectedExecutionException` — on the MAIN thread, inside
+     * `onDestroy`. Capacitor calls `handleOnDestroy` once per plugin
+     * lifecycle, but an activity recreated after a configuration change or a
+     * process-death restore does not owe us only-once.
+     *
+     * So both are swallowed on purpose, and the swallow is logged rather than
+     * silent. Nothing is left to tell: the app is going away, and a handle
+     * leaked out of a dying process costs nothing. `contexts` is still cleared
+     * in a `finally` so a failed free cannot leave a stale handle behind for a
+     * plugin instance that outlives it.
+     */
     override fun handleOnDestroy() {
-        executor.execute {
-            contexts.values.forEach { LlamaBridge.freeModel(it) }
-            contexts.clear()
-            contextInfo.clear()
+        try {
+            executor.execute {
+                try {
+                    contexts.values.forEach { LlamaBridge.freeModel(it) }
+                } catch (error: Throwable) {
+                    Log.w(TAG, "A llama.cpp context could not be freed during teardown.", error)
+                } finally {
+                    contexts.clear()
+                    contextInfo.clear()
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            Log.w(TAG, "The engine executor was already shut down at teardown.", error)
+        } finally {
+            executor.shutdown()
         }
-        executor.shutdown()
     }
 }

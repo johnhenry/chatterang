@@ -141,6 +141,46 @@ void throw_java(JNIEnv *env, const char *message) {
     if (clazz != nullptr) env->ThrowNew(clazz, message);
 }
 
+/*
+ * Turns a failed by-name lookup into a rejection the Kotlin side can catch.
+ *
+ * `FindClass` and `GetMethodID` do not merely return null — they LEAVE A
+ * PENDING EXCEPTION. Carrying on with one pending is not a survivable state:
+ * the next JNI call is a fatal `JNI DETECTED ERROR IN APPLICATION` and ART
+ * aborts the process, which is the same "kills the app instead of saying it
+ * could not run" failure this plugin exists not to have.
+ *
+ * Measured, by emptying `android/proguard-rules.pro` and building the app with
+ * `minifyEnabled true`: R8 renamed `TokenCallback.onToken`, the `GetMethodID`
+ * for it returned null, and four lines later `to_string`'s `GetStringLength`
+ * hit the pending `NoSuchMethodError` —
+ *
+ *   Abort message: 'JNI DETECTED ERROR IN APPLICATION: JNI GetStringLength
+ *     called with pending exception java.lang.NoSuchMethodError: no non-static
+ *     method "…LlamaCppPlugin$generate$1$result$2;.onToken(Ljava/lang/String;)Z"'
+ *   Fatal signal 6 (SIGABRT) … pid 11221 (erang.inference)
+ *
+ * — with the harness dying mid-run and `adb shell pidof` empty. Clearing it
+ * and throwing our own turns that into `LlamaCppPlugin.generate`'s
+ * `catch (Throwable)`, which rejects and emits the terminal event.
+ *
+ * The rules make this unreachable. It is here because "unreachable" is a
+ * property of a build-time config file that no build in this repo currently
+ * exercises, and the cost of being wrong about it is a process abort.
+ */
+bool missing(JNIEnv *env, const void *resolved, const char *name) {
+    if (resolved != nullptr) return false;
+    env->ExceptionClear();
+    LOGE("JNI could not resolve %s", name);
+    const std::string message =
+        std::string("On-device inference is unavailable in this build: the engine could not "
+                    "find \"") +
+        name +
+        "\". Minification renamed it; see native/plugin-llama-cpp/android/proguard-rules.pro.";
+    throw_java(env, message.c_str());
+    return true;
+}
+
 /* ── Process-global backend ────────────────────────────────────────────────
  *
  * `llama_backend_init()` sets up the ggml backend registry shared by every
@@ -572,6 +612,11 @@ Java_app_chatterang_llama_LlamaBridge_generate(JNIEnv *env, jobject, jlong handl
     jmethodID on_token = callback_class == nullptr
                              ? nullptr
                              : env->GetMethodID(callback_class, "onToken", "(Ljava/lang/String;)Z");
+    // A null callback is legal — it just means nobody wants the stream. A
+    // callback whose `onToken` cannot be resolved is not: see `missing`.
+    if (callback != nullptr && missing(env, on_token, "LlamaBridge$TokenCallback.onToken")) {
+        return nullptr;
+    }
 
     /* `add_special: true` lets the vocabulary prepend its own BOS — none of
      * the templates in `src/ai/prompt.ts` emit one, and a Gemma-family model
@@ -584,10 +629,12 @@ Java_app_chatterang_llama_LlamaBridge_generate(JNIEnv *env, jobject, jlong handl
     session->pending.clear();
 
     jclass result_class = env->FindClass("app/chatterang/llama/LlamaBridge$GenerateResult");
-    if (result_class == nullptr) return nullptr;
+    if (missing(env, result_class, "app/chatterang/llama/LlamaBridge$GenerateResult")) {
+        return nullptr;
+    }
     jmethodID result_init =
         env->GetMethodID(result_class, "<init>", "(Ljava/lang/String;IIILjava/lang/String;D)V");
-    if (result_init == nullptr) return nullptr;
+    if (missing(env, result_init, "LlamaBridge$GenerateResult.<init>")) return nullptr;
     // Negative means "not measured", which is different from 0% and must not
     // be reported as it. Nothing here measures speculative decoding.
     constexpr jdouble kDraftNotMeasured = -1.0;
@@ -816,9 +863,9 @@ Java_app_chatterang_llama_LlamaBridge_benchmark(JNIEnv *env, jobject, jlong hand
     session->cached_tokens.clear();
 
     jclass clazz = env->FindClass("app/chatterang/llama/LlamaBridge$BenchmarkResult");
-    if (clazz == nullptr) return nullptr;
+    if (missing(env, clazz, "app/chatterang/llama/LlamaBridge$BenchmarkResult")) return nullptr;
     jmethodID init = env->GetMethodID(clazz, "<init>", "(DD)V");
-    if (init == nullptr) return nullptr;
+    if (missing(env, init, "LlamaBridge$BenchmarkResult.<init>")) return nullptr;
     return env->NewObject(clazz, init, static_cast<jdouble>(tokens.size()) / prefill_seconds,
                           static_cast<jdouble>(produced) / decode_seconds);
 }

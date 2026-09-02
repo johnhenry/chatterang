@@ -57,6 +57,17 @@ android {
     defaultConfig {
         minSdkVersion rootProject.ext.has('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
 
+        /*
+         * Keep rules for the JNI's runtime name lookups, shipped INSIDE this
+         * module so R8 merges them into whatever app consumes it. Same
+         * mechanism `@capacitor/android` uses for its own reflective plugin
+         * discovery (capacitor/build.gradle:50), and the only placement that
+         * survives `cap sync` — `android/app/proguard-rules.pro` is in the
+         * generated, gitignored tree. `proguard-rules.pro` says what breaks
+         * without it.
+         */
+        consumerProguardFiles 'proguard-rules.pro'
+
         externalNativeBuild {
             cmake {
                 arguments "-DLLAMA_CPP_DIR=${llamaCppDir}",
