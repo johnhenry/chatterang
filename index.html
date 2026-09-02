@@ -2,6 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!--
+      Model output is untrusted, and a markdown image is a GET the page makes on
+      the user's behalf with no click. This is the belt to Markdown.tsx's
+      braces: even if a future component renders a model-supplied URL without
+      going through `urlTransform`, the browser refuses the request.
+
+      Deliberately narrow. Only `img-src` is set, because that is the channel
+      that leaks; a fuller policy would also have to admit the webfont hosts and
+      every provider endpoint, and a CSP widened for each new provider is one
+      that gets widened carelessly. Every image the app renders is `data:`
+      (Studio) or `blob:` (attachments) — checked, nothing remote is legitimate.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data: blob:" />
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
