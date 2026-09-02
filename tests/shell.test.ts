@@ -734,8 +734,12 @@ describe('chatterang commands', () => {
   });
 
   it('answers what leaves the device', async () => {
+    // What each line of that answer claims, and whether the app actually does
+    // it, is pinned sentence by sentence in `tests/privacy-copy.test.ts`. This
+    // one is about the shell: the command runs, reads the stores it is given,
+    // and reaches the terminal.
     const result = await sh.exec('privacy');
-    expect(result.stdout).toContain('no remote providers are enabled');
+    expect(result.stdout).toContain('no provider is enabled');
     expect(result.stdout).toContain('Stays on this device');
   });
 

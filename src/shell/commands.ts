@@ -84,6 +84,16 @@ export interface ShellStores {
   device: () => DeviceRow | null;
   benchmarks: () => readonly BenchRow[];
   runBenchmark(modelId: string): Promise<void>;
+  /**
+   * Connected MCP servers, for `privacy` to name.
+   *
+   * Optional because it arrived after the interface did and every test builds
+   * this object by hand. `privacy` treats its absence as "no servers", which
+   * is the same answer an empty array gives — the command must never claim a
+   * server does not exist because a caller forgot to wire this up, so the
+   * MCP paragraph is printed only when there is a named server to print.
+   */
+  mcpServers?: () => readonly McpRow[];
 }
 
 interface ModelRow {
@@ -147,6 +157,12 @@ interface BenchRow {
   generateTokensPerSecond: number;
   backend: string;
   createdAt: number;
+}
+interface McpRow {
+  name: string;
+  /** Where a call to this server's tools actually goes. */
+  host: string;
+  enabled: boolean;
 }
 
 /* ── Formatting helpers ──────────────────────────────────────────────── */
@@ -462,41 +478,98 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
     },
   };
 
+  /**
+   * What leaves this device.
+   *
+   * This command is what a privacy-conscious person runs to check, so it is
+   * the one place that must not be reassuring by omission — and, after a
+   * review found every sentence it printed false, the one place that must not
+   * be reassuring by wording either. The rule for this copy: a line is a
+   * measurement, or it does not ship. Where the measurement is unflattering
+   * the unflattering line ships, because a false answer to someone actively
+   * checking is worse than no answer.
+   *
+   * What was deleted rather than narrowed again, and why:
+   *
+   *   - "nothing else: no remote providers are enabled". A completeness
+   *     claim, printed in exactly the configuration where it is false: an
+   *     MCP tool sends its arguments to its own server from a chat with no
+   *     provider in it at all. There is no completeness claim here now.
+   *
+   *   - "withholds it … if the reply diverted to a fallback". `stream()`
+   *     tests `egress.isGranted` BEFORE it tests for a fallback, so a
+   *     conversation grant covers the diverted turn too; only an ungranted
+   *     fallback withholds. Measured at the adapter: the diverted request
+   *     carried the tool output. The rule the code follows is stated below
+   *     instead of the rule we meant to write.
+   *
+   *   - "that reply in every later turn". The taint mark is derived from
+   *     `Message.toolCalls`, and `regenerate` moves the old text into
+   *     `variants` on a row whose `toolCalls` belong to the new turn.
+   *     Measured after `cycleVariant`: the history is unmarked and the bytes
+   *     reach a remote adapter with no sheet. That is a defect in the code,
+   *     not in the sentence, so the sentence says it plainly and the defect
+   *     stays on the list.
+   */
   const privacy: ShellCommand = {
     name: 'privacy',
     summary: 'What leaves this device',
     usage: 'privacy',
     async run() {
       const enabled = stores.providers().list.filter((p) => p.enabled);
+      const servers = (stores.mcpServers?.() ?? []).filter((s) => s.enabled);
+
       return ok(
         [
           'Leaves this device:',
-          '  - model downloads from Hugging Face, when you ask for one',
+          '  - what you type into the model search, and the model files you',
+          '    download, to huggingface.co',
           enabled.length > 0
             ? `  - messages you send to: ${enabled.map((p) => p.label).join(', ')}`
-            : '  - nothing else: no remote providers are enabled',
-          // This command is what a privacy-conscious person runs to check, so
-          // it is the one place that must not be reassuring by omission. Tool
-          // output is not a message the user typed, and it is drawn from
-          // /chats, /models and /personas — the very things the list below
-          // used to promise stayed put.
+            : '  - no provider is enabled, so nothing you type is sent to one',
+          // Printed only when there is a server to name. An unconditional
+          // paragraph about MCP would be describing something that is not
+          // happening; a named server is a fact the user can check.
+          ...(servers.length > 0
+            ? [
+                '  - the arguments of an MCP tool, to the server that tool comes',
+                `    from: ${servers.map((s) => `${s.name} (${s.host})`).join(', ')}.`,
+                '    That tool runs there, not here, and nothing is asked before',
+                '    its arguments go — enabling the tool for a chat is the whole',
+                '    of the consent. A call the server itself calls destructive',
+                '    does ask, but about changing data there, not about what',
+                '    leaves. The arguments are whatever the model wrote from the',
+                '    conversation.',
+              ]
+            : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
           '    what the tool read, which for `bash` is this app’s own data —',
-          '    /chats, /models, /personas. The app asks once per conversation',
-          '    before it does, and withholds it if you decline or if the reply',
-          '    diverted to a fallback. Every grant is dropped when the provider',
-          '    it named is removed or switched off — `provider disable <id>`.',
+          '    /chats, /models, /personas. The app asks before it does, and',
+          '    withholds it if you decline. “Send for this conversation” is the',
+          '    answer that stops the asking; “Send this turn” is asked again on',
+          '    the next turn. Every grant is dropped when the provider it named',
+          '    is removed or switched off — `provider disable <id>`.',
           '  - anything DERIVED from that output, under the same grant: a later',
-          '    tool call’s arguments OR ITS NAME, a reply the model wrote while',
-          '    the tool was running, and that reply in every later turn. Moving',
-          '    it into a different block, field or argument does not get it out;',
-          '    a withheld call is rebuilt from the app’s own strings rather than',
-          '    emptied of the ones we thought to empty.',
+          '    tool call’s arguments OR ITS NAME, and a reply the model wrote',
+          '    while the tool was running. Moving it into a different block,',
+          '    field or argument does not get it out; a withheld call is rebuilt',
+          '    from the app’s own strings rather than emptied of the ones we',
+          '    thought to empty.',
+          '  - a benchmark run, if you turn leaderboard publishing on and',
+          '    publish one. The exact payload is shown before it is sent.',
+          '',
+          'Two things reach further than they read:',
+          '  - a grant covers the conversation, so it also covers a turn this',
+          '    device could not finish and diverted to your fallback provider.',
+          '    You are not asked again at the moment it diverts.',
+          '  - flipping between regenerated answers moves the older text out of',
+          '    the turn whose tool produced it. From then on it is sent as',
+          '    ordinary text: nothing withheld, nothing asked.',
           '',
           'Stays on this device:',
-          '  - personas, generated images, settings, benchmark runs',
-          '  - conversations, except the parts a tool reads in a chat you have',
-          '    granted above, and the messages you send to an enabled provider',
+          '  - conversations, personas, generated images, settings and benchmark',
+          '    runs are stored here and nowhere else. There is no account and',
+          '    nothing syncs. What can leave a conversation is the list above.',
         ].join('\n'),
       );
     },

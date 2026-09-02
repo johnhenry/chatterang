@@ -378,9 +378,26 @@ export interface ClearOptions {
    * meant to stop depending on.
    *
    * So: local keeps the mark, and `renderPrompt` encodes. Non-local strips it,
-   * and a non-local destination renders no template at all — its structure is
-   * JSON, not markers, so there is nothing there for a marker to forge.
-   * Omitting the flag strips, which keeps the provider-facing default.
+   * because this app's bookkeeping must never reach a provider SDK. Omitting
+   * the flag strips, which keeps the provider-facing default.
+   *
+   * What this comment used to claim next — that a non-local destination
+   * "renders no template at all — its structure is JSON, not markers, so there
+   * is nothing there for a marker to forge" — is not true, and it was
+   * justifying the strip with it. `local` is `isLocalEngine(engine)`, and
+   * `ollama` and `lmstudio` are `self-hosted` providers whose engine is
+   * `remote`: non-local by this flag, and servers that apply the model's own
+   * chat template to the JSON they are handed. Nothing encodes on that path —
+   * `renderPrompt`/`sanitiseMessages` run only inside the llama.cpp adapter —
+   * so a marker in tool output reaches a renderer, just not this app's.
+   * Measured through `clearForDestination` with `local: false`: the body still
+   * contained `<|im_start|>` verbatim, where the same bytes through
+   * `renderPrompt` came out substituted.
+   *
+   * That is a hole in the code, not in the sentence, and it is not closed
+   * here. The flag's job is the mark; encoding for a destination that renders
+   * somebody else's template is a separate piece of work. This comment says so
+   * rather than explaining why it does not need doing.
    */
   readonly local?: boolean;
 }

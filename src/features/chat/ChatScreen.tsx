@@ -564,16 +564,21 @@ function ChatSettingsSheet({
         <div className="section__head">
           <h2>Tools</h2>
         </div>
-        {/* The old line here — "Tools run on this device and cannot reach the
-            network" — sat directly above an unfiltered `toolRegistry.list()`,
-            and `state/mcp.ts` registers every MCP tool into that same
-            registry. So it was false for MCP tools by construction, and
-            misleading for `bash`: the shell has no socket, but its output is
-            appended to the conversation, and the conversation goes to whatever
-            serves the next turn. */}
+        {/* This line has been wrong twice, each time by generalising over a
+            list it does not control. "Tools run on this device and cannot
+            reach the network" was false for every MCP tool in the unfiltered
+            `toolRegistry.list()` below. Its replacement led with "Tools run on
+            this device" and then "the app asks first", and both halves were
+            measured false: an MCP tool executes on its server, and calling one
+            sends the model's arguments there with no sheet at all. So the
+            sentence is split by where the tool actually runs, and the MCP half
+            says what does not happen. */}
         <p className="section__hint">
-          Tools run on this device. What they read goes to the model — off this device if the
-          model is remote, and the app asks first. MCP tools call a server by definition.
+          A tool from an MCP server runs on that server: calling one sends its arguments there,
+          and nothing is asked first — a call the server calls destructive asks about changing
+          data there, not about what leaves. Every other tool runs on this device; what it reads
+          goes to the model, and off this device with it when the model is remote — that one the
+          app asks about, every turn until you answer for the whole conversation.
         </p>
         <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
           {toolRegistry.list().map((tool) => {

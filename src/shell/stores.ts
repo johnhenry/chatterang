@@ -8,8 +8,10 @@
 
 import { db } from '@/db';
 import { CATALOG } from '@/data/catalog';
+import { destinationHost } from '@/domain/mcp';
 import type { ShellStores } from '@/shell/commands';
 import { useApp } from '@/state/app';
+import { useMcp } from '@/state/mcp';
 import { useBench } from '@/state/bench';
 import { useChats } from '@/state/chat';
 import { useModels } from '@/state/models';
@@ -98,5 +100,16 @@ export function liveStores(): ShellStores {
       })),
 
     runBenchmark: (modelId) => useBench.getState().run(modelId),
+
+    // `privacy` names these, because an MCP tool's arguments leave the device
+    // whether or not a provider is enabled — which is the case the old copy
+    // called "nothing else". Projects the host rather than the URL: the token
+    // and the path are not the user's question, and the host is.
+    mcpServers: () =>
+      useMcp.getState().servers.map((server) => ({
+        name: server.name,
+        host: destinationHost(server.url),
+        enabled: server.enabled,
+      })),
   };
 }

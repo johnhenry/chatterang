@@ -1,18 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { BackendAdapter, IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
-import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
-
 import {
   ChatterangEngine,
   targetFor,
-  type GenerationEvent,
   type ToolEgressPolicy,
   type ToolEgressRequest,
 } from '@/ai/engine';
 import { toolRegistry } from '@/ai/tools/registry';
-import { DEFAULT_SAMPLER } from '@/domain/manifest';
-import { catalogEntry } from '@/data/catalog';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
 import { ENGINE_PHASE, isLocalEngine, type EngineId } from '@/domain/manifest';
@@ -20,6 +14,18 @@ import { CATALOG, IMAGE_GEN_RAM_FLOOR } from '@/data/catalog';
 import { PROVIDERS, connectionConfig, getProvider } from '@/ai/providers';
 import { BUILT_IN_PERSONAS, MARKETPLACE } from '@/data/personas';
 import type { BenchmarkRun } from '@/db';
+import {
+  CALL,
+  SECRET,
+  callsThenFails,
+  cloudTarget,
+  drainEvents,
+  leakyTool,
+  probeManifest,
+  probeResolver,
+  recordingBackend,
+  sent,
+} from './support/egress-probe';
 
 /**
  * These assert the promises the product makes, not just that the code runs.
@@ -251,94 +257,12 @@ describe('persona catalog', () => {
  * loop; a test that only asserted it is PRESENT under a grant would pass if the
  * gate never ran. Both are here, against the same probe.
  */
-const SECRET = 'PASSPHRASE-ORTHOGONAL-PANGOLIN-7731';
-const probeManifest = catalogEntry('qwen3-4b-instruct-q4km')!;
-
-const probeResolver = {
-  getManifest: (id: string) => (id === probeManifest.id ? probeManifest : null),
-  getPath: () => '/dev/model.gguf',
-  getSampler: () => ({ ...DEFAULT_SAMPLER, maxTokens: 64 }),
-};
-
-const CALL = '<tool_call>{"name":"leaky","arguments":{}}</tool_call>';
-
-/** Stands in for `bash`: returns the user's own data, as the shell would. */
-const leakyTool = {
-  id: 'leaky',
-  name: 'leaky',
-  description: 'Reads this app’s own data.',
-  summary: 'probe',
-  parameters: { type: 'object' as const, properties: {} },
-  execute: async () => ({
-    output: `# Therapy notes\n\n## You\n\nmy ${SECRET}\n`,
-  }),
-};
-
-/** A backend that records every request it is handed, then replies to script. */
-function recordingBackend(turns: string[]): {
-  adapter: BackendAdapter;
-  seen: IRChatRequest[];
-} {
-  const seen: IRChatRequest[] = [];
-  let turn = 0;
-  const next = (request: IRChatRequest): string => {
-    seen.push(structuredClone(request));
-    return turns[Math.min(turn++, turns.length - 1)] ?? '';
-  };
-
-  return {
-    seen,
-    adapter: new FunctionBackendAdapter({
-      execute: async (request) => ({
-        message: { role: 'assistant', content: next(request) },
-        finishReason: 'stop',
-        metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
-      }),
-      executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
-        const text = next(request);
-        yield { type: 'start', sequence: 0, metadata: request.metadata };
-        yield { type: 'content', sequence: 1, delta: text };
-        yield { type: 'done', sequence: 2, finishReason: 'stop' };
-      },
-    }),
-  };
-}
-
-/** A local backend that answers once with a tool call, then dies. */
-function callsThenFails(): BackendAdapter {
-  let turn = 0;
-  return new FunctionBackendAdapter({
-    execute: async () => {
-      throw new Error('not enough memory');
-    },
-    executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
-      if (turn++ > 0) throw new Error('not enough memory');
-      yield { type: 'start', sequence: 0, metadata: request.metadata };
-      yield { type: 'content', sequence: 1, delta: CALL };
-      yield { type: 'done', sequence: 2, finishReason: 'stop' };
-    },
-  });
-}
-
-async function drainEvents(stream: AsyncGenerator<GenerationEvent>): Promise<GenerationEvent[]> {
-  const events: GenerationEvent[] = [];
-  for await (const event of stream) events.push(event);
-  return events;
-}
-
-function sent(requests: readonly IRChatRequest[]): string[] {
-  return requests.map((request) => JSON.stringify(request.messages));
-}
+/**
+ * The rig lives in `./support/egress-probe`, shared with `privacy-copy.test.ts`
+ * so both suites measure the same thing rather than two copies of it.
+ */
 
 describe('tool output does not leave the device without a grant', () => {
-  const cloudTarget = {
-    backendId: 'cloud',
-    engine: 'remote' as const,
-    modelId: 'gpt-4o-mini',
-    modelName: 'GPT-4o mini',
-    local: false,
-  };
-
   function setUp(turns: string[] = [CALL, 'Done.']) {
     toolRegistry.register(leakyTool);
     const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });

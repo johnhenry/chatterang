@@ -95,17 +95,22 @@ export function ProvidersPanel(): ReactNode {
         </div>
       ) : null}
 
+      {/* "Requests stay inside your network" was a promise about an address
+          the user types and nothing validates. */}
       <ProviderGroup
         title="On your own network"
-        hint="Requests stay inside your network."
+        hint="Requests go to the address you give. Nothing here checks that it is on your network."
         providers={grouped['self-hosted']}
         onPick={setAdding}
       />
-      {/* "Messages you send leave your device" was too narrow: tool output is
-          not a message the user sent, and it travels in the same request. */}
+      {/* "…and, if you allow it, what a tool read" made allowing it the
+          precondition. Measured, it is not one: flipping between regenerated
+          answers moves tool-derived text into an ordinary message, and it goes
+          out with no grant and no sheet. The hint now states the grant as the
+          usual path and names the exception rather than implying none. */}
       <ProviderGroup
         title="Cloud providers"
-        hint="Messages you send leave your device — and, if you allow it, what a tool read."
+        hint="Messages you send leave your device. What a tool read goes too, once you allow it for a conversation — and, after you flip between regenerated answers, whether you allowed it or not."
         providers={grouped.cloud}
         onPick={setAdding}
       />

@@ -63,20 +63,36 @@ export function SettingsScreen(): ReactNode {
                   gap: 4,
                 }}
               >
-                <li>Model downloads from Hugging Face.</li>
+                <li>What you search for and download from Hugging Face.</li>
                 <li>
                   {enabledConnections.length === 0
-                    ? 'Nothing else — no remote providers are connected.'
+                    ? 'No provider is enabled, so nothing you type is sent to one.'
                     : `Messages you send to ${enabledConnections.map((connection) => connection.label).join(', ')}.`}
                 </li>
+                {mcpToolCount > 0 ? (
+                  <li>
+                    The arguments of any MCP tool the model calls, to the server that tool comes
+                    from. Nothing is asked before they go.
+                  </li>
+                ) : null}
                 <li>
                   {settings.leaderboardOptIn
                     ? 'Benchmark runs you explicitly publish.'
                     : 'No benchmark data — leaderboard publishing is off.'}
                 </li>
               </ul>
+              {/* This card was a second copy of the shell's `privacy` list that
+                  nobody updated when that list grew, so it was stale as well as
+                  wrong: it said "Nothing else — no remote providers are
+                  connected" a few hundred pixels above the MCP section, and it
+                  ended on a storage sentence positioned as an egress promise.
+                  It is no longer a second source of truth. It states what it
+                  can state exactly and sends the reader to the one list that is
+                  kept current. */}
               <p className="section__hint">
-                Conversations, personas, and generated images are stored only on this device.
+                Conversations, personas, and generated images are stored only on this device —
+                there is no account and nothing syncs. What can leave a conversation is longer
+                than this card: run <code>privacy</code> in the shell.
               </p>
             </div>
 
