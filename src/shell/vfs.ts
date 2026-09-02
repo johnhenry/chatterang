@@ -34,6 +34,10 @@ export const PROJECTED_PATHS = [
   '/chats',
   '/models',
   '/personas',
+  // Added with the projection itself, not after: the test that guards this list
+  // says the seam is 'where a projection added tomorrow would quietly land in
+  // writable space', and that is exactly how /providers first arrived.
+  '/providers',
   '/README.md',
   '/device.json',
 ] as const;
@@ -156,6 +160,35 @@ export async function buildVfs(stores: ShellStores): Promise<VfsSnapshot> {
   }
 
   if (personas.length === 0) files['/personas/.keep'] = '';
+
+  /*
+   * ── Providers ──────────────────────────────────────────────────────
+   *
+   * A WHITELIST, not the stored object.
+   *
+   * `ProviderConnection.apiKey` lives beside these fields, so serialising the
+   * record whole put a live credential in the VFS — where the model can read
+   * it, and where the shell's whole premise is that it cannot. Caught by
+   * `tests/shell.test.ts`'s canary, which greps the projection for key shapes
+   * and has guarded this since before the desktop build existed.
+   *
+   * The projection is a whitelist by construction rather than a redaction on
+   * the way past: a field added to the stored record does not appear here
+   * until someone adds it deliberately, which is the failure mode that
+   * matters — nobody re-reads this loop when they add a token to the store.
+   */
+  for (const provider of stores.providers().list) {
+    files[`/providers/${slug(provider.label, provider.id)}.json`] = `${JSON.stringify(
+      {
+        id: provider.id,
+        label: provider.label,
+        enabled: provider.enabled,
+        defaultModel: provider.defaultModel,
+      },
+      null,
+      2,
+    )}\n`;
+  }
 
   /* ── Device ────────────────────────────────────────────────────────── */
   const device = stores.device();

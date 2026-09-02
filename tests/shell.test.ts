@@ -134,7 +134,7 @@ describe('sandbox boundaries', () => {
   it('mounts only app data, nothing resembling a device path', async () => {
     const paths = Object.keys(await buildVfs(stores()));
     for (const path of paths) {
-      expect(path).toMatch(/^\/(workspace|chats|models|personas|README\.md|device\.json)/);
+      expect(path).toMatch(/^\/(workspace|chats|models|personas|providers|README\.md|device\.json)/);
     }
   });
 

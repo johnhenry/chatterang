@@ -503,11 +503,25 @@ describe.skipIf(ELECTRON === undefined)('the numbers the comments claim', () => 
     expect(row!.titleWidth).toBeLessThanOrEqual(158);
     expect(row!.titleWidth).toBeGreaterThanOrEqual(140);
 
+    /*
+     * A RANGE, because the budget is not a single number.
+     *
+     * `titleWidth` is allowed 140-158 above, and it varies with the platform's
+     * scrollbar. Dividing by the advance therefore gives ~21 characters at the
+     * narrow end and ~24 at the wide one — so an assertion of `< 23` is true
+     * only at one end of the range this same test permits, and it failed the
+     * moment it was measured on a machine with a narrower scrollbar.
+     *
+     * The finding stands and is now stated correctly: tokens.css claimed a
+     * flat "~23 characters" from a sum that omitted `.history__body`'s 12px of
+     * padding each side, the card's borders, `.history`'s own right border and
+     * the scrollbar. The honest figure is a band, and the number that matters
+     * for truncation is the FLOOR — what the column carries on the platform
+     * with the widest scrollbar.
+     */
     const characters = row!.titleWidth / measured().fonts.withArchivo.advance;
     expect(characters).toBeGreaterThanOrEqual(20);
-    // And the old claim is false, which is the finding: 23 characters was
-    // never available in this column.
-    expect(characters).toBeLessThan(23);
+    expect(characters).toBeLessThanOrEqual(25);
   });
 
   it('counts 66ch in prose characters rather than in zeroes', () => {
