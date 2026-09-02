@@ -104,7 +104,33 @@ final class LlamaContext {
     private(set) var supportsVision: Bool
     private(set) var chatTemplate: String
 
-    static let engineVersion = "llama.cpp \(String(cString: llama_print_system_info()).prefix(0))b-chatterang"
+    /// The llama.cpp tag `tools/build-llama-xcframework.sh` pins. This is a
+    /// SOURCE CONSTANT: it records what we intended to build against, not what
+    /// actually loaded. On its own it proves nothing — a plugin that linked no
+    /// engine at all would report it just as confidently.
+    static let pinnedTag = "b10760"
+
+    /// Engine identity, and the only field in `getCapabilities` that can serve
+    /// as evidence the real engine is present.
+    ///
+    /// `simulated: false` cannot do that job — it is a boolean an implementation
+    /// sets, and a stub returning a plausible struct sets it the same way. Nor
+    /// can `chipset`, `cpuCores` or `totalMemory`: on a simulator those are the
+    /// host Mac's values, not a phone's.
+    ///
+    /// `llama_print_system_info()` is different in kind. It is produced by the
+    /// engine, it enumerates the feature flags the binary was actually compiled
+    /// with (NEON, ARM_FMA, ACCELERATE, METAL...), and reaching it at all
+    /// requires the framework to have linked and loaded.
+    ///
+    /// This line previously read `.prefix(0)` — which is the empty string, so
+    /// the whole field collapsed to the compile-time constant
+    /// "llama.cpp b-chatterang" and was indistinguishable from a stub's output.
+    static let engineVersion: String = {
+        let reported = String(cString: llama_print_system_info())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "llama.cpp \(pinnedTag) | \(reported)"
+    }()
 
     static var metalAvailable: Bool {
         #if targetEnvironment(simulator)
@@ -128,8 +154,11 @@ final class LlamaContext {
         // model does not fit"; partial offload is rarely the right answer.
         let wantsGpu = options.requestedBackend.hasPrefix("gpu") && Self.metalAvailable
         modelParams.n_gpu_layers = wantsGpu ? Int32(options.gpuLayers) : 0
-        modelParams.use_mmap = options.useMmap
-        modelParams.use_mlock = false
+        // API drift, b10760: `use_mmap`/`use_mlock` were replaced by a single
+        // `load_mode` enum. `.NONE` is the honest translation of the old
+        // `use_mmap = false, use_mlock = false` pair — not `.AUTO`, which would
+        // let llama.cpp re-enable mmap behind a caller that asked for it off.
+        modelParams.load_mode = options.useMmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE
 
         model = llama_model_load_from_file(options.modelPath, modelParams)
 
@@ -188,7 +217,7 @@ final class LlamaContext {
         if let draftPath = options.draftModelPath {
             var draftParams = llama_model_default_params()
             draftParams.n_gpu_layers = modelParams.n_gpu_layers
-            draftParams.use_mmap = true
+            draftParams.load_mode = LLAMA_LOAD_MODE_MMAP
             draftModel = llama_model_load_from_file(draftPath, draftParams)
 
             if let draftModel {
@@ -314,7 +343,7 @@ final class LlamaContext {
 
         cachedTokens = promptTokens
 
-        let chain = makeSamplerChain(sampler)
+        let chain = try makeSamplerChain(sampler)
         defer { llama_sampler_free(chain) }
 
         var text = ""
@@ -376,12 +405,28 @@ final class LlamaContext {
 
     private var lastDraftAcceptance: Double = 0
 
-    private func makeSamplerChain(_ sampler: Sampler) -> OpaquePointer {
+    // API drift, b10760: `struct llama_sampler` is a complete type in llama.h,
+    // so Swift imports `llama_sampler *` as `UnsafeMutablePointer<llama_sampler>`,
+    // not as `OpaquePointer`. Model and context pointers remain opaque; only
+    // the sampler chain changed.
+    //
+    // It throws rather than force-unwrapping: `llama_sampler_chain_init`
+    // returns a nullable pointer, and the only realistic null is an allocation
+    // failure. Passing that null on to `llama_sampler_sample` would dereference
+    // it inside C — a crash with no message — where throwing surfaces the same
+    // condition as the recoverable out-of-memory the callers already handle.
+    private func makeSamplerChain(_ sampler: Sampler) throws -> UnsafeMutablePointer<llama_sampler> {
         var params = llama_sampler_chain_default_params()
         params.no_perf = true
-        let chain = llama_sampler_chain_init(params)
+        guard let chain = llama_sampler_chain_init(params) else {
+            throw EngineError.outOfMemory
+        }
 
+        // API drift, b10760: `llama_sampler_init_penalties` grew a leading
+        // `int32_t n_vocab`. NOTE: this argument has never been exercised by a
+        // real load — `getCapabilities` does not reach here.
         llama_sampler_chain_add(chain, llama_sampler_init_penalties(
+            llama_vocab_n_tokens(vocab),
             sampler.repeatLastN,
             sampler.repeatPenalty,
             sampler.frequencyPenalty,
@@ -426,7 +471,7 @@ final class LlamaContext {
 
         var sampler = Sampler(from: [:])
         sampler.maxTokens = Int32(generateTokens)
-        let chain = makeSamplerChain(sampler)
+        let chain = try makeSamplerChain(sampler)
         defer { llama_sampler_free(chain) }
 
         let decodeStart = Date()

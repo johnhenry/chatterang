@@ -36,3 +36,11 @@ tests/**/*.js.map
 /apps/desktop/build.server-test/
 /apps/desktop/app/
 /apps/server/build/
+
+# llama.cpp is neither vendored nor submoduled: `native/plugin-llama-cpp/tools/
+# build-llama-xcframework.sh` clones a pinned tag into `.cache/` and builds the
+# XCFramework that Package.swift's `llama` binaryTarget points at. Both are
+# reproducible from that script and the tag pinned inside it. Anchored, so
+# `.cache` elsewhere in the tree is not silently swallowed.
+/.cache/
+/native/plugin-llama-cpp/ios/llama.xcframework/

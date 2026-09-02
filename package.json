@@ -37,6 +37,7 @@
     "@capacitor/preferences": "8.0.1",
     "@capacitor/share": "8.0.1",
     "@capacitor/status-bar": "8.0.3",
+    "@chatterang/plugin-llama-cpp": "file:./native/plugin-llama-cpp",
     "@johnhenry/aimatey": "0.1.0",
     "@johnhenry/aimatey-backend": "0.2.0",
     "@johnhenry/aimatey-backend-browser": "0.1.2",

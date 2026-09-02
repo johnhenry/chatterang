@@ -1,0 +1,20 @@
+{
+  "name": "@chatterang/plugin-llama-cpp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Capacitor plugin package that makes the llama.cpp native sources discoverable by `cap sync`. The TypeScript contract lives in src/plugins/llama-cpp; this package carries only the native halves.",
+  "license": "Apache-2.0",
+  "files": [
+    "ios/Sources",
+    "android/src/main/",
+    "Package.swift"
+  ],
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}
