@@ -117,6 +117,67 @@ describe('the capability table', () => {
     });
   });
 
+  it('gives the served deployment the server row, and justifies each field', () => {
+    /*
+     * A9'S ROW. Nothing in this file previously forced a NEW row's values to
+     * be argued for — a wrong one would have shipped green — so each field
+     * here is asserted against the reason it holds, not against the table.
+     *
+     * `modelStore: 'filesystem'`  the weights live on the SERVER's disk,
+     *   because the server's inference host is what opens them. `'opfs'` would
+     *   put a multi-gigabyte download in the connecting browser's private
+     *   filesystem, where the process with the GPU can never read it — which
+     *   is eb3a279 on a fifth platform. The row is a claim about the
+     *   `Filesystem` plugin being routed over the wire, and
+     *   `tests/server-bootstrap.test.ts` is where that claim is checked
+     *   against the real `@capacitor/core`.
+     *
+     * `fileHandoff: 'browser-download'`  a real browser with a real download
+     *   shelf, saving to the machine the PERSON is at — which is not the
+     *   machine the file was computed on. `'share-sheet'` would call a plugin
+     *   the server does not register.
+     *
+     * `offlineCache: false`  the one genuine judgement call, and the only
+     *   field where the packaged platforms' second clause fails on its own. A
+     *   served http origin CAN register a service worker, so "not possible"
+     *   stops applying; "not wanted" does not. The server owns the bundle on
+     *   local disk, so there is no latency to hide, and a second cache with
+     *   its own lifecycle in front of an app whose bundle changes when the
+     *   operator upgrades the server is a stale-page bug for somebody else.
+     *
+     * `purchases: false`  there is no store here.
+     */
+    expect(on('server', capabilities)).toEqual({
+      id: 'server',
+      modelStore: 'filesystem',
+      offlineCache: false,
+      fileHandoff: 'browser-download',
+      purchases: false,
+    });
+
+    /*
+     * SAID PLAINLY: THIS ASSERTION CANNOT TELL THE ROW FROM THE FALLBACK.
+     *
+     * `unknownPlatform()` answers filesystem / false / browser-download /
+     * false and reports the id it was given — which is field for field what
+     * the server row says. So deleting the row would not fail this test, and
+     * claiming otherwise would be exactly the vacuous guard this file keeps
+     * warning about.
+     *
+     * What actually forces the row to exist is the TYPE: `PLATFORMS` is a
+     * `Readonly<Record<PlatformId, PlatformCapabilities>>`, so adding 'server'
+     * to the union without a row is a compile error — measured, one error, at
+     * `platform.ts`'s table. The agreement between the two is not an accident
+     * either: `unknownPlatform` was written as "a packaged platform with no
+     * claims made on its behalf", and a served deployment is precisely that.
+     * The row exists so the values are STATED and argued, not inferred.
+     */
+    expect(on('some-future-shell', capabilities)).toEqual({
+      ...on('server', capabilities),
+      id: 'some-future-shell',
+    });
+  });
+
   it('treats an unfamiliar platform as packaged, never as the web', () => {
     // FAULT INJECTED: the fallback changed to `PLATFORMS.web`. Observed: this
     // failed on `modelStore` — a packaged shell would have been handed OPFS,
