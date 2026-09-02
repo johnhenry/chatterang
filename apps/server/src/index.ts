@@ -59,14 +59,16 @@
  * `PluginHost` refuses a plugin name it does not hold and a method the
  * definition does not declare, before touching any implementation. So "the
  * shell is not exposed" is not a promise about intent, it is the absence of a
- * row — and `tests/server.test.ts` asserts the exact plugin list over a real
- * socket, which is a claim that fails the day someone registers a fifth.
+ * row.
  *
- * Not registered, therefore not reachable: the shell and its `bash` tool, the
- * MCP registry, the chat/persona/provider stores, the leaderboard upload,
- * billing, and the menu command channel (which on desktop is the only inbound
- * push to a page — a server that could push commands into a connected browser
- * would be a way for whoever holds the machine to drive somebody else's app).
+ * Which four rows there are, which nine surfaces are off, and the boot-time
+ * refusal that keeps the list honest all live in `surface.ts` —
+ * `assertServerSurface` runs below, on the manifest, before this process binds
+ * a port. That file exists because this paragraph used to be the only thing
+ * enforcing it: the registration was inline in `main.ts`, no test executed
+ * `main.ts`, and a fifth `pluginHost.register(…)` left the suite green.
+ * `tests/server-surface.test.ts` now drives the real registration over a real
+ * socket, and `tests/server-auth.test.ts` does the same for the token.
  */
 
 import { createServer as createHttpServer } from 'node:http';
@@ -81,6 +83,7 @@ import type { ServerBinding } from './binding.js';
 import { serverBootstrapSource } from './client-bootstrap.js';
 import { createRequestListener } from './http.js';
 import { SessionRegistry } from './sessions.js';
+import { assertServerSurface } from './surface.js';
 
 export {
   LOOPBACK_HOST,
@@ -89,7 +92,7 @@ export {
   asTlsMaterial,
   listenHost,
   parseArgv,
-  requiresToken,
+  cookieIsSecure,
   resolveBinding,
   scheme,
   selfOrigin,
@@ -110,6 +113,14 @@ export {
 export { checkToken, createRequestListener, dispatch } from './http.js';
 export type { ServerRoutes } from './http.js';
 export { installServerBridge, serverBootstrapSource, SERVER_BRIDGE_GLOBAL } from './client-bootstrap.js';
+export {
+  OFF_SURFACES,
+  SERVER_PLUGINS,
+  assertServerSurface,
+  registerServerSurface,
+  servedUri,
+} from './surface.js';
+export type { ServedRoots, ServerImplementations } from './surface.js';
 export { SessionRegistry, encodeFrame } from './sessions.js';
 export type { Session, SessionSink } from './sessions.js';
 export { assertJsonWireSafe, NotJsonSafeError } from './wire.js';
@@ -123,8 +134,10 @@ export interface ServerOptions {
    * The plugin host, already populated.
    *
    * Passed in rather than built here, because what is registered on it IS the
-   * server's whole attack surface and that decision belongs at the top of the
-   * program where it can be read in one place — `main.ts`.
+   * server's whole attack surface and that decision belongs somewhere it can
+   * be read in one place — `surface.ts`, which `main.ts` calls. `startServer`
+   * checks the result with `assertServerSurface` rather than trusting the
+   * caller, because "passed in" is also how a fifth plugin would arrive.
    */
   readonly pluginHost: PluginHost;
   /** A peer went away. `main.ts` wires this to `HostFleet.releaseRenderer`. */
@@ -154,6 +167,11 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   const sessions = new SessionRegistry();
   const router = createMainRouter(options.pluginHost);
   const manifest = router.bootstrap();
+  // BEFORE THE SOCKET, not after. The manifest is what the channel table was
+  // built from and what the served bootstrap embeds, so this is the reachable
+  // surface rather than the intended one — and a server that would expose a
+  // fifth plugin never binds a port at all. See `surface.ts`.
+  assertServerSurface(manifest);
 
   const host = listenHost(options.binding);
   const listener = createRequestListener({

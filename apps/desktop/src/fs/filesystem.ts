@@ -118,6 +118,30 @@ export interface FilesystemPluginOptions {
    * guessed.
    */
   readonly roots: ReadonlyMap<string, string>;
+
+  /**
+   * How a confined real path is rendered as the `uri` a caller gets back.
+   *
+   * DEFAULTS TO THE ABSOLUTE REAL PATH, which is the desktop's answer and the
+   * one `getUri`'s own doc argues for at length: `download.ts:218` stores the
+   * string verbatim, `LlamaCpp.load` is handed it, and
+   * `tests/desktop-filesystem.test.ts` pins `confineRealPath(modelRoot, uri)
+   * === uri`. On desktop the page and the disk belong to the same person, so
+   * the path is not a disclosure.
+   *
+   * IT IS ONE WHEN THE PAGE IS SOMEWHERE ELSE. `apps/server` serves this
+   * plugin to a browser on another machine, and the success path was handing
+   * that browser `<root>/files/data/…` — the operator's home directory and
+   * their data root — while every FAILURE path in this file goes out of its
+   * way to say "the path is not echoed back". This hook is how the server
+   * closes that without changing what desktop answers; see
+   * `apps/server/src/main.ts:servedUri` for what it returns instead and why
+   * that string still loads.
+   *
+   * It renders only. It is not a confinement: `confine()` has already run, and
+   * this is called on its result.
+   */
+  readonly renderUri?: (real: string) => string;
 }
 
 /**
@@ -335,6 +359,9 @@ function refuseMethod(method: string): PluginMethod {
  */
 export function createFilesystemPlugin(options: FilesystemPluginOptions): PluginImplementation {
   const roots = options.roots;
+  // Identity by default: see `renderUri` on the options for why the desktop's
+  // answer is the absolute real path and why a served deployment's is not.
+  const renderUri = options.renderUri ?? ((real: string): string => real);
 
   const implementation: Record<string, PluginMethod> = {
     /**
@@ -360,7 +387,7 @@ export function createFilesystemPlugin(options: FilesystemPluginOptions): Plugin
         await requireDirectory('writeFile', parent);
       }
       await io('writeFile', () => writeFile(real, bytes, { flag: 'w' }));
-      return { uri: real };
+      return { uri: renderUri(real) };
     },
 
     /**
@@ -472,7 +499,7 @@ export function createFilesystemPlugin(options: FilesystemPluginOptions): Plugin
      */
     getUri: async (raw: unknown): Promise<{ uri: string }> => {
       const { real } = confine(roots, 'getUri', asRecord(raw));
-      return { uri: real };
+      return { uri: renderUri(real) };
     },
   };
 

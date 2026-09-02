@@ -15,11 +15,16 @@
  * bundle is not a secret; serving it to an anonymous peer is still a decision,
  * and this server does not make it.
  *
- * Gates 2 and 3 are what make a LOOPBACK binding with no token something other
- * than "unauthenticated". `http://127.0.0.1:8973` is reachable from every page
- * in the operator's browser: any website can POST to it. It cannot READ the
- * response — the same-origin policy still applies — but a side effect does not
- * need a readable response. Two things stop it, and both are needed:
+ * Gate 1 also covers BOTH ARMS, with no exception for the loopback one. It
+ * used to pass everything on a loopback binding, on the reasoning that gates 2
+ * and 3 were enough there. They are not, and it is worth being precise about
+ * what they do and do not cover, because the two gates themselves are right.
+ *
+ * WHAT GATES 2 AND 3 DEFEND AGAINST: a web page in the operator's own browser.
+ * `http://127.0.0.1:8973` is reachable from every tab they have open, and any
+ * site can POST to it. It cannot READ the response — the same-origin policy
+ * still applies — but a side effect does not need a readable response. Two
+ * things stop it, and both are needed:
  *
  *   the custom session header forces a CORS preflight, which is answered with
  *   nothing permissive, so the real request is never sent;
@@ -29,6 +34,24 @@
  * A `<form>` post cannot set a header at all, and a `fetch` that sets one is
  * preflighted. That is the whole defence and it is why `SESSION_HEADER` is
  * documented as a CSRF guard rather than as plumbing.
+ *
+ * WHAT THEY DO NOT DEFEND AGAINST, AND CANNOT: a caller that is not a browser.
+ * Every gate above is enforced by the peer, not by this process — a preflight
+ * is something a browser chooses to send, an `Origin` is something a browser
+ * chooses to set, and `originAllowed` accepts an absent one because browsers
+ * omit it on same-origin GETs. `curl` sends no `Origin`, sets any header it
+ * likes, and opens the event stream to be handed a session id. Measured, in
+ * two requests with no token: `Filesystem.writeFile` answered `{"ok":true}`
+ * for arbitrary bytes inside the data root, and
+ * `Filesystem.rmdir({path:'models',recursive:true})` answered `{"ok":true}`
+ * for the model directory. See `binding.ts` for why "only this machine" was
+ * the wrong unit: the principal being protected is the operator, and a process
+ * they did not start is not them.
+ *
+ * So gate 1 is now unconditional, which is also the smaller construction —
+ * there is no arm-dependent branch left for a mutation to delete quietly, and
+ * `tests/server-auth.test.ts` drives every route on both arms over a real
+ * socket rather than trusting this paragraph.
  *
  * ── WHAT IS NOT HERE ────────────────────────────────────────────────────
  *
@@ -49,7 +72,7 @@ import {
 import type { InvokeResult, MainRouter } from '@chatterang/desktop/bridge';
 import { resolveBundleRequest } from '@chatterang/desktop/security';
 
-import { requiresToken } from './binding.js';
+import { cookieIsSecure } from './binding.js';
 import type { ServerBinding } from './binding.js';
 import { SERVED_CSP, SECURITY_HEADERS, originAllowed, prepareDocument, readCookie, tokenCookie } from './policy.js';
 import type { SessionRegistry } from './sessions.js';
@@ -157,11 +180,14 @@ type TokenVerdict =
 /**
  * Decide whether this request carries the operator token.
  *
- * A loopback binding has no token to carry, so this passes everything — the
- * binding TYPE is what guarantees that arm never reached a network address.
+ * NO ARM IS EXEMPT. There is deliberately no `if (binding.kind === …)` here:
+ * the union guarantees every binding HAS a token, so there is no arm this
+ * function could pass without checking one. That is the difference between
+ * this and the version it replaces, which returned `{k:'pass'}` for the whole
+ * loopback arm and made the plugin bridge anonymous to every process on the
+ * machine.
  */
 export function checkToken(binding: ServerBinding, url: URL, cookieHeader: string | undefined): TokenVerdict {
-  if (!requiresToken(binding)) return { k: 'pass' };
   if (tokenMatches(binding.token, readCookie(cookieHeader, TOKEN_COOKIE))) return { k: 'pass' };
 
   const presented = url.searchParams.get(TOKEN_QUERY);
@@ -170,7 +196,7 @@ export function checkToken(binding: ServerBinding, url: URL, cookieHeader: strin
     clean.searchParams.delete(TOKEN_QUERY);
     return {
       k: 'adopt',
-      cookie: tokenCookie(TOKEN_COOKIE, binding.token.value),
+      cookie: tokenCookie(TOKEN_COOKIE, binding.token.value, cookieIsSecure(binding)),
       // Path and query only: an absolute Location built from a client-supplied
       // Host header is an open redirect waiting to happen.
       location: `${clean.pathname}${clean.search}`,
@@ -206,7 +232,16 @@ async function handle(
   // Gate 1, before the route is even looked at.
   const verdict = checkToken(routes.binding, url, request.headers.cookie);
   if (verdict.k === 'refuse') {
-    refuse(response, 401, 'Unauthorized');
+    // Says what to do, and names `<root>` rather than the real directory: the
+    // operator knows what they passed to --root, and a peer that does not is
+    // exactly who this refusal is for. Same rule the filesystem plugin's
+    // failure messages keep — the path is not echoed back.
+    refuse(
+      response,
+      401,
+      'Unauthorized. This server requires its operator token: open the one-time URL it ' +
+        'printed at startup, or read the token from <root>/server-token.',
+    );
     return;
   }
   if (verdict.k === 'adopt') {

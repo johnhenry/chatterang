@@ -24,11 +24,11 @@ import {
   LOOPBACK_HOST,
   asAuthToken,
   asTlsMaterial,
+  cookieIsSecure,
   generateToken,
   listenHost,
   parseArgv,
   readOrCreateToken,
-  requiresToken,
   resolveBinding,
   selfOrigin,
   tokenMatches,
@@ -51,8 +51,27 @@ describe('the binding type', () => {
     // @ts-expect-error the authenticated arm requires both a token and TLS.
     const noCredentials: ServerBinding = { kind: 'authenticated', host: '0.0.0.0', port: 8080 };
 
-    // @ts-expect-error the loopback arm has no host field to put an address in.
-    const loopbackWithHost: ServerBinding = { kind: 'loopback', port: 8080, host: '0.0.0.0' };
+    const loopbackWithHost: ServerBinding = {
+      kind: 'loopback',
+      port: 8080,
+      // @ts-expect-error the loopback arm has no host field to put an address in.
+      host: '0.0.0.0',
+      token: generateToken(),
+    };
+
+    // The loopback arm carries a token TOO, and this is the pin for it. The
+    // arm shipped without one and the plugin bridge answered every process on
+    // the machine; see the header of `apps/server/src/binding.ts`. The day
+    // someone drops the field to make a test shorter, the BUILD fails.
+    // @ts-expect-error the loopback arm cannot be written down without a token.
+    const loopbackWithoutToken: ServerBinding = { kind: 'loopback', port: 8080 };
+
+    const loopbackNotAToken: ServerBinding = {
+      kind: 'loopback',
+      port: 8080,
+      // @ts-expect-error not on this arm either: a token is not a string.
+      token: 'hunter2',
+    };
 
     const notAToken: ServerBinding = {
       kind: 'authenticated',
@@ -73,15 +92,25 @@ describe('the binding type', () => {
     };
 
     // The values still exist at runtime; it is the types that refuse.
-    expect([noCredentials, loopbackWithHost, notAToken, notCertificates]).toHaveLength(4);
+    expect([
+      noCredentials,
+      loopbackWithHost,
+      loopbackWithoutToken,
+      loopbackNotAToken,
+      notAToken,
+      notCertificates,
+    ]).toHaveLength(6);
   });
 
   it('binds the loopback arm to a constant, with no field behind it', () => {
-    const binding: ServerBinding = { kind: 'loopback', port: 1234 };
+    const binding: ServerBinding = { kind: 'loopback', port: 1234, token: generateToken() };
     expect(listenHost(binding)).toBe(LOOPBACK_HOST);
     expect(LOOPBACK_HOST).toBe('127.0.0.1');
-    expect(requiresToken(binding)).toBe(false);
     expect(selfOrigin(binding)).toBe('http://127.0.0.1:1234');
+    // No `Secure` on the cookie for this arm, and it is not an oversight:
+    // there is no https origin here to send it back over. See
+    // `binding.ts:cookieIsSecure`.
+    expect(cookieIsSecure(binding)).toBe(false);
   });
 
   it('binds the authenticated arm where it was told, over https', () => {
@@ -93,7 +122,7 @@ describe('the binding type', () => {
       tls: MATERIAL,
     };
     expect(listenHost(binding)).toBe('10.0.0.4');
-    expect(requiresToken(binding)).toBe(true);
+    expect(cookieIsSecure(binding)).toBe(true);
     // The default port for the scheme is omitted, because that is how a
     // browser spells an origin and the origin check compares strings.
     expect(selfOrigin(binding)).toBe('https://10.0.0.4');
@@ -151,7 +180,29 @@ describe('resolving a binding from what the operator asked for', () => {
       credentials(),
     );
     expect(binding.kind).toBe('authenticated');
-    expect(requiresToken(binding)).toBe(true);
+    expect(cookieIsSecure(binding)).toBe(true);
+  });
+
+  it('takes a token for the bare loopback arm too, rather than skipping one', () => {
+    // THE REGRESSION THIS PINS. `resolveBinding({})` used to answer
+    // `{kind:'loopback', port}` and never call `credentials.token()` at all —
+    // which is what made the plugin bridge anonymous to every process on the
+    // machine. Counting the calls is the only way to see it from here: the
+    // binding LOOKS the same either way until something asks for the secret.
+    let tokensTaken = 0;
+    const binding = resolveBinding(
+      {},
+      {
+        tls: () => MATERIAL,
+        token: () => {
+          tokensTaken += 1;
+          return generateToken();
+        },
+      },
+    );
+    expect(binding.kind).toBe('loopback');
+    expect(tokensTaken).toBe(1);
+    expect(binding.token.value).toHaveLength(43);
   });
 
   it('refuses a port that is not one', () => {
@@ -227,7 +278,16 @@ describe('the operator token', () => {
     // by how long it takes to say no.
     expect(tokenMatches(token, token.value.slice(0, -1))).toBe(false);
     expect(tokenMatches(token, `${token.value}x`)).toBe(false);
-    expect(tokenMatches(token, `x${token.value.slice(1)}`)).toBe(false);
+    /*
+     * FLIPPED, NOT SUBSTITUTED WITH A LITERAL. This line used to be
+     * `` `x${token.value.slice(1)}` ``, which is not a flipped character when
+     * the token already begins with `x` — one run in 64, on a random 43-char
+     * base64url string, in which the "wrong" token IS the token and this
+     * asserted `false` about a value that is equal. Observed, on this branch,
+     * as `expected true to be false` with nothing else changed.
+     */
+    const first = token.value[0] === 'x' ? 'y' : 'x';
+    expect(tokenMatches(token, `${first}${token.value.slice(1)}`)).toBe(false);
     expect(tokenMatches(token, asAuthToken('a'.repeat(43)).value)).toBe(false);
   });
 

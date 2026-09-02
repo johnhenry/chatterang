@@ -156,7 +156,7 @@ describe('who may call the API', () => {
 
 describe('the token cookie', () => {
   it('cannot be read by script, sent over plaintext, or attached cross-site', () => {
-    const cookie = tokenCookie('chatterang_token', 'abc/def');
+    const cookie = tokenCookie('chatterang_token', 'abc/def', true);
     expect(cookie).toContain('HttpOnly');
     expect(cookie).toContain('Secure');
     expect(cookie).toContain('SameSite=Strict');
@@ -164,6 +164,19 @@ describe('the token cookie', () => {
     // Encoded, so a token containing a cookie delimiter cannot inject an
     // attribute of its own.
     expect(cookie).toContain('abc%2Fdef');
+  });
+
+  it('drops only Secure on the plaintext arm, and keeps the other three', () => {
+    // The loopback arm has a token now, so this cookie is set over http. A
+    // `Secure` cookie there is accepted by browsers that treat 127.0.0.1 as a
+    // trustworthy origin and dropped by ones that do not — an authentication
+    // that works in three browsers and loops in the fourth. The two attributes
+    // that actually defend it are not conditional.
+    const cookie = tokenCookie('chatterang_token', 'abc/def', false);
+    expect(cookie).not.toContain('Secure');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Strict');
+    expect(cookie).toContain('Path=/');
   });
 
   it('reads one cookie out of a header with several', () => {

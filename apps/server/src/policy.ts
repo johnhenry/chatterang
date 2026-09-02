@@ -197,12 +197,18 @@ export function readCookie(header: string | undefined, name: string): string | u
  * The `Set-Cookie` value for the token cookie.
  *
  * `HttpOnly` so no script can read it back out — including a compromised
- * dependency in the app's own bundle. `Secure` unconditionally, because the
- * cookie only ever exists in the authenticated arm and that arm is always TLS.
- * `SameSite=Strict` so it is not attached to a cross-site navigation, which is
- * the second layer under the custom-header requirement on the API routes.
- * `Path=/` because the assets and the API both need it.
+ * dependency in the app's own bundle. `SameSite=Strict` so it is not attached
+ * to a cross-site navigation, which is the second layer under the
+ * custom-header requirement on the API routes. `Path=/` because the assets and
+ * the API both need it. All three are unconditional.
+ *
+ * `Secure` is the one that is not, and `binding.ts:cookieIsSecure` holds the
+ * reason: it used to be unconditional because the cookie only ever existed on
+ * the TLS arm, and the loopback arm now has a token too. A `Secure` cookie
+ * over plaintext loopback is accepted by browsers that treat 127.0.0.1 as a
+ * potentially-trustworthy origin and dropped by ones that do not, which is an
+ * authentication that works in three browsers and loops forever in the fourth.
  */
-export function tokenCookie(name: string, value: string): string {
-  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+export function tokenCookie(name: string, value: string, secure: boolean): string {
+  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly;${secure ? ' Secure;' : ''} SameSite=Strict`;
 }

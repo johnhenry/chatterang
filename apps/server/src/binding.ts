@@ -9,7 +9,7 @@
  * So the bind address and the credentials are ONE VALUE, not two flags that
  * can disagree:
  *
- *   { kind: 'loopback',      port }                       — no host field AT ALL
+ *   { kind: 'loopback',      port, token }                — no host field AT ALL
  *   { kind: 'authenticated', host, port, token, tls }     — both required
  *
  * The loopback arm has nowhere to put a host: `listenHost()` returns the
@@ -39,6 +39,54 @@
  * module that can address a real filesystem. `--host 0.0.0.0` with no
  * certificate is the same class of thing, and gets the same answer: a boot
  * failure naming what is missing.
+ *
+ * ── WHY THE LOOPBACK ARM CARRIES A TOKEN TOO, WHICH IT DID NOT ──────────
+ *
+ * It shipped without one. The reasoning was that `127.0.0.1` is unreachable
+ * from another machine, and that the two gates in `http.ts` — a same-origin
+ * check and a custom request header that forces a CORS preflight — keep the
+ * one caller that CAN reach it, a web page in the operator's own browser, from
+ * doing anything with it. Both halves of that are still true and neither was
+ * the whole question.
+ *
+ * MEASURED, on 127.0.0.1 with no token, in two requests:
+ *
+ *   Filesystem.writeFile  -> {"ok":true,…}   arbitrary bytes inside the data root
+ *   Filesystem.rmdir      -> {"ok":true}     the model directory, recursively, gone
+ *
+ * Neither request was a browser. `curl` sends no `Origin`, and `originAllowed`
+ * accepts an absent one — it must, because browsers omit it on same-origin
+ * GETs. `curl` also sets any header it likes, so the preflight that stops a
+ * cross-origin `fetch` never happens to it, and the session id it needs is
+ * handed out by an event stream that was equally open. Every gate held exactly
+ * as designed and the gates were aimed at the wrong principal.
+ *
+ * THE PRINCIPAL IS THE POINT. "Only this machine can reach it" is a statement
+ * about machines, and the thing being protected is not a machine — it is the
+ * operator's model directory, their GPU, and the disk under both. A cron job,
+ * a dependency's postinstall script, a second person on a shared box, anything
+ * the operator did not start: all of them are on this machine and none of them
+ * is the operator. Deleting the model directory is not a read, and there is no
+ * version of "safe because it is local" that survives a stranger's process
+ * calling `rmdir({recursive:true})` and being answered `{"ok":true}`.
+ *
+ * So there is one rule on both arms — every binding carries a token, and
+ * `http.ts` gate 1 checks it on every route — rather than a rule with an
+ * exception for the arm that happens to be the default. The exception is what
+ * was mutated away without anything noticing; a single unconditional check has
+ * nothing to remove that a test cannot see.
+ *
+ * WHAT IT COSTS THE OPERATOR: one visit to the `?token=…` URL printed at
+ * startup, which sets an HttpOnly cookie and is then never needed again. The
+ * page's own `fetch` and `EventSource` are same-origin and carry it with no
+ * client change at all. That is the whole cost, and it is smaller than the
+ * paragraph explaining why it was not paid.
+ *
+ * WHAT IT DOES NOT BUY, said plainly: a process on this machine that can READ
+ * `<root>/server-token` is the operator as far as this server is concerned.
+ * The file is 0600 and that is the boundary — the same boundary an SSH key
+ * has. What changes is that reaching the bridge now requires having read
+ * something, rather than requiring nothing.
  */
 
 /**
@@ -121,6 +169,12 @@ export type ServerBinding =
   | {
       readonly kind: 'loopback';
       readonly port: number;
+      /**
+       * Required, exactly as on the other arm. See the file header: an
+       * unauthenticated bridge on 127.0.0.1 answered a stranger's process
+       * `{"ok":true}` to a recursive delete of the model directory.
+       */
+      readonly token: AuthToken;
     }
   | {
       readonly kind: 'authenticated';
@@ -143,11 +197,20 @@ export function listenHost(binding: ServerBinding): string {
   return binding.kind === 'loopback' ? LOOPBACK_HOST : binding.host;
 }
 
-/** Does this binding require a credential on every request? */
-export function requiresToken(binding: ServerBinding): binding is Extract<
-  ServerBinding,
-  { kind: 'authenticated' }
-> {
+/**
+ * Does the cookie this binding sets get the `Secure` attribute?
+ *
+ * NOT UNCONDITIONAL ANY MORE, and the change is forced rather than chosen. A
+ * `Secure` cookie is one a browser will only send back over https; setting it
+ * on the plaintext loopback arm would produce a `Set-Cookie` the browser
+ * accepts (127.0.0.1 is a potentially-trustworthy origin, so Chrome and
+ * Firefox allow it) and Safari historically does not — an authentication that
+ * works in three browsers and silently loops in the fourth. There is no wire
+ * to sniff on loopback and no https origin to downgrade from, so the attribute
+ * buys nothing there; `HttpOnly` and `SameSite=Strict`, which are what stop a
+ * script and a cross-site navigation, are set on both arms unconditionally.
+ */
+export function cookieIsSecure(binding: ServerBinding): boolean {
   return binding.kind === 'authenticated';
 }
 
@@ -212,7 +275,10 @@ export function resolveBinding(request: BindingRequest, credentials: Credentials
   const hasTls = request.tlsKeyPath !== undefined || request.tlsCertPath !== undefined;
 
   if (host === undefined || host === LOOPBACK_HOST) {
-    if (!hasTls) return { kind: 'loopback', port };
+    // The token is read (or created) for the loopback arm too. See the file
+    // header: the arm that binds nowhere is still the arm that answers the
+    // plugin bridge, and every process on this machine can reach it.
+    if (!hasTls) return { kind: 'loopback', port, token: credentials.token() };
     // TLS on loopback is not a mistake, and refusing it would be. It is the
     // authenticated arm with a loopback address: a token is still required,
     // because the whole point of the second arm is that it never binds without

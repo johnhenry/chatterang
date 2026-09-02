@@ -5,7 +5,7 @@ inference hosts the Electron shell runs — and nothing else.
 
 ```
 npm run server:build                         # build:web, desktop:build, bundle server.mjs
-npm run server:start -- --root ~/.chatterang # 127.0.0.1:8973, no token needed
+npm run server:start -- --root ~/.chatterang # 127.0.0.1:8973; prints a one-time URL
 ```
 
 `--root` has no default. It is where the model directory, the cache and the
@@ -36,7 +36,7 @@ Binding beyond loopback without authentication is not discouraged, it is
 **inexpressible**: the address and the credentials are one value.
 
 ```ts
-{ kind: 'loopback',      port }                    // no host field at all
+{ kind: 'loopback',      port, token }             // no host field at all
 { kind: 'authenticated', host, port, token, tls }  // both required, both branded
 ```
 
@@ -48,12 +48,21 @@ can be written as a literal — `tests/server-binding.test.ts` pins that with
 
 The token is 256 bits, generated on first start, written `0600` to
 `<root>/server-token`, printed once, and delivered as a one-time `?token=` that
-sets an `HttpOnly; Secure; SameSite=Strict` cookie and redirects to a clean URL.
+sets an `HttpOnly; SameSite=Strict` cookie (plus `Secure` on the TLS arm) and
+redirects to a clean URL. **Both arms require it, on every route** — the
+document, the assets, the bootstrap script, the event stream and the RPC route.
 
-Loopback with no token is still not "anonymous": every API route requires a
-session id that only the event stream hands out, and it is sent in a custom
-header — which forces a CORS preflight this server never grants. That is what
-stops any page in the operator's browser from driving `127.0.0.1`.
+Loopback used to have no token, on the reasoning that the origin check and the
+custom-header CSRF rule made it "not anonymous". Both are true and both defend
+against the wrong thing: they stop a *web page* in the operator's browser, and
+every one of them is enforced by the browser rather than by this process. `curl`
+sends no `Origin`, sets any header it likes, and opens the event stream to be
+handed a session id. Measured, on 127.0.0.1 with no token, in two requests:
+`Filesystem.writeFile` answered `{"ok":true}` for arbitrary bytes inside the
+data root, and `Filesystem.rmdir({path:'models',recursive:true})` answered
+`{"ok":true}` for the model directory. A process the operator did not start is
+not the operator. `tests/server-auth.test.ts` drives every route on both arms
+over a real socket.
 
 ## What is off, and how
 
@@ -61,7 +70,17 @@ The reachable surface is the manifest: `LlamaCpp`, `OnnxRuntime`, `Filesystem`,
 `DshHost`. `PluginHost` refuses a plugin name it does not hold before touching
 any implementation, so the shell, its `bash` tool, the MCP registry, the stores,
 the leaderboard upload and billing are not "disabled" — they have no row.
-`tests/server.test.ts` asserts that list over a real socket.
+
+That list lives in `src/surface.ts`, with the nine off surfaces written down
+beside it, and `startServer` runs `assertServerSurface` on the manifest before
+it binds a port: a fifth plugin registered by any path is a boot failure naming
+it. It moved there because the registration used to be inline in `main.ts`,
+which no test can execute — so adding a fifth left the suite green.
+`tests/server-surface.test.ts` drives the real registration over a real socket.
+
+A `uri` this server hands back is the name the loader knows a model by —
+`<engine>/<id>`, relative to the model root — not the server's absolute path.
+The failure paths never echoed a path; the success paths did.
 
 The server owns no user data. Chats, personas, provider connections, API keys
 and egress grants live in the connecting browser's IndexedDB exactly as they do

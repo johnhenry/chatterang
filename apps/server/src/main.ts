@@ -35,8 +35,6 @@ import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import {
-  DSH_PLUGIN,
-  FILESYSTEM_PLUGIN,
   HostFleet,
   LLAMA_ENGINE,
   LLAMA_PLUGIN,
@@ -51,6 +49,7 @@ import { createFilesystemPlugin } from '@chatterang/desktop/fs/filesystem';
 import { asTlsMaterial, parseArgv, resolveBinding } from './binding.js';
 import type { ServerBinding } from './binding.js';
 import { startServer } from './index.js';
+import { registerServerSurface, servedUri } from './surface.js';
 import { readOrCreateToken } from './token.js';
 import { TOKEN_QUERY } from './wire.js';
 
@@ -150,10 +149,12 @@ function describe(binding: ServerBinding, origin: string, tokenValue: string | n
   const lines = [`serving ${origin}`];
   if (binding.kind === 'loopback') {
     lines.push(
-      'bound to 127.0.0.1 with no token: only this machine can reach it. Binding anywhere ' +
-        'else requires --tls-key/--tls-cert, and the token below.',
+      'bound to 127.0.0.1: no other machine can reach it. Every process on THIS machine can, ' +
+        'so the bridge still requires the token below. Binding anywhere else additionally ' +
+        'requires --tls-key/--tls-cert.',
     );
-  } else if (tokenValue !== null) {
+  }
+  if (tokenValue !== null) {
     // Printed ONCE, on the run that created it. Every later start says where
     // the file is instead: a secret echoed at every boot ends up in the
     // scrollback of every terminal the operator has ever used.
@@ -247,25 +248,28 @@ async function main(): Promise<void> {
     warn: (hostName, message) => console.warn(`[chatterang-server:${hostName}] ${message}`),
   });
 
-  pluginHost.register(LLAMA_PLUGIN, fleet.plugin(LLAMA_PLUGIN.name));
-  pluginHost.register(ONNX_PLUGIN, fleet.plugin(ONNX_PLUGIN.name));
-  // See `index.ts`: leaving this out does not make the server smaller, it
-  // makes model downloads land in the browser's IndexedDB where the process
-  // with the GPU cannot read them.
-  pluginHost.register(
-    FILESYSTEM_PLUGIN,
-    createFilesystemPlugin({
+  // ONE CALL, and the list it registers is in `surface.ts` next to the nine
+  // surfaces that are off. It used to be four `pluginHost.register` calls
+  // here, in a file no test can execute — so a fifth one was invisible.
+  registerServerSurface(pluginHost, {
+    llama: fleet.plugin(LLAMA_PLUGIN.name),
+    onnx: fleet.plugin(ONNX_PLUGIN.name),
+    // See `index.ts`: leaving this out does not make the server smaller, it
+    // makes model downloads land in the browser's IndexedDB where the process
+    // with the GPU cannot read them.
+    filesystem: createFilesystemPlugin({
       roots: new Map([
         ['DATA', paths.data],
         ['CACHE', paths.cache],
       ]),
+      renderUri: servedUri(paths),
     }),
-  );
-  pluginHost.register(DSH_PLUGIN, {
-    getStatus: async (): Promise<DshStatus> => fleet.statusOf(LLAMA_PLUGIN.name),
-    listProviders: async (): Promise<{ providers: readonly string[] }> => ({
-      providers: fleet.statusOf(LLAMA_PLUGIN.name).routes,
-    }),
+    dsh: {
+      getStatus: async (): Promise<DshStatus> => fleet.statusOf(LLAMA_PLUGIN.name),
+      listProviders: async (): Promise<{ providers: readonly string[] }> => ({
+        providers: fleet.statusOf(LLAMA_PLUGIN.name).routes,
+      }),
+    },
   });
 
   const running = await startServer({
@@ -277,7 +281,9 @@ async function main(): Promise<void> {
   });
   sessionsRef = running.sessions;
 
-  for (const line of describe(binding, running.origin, created && binding.kind === 'authenticated' ? binding.token.value : null)) {
+  // Both arms now, because both arms have a token. `created` is still the
+  // gate: the secret is printed on the run that made it and never again.
+  for (const line of describe(binding, running.origin, created ? binding.token.value : null)) {
     log(line);
   }
 
