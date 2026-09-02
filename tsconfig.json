@@ -35,7 +35,9 @@
       "@chatterang/inference-node": ["packages/inference-node/src/index.ts"],
       "@chatterang/onnx-node": ["packages/onnx-node/src/index.ts"],
       "@chatterang/cordis-aimatey": ["packages/cordis-aimatey/src/index.ts"],
-      "@chatterang/desktop/*": ["apps/desktop/src/*"]
+      "@chatterang/desktop/*": ["apps/desktop/src/*"],
+      "@chatterang/server": ["apps/server/src/index.ts"],
+      "@chatterang/server/*": ["apps/server/src/*"]
     }
   },
   "include": [
@@ -43,6 +45,7 @@
     "tests",
     "packages/*/src",
     "apps/desktop/src",
+    "apps/server/src",
     "vite.config.ts",
     "capacitor.config.ts"
   ]

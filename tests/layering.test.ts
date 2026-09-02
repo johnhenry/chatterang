@@ -303,7 +303,7 @@ describe('the app never reaches the desktop-only layer', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('src/ never imports the Electron shell, Electron itself, or a Node builtin', () => {
+  it('src/ never imports a shell app, Electron itself, or a Node builtin', () => {
     // A5 added `apps/desktop`, and it is the same seam as the one above with
     // the same doors. The shell imports Electron, `node:fs`, `utilityProcess`
     // and `@deepseek-ai/*`; one import from `src/` would put all of that in the
@@ -323,13 +323,21 @@ describe('the app never reaches the desktop-only layer', () => {
     // too. `node:fs` in the renderer is not a desktop feature; on iOS it is a
     // module that does not exist, and the failure is a blank page.
     //
+    // A9 ADDED `apps/server`, AND IT IS THE SAME SEAM. The headless server
+    // imports `node:http`, `node:https`, `node:crypto`, `node:child_process`
+    // and the desktop bridge; one import of it from `src/` would put all of
+    // that in the web and mobile bundles. It is named here rather than left
+    // to the `apps/desktop` rule, because that rule spells the directory and
+    // would have waved `@chatterang/server` straight through — the guard would
+    // have looked like it covered the case and would not have.
+    //
     // Doors, checked as five: the bare specifier, a subpath
     // (`@chatterang/desktop/bridge` — which is how the tests import it, so it
-    // is not hypothetical), a relative path into the directory, bare
+    // is not hypothetical), a relative path into either directory, bare
     // `electron`/`electron/...`, and any `node:` builtin. The specifier matcher
     // itself covers `require(...)` as well as the three import forms.
     const banned =
-      /^@chatterang\/desktop(\/|$)|(^|\/)apps\/desktop(\/|$)|^electron($|\/)|(^|\/)node_modules(\/|$)/;
+      /^@chatterang\/(desktop|server)(\/|$)|(^|\/)apps\/(desktop|server)(\/|$)|^electron($|\/)|(^|\/)node_modules(\/|$)/;
     const offenders = files
       .filter((file) =>
         [...readFileSync(file, 'utf8').matchAll(SPECIFIER)].some((m) => {
@@ -384,6 +392,28 @@ describe('the app never reaches the desktop-only layer', () => {
     // so the rule is a rule and not a substring search.
     for (const allowed of ['onnxruntime-web', '@chatterang/contracts', 'node-llama-cpp-web']) {
       expect(onnxBan.test(allowed), allowed).toBe(false);
+    }
+
+    // The shell-app ban, spelled the same way and revert-checked the same way.
+    // The `@chatterang/server` forms are the ones the previous version of this
+    // regex missed, so they are named individually rather than trusted to a
+    // shared alternation.
+    const shellBan =
+      /^@chatterang\/(desktop|server)(\/|$)|(^|\/)apps\/(desktop|server)(\/|$)|^electron($|\/)|(^|\/)node_modules(\/|$)/;
+    const shellForms: [string, string][] = [
+      ["import { startServer } from '@chatterang/server';", '@chatterang/server'],
+      ["import { SERVED_CSP } from '@chatterang/server/policy';", '@chatterang/server/policy'],
+      ["const s = await import('../../apps/server/src/index');", '../../apps/server/src/index'],
+      ["import { PluginHost } from '@chatterang/desktop/bridge';", '@chatterang/desktop/bridge'],
+      ["const m = require('../apps/desktop/src/main');", '../apps/desktop/src/main'],
+    ];
+    for (const [form, specifier] of shellForms) {
+      const found = [...form.matchAll(new RegExp(SPECIFIER.source, 'g'))].map((m) => m[1]);
+      expect(found, form).toContain(specifier);
+      expect(shellBan.test(specifier), `${form} -> ${specifier}`).toBe(true);
+    }
+    for (const allowed of ['@chatterang/contracts', 'apps-server-helpers', '@chatterang/servers']) {
+      expect(shellBan.test(allowed), allowed).toBe(false);
     }
   });
 });

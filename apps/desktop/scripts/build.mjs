@@ -36,7 +36,20 @@ import * as esbuild from 'esbuild';
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = resolve(here, '..');
 const repo = resolve(desktop, '../..');
-const out = join(desktop, 'build');
+/*
+ * Where the three bundles land.
+ *
+ * `CHATTERANG_BUILD_OUT` exists for one caller: `tests/server.test.ts` runs
+ * this script to get its OWN copy of `host.mjs` to fork headlessly, and
+ * `tests/desktop-host-split.test.ts` runs it against the default location in
+ * the same suite. Vitest runs test files in parallel, and this script begins by
+ * deleting its output directory — so without a private output the second test
+ * to start would fork a host that another worker had just removed, or was
+ * halfway through writing. That is a flaky test with a confusing failure, and
+ * an env var read in one place is a cheaper fix than either test describing
+ * these esbuild options itself.
+ */
+const out = process.env['CHATTERANG_BUILD_OUT'] ?? join(desktop, 'build');
 
 /**
  * Resolve the repo's own path aliases, the same ones tsconfig and vite use.

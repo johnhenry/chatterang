@@ -31,4 +31,8 @@ tests/**/*.js.map
 # `apps/desktop/app` is a verbatim copy of `dist/`; both are reproducible from
 # `npm run desktop:build` and `npm run desktop:sync`.
 /apps/desktop/build/
+# The private host bundle `tests/server.test.ts` builds so that it and
+# `tests/desktop-host-split.test.ts` do not race over one output directory.
+/apps/desktop/build.server-test/
 /apps/desktop/app/
+/apps/server/build/

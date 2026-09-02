@@ -16,7 +16,7 @@
 
 import { channelCollisions } from './channels.js';
 import { assertCloneable } from './clone.js';
-import type { BootManifest, PluginDefinition } from './protocol.js';
+import type { BootManifest, BridgePlatform, PluginDefinition } from './protocol.js';
 import { SENDER_SCOPED } from './protocol.js';
 
 /** A method a plugin exposes to the renderer. */
@@ -88,9 +88,21 @@ export class PluginHost {
   /** Keyed `${senderId}:${subscriptionId}` — subscription ids are per-renderer. */
   readonly #subscriptions = new Map<string, Subscription>();
   readonly #deliver: EventDelivery;
+  readonly #platform: BridgePlatform;
 
-  constructor(deliver: EventDelivery) {
+  /**
+   * @param deliver how one event reaches one renderer.
+   * @param platform what the manifest says this shell is. DEFAULTS TO
+   *   `'electron'` so the desktop shell's construction is unchanged; the
+   *   headless server passes `'server'`, and that value travels all the way to
+   *   `Capacitor.getPlatform()` in the page and to the capability row
+   *   `src/lib/platform.ts` looks up by it. It was a hard-coded literal here
+   *   until A9 — one of the seven places the "new platform is just a row"
+   *   claim turned out to be false.
+   */
+  constructor(deliver: EventDelivery, platform: BridgePlatform = 'electron') {
     this.#deliver = deliver;
+    this.#platform = platform;
   }
 
   /**
@@ -154,7 +166,7 @@ export class PluginHost {
   /** What the renderer is told at boot. The only source of channel names. */
   manifest(): BootManifest {
     return {
-      platform: 'electron',
+      platform: this.#platform,
       plugins: [...this.#plugins.values()].map((it) => it.definition),
     };
   }

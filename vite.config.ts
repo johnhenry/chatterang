@@ -39,6 +39,11 @@ export default defineConfig({
       // that a rule rather than a habit. The alias exists so the bridge tests
       // can drive the real shell code without launching a window.
       '@chatterang/desktop': fileURLToPath(new URL('./apps/desktop/src', import.meta.url)),
+      // The headless server (A9). Node-only in the same way and for the same
+      // reason: it binds sockets and forks processes, so it is never part of a
+      // web build. Aliased to source so the server tests can bind a real port
+      // against the real code without a build step standing between them.
+      '@chatterang/server': fileURLToPath(new URL('./apps/server/src', import.meta.url)),
     },
   },
   server: {

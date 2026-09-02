@@ -85,6 +85,7 @@ export {
 } from './protocol.js';
 export type {
   BootManifest,
+  BridgePlatform,
   DshStatus,
   HostBoot,
   HostCall,

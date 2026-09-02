@@ -82,8 +82,8 @@
 
 import { Capacitor } from '@capacitor/core';
 
-/** The platforms this app is built for. A9's `'server'` becomes a fifth. */
-export type PlatformId = 'web' | 'ios' | 'android' | 'electron';
+/** The platforms this app is built for. A9 made `'server'` the fifth. */
+export type PlatformId = 'web' | 'ios' | 'android' | 'electron' | 'server';
 
 /** Where multi-gigabyte model weights are written, and what a path then means. */
 export type ModelStore =
@@ -148,11 +148,11 @@ export interface PlatformCapabilities {
 /**
  * One row per platform. A new platform is a row, not a branch.
  *
- *                web              ios / android    electron
- *   modelStore   opfs             filesystem       filesystem
- *   offlineCache true             false            false
- *   fileHandoff  browser-download share-sheet      browser-download
- *   purchases    false            true             false
+ *                web              ios / android    electron          server
+ *   modelStore   opfs             filesystem       filesystem        filesystem
+ *   offlineCache true             false            false             false
+ *   fileHandoff  browser-download share-sheet      browser-download  browser-download
+ *   purchases    false            true             false             false
  */
 const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.freeze({
   web: {
@@ -178,6 +178,58 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
   },
   electron: {
     id: 'electron',
+    modelStore: 'filesystem',
+    offlineCache: false,
+    fileHandoff: 'browser-download',
+    purchases: false,
+  },
+  /*
+   * A9: the bundle served by `apps/server`, running in an ordinary browser
+   * against a headless host on the machine that serves it.
+   *
+   * THE ROW IS THE CHEAP HALF, AND IT IS NOT THE HALF THAT MAKES IT TRUE.
+   * `Capacitor.getPlatform()` answers `'server'` only because the served
+   * bootstrap seeds `CapacitorCustomPlatform` before the bundle loads, and
+   * naming the platform does not decide which implementation answers a plugin
+   * call. Measured against the real `@capacitor/core`: with the platform named
+   * `'server'` and NO plugin header seeded, `registerPlugin('LlamaCpp', {web})`
+   * resolves to the WEB development shim — the one that synthesises text and
+   * reports `simulated: true`. So this row is honest only while
+   * `apps/server/src/client-bootstrap.ts` also seeds the headers; that file,
+   * not this one, is what stops a served deployment from streaming invented
+   * prose that looks like inference.
+   *
+   *   modelStore: 'filesystem'
+   *     The weights live on the SERVER's disk, because the server's inference
+   *     host is what opens them. `'opfs'` would put a multi-gigabyte download
+   *     in the connecting browser's Origin Private File System, where the
+   *     process with the GPU can never read it — eb3a279's bug on a fifth
+   *     platform. This row is therefore a claim about `@capacitor/filesystem`
+   *     being routed over the wire to the server's real directory; the server
+   *     registers `FILESYSTEM_PLUGIN` for exactly that reason, and a server
+   *     that omitted it would silently write into IndexedDB.
+   *
+   *   offlineCache: false
+   *     Both clauses fail, but only just, and this is the row's one genuine
+   *     judgement call. A served http origin CAN register a service worker —
+   *     unlike the packaged platforms, the "not possible" half stops applying.
+   *     It is still not WANTED: the server owns the bundle on local disk, so
+   *     there is no latency to hide, and a second cache with its own lifecycle
+   *     in front of an app whose bundle changes when the operator upgrades the
+   *     server is a stale-page bug waiting for someone else to debug.
+   *
+   *   fileHandoff: 'browser-download'
+   *     A real browser with a real download shelf, saving to the machine the
+   *     PERSON is sitting at — which is not the machine the file was computed
+   *     on. That difference is the point of server mode, and `<a download>` is
+   *     the only handoff that respects it.
+   *
+   *   purchases: false
+   *     There is no store here, and nothing in the served bundle should look
+   *     for one.
+   */
+  server: {
+    id: 'server',
     modelStore: 'filesystem',
     offlineCache: false,
     fileHandoff: 'browser-download',

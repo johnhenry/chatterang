@@ -96,7 +96,20 @@ describe('every source file on disk is a source file in git', () => {
      * all. This milestone added source to three of these five roots at once,
      * which is exactly when the old list would have missed one.
      */
-    const roots = ['src', 'packages', 'apps/desktop/src', 'apps/desktop/scripts', 'tests'];
+    // A9 added `apps/server`, both halves of it. The server's build script is
+    // what produces the thing `npm run server:start` runs, and its source is
+    // the whole of the headless profile — an untracked file in either is a
+    // clone that cannot serve, which is precisely the failure this list keeps
+    // growing to prevent.
+    const roots = [
+      'src',
+      'packages',
+      'apps/desktop/src',
+      'apps/desktop/scripts',
+      'apps/server/src',
+      'apps/server/scripts',
+      'tests',
+    ];
     const onDisk = new Set<string>();
     const walk = (dir: string): void => {
       if (!existsSync(dir)) return;

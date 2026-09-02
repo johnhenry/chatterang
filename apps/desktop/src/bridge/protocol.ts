@@ -66,9 +66,28 @@ export interface PluginDefinition {
  */
 export const SENDER_SCOPED: unique symbol = Symbol('chatterang.bridge.senderScoped');
 
+/**
+ * The platform id the shim reports through `Capacitor.getPlatform()`.
+ *
+ * TWO SHELLS SERVE THIS BRIDGE, and this type is where that stopped being a
+ * lie. It was the literal `'electron'` until A9, which was correct while the
+ * Electron shell was the only thing that built a manifest — and would have
+ * been silently wrong the moment `apps/server` built one, because the value
+ * does not stay here: `main.ts`/`server` hand it to `capacitorShimSource`,
+ * the shim writes it to `CapacitorCustomPlatform`, and `src/lib/platform.ts`
+ * looks up its capability ROW by it. A served bundle reporting `'electron'`
+ * would have taken the electron row — the same values, by luck, today — and
+ * named the wrong host in every diagnostic that asks.
+ *
+ * A union of two literals rather than `string`: these are the only two shells
+ * that exist, `src/lib/platform.ts` has a row for each, and a third one should
+ * fail to typecheck here before it fails to find a row there.
+ */
+export type BridgePlatform = 'electron' | 'server';
+
 /** What the renderer learns at boot: every plugin, and nothing else. */
 export interface BootManifest {
-  readonly platform: 'electron';
+  readonly platform: BridgePlatform;
   readonly plugins: readonly PluginDefinition[];
 }
 

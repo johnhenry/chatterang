@@ -39,8 +39,8 @@
  */
 
 import { createHostRuntime } from '../bridge/host-runtime.js';
-import type { MessageLink } from '../bridge/protocol.js';
 import { parseEngineName } from './host-engine.js';
+import { hostLink } from './host-link.js';
 
 /**
  * Where models live, as main told us.
@@ -62,36 +62,34 @@ function modelRoot(): string {
   return root;
 }
 
-/** Electron's utility-process parent port, typed only as much as we use it. */
-interface ParentPort {
-  postMessage(message: unknown): void;
-  on(event: 'message', listener: (event: { data: unknown }) => void): void;
-}
-
-function parentPortLink(port: ParentPort): MessageLink {
-  return {
-    postMessage: (message) => port.postMessage(message),
-    onMessage: (listener) => port.on('message', (event) => listener(event.data)),
-    // The parent port has no close event worth listening to: if main goes
-    // away, this process is killed with it. `onClose` exists for the OTHER
-    // end of this link, in the supervisor, which is where a death matters.
-    onClose: () => undefined,
-  };
-}
-
 async function main(): Promise<void> {
-  const port = (process as unknown as { parentPort?: ParentPort }).parentPort;
-  if (port === undefined) {
-    throw new Error(
-      'inference host: no parentPort. This entry point only runs inside an Electron utilityProcess.',
-    );
-  }
+  /*
+   * WHO FORKED US — and it is now two possible answers, not one.
+   *
+   * Electron's `utilityProcess` sets `process.parentPort`; a headless
+   * `child_process.fork` from `apps/server` sets `process.send`. `hostLink`
+   * takes whichever is there, unwraps the two different message shapes
+   * correctly, and REFUSES a process that has neither — which is still what
+   * `node build/host.mjs …` gets, still at exit code 1.
+   *
+   * Nothing else in this file changed for the headless profile, and that is
+   * the finding rather than the diff: the model root already arrives as
+   * `argv[2]`, the engine name as `argv[3]`, and neither the runtime nor
+   * either engine touches an Electron API.
+   */
+  const link = hostLink(process as unknown as Parameters<typeof hostLink>[0]);
   // Read BEFORE anything is loaded, so a bad selector is a boot failure rather
   // than a host that has already imported an addon it should not have.
   const engine = parseEngineName(process.argv);
   const root = modelRoot();
 
-  const link = parentPortLink(port);
+  // An orphan holds the GPU and the weights while nothing can reach it. On
+  // Electron this never fires (main's death takes the utility process with
+  // it); under a Node fork it is the only thing that stops a server crash from
+  // leaving two inference hosts behind.
+  link.onClose(() => {
+    process.exit(0);
+  });
   const warn = (message: string): void => console.warn(`[inference-host:${engine}] ${message}`);
 
   // ONE runtime, any number of plugins on it. Each host puts exactly one

@@ -1,0 +1,22 @@
+{
+  "name": "@chatterang/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The headless server profile (milestone A9): the built bundle, self-hosted, in front of the same inference hosts the desktop shell runs — and nothing else.",
+  "main": "build/server.mjs",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node build/server.mjs"
+  },
+  "dependencies": {
+    "@chatterang/contracts": "*",
+    "@chatterang/desktop": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
