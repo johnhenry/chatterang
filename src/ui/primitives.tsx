@@ -441,6 +441,24 @@ export interface ConfirmProps {
   title: string;
   body: string;
   confirmLabel: string;
+  /** Label for the decline button. "Cancel" reads wrong for a send/don't-send. */
+  cancelLabel?: string;
+  /**
+   * Lines shown between the body and the buttons — a file list, a size.
+   *
+   * Separated from `body` because they are the specifics a person scans rather
+   * than reads, and because a sentence that swallowed three paths would be a
+   * sentence nobody finishes.
+   */
+  detail?: readonly string[];
+  /**
+   * A second affirmative, broader than `confirmLabel` — "for this
+   * conversation" beside "this turn". Present only when there is a real
+   * difference between the two; a dialog with two identical-sounding yeses is
+   * worse than one yes.
+   */
+  extendedLabel?: string;
+  onExtended?: () => void;
   destructive?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -451,6 +469,10 @@ export function Confirm({
   title,
   body,
   confirmLabel,
+  cancelLabel,
+  detail,
+  extendedLabel,
+  onExtended,
   destructive,
   onConfirm,
   onCancel,
@@ -463,8 +485,13 @@ export function Confirm({
       footer={
         <>
           <button type="button" className="btn btn--secondary grow" onClick={onCancel}>
-            Cancel
+            {cancelLabel ?? 'Cancel'}
           </button>
+          {extendedLabel && onExtended ? (
+            <button type="button" className="btn btn--secondary grow" onClick={onExtended}>
+              {extendedLabel}
+            </button>
+          ) : null}
           <button
             type="button"
             className={`btn grow ${destructive ? 'btn--danger' : 'btn--primary'}`}
@@ -476,6 +503,13 @@ export function Confirm({
       }
     >
       <p style={{ color: 'var(--ink-2)', fontSize: 'var(--t-sm)' }}>{body}</p>
+      {detail?.length ? (
+        <ul className="confirm__detail">
+          {detail.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      ) : null}
     </Sheet>
   );
 }

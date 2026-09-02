@@ -49,6 +49,112 @@ import { newId } from '@/domain/chat';
 /** Execute → tools → execute round trips permitted per turn. */
 const TOOL_ITERATIONS = 4;
 
+/* ── Tool-output egress ─────────────────────────────────────────────── */
+
+/**
+ * What the user is being asked to allow.
+ *
+ * The shape is the sheet's shape on purpose: a destination, a model, and the
+ * tools whose output would go with the request. "2,140 characters of your
+ * conversations" is a thing a person can decide about; "the request contains a
+ * tool message" is not.
+ */
+export interface ToolEgressRequest {
+  /** Router registration id — the connection, not the provider family. */
+  readonly backendId: string;
+  readonly modelName: string;
+  readonly tools: readonly ExecutedTool[];
+  readonly characters: number;
+}
+
+/**
+ * `turn` allows this request only; `conversation` allows this chat and this
+ * destination until revoked; `deny` withholds.
+ *
+ * There is deliberately no app-wide "always". The shell's projection grows as
+ * the user's data grows, so a grant made in January cannot speak for a chat
+ * opened in June.
+ */
+export type ToolEgressDecision = 'turn' | 'conversation' | 'deny';
+
+export interface ToolEgressPolicy {
+  /** Grants this conversation already holds, by backend id. */
+  isGranted(backendId: string): boolean;
+  /** Ask. Absent means there is nobody to ask, which is a refusal. */
+  request?(request: ToolEgressRequest): Promise<ToolEgressDecision>;
+  /** Persist a `conversation` decision. */
+  onGranted?(backendId: string): void;
+}
+
+/** The string the model gets instead of the output. */
+function withheldNote(characters: number): string {
+  return (
+    "The user declined to send this tool's output off-device. It ran locally " +
+    `and produced ${characters.toLocaleString('en-US')} characters. Ask them to run the ` +
+    'command themselves, or answer without it.'
+  );
+}
+
+function isToolResult(block: { type: string }): boolean {
+  return block.type === 'tool_result';
+}
+
+/** Does this message array carry any tool output at all? */
+function carriesToolResults(messages: readonly IRMessage[]): boolean {
+  return messages.some(
+    (message) => Array.isArray(message.content) && message.content.some(isToolResult),
+  );
+}
+
+/** How much tool output the outgoing request would carry. */
+function toolResultCharacters(messages: readonly IRMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (!isToolResult(block)) continue;
+      const content = (block as { content?: unknown }).content;
+      if (typeof content === 'string') total += content.length;
+      else if (Array.isArray(content)) {
+        for (const part of content) total += String((part as { text?: string }).text ?? '').length;
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Replace every tool result with a note, for the outgoing request only.
+ *
+ * A note rather than a truncation, and rather than dropping the message: a
+ * model handed an empty tool result concludes the command failed and runs it
+ * again. A model told plainly what happened can say so, or answer without it.
+ * The user still sees the real, complete output in the thread — the shell ran
+ * locally and their answer is not what was withheld.
+ */
+function withholdToolResults(messages: readonly IRMessage[]): IRMessage[] {
+  return messages.map((message) => {
+    if (!Array.isArray(message.content) || !message.content.some(isToolResult)) return message;
+    return {
+      ...message,
+      content: message.content.map((block) => {
+        if (!isToolResult(block)) return block;
+        const inner = (block as { content?: unknown }).content;
+        const length =
+          typeof inner === 'string'
+            ? inner.length
+            : Array.isArray(inner)
+              ? inner.reduce(
+                  (sum: number, part) => sum + String((part as { text?: string }).text ?? '').length,
+                  0,
+                )
+              : 0;
+        return { ...block, content: withheldNote(length) };
+      }) as IRMessage['content'],
+    };
+  });
+}
+
 interface TurnResult {
   text: string;
   stats: GenerationStatsSnapshot;
@@ -81,6 +187,16 @@ export interface GenerationRequest {
     presencePenalty?: number;
   };
   readonly toolIds?: readonly string[];
+  /**
+   * Consent for sending tool output to a non-local backend.
+   *
+   * Omitting it is a refusal, not a bypass. That is deliberate: the defect this
+   * closes was that `stream` built one message array and handed it to whichever
+   * backend `target` named at that instant, so a caller that had never thought
+   * about egress leaked by default. Now a caller that has never thought about
+   * it withholds by default, and the model is told why.
+   */
+  readonly egress?: ToolEgressPolicy;
   readonly signal?: AbortSignal;
 }
 
@@ -89,6 +205,14 @@ export type GenerationEvent =
   | { readonly type: 'delta'; readonly text: string }
   | { readonly type: 'tool'; readonly tool: ExecutedTool }
   | { readonly type: 'fallback'; readonly event: FallbackEvent }
+  /** A request carrying tool output met a non-local backend. The receipt. */
+  | {
+      readonly type: 'egress';
+      readonly backendId: string;
+      readonly withheld: boolean;
+      readonly toolNames: readonly string[];
+      readonly characters: number;
+    }
   | {
       readonly type: 'done';
       readonly text: string;
@@ -118,6 +242,14 @@ export interface ProvenanceSnapshot {
   local: boolean;
   fallbackFrom?: string;
   fallbackReason?: FallbackReason;
+  /**
+   * Whether this reply's request carried tool output off the device.
+   *
+   * Absent when no tool output was in play — which is every turn that used no
+   * tools, and every turn served locally. The chip only appears when there is
+   * something to report.
+   */
+  toolEgress?: 'granted' | 'withheld';
 }
 
 export interface EngineOptions {
@@ -332,8 +464,62 @@ export class ChatterangEngine {
     let stats: GenerationStatsSnapshot = {};
     const tools: ExecutedTool[] = [];
 
+    // Egress state for this turn. `decided` caches per destination so a model
+    // that immediately re-runs the same command hits the same answer instead
+    // of a second sheet — a sheet that can be raised repeatedly is a sheet
+    // people learn to tap through.
+    const decided = new Map<string, boolean>();
+    let toolEgress: 'granted' | 'withheld' | undefined;
+
     for (let iteration = 0; iteration <= TOOL_ITERATIONS; iteration += 1) {
-      const irRequest = this.#toIR({ ...request, messages, target }, requestId, true);
+      // The check sits here, between the message array and the backend,
+      // because that is the only place that knows both — and because `target`
+      // is reassigned inside this loop, so consent captured anywhere earlier
+      // would be consent for a destination that no longer applies.
+      let outgoing = messages;
+      if (!target.local && carriesToolResults(messages)) {
+        const characters = toolResultCharacters(messages);
+        let allowed = decided.get(target.backendId);
+
+        if (allowed === undefined) {
+          if (request.egress?.isGranted(target.backendId)) {
+            allowed = true;
+            // A fallback has already fired this turn, so this destination was
+            // chosen by a thermal event or an OOM rather than by the user.
+          } else if (this.#lastFallback !== null || !request.egress?.request) {
+            // Two ways to arrive here. Either there is nobody to ask — a
+            // caller with no policy, which is a refusal and not a bypass — or
+            // the destination was picked by a fallback: the user is already
+            // waiting on a turn that is failing, and there is no honest moment
+            // to interrupt them. The fallback's own promise is that the reply
+            // still gets generated, and it still does; it just goes without
+            // the tool output.
+            allowed = false;
+          } else {
+            const decision = await request.egress.request({
+              backendId: target.backendId,
+              modelName: target.modelName,
+              tools,
+              characters,
+            });
+            allowed = decision !== 'deny';
+            if (decision === 'conversation') request.egress.onGranted?.(target.backendId);
+          }
+          decided.set(target.backendId, allowed);
+        }
+
+        if (!allowed) outgoing = withholdToolResults(messages);
+        toolEgress = allowed ? 'granted' : 'withheld';
+        yield {
+          type: 'egress',
+          backendId: target.backendId,
+          withheld: !allowed,
+          toolNames: [...new Set(tools.map((tool) => tool.name))],
+          characters,
+        };
+      }
+
+      const irRequest = this.#toIR({ ...request, messages: outgoing, target }, requestId, true);
 
       let turn: TurnResult;
       let failure: unknown = null;
@@ -417,7 +603,7 @@ export class ChatterangEngine {
             ? Number(((stats.completionTokens / totalMs) * 1000).toFixed(2))
             : undefined),
       },
-      provenance: this.#provenance(target),
+      provenance: { ...this.#provenance(target), toolEgress },
       tools,
     };
   }

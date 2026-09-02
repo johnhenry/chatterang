@@ -62,8 +62,31 @@ export const DEFAULT_SETTINGS: Settings = {
   onboardingSeen: false,
 };
 
+/**
+ * Extra shape for an approval that is not a plain "the model wants to X".
+ *
+ * The egress sheet needs a heading of its own, a list of what would be sent,
+ * and a second affirmative — "for this conversation" beside "this turn".
+ * Everything is optional, so the shell's existing one-line confirmations are
+ * unchanged.
+ */
+export interface ApprovalPrompt {
+  readonly title?: string;
+  readonly body?: string;
+  readonly detail?: readonly string[];
+  readonly confirmLabel?: string;
+  readonly cancelLabel?: string;
+  /**
+   * Label for a broader yes. Choosing it resolves the approval `true` and
+   * calls {@link onExtended} — so a caller that does not care about the
+   * difference still gets a boolean.
+   */
+  readonly extendedLabel?: string;
+  readonly onExtended?: () => void;
+}
+
 /** A confirmation the model has asked for and the user has not answered yet. */
-export interface PendingApproval {
+export interface PendingApproval extends ApprovalPrompt {
   readonly id: string;
   readonly action: string;
   readonly resolve: (approved: boolean) => void;
@@ -109,7 +132,7 @@ interface AppState {
   toast: (message: string, tone?: ToastTone, action?: Toast['action']) => void;
   dismissToast: (id: string) => void;
   /** Ask the user to approve something the model wants to do. */
-  requestApproval: (action: string) => Promise<boolean>;
+  requestApproval: (action: string, prompt?: ApprovalPrompt) => Promise<boolean>;
   answerApproval: (id: string, approved: boolean) => void;
 }
 
@@ -132,6 +155,25 @@ let resolverHooks: ResolverHooks = {
 /** Called once by the model store so the engine can resolve installed models. */
 export function installResolver(hooks: ResolverHooks): void {
   resolverHooks = hooks;
+}
+
+/**
+ * Drop every conversation's tool-output grant for a connection.
+ *
+ * A no-op until the chat store installs the real one. Registered rather than
+ * imported for the same reason `installResolver` is: the chat store already
+ * depends on this module, and importing it back — even dynamically — is a
+ * cycle `tests/layering.test.ts` rejects.
+ *
+ * It is wired to connection removal and to switching a connection off for the
+ * same reason `fallbackBackendId` is cleared there: a permission that outlived
+ * the connection it named would silently apply to whatever next claimed that
+ * id.
+ */
+let revokeEgressGrants: (connectionId: string) => Promise<void> = async () => {};
+
+export function installEgressRevoker(revoke: (connectionId: string) => Promise<void>): void {
+  revokeEgressGrants = revoke;
 }
 
 export const useApp = create<AppState>((set, get) => ({
@@ -240,6 +282,7 @@ export const useApp = create<AppState>((set, get) => ({
     if (get().settings.fallbackBackendId === id) {
       await get().updateSettings({ fallbackBackendId: null });
     }
+    await revokeEgressGrants(id);
   },
 
   async toggleConnection(id, enabled) {
@@ -263,6 +306,7 @@ export const useApp = create<AppState>((set, get) => ({
       if (get().settings.fallbackBackendId === id) {
         await get().updateSettings({ fallbackBackendId: null });
       }
+      await revokeEgressGrants(id);
     }
   },
 
@@ -276,10 +320,10 @@ export const useApp = create<AppState>((set, get) => ({
     set({ toasts: get().toasts.filter((toast) => toast.id !== id) });
   },
 
-  requestApproval(action) {
+  requestApproval(action, prompt) {
     return new Promise<boolean>((resolve) => {
       const id = newId('ask');
-      set({ approvals: [...get().approvals, { id, action, resolve }] });
+      set({ approvals: [...get().approvals, { id, action, ...prompt, resolve }] });
     });
   },
 

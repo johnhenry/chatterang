@@ -658,6 +658,22 @@
   background: var(--good-soft);
   color: var(--good);
 }
+/* The specifics under an approval sheet's sentence — the paths and sizes a
+   person scans before deciding. Monospace because they are identifiers, and
+   scrollable because a fragment of a file list is worse than none. */
+.confirm__detail {
+  margin: var(--s-2) 0 0;
+  padding: 0 0 0 var(--s-4);
+  max-height: 9rem;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--ink-3);
+}
+.confirm__detail li {
+  overflow-wrap: anywhere;
+}
+
 .chip--warn {
   background: var(--warn-soft);
   color: var(--warn);

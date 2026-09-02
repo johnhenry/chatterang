@@ -475,9 +475,22 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
           enabled.length > 0
             ? `  - messages you send to: ${enabled.map((p) => p.label).join(', ')}`
             : '  - nothing else: no remote providers are enabled',
+          // This command is what a privacy-conscious person runs to check, so
+          // it is the one place that must not be reassuring by omission. Tool
+          // output is not a message the user typed, and it is drawn from
+          // /chats, /models and /personas — the very things the list below
+          // used to promise stayed put.
+          '  - tool output, when a tool runs in a chat served by a remote model:',
+          '    what the tool read, which for `bash` is this app’s own data —',
+          '    /chats, /models, /personas. The app asks once per conversation',
+          '    before it does, and withholds it if you decline or if the reply',
+          '    diverted to a fallback. Every grant is dropped when the provider',
+          '    it named is removed or switched off — `provider disable <id>`.',
           '',
           'Stays on this device:',
-          '  - conversations, personas, generated images, settings, benchmark runs',
+          '  - personas, generated images, settings, benchmark runs',
+          '  - conversations, except the parts a tool reads in a chat you have',
+          '    granted above, and the messages you send to an enabled provider',
         ].join('\n'),
       );
     },
@@ -486,13 +499,31 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
   return [model, chat, persona, provider, bench, device, privacy];
 }
 
+/**
+ * Neutralise anything in a message body that could pass for a turn header.
+ *
+ * The transcript's only structure is `## Speaker`, so a message whose body
+ * contains that shape manufactures a turn — the model writes `## You` followed
+ * by words the user never said, and from then on the line appears in
+ * `/chats/*.md`, in `chat export`, and in the file the user downloads. Closing
+ * the filesystem route into `/chats` did not close this one: the message route
+ * needs no write at all.
+ *
+ * A backslash is the Markdown escape, so `\## You` renders as the literal text
+ * and greps the same. Only levels 1 and 2 are escaped — the two this renderer
+ * actually emits — so a `### Notes` heading the user wrote survives.
+ */
+function escapeTranscriptBody(text: string): string {
+  return text.replace(/^([ \t]{0,3})(#{1,2})(?=[ \t]|$)/gm, '$1\\$2');
+}
+
 /** Render a conversation as Markdown — used by `chat export` and the VFS. */
 export function renderTranscript(
   chat: { title: string; updatedAt: number },
   messages: readonly MessageRow[],
 ): string {
   const lines = [
-    `# ${chat.title || deriveTitle('')}`,
+    `# ${escapeTranscriptBody(chat.title || deriveTitle(''))}`,
     '',
     `_${messages.length} messages · last updated ${new Date(chat.updatedAt).toISOString().slice(0, 10)}_`,
     '',
@@ -510,7 +541,12 @@ export function renderTranscript(
         ? ' (on device)'
         : ' (remote)'
       : '';
-    lines.push(`## ${who}${where}`, '', message.content.trim(), '');
+    lines.push(
+      `## ${escapeTranscriptBody(who)}${where}`,
+      '',
+      escapeTranscriptBody(message.content.trim()),
+      '',
+    );
   }
 
   return lines.join('\n');

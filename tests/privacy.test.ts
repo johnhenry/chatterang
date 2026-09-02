@@ -1,5 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import type { BackendAdapter, IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
+import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
+
+import {
+  ChatterangEngine,
+  targetFor,
+  type GenerationEvent,
+  type ToolEgressPolicy,
+  type ToolEgressRequest,
+} from '@/ai/engine';
+import { toolRegistry } from '@/ai/tools/registry';
+import { DEFAULT_SAMPLER } from '@/domain/manifest';
+import { catalogEntry } from '@/data/catalog';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
 import { ENGINE_PHASE, isLocalEngine, type EngineId } from '@/domain/manifest';
@@ -219,5 +232,280 @@ describe('persona catalog', () => {
       ...MARKETPLACE.map((listing) => listing.persona.id),
     ];
     expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+/* ── Tool output and the network ─────────────────────────────────────── */
+
+/**
+ * The promise: a tool's output does not leave this device unless this
+ * conversation holds a grant for the destination it would leave to.
+ *
+ * These drive the real `ChatterangEngine.stream` and record at the
+ * `BackendAdapter` boundary — the last app-owned code before a provider SDK.
+ * Everything is asserted on the bytes the backend was handed, not on a flag
+ * the engine set about itself.
+ *
+ * The pair matters as much as either half. A test that only asserted the
+ * canary is ABSENT would pass if someone "fixed" this by deleting the tool
+ * loop; a test that only asserted it is PRESENT under a grant would pass if the
+ * gate never ran. Both are here, against the same probe.
+ */
+const SECRET = 'PASSPHRASE-ORTHOGONAL-PANGOLIN-7731';
+const probeManifest = catalogEntry('qwen3-4b-instruct-q4km')!;
+
+const probeResolver = {
+  getManifest: (id: string) => (id === probeManifest.id ? probeManifest : null),
+  getPath: () => '/dev/model.gguf',
+  getSampler: () => ({ ...DEFAULT_SAMPLER, maxTokens: 64 }),
+};
+
+const CALL = '<tool_call>{"name":"leaky","arguments":{}}</tool_call>';
+
+/** Stands in for `bash`: returns the user's own data, as the shell would. */
+const leakyTool = {
+  id: 'leaky',
+  name: 'leaky',
+  description: 'Reads this app’s own data.',
+  summary: 'probe',
+  parameters: { type: 'object' as const, properties: {} },
+  execute: async () => ({
+    output: `# Therapy notes\n\n## You\n\nmy ${SECRET}\n`,
+  }),
+};
+
+/** A backend that records every request it is handed, then replies to script. */
+function recordingBackend(turns: string[]): {
+  adapter: BackendAdapter;
+  seen: IRChatRequest[];
+} {
+  const seen: IRChatRequest[] = [];
+  let turn = 0;
+  const next = (request: IRChatRequest): string => {
+    seen.push(structuredClone(request));
+    return turns[Math.min(turn++, turns.length - 1)] ?? '';
+  };
+
+  return {
+    seen,
+    adapter: new FunctionBackendAdapter({
+      execute: async (request) => ({
+        message: { role: 'assistant', content: next(request) },
+        finishReason: 'stop',
+        metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
+      }),
+      executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+        const text = next(request);
+        yield { type: 'start', sequence: 0, metadata: request.metadata };
+        yield { type: 'content', sequence: 1, delta: text };
+        yield { type: 'done', sequence: 2, finishReason: 'stop' };
+      },
+    }),
+  };
+}
+
+/** A local backend that answers once with a tool call, then dies. */
+function callsThenFails(): BackendAdapter {
+  let turn = 0;
+  return new FunctionBackendAdapter({
+    execute: async () => {
+      throw new Error('not enough memory');
+    },
+    executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+      if (turn++ > 0) throw new Error('not enough memory');
+      yield { type: 'start', sequence: 0, metadata: request.metadata };
+      yield { type: 'content', sequence: 1, delta: CALL };
+      yield { type: 'done', sequence: 2, finishReason: 'stop' };
+    },
+  });
+}
+
+async function drainEvents(stream: AsyncGenerator<GenerationEvent>): Promise<GenerationEvent[]> {
+  const events: GenerationEvent[] = [];
+  for await (const event of stream) events.push(event);
+  return events;
+}
+
+function sent(requests: readonly IRChatRequest[]): string[] {
+  return requests.map((request) => JSON.stringify(request.messages));
+}
+
+describe('tool output does not leave the device without a grant', () => {
+  const cloudTarget = {
+    backendId: 'cloud',
+    engine: 'remote' as const,
+    modelId: 'gpt-4o-mini',
+    modelName: 'GPT-4o mini',
+    local: false,
+  };
+
+  function setUp(turns: string[] = [CALL, 'Done.']) {
+    toolRegistry.register(leakyTool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend(turns);
+    engine.router.register('cloud', cloud.adapter);
+    return { engine, cloud };
+  }
+
+  it('is a real probe: the tool really does return the user’s data', async () => {
+    // Without this, every "absent" assertion below could pass because the
+    // canary was never produced in the first place.
+    const result = await leakyTool.execute();
+    expect(result.output).toContain(SECRET);
+  });
+
+  it('withholds it from a remote backend the conversation has not granted', async () => {
+    const { engine, cloud } = setUp();
+
+    const events = await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is in my chats?' }],
+        target: cloudTarget,
+        toolIds: ['leaky'],
+      }),
+    );
+
+    expect(cloud.seen).toHaveLength(2);
+    const requests = sent(cloud.seen);
+    // Request 1 could not have carried it — the tool had not run.
+    expect(requests[0]).not.toContain(SECRET);
+    // Request 2 is the one that leaked before this change.
+    expect(requests[1]).not.toContain(SECRET);
+    // Withheld, not dropped: the tool turn is still there and the model is
+    // told what happened, so it does not simply re-run the command.
+    expect(requests[1]).toContain('declined to send');
+    expect(requests[1]).toContain('tool_result');
+
+    // And the user is not the one kept in the dark — the real output is in the
+    // event stream that paints the thread.
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.output).toContain(SECRET);
+
+    const done = events.at(-1);
+    expect(done?.type === 'done' && done.provenance.toolEgress).toBe('withheld');
+    toolRegistry.unregister('leaky');
+  });
+
+  it('sends it when the conversation holds a grant for that destination', async () => {
+    const { engine, cloud } = setUp();
+    const policy: ToolEgressPolicy = { isGranted: (id) => id === 'cloud' };
+
+    const events = await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is in my chats?' }],
+        target: cloudTarget,
+        toolIds: ['leaky'],
+        egress: policy,
+      }),
+    );
+
+    expect(sent(cloud.seen)[1]).toContain(SECRET);
+    const done = events.at(-1);
+    expect(done?.type === 'done' && done.provenance.toolEgress).toBe('granted');
+    toolRegistry.unregister('leaky');
+  });
+
+  it('asks once, and a "conversation" answer is handed back to be persisted', async () => {
+    const { engine, cloud } = setUp();
+    const onGranted = vi.fn();
+    const request = vi.fn(async (_: ToolEgressRequest) => 'conversation' as const);
+
+    await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'go' }],
+        target: cloudTarget,
+        toolIds: ['leaky'],
+        egress: { isGranted: () => false, request, onGranted },
+      }),
+    );
+
+    expect(request).toHaveBeenCalledTimes(1);
+    // The sheet is told what it is asking about, in the terms the user reads.
+    expect(request.mock.calls[0]?.[0]).toMatchObject({
+      backendId: 'cloud',
+      modelName: 'GPT-4o mini',
+    });
+    expect(onGranted).toHaveBeenCalledWith('cloud');
+    expect(sent(cloud.seen)[1]).toContain(SECRET);
+    toolRegistry.unregister('leaky');
+  });
+
+  it('does not raise a second sheet when the model re-runs the same command', async () => {
+    // Four tool-calling turns in a row. Without the per-turn cache this is four
+    // sheets, and a sheet that can be raised four times is one people learn to
+    // tap through without reading.
+    const { engine } = setUp([CALL]);
+    const request = vi.fn(async () => 'deny' as const);
+
+    const events = await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'go' }],
+        target: cloudTarget,
+        toolIds: ['leaky'],
+        egress: { isGranted: () => false, request },
+      }),
+    );
+
+    expect(events.filter((event) => event.type === 'tool').length).toBeGreaterThan(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    toolRegistry.unregister('leaky');
+  });
+
+  it('withholds on a fallback without asking — the user is already waiting', async () => {
+    // The case no dialog covers well, and the one that does not require the
+    // user to have chosen a remote model at all: they picked a local one, the
+    // device could not cope mid-turn, and the loop retargeted.
+    toolRegistry.register(leakyTool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('scripted', callsThenFails());
+    const cloud = recordingBackend(['Answered remotely.']);
+    engine.router.register('cloud', cloud.adapter);
+    engine.setFallbackBackend('cloud');
+
+    const request = vi.fn(async () => 'conversation' as const);
+    const events = await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'summarise my chats' }],
+        target: targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted'),
+        toolIds: ['leaky'],
+        egress: { isGranted: () => false, request },
+      }),
+    );
+
+    // The fallback fired, so the turn did divert — otherwise the assertions
+    // below would be about a code path that never ran.
+    expect(events.some((event) => event.type === 'fallback')).toBe(true);
+    // The remote provider's first and only request must not carry it.
+    expect(cloud.seen.length).toBeGreaterThan(0);
+    for (const payload of sent(cloud.seen)) expect(payload).not.toContain(SECRET);
+    // And it is resolved structurally rather than by interrupting.
+    expect(request).not.toHaveBeenCalled();
+    // The fallback's own promise is kept: a reply was still generated.
+    const done = events.at(-1);
+    expect(done?.type === 'done' && done.text).toBe('Answered remotely.');
+    toolRegistry.unregister('leaky');
+  });
+
+  it('leaves a local turn completely alone — nothing is withheld on device', async () => {
+    // The control. If this failed, the rule would be costing the app the
+    // feature rather than protecting it.
+    toolRegistry.register(leakyTool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const local = recordingBackend([CALL, 'Three files.']);
+    engine.router.register('scripted', local.adapter);
+
+    const events = await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is in my chats?' }],
+        target: targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted'),
+        toolIds: ['leaky'],
+      }),
+    );
+
+    expect(sent(local.seen)[1]).toContain(SECRET);
+    expect(events.some((event) => event.type === 'egress')).toBe(false);
+    const done = events.at(-1);
+    expect(done?.type === 'done' && done.provenance.toolEgress).toBeUndefined();
+    toolRegistry.unregister('leaky');
   });
 });

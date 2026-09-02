@@ -3,6 +3,7 @@ import { AttachmentImage } from '@/features/chat/AttachmentImage';
 
 import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
+import { frameDocument } from '@/ui/frame';
 import type { Message, ToolInvocation } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
@@ -92,6 +93,25 @@ export function MessageView({
             {message.provenance.local ? 'On device' : 'Remote'}
           </span>
         ) : null}
+        {/* The chip says where the reply was made. This says what went with
+            the request — a remote turn that carried the contents of your
+            conversations is a different event from one that carried only the
+            words you typed, and "Remote" alone cannot tell them apart. */}
+        {message.provenance?.toolEgress ? (
+          <span
+            className={`chip ${message.provenance.toolEgress === 'granted' ? 'chip--remote' : 'chip--local'}`}
+            title={
+              message.provenance.toolEgress === 'granted'
+                ? `Tool output from ${(message.toolCalls ?? []).map((tool) => tool.name).join(', ') || 'a tool'} was sent to ${message.provenance.modelName}, because you allowed it for this conversation. Expand the tool block below to see exactly what.`
+                : 'Tool output stayed on this device. The model answered without it, and was told so.'
+            }
+          >
+            <Icon name="tool" size={10} />
+            {message.provenance.toolEgress === 'granted'
+              ? `carried ${message.toolCalls?.length ?? 1} tool result${(message.toolCalls?.length ?? 1) === 1 ? '' : 's'}`
+              : 'tool output withheld'}
+          </span>
+        ) : null}
         {message.stats?.tokensPerSecond ? (
           <span className="readout">{message.stats.tokensPerSecond.toFixed(1)} tok/s</span>
         ) : null}
@@ -128,6 +148,10 @@ export function MessageView({
         <div className="chip chip--warn" style={{ alignSelf: 'flex-start', whiteSpace: 'normal' }}>
           <Icon name="alert" size={11} />
           Generated remotely — the device could not run this turn locally
+          {/* The divert picks the destination, so no sheet could have asked
+              about it in time. The rule is applied instead of asked, and the
+              chip has to say so or the user learns it the hard way. */}
+          {message.provenance.toolEgress === 'withheld' ? '. Tool output was not sent' : ''}
         </div>
       ) : null}
 
@@ -287,10 +311,14 @@ function ToolCall({ tool }: { tool: ToolInvocation }): ReactNode {
         <iframe
           className="tool__frame"
           title={`Output of ${tool.name}`}
-          // No scripts, no same-origin, no network: the model's HTML is
-          // rendered but cannot reach anything.
+          // `sandbox=""` is every restriction the flag list can lift: no
+          // scripts, an opaque origin, no forms, no popups, no top-level
+          // navigation. What it does NOT do is stop the document fetching what
+          // its markup names — an `<img>` or a `<link>` in the model's fragment
+          // is a request. That is `frameDocument`'s job, and the two are named
+          // separately here because they stop different things.
           sandbox=""
-          srcDoc={html}
+          srcDoc={frameDocument(html)}
           height={Number(tool.input.height ?? 260)}
         />
       ) : null}

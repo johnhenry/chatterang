@@ -35,26 +35,57 @@
  *  2. **No network, as a capability rather than a missing command.**
  *     `just-bash` ships `curl` as opt-in and this never registers it — and
  *     because the `Bash` is constructed with no `network` option, `ctx.fetch`
- *     on the context handed to every custom command is `undefined` too. A
- *     shell with a filesystem, a model, and a socket is an exfiltration path,
- *     and this is the one surface in the app where model output is executed
- *     rather than displayed: one `curl` turns every byte the shell can read
- *     into a byte it can send, composably, with nobody in the loop. That is
- *     the trade this app exists to make, so it is not configurable from
- *     inside the shell. If network is ever wanted, `just-bash` offers an
- *     origin-and-prefix allow-list with a private-IP check — that shape, not
- *     a switch.
+ *     on the context handed to every custom command is `undefined` too. So
+ *     nothing *inside* the shell can open a socket, and
+ *     {@link assertConfinedBuild} fails the boot rather than trusting an
+ *     import specifier to keep it that way. If network is ever wanted,
+ *     `just-bash` offers an origin-and-prefix allow-list with a private-IP
+ *     check — that shape, not a switch.
+ *
+ *     What this paragraph used to imply, and does not say now: that what the
+ *     shell reads stays on the device. It did not. `bash` is a tool, a tool's
+ *     output is appended to the conversation, and the conversation is sent to
+ *     whatever backend serves the *next* turn. Measured on
+ *     `ChatterangEngine.stream`: a projected `/chats` transcript arrived
+ *     verbatim in the following request — including on a turn the user started
+ *     locally, where the local engine failed and the loop diverted to the
+ *     nominated fallback, so the remote provider's first and only request
+ *     already carried it. The shell has no socket; the tool call that wraps it
+ *     hands its stdout to one. Absent `curl` is what stops the shell
+ *     exfiltrating by itself. It is not what stops it exfiltrating through the
+ *     model. That is (4).
  *
  *  3. **The projection is read-only.** Enforced in `shell/fs.ts`, because it
  *     was not before and four places said it was. Writing into `/chats` lets
  *     a model manufacture the user's own words and quote them back; that is
- *     the model-driven risk that does not need a socket at all.
+ *     the model-driven risk that does not need a socket at all. The other half
+ *     of that forgery — a turn header inside a message, which needs no write
+ *     — is escaped in `renderTranscript`.
+ *
+ *  4. **Tool output does not leave the device without a grant on this
+ *     conversation.** Enforced in `ai/engine.ts`, not here, because the defect
+ *     was that `stream` built one message array and handed it to whichever
+ *     backend `target` named at that instant — and `target` is reassigned
+ *     mid-loop when the device cannot cope, so consent captured when the tool
+ *     was enabled could not have covered the destination. A `tool_result` is
+ *     therefore withheld from any request to a non-local backend unless this
+ *     chat holds an egress grant for that connection, and the model is told
+ *     plainly that it was withheld rather than handed a truncation. Read-only
+ *     describes what happens to the server's state, not to your data — the
+ *     same argument `ai/mcp/tools.ts` already makes about a third party's
+ *     tools, applied to our own.
+ *
+ * That last one is the trade this app exists to make, and it is why it is not
+ * configurable from inside the shell: a shell with a filesystem, a model, and
+ * a socket at the far end of the model is an exfiltration path whether or not
+ * the socket is in this file.
  *
  * What is deliberately allowed, and stays allowed: reading every projection
  * of the user's own data and computing over it with the full Unix set,
  * writing freely in `/workspace`, and asking for a state change — which the
  * user may refuse. `grep -ril "quantisation" /chats` is the point of the
- * whole thing, and it costs nothing the model did not already have.
+ * whole thing. It costs nothing while the model is on this device, and one
+ * explicit grant when it is not.
  *
  * ## The bundle
  *
@@ -307,6 +338,10 @@ export class ChatterangShell {
             '',
             'Standard tools are available: grep, sed, awk, jq, find, sort, wc, diff …',
             'Network access is not available, by design.',
+            '',
+            'What you read here goes to the model. If the model is remote, that is',
+            'off this device — the app asks once per conversation before it does.',
+            'Run `privacy` for the full list of what leaves.',
           ].join('\n'),
         }) satisfies ShellOutput,
     };

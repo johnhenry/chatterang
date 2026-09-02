@@ -21,9 +21,20 @@ export function ApprovalGate(): ReactNode {
   return (
     <Confirm
       open
-      title="The model wants to do something"
-      body={`It is asking to ${next.action}. Nothing happens unless you allow it.`}
-      confirmLabel="Allow"
+      title={next.title ?? 'The model wants to do something'}
+      body={next.body ?? `It is asking to ${next.action}. Nothing happens unless you allow it.`}
+      detail={next.detail}
+      confirmLabel={next.confirmLabel ?? 'Allow'}
+      cancelLabel={next.cancelLabel}
+      extendedLabel={next.extendedLabel}
+      onExtended={
+        next.onExtended
+          ? () => {
+              next.onExtended?.();
+              answer(next.id, true);
+            }
+          : undefined
+      }
       onCancel={() => answer(next.id, false)}
       onConfirm={() => answer(next.id, true)}
     />

@@ -17,20 +17,21 @@ import {
   type Attachment,
   type Chat,
   type ChatMode,
+  type EgressGrant,
   type Message,
   type ToolInvocation,
 } from '@/domain/chat';
 import { renderLore, renderSystemPrompt, selectLore } from '@/domain/persona';
 import { DEFAULT_SAMPLER, type SamplerSettings } from '@/domain/manifest';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
-import { targetFor, type EngineTarget } from '@/ai/engine';
+import { targetFor, type EngineTarget, type ToolEgressPolicy } from '@/ai/engine';
 import {
   contextBudget,
   estimateConversationTokens,
   fitToContext,
   type FitResult,
 } from '@/ai/context';
-import { useApp } from '@/state/app';
+import { installEgressRevoker, useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
 
@@ -73,6 +74,17 @@ interface ChatState {
   renameChat: (chatId: string, title: string) => Promise<void>;
   togglePin: (chatId: string) => Promise<void>;
   updateChat: (chatId: string, patch: Partial<Chat>) => Promise<void>;
+  /** Let this conversation send tool output to one connection, until revoked. */
+  grantEgress: (chatId: string, connectionId: string) => Promise<void>;
+  /**
+   * Drop grants for a connection, across every conversation.
+   *
+   * Called when a connection is removed or switched off, for the same reason
+   * `app.removeConnection` already clears `fallbackBackendId`: a permission
+   * that outlived the thing it was granted to would silently apply to whatever
+   * next claimed that id.
+   */
+  revokeEgress: (connectionId: string, chatId?: string) => Promise<void>;
 
   refreshContext: () => void;
   send: (text: string, attachments?: Attachment[]) => Promise<void>;
@@ -202,6 +214,32 @@ export const useChats = create<ChatState>((set, get) => ({
     set({
       chats: sortChats(get().chats.map((entry) => (entry.id === chatId ? updated : entry))),
     });
+  },
+
+  async grantEgress(chatId, connectionId) {
+    const chat = get().chats.find((entry) => entry.id === chatId);
+    if (!chat) return;
+    if (chat.egressGrants?.some((grant) => grant.connectionId === connectionId)) return;
+    const egressGrants: EgressGrant[] = [
+      ...(chat.egressGrants ?? []),
+      { connectionId, grantedAt: Date.now() },
+    ];
+    await get().updateChat(chatId, { egressGrants });
+  },
+
+  async revokeEgress(connectionId, chatId) {
+    const affected = get().chats.filter(
+      (chat) =>
+        (chatId === undefined || chat.id === chatId) &&
+        chat.egressGrants?.some((grant) => grant.connectionId === connectionId),
+    );
+    for (const chat of affected) {
+      await get().updateChat(chat.id, {
+        egressGrants: (chat.egressGrants ?? []).filter(
+          (grant) => grant.connectionId !== connectionId,
+        ),
+      });
+    }
   },
 
   async send(text, attachments = []) {
@@ -408,6 +446,7 @@ async function runGeneration(
       target,
       sampler: resolveSampler(chat, target.modelId),
       toolIds: chat.tools,
+      egress: egressPolicy(chat.id),
       signal: controller.signal,
     });
 
@@ -483,6 +522,7 @@ async function runGeneration(
               local: event.provenance.local,
               fallbackFrom: event.provenance.fallbackFrom,
               fallbackReason: event.provenance.fallbackReason,
+              toolEgress: event.provenance.toolEgress,
             },
             stats: event.stats,
           };
@@ -530,6 +570,57 @@ async function runGeneration(
       });
     }
   }
+}
+
+/* ── Tool-output egress ──────────────────────────────────────────────── */
+
+/**
+ * The consent side of the engine's rule, in the app's own voice.
+ *
+ * Read live from the store rather than captured when the turn started: a grant
+ * made in the sheet has to be visible to the check that raised it, and the
+ * chat record may have moved on by then.
+ */
+function egressPolicy(chatId: string): ToolEgressPolicy {
+  const grantsFor = (): readonly EgressGrant[] =>
+    useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
+
+  return {
+    isGranted: (backendId) => grantsFor().some((grant) => grant.connectionId === backendId),
+
+    onGranted: (backendId) => {
+      void useChats.getState().grantEgress(chatId, backendId);
+    },
+
+    async request({ backendId, modelName, tools, characters }) {
+      const app = useApp.getState();
+      const label =
+        app.connections.find((connection) => connection.id === backendId)?.label ?? backendId;
+      const names = [...new Set(tools.map((tool) => tool.name))];
+
+      // Named, counted, and attributed. "The request contains a tool message"
+      // is not a thing anybody can decide about; "`bash` read 3 files from this
+      // app's own data" is.
+      let extended = false;
+      const allowed = await app.requestApproval(`send tool output to ${label}`, {
+        title: `Send tool output to ${label}?`,
+        body:
+          `${names.join(', ') || 'A tool'} read from this app’s own data. ` +
+          `To answer, ${modelName} has to see it. ` +
+          `${characters.toLocaleString()} characters — this is not a message you typed.`,
+        detail: tools.slice(0, 4).map((tool) => `${tool.name} · ${tool.output.length} chars`),
+        confirmLabel: 'Send this turn',
+        extendedLabel: 'Send for this conversation',
+        cancelLabel: 'Don’t send',
+        onExtended: () => {
+          extended = true;
+        },
+      });
+
+      if (!allowed) return 'deny';
+      return extended ? 'conversation' : 'turn';
+    },
+  };
 }
 
 /** Decide which backend and model serve this chat. */
@@ -695,3 +786,9 @@ function sortChats(chats: Chat[]): Chat[] {
     return b.updatedAt - a.updatedAt;
   });
 }
+
+// Registered at module load, so a connection removed anywhere in the app drops
+// the grants that named it without this store having to be open.
+installEgressRevoker(async (connectionId) => {
+  await useChats.getState().revokeEgress(connectionId);
+});

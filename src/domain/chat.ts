@@ -57,6 +57,15 @@ export interface Provenance {
   /** Set when the router fell back from another backend. */
   readonly fallbackFrom?: string;
   readonly fallbackReason?: string;
+  /**
+   * Whether this reply's request carried tool output off the device.
+   *
+   * Absent when there was no tool output in play. A remote message that
+   * carried the contents of your conversations is materially different from
+   * one that carried only the words you typed, and the chip alone cannot say
+   * which it was.
+   */
+  readonly toolEgress?: 'granted' | 'withheld';
 }
 
 export interface GenerationStats {
@@ -97,6 +106,13 @@ export interface Message {
 
 export type ChatMode = 'chat' | 'task';
 
+/** One conversation's permission to send tool output to one connection. */
+export interface EgressGrant {
+  /** Router/connection id, not the provider family — the key the engine gates on. */
+  readonly connectionId: string;
+  readonly grantedAt: number;
+}
+
 export interface Chat {
   readonly id: string;
   title: string;
@@ -107,6 +123,16 @@ export interface Chat {
   sampler: Partial<SamplerSettings> | null;
   /** Tool ids enabled for this chat. */
   tools: string[];
+  /**
+   * Destinations this conversation has agreed may receive tool output.
+   *
+   * Per conversation and per connection, because neither alone is the decision
+   * the user made: enabling `bash` says nothing about where its output goes,
+   * and connecting a provider says nothing about which of your conversations
+   * it may read. Absent on chats created before the grant existed, which reads
+   * as "no grants" — the safe way round.
+   */
+  egressGrants?: EgressGrant[];
   showThinking: boolean;
   readonly createdAt: number;
   updatedAt: number;

@@ -101,9 +101,11 @@ export function ProvidersPanel(): ReactNode {
         providers={grouped['self-hosted']}
         onPick={setAdding}
       />
+      {/* "Messages you send leave your device" was too narrow: tool output is
+          not a message the user sent, and it travels in the same request. */}
       <ProviderGroup
         title="Cloud providers"
-        hint="Messages you send leave your device."
+        hint="Messages you send leave your device — and, if you allow it, what a tool read."
         providers={grouped.cloud}
         onPick={setAdding}
       />
