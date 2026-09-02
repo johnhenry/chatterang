@@ -150,6 +150,17 @@ object LlamaBridge {
 
     external fun supportsVision(handle: Long): Boolean
 
+    /**
+     * Chat-template NAME sniffed from the GGUF's own metadata, or `""` when
+     * the file carries none this build recognises.
+     *
+     * The GGUF knows; the caller only guessed from a model id. This mirrors
+     * `LlamaContext.templateName(of:)` on iOS, and it is why `LoadResult`'s
+     * `chatTemplate` can be documented as "resolved from the GGUF metadata"
+     * rather than "echoed back".
+     */
+    external fun chatTemplate(handle: Long): String
+
     external fun tokenize(handle: Long, text: String): IntArray
 
     @Suppress("LongParameterList")

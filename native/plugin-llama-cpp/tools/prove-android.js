@@ -127,6 +127,15 @@
       });
     }
 
+    /* Even a refusal owes the stream its one terminal event. A `generate` that
+     * rejects without emitting `llamaEnd` leaves the adapter in
+     * `src/ai/backends/llama-cpp.ts` waiting on a stream that will never end —
+     * the promise rejects, the spinner stays. */
+    out('refused.generate.terminalEvent', {
+      ok: (await settle('prove-refusal-generate')) === 1,
+      llamaEndCount: await settle('prove-refusal-generate'),
+    });
+
     // Methods that need no engine must still work: a device without llama.cpp
     // is a degraded app, not a dead one.
     try {
@@ -158,6 +167,23 @@
     out('listLoaded.before', { ok: true, ...(await Llama.listLoaded()) });
 
     if (!CONFIG.modelPath) {
+      /* No model to load, but the engine is present — so assert the one thing
+       * that can be asserted without one: `engineVersion` is llama.cpp's own
+       * `llama_print_system_info()`, which no stub produces and which cannot
+       * be reached without the `.so` having loaded, linked and run. */
+      const version = capabilities.engineVersion || '';
+      out('engineVersion', {
+        ok: /llama\.cpp .*=\s*1/.test(version),
+        engineVersion: version,
+        error: /llama\.cpp .*=\s*1/.test(version)
+          ? undefined
+          : 'engineVersion does not look like llama_print_system_info() output',
+      });
+      let refused = null;
+      await Llama.load({ modelPath: '/data/local/tmp/definitely-not-here.gguf' }).catch((e) => {
+        refused = String((e && e.message) || e);
+      });
+      out('load.missingFile', { ok: refused !== null, refused });
       return out('done', { ok: true, mode: 'engine-no-model' });
     }
 
@@ -183,14 +209,38 @@
      * have come out of the GGUF's own tokenizer. With `parse_special: false`
      * it comes back as a handful of ordinary text tokens instead — the exact
      * bug iOS shipped and only found by diffing against Node. */
-    for (const text of [
-      ...(CONFIG.templateMarkers || []),
-      ...(CONFIG.wrongMarkers || []),
-      'The capital of Australia is',
-    ]) {
+    const reference = CONFIG.tokenizerReference || {};
+    const texts = Object.keys(reference).length
+      ? Object.keys(reference)
+      : [
+          ...(CONFIG.templateMarkers || []),
+          ...(CONFIG.wrongMarkers || []),
+          'The capital of Australia is',
+        ];
+    for (const text of texts) {
       const { tokens } = await Llama.tokenize({ handle, text });
       const { count } = await Llama.countTokens({ handle, text });
-      out('tokenize', { ok: true, text, tokens, count, agrees: count === tokens.length });
+      const expected = reference[text];
+      // The device's ids, diffed against the ids the SAME model produces
+      // through `packages/inference-node`. Nothing in the Kotlin or the C++
+      // knows these numbers; they can only have come out of the GGUF.
+      const matchesNode =
+        expected === undefined ? undefined : JSON.stringify(tokens) === JSON.stringify(expected);
+      out('tokenize', {
+        ok: matchesNode !== false && count === tokens.length,
+        text,
+        tokens,
+        expected,
+        matchesNode,
+        count,
+        agrees: count === tokens.length,
+        error:
+          matchesNode === false
+            ? `device ${JSON.stringify(tokens)} != node ${JSON.stringify(expected)}`
+            : count === tokens.length
+              ? undefined
+              : 'countTokens disagrees with tokenize',
+      });
     }
 
     /* ── template A/B ───────────────────────────────────────────────────── */
@@ -243,7 +293,11 @@
     const r2 = 'prove-greedy-2';
     const g2 = await Llama.generate({ handle, prompt, requestId: r2, sampler });
     out('generate.cachereuse', {
-      ok: true,
+      ok: g2.cachedTokens === g2.promptTokens - 1,
+      error:
+        g2.cachedTokens === g2.promptTokens - 1
+          ? undefined
+          : `cachedTokens ${g2.cachedTokens}, expected ${g2.promptTokens - 1}`,
       text: g2.text,
       promptTokens: g2.promptTokens,
       cachedTokens: g2.cachedTokens,

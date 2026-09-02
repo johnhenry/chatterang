@@ -28,12 +28,59 @@ buildscript {
 apply plugin: 'com.android.library'
 apply plugin: 'org.jetbrains.kotlin.android'
 
+/*
+ * llama.cpp is neither vendored nor submoduled. `tools/fetch-llama-cpp.sh`
+ * clones the pinned tag into a gitignored `.cache/` directory shared with the
+ * iOS build, and its path is handed to CMake.
+ *
+ * The pin lives in the script, and is read from it rather than repeated here:
+ * two copies of a version number drift, and the failure that produces is a
+ * link error against the wrong `llama.h` much later.
+ */
+def fetchScript = file("${projectDir}/../tools/fetch-llama-cpp.sh")
+def llamaCppTag = (fetchScript.text =~ /LLAMA_TAG="([^"]+)"/)[0][1]
+def llamaCppDir = file("${projectDir}/../../../.cache/llama.cpp-${llamaCppTag}")
+
+if (!llamaCppDir.exists()) {
+    // Refuse rather than guess, and name the one command that fixes it.
+    throw new GradleException(
+        "llama.cpp ${llamaCppTag} is not in the cache at ${llamaCppDir}.\n" +
+        "Run: ./native/plugin-llama-cpp/tools/fetch-llama-cpp.sh")
+}
+
 android {
     namespace = "app.chatterang.llama"
     compileSdk = rootProject.ext.has('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 36
 
+    ndkVersion = "27.1.12297006"
+
     defaultConfig {
         minSdkVersion rootProject.ext.has('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DLLAMA_CPP_DIR=${llamaCppDir}",
+                          "-DCHATTERANG_LLAMA_TAG=${llamaCppTag}",
+                          "-DANDROID_STL=c++_shared"
+                cppFlags "-O3", "-fexceptions", "-frtti"
+            }
+        }
+
+        // arm64-v8a alone. It is what every Android device this app targets
+        // runs and what the API-36 emulator on an Apple-silicon Mac runs, and
+        // each extra ABI is another full llama.cpp compile — armeabi-v7a in
+        // particular is 32-bit, where a 6 GB mmap of a GGUF cannot fit in the
+        // address space at all. Adding one is a line here, not a redesign.
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
     }
 
     compileOptions {

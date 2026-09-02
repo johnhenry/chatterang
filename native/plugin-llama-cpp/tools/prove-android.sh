@@ -53,6 +53,7 @@ What is the capital city of Australia? Answer in one word.<end_of_turn>
 "
 
 command -v "$ADB" >/dev/null 2>&1 || { echo "no adb at $ADB" >&2; exit 2; }
+[ -z "$MODEL" ] || [ -f "$MODEL" ] || { echo "no such model: $MODEL" >&2; exit 2; }
 DEVICE="${PROVE_DEVICE:-$("$ADB" devices | awk 'NR>1 && $2=="device" {print $1; exit}')}"
 [ -n "$DEVICE" ] || { echo "no device: start an emulator or plug a phone in" >&2; exit 2; }
 
@@ -65,11 +66,64 @@ fi
 
 mkdir -p "$ROOT/.cache"
 cd "$ROOT"
+
+# -- The reference the device is diffed against ---------------------------
+#
+# Token ids the SAME GGUF produces through node-llama-cpp on this host: the
+# identical call `packages/inference-node/src/llama-cpp.ts:708` makes for the
+# contract's `tokenize`,
+#
+#     return { tokens: this.#require(handle).model.tokenize(text, true) };
+#
+# where `true` is `parse_special`. That argument is the whole point: with
+# `false` a control marker comes back as a handful of ordinary text tokens.
+# iOS shipped exactly that bug and it was invisible until someone diffed the
+# ids. Computing the reference here rather than pasting numbers in means the
+# diff cannot go stale.
+REFERENCE='{}'
+if [ -n "$MODEL" ]; then
+  echo "--- tokenizing the reference strings on this host ---"
+  REFERENCE="$(node - "$MODEL" 2>/dev/null <<'JS' | tail -1
+import { getLlama } from 'node-llama-cpp';
+const llama = await getLlama();
+const model = await llama.loadModel({ modelPath: process.argv[2] });
+const strings = ['The capital of Australia is', 'hello world', 'Canberra', 'héllo 🌊 漢字'];
+const out = {};
+for (const s of strings) out[s] = Array.from(model.tokenize(s, true));
+console.log(JSON.stringify(out));
+JS
+)"
+  [ -n "$REFERENCE" ] || REFERENCE='{}'
+  echo "reference: $REFERENCE"
+fi
+
+# -- The model, on the device ---------------------------------------------
+#
+# The app's own external files directory: readable by the app with no runtime
+# permission, and writable by adb. `/data/local/tmp` is not -- SELinux labels
+# it `shell_data_file` and an untrusted app cannot read it.
+DEVICE_MODEL=""
+if [ -n "$MODEL" ]; then
+  DEVICE_DIR="/sdcard/Android/data/${APP_ID}/files"
+  DEVICE_MODEL="${DEVICE_DIR}/$(basename "$MODEL")"
+  "$ADB" -s "$DEVICE" shell mkdir -p "$DEVICE_DIR" >/dev/null 2>&1 || true
+  # `|| true`: `set -o pipefail` is on, and a missing file makes the remote
+  # `stat` — and so the whole pipeline — exit non-zero. Not finding the model
+  # on the device is the normal first-run case, not an error.
+  ON_DEVICE_SIZE="$("$ADB" -s "$DEVICE" shell "stat -c %s '$DEVICE_MODEL' 2>/dev/null" | tr -d '\r' || true)"
+  if [ "$ON_DEVICE_SIZE" = "$(stat -f %z "$MODEL")" ]; then
+    echo "model already on device at $DEVICE_MODEL"
+  else
+    echo "--- pushing $(du -h "$MODEL" | cut -f1) to $DEVICE_MODEL ---"
+    "$ADB" -s "$DEVICE" push "$MODEL" "$DEVICE_MODEL" >/dev/null
+  fi
+fi
+
 npm run build:web >/dev/null
 
 # The config the harness reads, and the harness itself, appended to the built
 # index. Both land in dist/ only.
-python3 - "$MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" <<'PY'
+python3 - "$DEVICE_MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" "$REFERENCE" <<'PY'
 import json, pathlib, shutil, sys
 root = pathlib.Path.cwd()
 dist = root / 'dist'
@@ -87,6 +141,7 @@ cfg = {
     'contextLength': 1024,
     'maxTokens': 24,
 }
+cfg['tokenizerReference'] = json.loads(sys.argv[5])
 if sys.argv[1]:
     cfg['modelPath'] = sys.argv[1]
 html = html.replace(

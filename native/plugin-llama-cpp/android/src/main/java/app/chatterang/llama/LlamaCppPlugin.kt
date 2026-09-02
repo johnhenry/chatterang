@@ -62,12 +62,7 @@ class LlamaCppPlugin : Plugin() {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }
 
-        val backends = JSArray().apply {
-            put("cpu")
-            if (LlamaBridge.hasOpenCl()) put("gpu-opencl")
-            if (LlamaBridge.hasVulkan()) put("gpu-vulkan")
-            if (LlamaBridge.hasHexagon()) put("npu-hexagon")
-        }
+        val backends = JSArray(availableBackends())
 
         // Preferred backend follows the tier order in the PRD: NPU, then GPU,
         // then CPU. The engine still falls back at load time if the chosen
@@ -147,12 +142,45 @@ class LlamaCppPlugin : Plugin() {
                     return@execute
                 }
 
-                val requested = call.getString("backend") ?: "gpu-vulkan"
                 val contextLength = call.getInt("contextLength") ?: 4096
                 val threads = call.getInt("threads")
                     ?: max(2, Runtime.getRuntime().availableProcessors() - 2)
 
+                /*
+                 * Clamp the request to what this build actually has, and say
+                 * so — rather than attempting a GPU load that cannot succeed
+                 * and then reporting "the GPU could not load this model",
+                 * which names the wrong cause. Only the CPU variant is built
+                 * (`src/main/cpp/CMakeLists.txt` says why), so on this build
+                 * `available` is `[cpu]` and every request lands here.
+                 */
+                val requested = call.getString("backend") ?: "gpu-vulkan"
+                val available = availableBackends()
                 var backend = requested
+                if (requested !in available) {
+                    warnings.put(
+                        "This build has no $requested backend, so the model is running on the " +
+                            "CPU. Expect it to be slower.",
+                    )
+                    backend = "cpu"
+                }
+
+                // Neither is compiled in — `LLAMA_BUILD_MTMD` is OFF and no
+                // draft path exists — and the native side ignores both. A
+                // caller that asked for them is told, because a silently
+                // dropped capability reads as a broken model.
+                if (!call.getString("mmprojPath").isNullOrBlank()) {
+                    warnings.put(
+                        "This build has no vision support, so any images in this conversation " +
+                            "will be ignored.",
+                    )
+                }
+                if (!call.getString("draftModelPath").isNullOrBlank()) {
+                    warnings.put(
+                        "This build has no speculative decoding, so the draft model is unused.",
+                    )
+                }
+
                 var handle = LlamaBridge.loadModel(
                     file.absolutePath,
                     call.getString("mmprojPath")?.let { stripFileScheme(it) },
@@ -164,8 +192,11 @@ class LlamaCppPlugin : Plugin() {
                     call.getBoolean("useMmap") ?: true,
                 )
 
-                // Hardware-tiered fallback (PRD §3.1): whatever was asked for,
-                // degrade rather than fail.
+                // Hardware-tiered fallback (PRD §3.1): a GPU that refuses the
+                // model degrades to CPU rather than failing outright. Reached
+                // only when a GPU backend is actually compiled in — otherwise
+                // the clamp above already chose CPU, and retrying CPU after
+                // CPU would just fail twice and blame the GPU for it.
                 if (handle == 0L && backend != "cpu") {
                     warnings.put(
                         "The GPU could not load this model, so it is running on the CPU. Expect it to be slower.",
@@ -196,12 +227,51 @@ class LlamaCppPlugin : Plugin() {
                     warnings.put("The context was reduced to $actualContext tokens to fit in memory.")
                 }
 
+                /*
+                 * The GGUF's own template beats the caller's guess: the caller
+                 * chose by model id, the file knows. llama.cpp hands back the
+                 * raw Jinja body rather than a name, so the native side sniffs
+                 * the family from its markers — a heuristic, which is why it
+                 * returns "" when it recognises nothing and the caller's value
+                 * remains the fallback.
+                 */
+                val sniffed = LlamaBridge.chatTemplate(handle).ifBlank { null }
                 val info = LoadedInfo(
                     backend = backend,
                     contextLength = actualContext,
                     supportsVision = LlamaBridge.supportsVision(handle),
-                    chatTemplate = call.getString("chatTemplate") ?: "chatml",
+                    chatTemplate = sniffed ?: call.getString("chatTemplate") ?: "chatml",
                 )
+
+                /*
+                 * Does the chosen template's vocabulary actually exist in this
+                 * model?
+                 *
+                 * A control marker the model knows tokenizes to exactly ONE
+                 * token. If not one of the template's markers does, the
+                 * template belongs to a different model family and every turn
+                 * is rendered in a language this model cannot read — the
+                 * symptom is incoherent output, which reads as a broken model
+                 * rather than a wrong template.
+                 *
+                 * A warning, not a refusal, matching `packages/inference-node`
+                 * and iOS: some templates legitimately use plain-text markers,
+                 * and one wrong guess should not make a model unloadable.
+                 */
+                val markers = call.getArray("templateMarkers")
+                    ?.toList<String>()
+                    ?.filter { it.isNotEmpty() }
+                    ?: emptyList()
+                if (markers.isNotEmpty() &&
+                    markers.none { LlamaBridge.tokenize(handle, it).size == 1 }
+                ) {
+                    warnings.put(
+                        "The \"${info.chatTemplate}\" chat template does not match this model: " +
+                            "none of its markers (${markers.joinToString(", ")}) exist in its " +
+                            "vocabulary, so they will be sent as ordinary text. Expect incoherent " +
+                            "output until the template is changed.",
+                    )
+                }
 
                 contexts[id] = handle
                 contextInfo[id] = info
@@ -246,20 +316,51 @@ class LlamaCppPlugin : Plugin() {
 
     @PluginMethod
     fun generate(call: PluginCall) {
-        if (rejectIfUnavailable(call)) return
+        val requestId = call.getString("requestId")
+        if (requestId == null) {
+            // No requestId means no stream anyone could be listening to, so a
+            // plain rejection is the whole of the contract here.
+            call.reject("handle, prompt, and requestId are required.")
+            return
+        }
+
+        /*
+         * From here on a `requestId` exists, so EVERY exit owes it exactly one
+         * `llamaEnd` — including the early refusals.
+         *
+         * This is where the rule is easiest to break and hardest to see. The
+         * adapter in `src/ai/backends/llama-cpp.ts` resolves its stream on the
+         * terminal event, so a rejection without one leaves the turn pending
+         * forever: the promise rejects, the stream never ends, and the UI sits
+         * on a spinner. `prove-android.sh` counts the events per requestId
+         * precisely because the failure is invisible from the inside — it
+         * caught this exact path returning zero.
+         */
+        fun refuse(message: String) {
+            val payload = JSObject()
+                .put("requestId", requestId)
+                .put("text", "")
+                .put("stopReason", "error")
+                .put("error", message)
+            notifyListeners("llamaEnd", payload)
+            call.reject(message, payload)
+        }
+
+        LlamaBridge.loadFailure?.let {
+            refuse(it)
+            return
+        }
 
         val id = call.getString("handle")
         val prompt = call.getString("prompt")
-        val requestId = call.getString("requestId")
-
-        if (id == null || prompt == null || requestId == null) {
-            call.reject("handle, prompt, and requestId are required.")
+        if (id == null || prompt == null) {
+            refuse("handle, prompt, and requestId are required.")
             return
         }
 
         val handle = contexts[id]
         if (handle == null) {
-            call.reject("No model is loaded for that handle.")
+            refuse("No model is loaded for that handle.")
             return
         }
 
@@ -497,6 +598,20 @@ class LlamaCppPlugin : Plugin() {
      * implementation — but it fails as an `UnsatisfiedLinkError`, which
      * Capacitor turns into a process kill (see `LlamaBridge`'s header).
      */
+    /**
+     * Backends this build was compiled with AND this device supports.
+     *
+     * Asked of the engine, not asserted: `nativeHasVulkan` and friends query
+     * the ggml backend registry, so this list shrinks and grows with what was
+     * actually linked in.
+     */
+    private fun availableBackends(): List<String> = buildList {
+        add("cpu")
+        if (LlamaBridge.hasOpenCl()) add("gpu-opencl")
+        if (LlamaBridge.hasVulkan()) add("gpu-vulkan")
+        if (LlamaBridge.hasHexagon()) add("npu-hexagon")
+    }
+
     private fun rejectIfUnavailable(call: PluginCall): Boolean {
         val reason = LlamaBridge.loadFailure ?: return false
         call.reject(reason, ENGINE_UNAVAILABLE)
