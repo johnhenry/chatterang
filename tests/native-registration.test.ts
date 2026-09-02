@@ -147,10 +147,25 @@ describe('llama.cpp is pinned, not copied into the tree', () => {
     // The build script clones a pinned tag into a gitignored `.cache/` and
     // builds the XCFramework from it. Neither the clone nor the 16 MB artefact
     // may ever become tracked content.
+    //
+    // Our OWN native sources are the exception, and they are listed by exact
+    // path rather than by pattern. The Android JNI shim is a C++ file we wrote
+    // and must track; a blanket `.cpp` ban rejected it, which is how this guard
+    // read a legitimate 1-file shim as vendored llama.cpp. Naming the
+    // allowance keeps the guard's real job intact: anything else with these
+    // extensions still fails, so a future `git add` of the clone is caught.
+    const OURS = ['native/plugin-llama-cpp/android/src/main/cpp/llama-jni.cpp'];
+
     const foreign = tracked.filter(
-      (path) => path.includes('llama.xcframework') || /\.(c|cpp|h|hpp|metal)$/.test(path),
+      (path) =>
+        !OURS.includes(path) &&
+        (path.includes('llama.xcframework') || /\.(c|cpp|h|hpp|metal)$/.test(path)),
     );
     expect(foreign).toEqual([]);
+
+    // The allowance is not a hole: every path in it must actually exist, or a
+    // renamed file would silently widen the guard.
+    for (const path of OURS) expect(tracked).toContain(path);
   });
 
   it('anchors the generated artefacts in .gitignore', () => {

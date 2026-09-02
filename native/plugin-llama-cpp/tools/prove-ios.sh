@@ -23,18 +23,26 @@ MODEL="${1:?usage: prove-ios.sh /abs/path/to/model.gguf [prompt]}"
 # closes with `<turn|>`, which is NOT the `<start_of_turn>` / `<end_of_turn>`
 # pair `src/ai/prompt.ts`'s `gemma` template emits. WRONG_PROMPT is that older
 # pair, kept deliberately so one run shows both and the difference is visible.
-PROMPT="${2:-<|turn>user
+PROMPT="${2:-${PROVE_PROMPT:-<|turn>user
 What is the capital city of Australia? Answer in one word.<turn|>
 <|turn>model
-}"
-CREATIVE_PROMPT="<|turn>user
+}}"
+CREATIVE_PROMPT="${PROVE_CREATIVE_PROMPT:-<|turn>user
 Invent one strange sentence about the sea. Just the sentence.<turn|>
 <|turn>model
-"
-WRONG_PROMPT="<start_of_turn>user
+}"
+WRONG_PROMPT="${PROVE_WRONG_PROMPT:-<start_of_turn>user
 What is the capital city of Australia? Answer in one word.<end_of_turn>
 <start_of_turn>model
-"
+}"
+# Overridable for the same reason as in `prove-android.sh`: the family belongs
+# to the model you pass in. Keeping the two scripts' knobs identically named is
+# what makes a cross-platform tokenizer diff a matter of running both with the
+# same environment.
+TEMPLATE_NAME="${PROVE_TEMPLATE_NAME:-gemma4}"
+TEMPLATE_MARKERS="${PROVE_TEMPLATE_MARKERS:-[\"<|turn>\", \"<turn|>\"]}"
+WRONG_MARKERS="${PROVE_WRONG_MARKERS:-[\"<start_of_turn>\", \"<end_of_turn>\"]}"
+STOP_SEQUENCES="${PROVE_STOP_SEQUENCES:-[\"<turn|>\"]}"
 DEVICE="${PROVE_DEVICE:-$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for v in d.values() for x in v))')}"
 APP_ID="app.chatterang.inference"
 DD="$ROOT/.cache/dd"
@@ -49,7 +57,8 @@ npm run build:web >/dev/null
 
 # The config the harness reads, and the harness itself, appended to the built
 # index. Both land in dist/ only.
-python3 - "$MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" <<'PY'
+python3 - "$MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" \
+         "$TEMPLATE_NAME" "$TEMPLATE_MARKERS" "$WRONG_MARKERS" "$STOP_SEQUENCES" <<'PY'
 import json, pathlib, shutil, sys
 root = pathlib.Path.cwd()
 dist = root / 'dist'
@@ -61,10 +70,10 @@ cfg = json.dumps({
     'prompt': sys.argv[2],
     'wrongPrompt': sys.argv[3],
     'creativePrompt': sys.argv[4],
-    'templateName': 'gemma4',
-    'templateMarkers': ['<|turn>', '<turn|>'],
-    'wrongMarkers': ['<start_of_turn>', '<end_of_turn>'],
-    'stopSequences': ['<turn|>'],
+    'templateName': sys.argv[5],
+    'templateMarkers': json.loads(sys.argv[6]),
+    'wrongMarkers': json.loads(sys.argv[7]),
+    'stopSequences': json.loads(sys.argv[8]),
     'contextLength': 1024,
     'maxTokens': 24,
 })

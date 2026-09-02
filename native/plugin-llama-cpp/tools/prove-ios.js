@@ -91,7 +91,19 @@
      * id; a single-token result carrying a specific id can only have come out
      * of the 6.5 GB file's tokenizer. With the old `parse_special: false` this
      * came back as a handful of ordinary text tokens instead. */
-    for (const text of [...(CONFIG.templateMarkers || []), ...(CONFIG.wrongMarkers || []), 'The capital of Australia is']) {
+    /* The trailing four are the SAME strings `prove-android.sh` diffs against
+     * node-llama-cpp. Keeping the lists identical is what makes the three
+     * implementations comparable id-for-id rather than merely both plausible:
+     * a tokenizer bug that only shows up above the BMP (the emoji and the CJK)
+     * or on a multi-token proper noun is invisible on markers alone. */
+    for (const text of [
+      ...(CONFIG.templateMarkers || []),
+      ...(CONFIG.wrongMarkers || []),
+      'The capital of Australia is',
+      'hello world',
+      'Canberra',
+      'héllo 🌊 漢字',
+    ]) {
       const { tokens } = await Llama.tokenize({ handle, text });
       const { count } = await Llama.countTokens({ handle, text });
       out('tokenize', { ok: true, text, tokens, count, agrees: count === tokens.length });

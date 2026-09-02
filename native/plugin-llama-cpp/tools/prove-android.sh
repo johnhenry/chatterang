@@ -39,18 +39,36 @@ LOG="$ROOT/.cache/prove-android.log"
 # The turn markers the reference model actually uses, read out of its own GGUF
 # chat template. WRONG_PROMPT is a different family's pair, kept deliberately
 # so one run shows both and the difference is visible.
+#
+# These default to the Gemma family. EVERY one is overridable, because the
+# family is a property of the model you pass in, not of this script — running
+# a Qwen GGUF against Gemma's `<|turn>` markers would make the template A/B
+# vacuous in the quietest possible way (both halves wrong, so both halves
+# agree). For a ChatML model (Qwen, and anything `inferTemplate` maps to
+# `chatml` in `src/ai/prompt.ts`) set:
+#
+#   PROVE_TEMPLATE_NAME=chatml
+#   PROVE_TEMPLATE_MARKERS='["<|im_start|>", "<|im_end|>"]'
+#   PROVE_STOP_SEQUENCES='["<|im_end|>"]'
+#   PROVE_WRONG_MARKERS='["<start_of_turn>", "<end_of_turn>"]'
+#   PROVE_PROMPT / PROVE_CREATIVE_PROMPT / PROVE_WRONG_PROMPT to match.
 PROMPT="${PROVE_PROMPT:-<|turn>user
 What is the capital city of Australia? Answer in one word.<turn|>
 <|turn>model
 }"
-CREATIVE_PROMPT="<|turn>user
+CREATIVE_PROMPT="${PROVE_CREATIVE_PROMPT:-<|turn>user
 Invent one strange sentence about the sea. Just the sentence.<turn|>
 <|turn>model
-"
-WRONG_PROMPT="<start_of_turn>user
+}"
+WRONG_PROMPT="${PROVE_WRONG_PROMPT:-<start_of_turn>user
 What is the capital city of Australia? Answer in one word.<end_of_turn>
 <start_of_turn>model
-"
+}"
+# JSON, because these are lists and shell arrays do not survive an env var.
+TEMPLATE_NAME="${PROVE_TEMPLATE_NAME:-gemma4}"
+TEMPLATE_MARKERS="${PROVE_TEMPLATE_MARKERS:-[\"<|turn>\", \"<turn|>\"]}"
+WRONG_MARKERS="${PROVE_WRONG_MARKERS:-[\"<start_of_turn>\", \"<end_of_turn>\"]}"
+STOP_SEQUENCES="${PROVE_STOP_SEQUENCES:-[\"<turn|>\"]}"
 
 command -v "$ADB" >/dev/null 2>&1 || { echo "no adb at $ADB" >&2; exit 2; }
 [ -z "$MODEL" ] || [ -f "$MODEL" ] || { echo "no such model: $MODEL" >&2; exit 2; }
@@ -80,14 +98,22 @@ cd "$ROOT"
 # iOS shipped exactly that bug and it was invisible until someone diffed the
 # ids. Computing the reference here rather than pasting numbers in means the
 # diff cannot go stale.
+#
+# THE MARKERS ARE IN THE LIST DELIBERATELY. Four ordinary strings tokenise
+# identically whether `parse_special` is true or false, so a reference made
+# only of prose cannot see the bug it was written to catch. `$TEMPLATE_MARKERS`
+# is passed in and prepended, and each one must come back as a SINGLE id.
 REFERENCE='{}'
 if [ -n "$MODEL" ]; then
   echo "--- tokenizing the reference strings on this host ---"
-  REFERENCE="$(node - "$MODEL" 2>/dev/null <<'JS' | tail -1
+  REFERENCE="$(node - "$MODEL" "$TEMPLATE_MARKERS" 2>/dev/null <<'JS' | tail -1
 import { getLlama } from 'node-llama-cpp';
 const llama = await getLlama();
 const model = await llama.loadModel({ modelPath: process.argv[2] });
-const strings = ['The capital of Australia is', 'hello world', 'Canberra', 'héllo 🌊 漢字'];
+const strings = [
+  ...JSON.parse(process.argv[3]),
+  'The capital of Australia is', 'hello world', 'Canberra', 'héllo 🌊 漢字',
+];
 const out = {};
 for (const s of strings) out[s] = Array.from(model.tokenize(s, true));
 console.log(JSON.stringify(out));
@@ -123,7 +149,8 @@ npm run build:web >/dev/null
 
 # The config the harness reads, and the harness itself, appended to the built
 # index. Both land in dist/ only.
-python3 - "$DEVICE_MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" "$REFERENCE" <<'PY'
+python3 - "$DEVICE_MODEL" "$PROMPT" "$WRONG_PROMPT" "$CREATIVE_PROMPT" "$REFERENCE" \
+         "$TEMPLATE_NAME" "$TEMPLATE_MARKERS" "$WRONG_MARKERS" "$STOP_SEQUENCES" <<'PY'
 import json, pathlib, shutil, sys
 root = pathlib.Path.cwd()
 dist = root / 'dist'
@@ -134,10 +161,10 @@ cfg = {
     'prompt': sys.argv[2],
     'wrongPrompt': sys.argv[3],
     'creativePrompt': sys.argv[4],
-    'templateName': 'gemma4',
-    'templateMarkers': ['<|turn>', '<turn|>'],
-    'wrongMarkers': ['<start_of_turn>', '<end_of_turn>'],
-    'stopSequences': ['<turn|>'],
+    'templateName': sys.argv[6],
+    'templateMarkers': json.loads(sys.argv[7]),
+    'wrongMarkers': json.loads(sys.argv[8]),
+    'stopSequences': json.loads(sys.argv[9]),
     'contextLength': 1024,
     'maxTokens': 24,
 }
