@@ -110,6 +110,18 @@ function withheldNote(characters: number): string {
   );
 }
 
+/**
+ * The tool names this request declares, which are the app's own strings.
+ *
+ * `clearForDestination` keeps a withheld call's name only if it is in here.
+ * Built from the registry rather than from the message array on purpose: the
+ * names IN the array are whatever the model typed, and the whole point is to
+ * compare them against a set the model did not write.
+ */
+function declaredToolNames(toolIds: readonly string[] | undefined): ReadonlySet<string> {
+  return new Set((toolIds?.length ? toolRegistry.toIRTools(toolIds) : []).map((tool) => tool.name));
+}
+
 interface TurnResult {
   text: string;
   stats: GenerationStatsSnapshot;
@@ -419,6 +431,10 @@ export class ChatterangEngine {
     let stats: GenerationStatsSnapshot = {};
     const tools: ExecutedTool[] = [];
 
+    // The names the app itself declared this turn, so a withheld call cannot
+    // carry out a name the model invented.
+    const declared = declaredToolNames(request.toolIds);
+
     // Egress state for this turn. `decided` caches per destination so a model
     // that immediately re-runs the same command hits the same answer instead
     // of a second sheet — a sheet that can be raised repeatedly is a sheet
@@ -434,7 +450,12 @@ export class ChatterangEngine {
       // Cleared for THIS destination, this iteration. `target` is reassigned
       // inside the loop, so a clearance computed anywhere earlier would be a
       // clearance for a backend that no longer applies.
-      let outgoing = clearForDestination(messages, { allowed: true, note: withheldNote });
+      let outgoing = clearForDestination(messages, {
+        allowed: true,
+        note: withheldNote,
+        declaredToolNames: declared,
+        local: target.local,
+      });
 
       if (!target.local && carriesTaint(messages)) {
         const characters = taintedCharacters(messages);
@@ -468,7 +489,11 @@ export class ChatterangEngine {
         }
 
         if (!allowed) {
-          outgoing = clearForDestination(messages, { allowed: false, note: withheldNote });
+          outgoing = clearForDestination(messages, {
+            allowed: false,
+            note: withheldNote,
+            declaredToolNames: declared,
+          });
         }
         toolEgress = allowed ? 'granted' : 'withheld';
         yield {
@@ -641,7 +666,12 @@ export class ChatterangEngine {
   async complete(request: GenerationRequest): Promise<IRChatResponse> {
     const allowed =
       request.target.local || request.egress?.isGranted(request.target.backendId) === true;
-    const outgoing = clearForDestination(request.messages, { allowed, note: withheldNote });
+    const outgoing = clearForDestination(request.messages, {
+      allowed,
+      note: withheldNote,
+      declaredToolNames: declaredToolNames(request.toolIds),
+      local: request.target.local,
+    });
     const irRequest = this.#toIR(request, outgoing, newId('req'), false);
     return (await this.#bridge.chat(irRequest, {
       signal: request.signal,

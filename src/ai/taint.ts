@@ -60,6 +60,34 @@
  * {@link clearForDestination} is the only thing that can produce the
  * {@link ClearedMessage} array the engine is allowed to build a request from.
  * A call site that forgets the gate does not compile.
+ *
+ * ## What round four corrected, and why it is written down here
+ *
+ * The three paragraphs above were true of the code that introduced them and
+ * still let three things through, each found by attacking the code rather than
+ * by reading it. All three are the same mistake in different clothes — a rule
+ * that SUBTRACTS the field known to hold the bytes and copies the rest:
+ *
+ * 1. `sanitiseMessages` exempted values under keys named `type` and `data`
+ *    from encoding, to avoid rewriting image base64. A model names its own
+ *    tool arguments, so naming one `data` put an unencoded `<|im_start|>` in
+ *    the prompt. The exemption is gone; {@link encodeUntrusted} returns its
+ *    input untouched when there is nothing to encode, which is what base64
+ *    needed and what a key name was standing in for.
+ * 2. {@link clearForDestination} withheld a `tool_use` by emptying `input` and
+ *    spreading the rest — including `name`, which `findToolCalls` reads out of
+ *    the model's own text. Naming a tool after the secret walked it out. Every
+ *    withheld block is now REBUILT from named fields; the name survives only if
+ *    the request declared it, and ids are renamed outright.
+ * 3. The mark was stripped for every destination, including on-device ones —
+ *    but the local prompt renderer sits behind this gate, so `isTainted()` was
+ *    false everywhere it mattered and property A quietly fell back to round 3's
+ *    marker denylist for any carrier without a block-type floor. See
+ *    {@link ClearOptions.local}.
+ *
+ * The lesson is worth more than the three fixes: prefer constructions that
+ * enumerate what is ALLOWED out. Every defect in this milestone has been a list
+ * of what was not.
  */
 
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
@@ -125,6 +153,33 @@ const FOLDED: ReadonlyMap<string, string> = new Map(
 /** Whitespace a reader needs and no template treats as a role boundary. */
 const KEPT_CONTROLS = new Set(['\n', '\t', '\r']);
 
+/** `\u{…}` escape for one code point, safe inside a regex character class. */
+const classEscape = (codePoint: number): string => `\\u{${codePoint.toString(16)}}`;
+
+/**
+ * Does this string contain anything {@link encodeUntrusted} would change?
+ *
+ * Derived from the same three data sources the encoder branches on — the
+ * structural alphabet, the folding code points, and the invisibles minus the
+ * kept whitespace — so it cannot drift out of agreement with the encoder. That
+ * agreement is asserted directly over a Unicode sweep in `tests/taint.test.ts`
+ * rather than argued for here.
+ *
+ * It exists because the encoder now runs over EVERY string in a tainted
+ * message, including a megabyte of image base64. Base64 contains none of these
+ * characters, so the scan answers "no" and the original string is returned
+ * without a single allocation. That is what let the previous key-name
+ * exemption — which was a hole, not an optimisation — be deleted.
+ */
+const ACTIONABLE = new RegExp(
+  [
+    `[${STRUCTURAL.map((character) => classEscape(character.codePointAt(0) ?? 0)).join('')}]`,
+    `[${FOLDS_INTO_STRUCTURE.map(classEscape).join('')}]`,
+    `(?![${[...KEPT_CONTROLS].map((character) => classEscape(character.codePointAt(0) ?? 0)).join('')}])[\\p{Cc}\\p{Cf}]`,
+  ].join('|'),
+  'u',
+);
+
 /**
  * Invisible characters: C0/C1 controls and Unicode format characters.
  *
@@ -143,6 +198,8 @@ const INVISIBLE = /[\p{Cc}\p{Cf}]/u;
  * what the tool printed.
  */
 export function encodeUntrusted(text: string): string {
+  if (!ACTIONABLE.test(text)) return text;
+
   let out = '';
   for (const character of text) {
     const code = character.codePointAt(0) ?? 0;
@@ -259,7 +316,13 @@ function blockCharacters(block: MessageContent): number {
     );
   }
   if (block.type === 'text') return block.text.length;
-  if (record.input !== undefined) return JSON.stringify(record.input).length;
+  if (record.input !== undefined) {
+    // The name counts. It is a field the model writes, so it is a field that
+    // can carry the bytes, and a receipt that said "2 characters" while a
+    // thirty-five-character secret sat in the name would be the same kind of
+    // false-but-reassuring string as the `privacy` command used to print.
+    return JSON.stringify(record.input).length + String(record.name ?? '').length;
+  }
   return 0;
 }
 
@@ -284,7 +347,46 @@ export interface ClearOptions {
   readonly allowed: boolean;
   /** What the model is told in place of what was withheld. */
   readonly note: (characters: number) => string;
+  /**
+   * The tool names this request declares — the app's own strings.
+   *
+   * A withheld `tool_use` keeps its name only if it is in here. That is not
+   * politeness: `findToolCalls` reads the name out of the model's own text
+   * (`{"name":"…","arguments":{}}`), so the name is a model-controlled field,
+   * and a withheld block that spread `...block` carried it out verbatim. The
+   * measured attack was to read a secret with one tool and then emit a second
+   * call whose NAME was the secret — the round-3 defect one field further
+   * over. Omitting this set withholds every name, which is the safe default.
+   */
+  readonly declaredToolNames?: ReadonlySet<string>;
+  /**
+   * Is the destination an on-device engine?
+   *
+   * This decides whether the taint MARK is stripped, and it exists because
+   * stripping it unconditionally silently disarmed property A.
+   *
+   * The mark is stripped so it cannot reach a provider SDK. But the local
+   * prompt renderer sits BEHIND this gate too — `renderPrompt` runs inside the
+   * llama.cpp adapter, downstream of `#toIR` — so an unconditional strip meant
+   * `sanitiseMessages` never once saw `isTainted() === true` in the running
+   * app. Encoding still happened for `tool_use`/`tool_result` blocks, which
+   * have a block-type floor under them, and did NOT happen for the carrier the
+   * mark exists to cover: an ordinary text message that a previous turn's tool
+   * output is derived from. Measured — a reply quoting `<<SYS>>` came back
+   * through into the local ChatML prompt with only round 3's marker denylist
+   * between it and the tokeniser, which is exactly the denylist this round was
+   * meant to stop depending on.
+   *
+   * So: local keeps the mark, and `renderPrompt` encodes. Non-local strips it,
+   * and a non-local destination renders no template at all — its structure is
+   * JSON, not markers, so there is nothing there for a marker to forge.
+   * Omitting the flag strips, which keeps the provider-facing default.
+   */
+  readonly local?: boolean;
 }
+
+/** The name a withheld call gets when its own is not one the app declared. */
+export const WITHHELD_TOOL_NAME = 'withheld_tool';
 
 /**
  * Strip the taint marks, and — when the destination has no grant — the tainted
@@ -300,54 +402,100 @@ export function clearForDestination(
   messages: readonly IRMessage[],
   options: ClearOptions,
 ): ClearedMessage[] {
+  // One renaming map for the whole array, so a `tool_result` and the
+  // `tool_use` it answers still agree after both have been rewritten.
+  const renamed = new Map<string, string>();
+  const idFor = (id: unknown): string => {
+    const key = typeof id === 'string' ? id : String(id);
+    const existing = renamed.get(key);
+    if (existing !== undefined) return existing;
+    const fresh = `withheld_call_${renamed.size}`;
+    renamed.set(key, fresh);
+    return fresh;
+  };
+
   return messages.map((message) => {
     const tainted = isTainted(message);
-    const metadata = stripMark(message.metadata);
+    // On-device: the mark rides through, because the thing that consumes it —
+    // `sanitiseMessages`, inside the local prompt renderer — is downstream of
+    // this gate. Off-device: it is stripped, because a provider must never see
+    // this app's bookkeeping.
+    const metadata = options.local === true ? message.metadata : stripMark(message.metadata);
     const base = metadata === undefined ? omitMetadata(message) : { ...message, metadata };
 
     if (options.allowed) return base as ClearedMessage;
 
     if (typeof message.content === 'string') {
       if (!tainted) return base as ClearedMessage;
-      return { ...base, content: options.note(message.content.length) } as ClearedMessage;
+      // Rebuilt, not spread: a withheld message keeps its role and nothing
+      // else, so a field added to `IRMessage` later cannot become a carrier
+      // by default.
+      return { role: message.role, content: options.note(message.content.length) } as ClearedMessage;
     }
 
     if (!Array.isArray(message.content)) return base as ClearedMessage;
     if (!tainted && !message.content.some(isToolBlock)) return base as ClearedMessage;
 
     return {
-      ...base,
+      role: message.role,
       content: message.content.map((block) =>
-        tainted || isToolBlock(block) ? withhold(block, options.note) : block,
+        tainted || isToolBlock(block) ? withhold(block, options, idFor) : block,
       ),
     } as unknown as ClearedMessage;
   });
 }
 
 /**
- * One block, emptied of the bytes but not of its shape.
+ * One block, rebuilt from a closed set of fields.
  *
- * Every branch is deliberate. A `tool_use` keeps its id and its name — the
- * name is the app's own string, and the id is what pairs it with its result —
- * but loses every argument, because an argument is exactly where the measured
- * copy-through landed. A media block becomes text, because a tainted image is
- * a tainted image and there is no partial version of it.
+ * The shape of the previous version was `{ ...block, content: note }` — subtract
+ * the field known to hold the bytes, keep everything else. That is the same
+ * denylist mistake as the marker escaper, and it leaked for the same reason:
+ * something else was holding the bytes. Measured at the `BackendAdapter`
+ * boundary, with no grant, every other field withheld — the secret rode out in
+ * `tool_use.name`, which `findToolCalls` copies straight from the model's text
+ * and which the old comment here wrongly called "the app's own string".
+ *
+ * So nothing is spread. Each branch NAMES the fields it emits:
+ *
+ * - `toolUseId` / `id` are renamed to an app-generated `withheld_call_N`. They
+ *   only ever need to agree with each other inside one request, so renaming
+ *   them costs nothing and closes the id as a channel outright — including for
+ *   a provider-native block whose id this app did not choose.
+ * - `name` survives only if the request declared it. The set is finite, it is
+ *   the app's, and a name outside it is by definition not a tool that ran.
+ * - Everything else becomes the note, including media: a tainted image is a
+ *   tainted image and there is no partial version of it.
  */
-function withhold(block: MessageContent, note: (characters: number) => string): MessageContent {
+function withhold(
+  block: MessageContent,
+  options: ClearOptions,
+  idFor: (id: unknown) => string,
+): MessageContent {
   const record = block as unknown as Record<string, unknown>;
-  const characters = blockCharacters(block);
+  const note = options.note(blockCharacters(block));
 
   if (block.type === 'tool_result') {
-    return { ...block, content: note(characters) } as MessageContent;
+    return {
+      type: 'tool_result',
+      toolUseId: idFor(record.toolUseId),
+      content: note,
+      isError: record.isError === true,
+    } as unknown as MessageContent;
   }
+
   if (block.type === 'tool_use') {
-    return { ...block, input: { withheld: note(characters) } } as MessageContent;
+    const name = record.name;
+    const declared = typeof name === 'string' && options.declaredToolNames?.has(name) === true;
+    return {
+      type: 'tool_use',
+      id: idFor(record.id),
+      name: declared ? (name as string) : WITHHELD_TOOL_NAME,
+      input: { withheld: note },
+    } as unknown as MessageContent;
   }
-  if (block.type === 'text') {
-    return { ...block, text: note(characters) } as MessageContent;
-  }
-  void record;
-  return { type: 'text', text: note(characters) } as MessageContent;
+
+  return { type: 'text', text: note } as MessageContent;
 }
 
 function stripMark(
