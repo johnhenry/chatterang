@@ -17,6 +17,9 @@ final class LlamaContext {
         let threads: Int
         let useMmap: Bool
         let chatTemplate: String?
+        /// The chosen template's control markers, for the load-time match
+        /// check. See `recogniseTemplate`.
+        let templateMarkers: [String]
     }
 
     struct Sampler {
@@ -93,6 +96,13 @@ final class LlamaContext {
     private var vocab: OpaquePointer?
     private var batch: llama_batch
     private let threads: Int32
+    /// `free()` is called explicitly by `unload` and again by `deinit`. Without
+    /// this, `llama_batch_free` runs twice on the same allocation.
+    private var released = false
+
+    /// Bytes of a multi-byte UTF-8 sequence that arrived split across tokens.
+    /// See `decode(_:)`.
+    private var pendingBytes: [UInt8] = []
 
     /// Tokens currently resident in the KV cache, in order. Compared against
     /// the next prompt to find how much prefill can be skipped.
@@ -142,12 +152,33 @@ final class LlamaContext {
 
     // MARK: - Lifecycle
 
-    init(options: LoadOptions) throws {
+    /// `llama_backend_init()` / `llama_backend_free()` are PROCESS-GLOBAL: they
+    /// set up and tear down the ggml backend registry shared by every model in
+    /// the process, and neither is reference-counted.
+    ///
+    /// So this is initialised exactly once, lazily, and is never freed. The
+    /// previous shape — init per context, free in `free()` — meant unloading
+    /// one handle tore the backend out from under every other one that was
+    /// still loaded. `packages/inference-node` has the right shape and is worth
+    /// copying: it disposes sequence → context → model per handle and touches
+    /// nothing global until the whole plugin is disposed.
+    ///
+    /// Not freeing at all is the correct trade here. The backend registry is a
+    /// fixed, small allocation, the plugin lives as long as the app does, and
+    /// iOS reclaims it at exit — whereas a global teardown reachable from a
+    /// per-handle call is a use-after-free waiting for a second handle.
+    private static let backendReady: Void = {
         llama_backend_init()
+    }()
+
+    init(options: LoadOptions) throws {
+        _ = Self.backendReady
 
         threads = Int32(options.threads)
         contextLength = options.contextLength
-        chatTemplate = options.chatTemplate ?? "chatml"
+        // Provisional; replaced below once the model's own metadata is
+        // readable, which needs the model loaded.
+        chatTemplate = options.chatTemplate ?? "unknown"
 
         var modelParams = llama_model_default_params()
         // On a phone the choice is between "all layers on the GPU" and "the
@@ -174,11 +205,17 @@ final class LlamaContext {
         }
 
         guard let model else {
-            llama_backend_free()
             throw EngineError.modelLoadFailed(options.modelPath)
         }
 
         vocab = llama_model_get_vocab(model)
+
+        // The GGUF's own template, when it carries one, beats the caller's
+        // guess — the caller chose by model id, the file knows. llama.cpp
+        // returns the raw Jinja body rather than a name, so the name is
+        // sniffed from its markers; that is a heuristic and falls back to what
+        // the caller asked for.
+        chatTemplate = Self.templateName(of: model) ?? options.chatTemplate ?? "unknown"
 
         var contextParams = llama_context_default_params()
         contextParams.n_ctx = UInt32(options.contextLength)
@@ -189,7 +226,7 @@ final class LlamaContext {
         context = llama_init_from_model(model, contextParams)
         guard context != nil else {
             llama_model_free(model)
-            llama_backend_free()
+            self.model = nil
             throw EngineError.contextCreationFailed
         }
 
@@ -231,9 +268,43 @@ final class LlamaContext {
                 warnings.append("The draft model could not be loaded, so speculative decoding is off.")
             }
         }
+
+        // Does the chosen template's vocabulary actually exist in this model?
+        //
+        // A control marker the model knows tokenizes to exactly one token. If
+        // NOT ONE of the template's markers does, the template belongs to a
+        // different model family and every turn is rendered in a language this
+        // model cannot read — the symptom is incoherent output, which reads as
+        // a broken model rather than a wrong template.
+        //
+        // A warning, not a refusal, matching `packages/inference-node`: some
+        // templates legitimately use plain-text markers, and one wrong guess
+        // should not make a model unloadable.
+        let markers = options.templateMarkers.filter { !$0.isEmpty }
+        if !markers.isEmpty {
+            let recognised = markers.filter {
+                tokenize($0, addSpecial: false, parseSpecial: true).count == 1
+            }
+            if recognised.isEmpty {
+                warnings.append(
+                    "The \"\(options.chatTemplate ?? chatTemplate)\" chat template does not match this "
+                        + "model: none of its markers (\(markers.joined(separator: ", "))) exist in its "
+                        + "vocabulary, so they will be sent as ordinary text. Expect incoherent output "
+                        + "until the template is changed."
+                )
+            }
+        }
     }
 
+    /// Releases this handle's resources. Idempotent: `unload` calls it and then
+    /// `deinit` calls it again on the same instance, which without the guard
+    /// double-frees `batch`.
+    ///
+    /// Innermost first, and nothing process-global — see `backendReady`.
     func free() {
+        guard !released else { return }
+        released = true
+
         llama_batch_free(batch)
         if let draftContext { llama_free(draftContext) }
         if let draftModel { llama_model_free(draftModel) }
@@ -243,30 +314,110 @@ final class LlamaContext {
         draftModel = nil
         context = nil
         model = nil
-        llama_backend_free()
+        vocab = nil
     }
 
     deinit { free() }
 
     // MARK: - Tokenisation
 
-    func tokenize(_ text: String) -> [Int32] {
-        guard let vocab else { return [] }
+    /// - Parameters:
+    ///   - addSpecial: let the vocabulary prepend its BOS token.
+    ///   - parseSpecial: read `<start_of_turn>` and friends as the control
+    ///     tokens they are, rather than as their literal characters.
+    ///
+    /// `parseSpecial` is the load-bearing one, and it used to be `false` here
+    /// while the Node implementation passes `true`
+    /// (`model.tokenize(prompt, true)` at `packages/inference-node/src/llama-cpp.ts:573`).
+    /// The prompt arrives from `src/ai/prompt.ts` already rendered by the app's
+    /// own template, so with `false` every `<start_of_turn>` reached the model
+    /// as ordinary text — the exact failure the `templateMarkers` check exists
+    /// to warn about, except self-inflicted and unwarnable.
+    func tokenize(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {
+        guard let vocab, !text.isEmpty else { return [] }
         let utf8Count = text.utf8.count
+        // One token per byte is the floor; the slack covers BOS/EOS.
         let capacity = utf8Count + 8
         var tokens = [llama_token](repeating: 0, count: capacity)
 
-        let count = llama_tokenize(vocab, text, Int32(utf8Count), &tokens, Int32(capacity), true, false)
+        let count = llama_tokenize(
+            vocab, text, Int32(utf8Count), &tokens, Int32(capacity), addSpecial, parseSpecial
+        )
         guard count > 0 else { return [] }
         return Array(tokens.prefix(Int(count)))
     }
 
-    private func detokenize(_ token: llama_token) -> String {
-        guard let vocab else { return "" }
+    /// Raw bytes of one token. Deliberately NOT a `String`: see `decode`.
+    private func bytes(of token: llama_token) -> [UInt8] {
+        guard let vocab else { return [] }
         var buffer = [CChar](repeating: 0, count: 64)
-        let length = llama_token_to_piece(vocab, token, &buffer, 64, 0, false)
-        guard length > 0 else { return "" }
-        return String(decoding: buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        var length = llama_token_to_piece(vocab, token, &buffer, Int32(buffer.count), 0, false)
+        if length < 0 {
+            // Negative is "buffer too small, and this is how much you need".
+            // Dropping it (the old `guard length > 0`) silently swallowed any
+            // token longer than 63 bytes.
+            buffer = [CChar](repeating: 0, count: Int(-length))
+            length = llama_token_to_piece(vocab, token, &buffer, Int32(buffer.count), 0, false)
+        }
+        guard length > 0 else { return [] }
+        return buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }
+    }
+
+    /// Token bytes → text, holding back a trailing partial UTF-8 sequence.
+    ///
+    /// A token is a byte sequence, not a character: BPE splits "é" (or an
+    /// emoji, or any CJK glyph) across two or three tokens. Decoding each
+    /// token independently — which is what the old `detokenize` did — turns
+    /// every one of those into U+FFFD, so the stream the user watches is
+    /// corrupt even though the final text would not be.
+    ///
+    /// So incomplete trailing bytes are carried into the next call. `flush()`
+    /// drains whatever is left when generation ends.
+    private func decode(_ bytes: [UInt8]) -> String {
+        pendingBytes.append(contentsOf: bytes)
+
+        // Walk back at most 3 bytes looking for the start of a sequence that
+        // is not yet complete; UTF-8 continuation bytes are 0b10xxxxxx.
+        var boundary = pendingBytes.count
+        var back = 0
+        while back < 4, boundary > 0 {
+            let lead = pendingBytes[boundary - 1]
+            if lead & 0b1100_0000 == 0b1000_0000 {
+                // Continuation byte: keep walking back to its lead byte.
+                boundary -= 1
+                back += 1
+                continue
+            }
+            let expected: Int
+            if lead & 0b1000_0000 == 0 { expected = 1 }
+            else if lead & 0b1110_0000 == 0b1100_0000 { expected = 2 }
+            else if lead & 0b1111_0000 == 0b1110_0000 { expected = 3 }
+            else if lead & 0b1111_1000 == 0b1111_0000 { expected = 4 }
+            else { expected = 1 } // Invalid lead; let the decoder replace it.
+
+            if boundary - 1 + expected > pendingBytes.count {
+                // The last sequence is short. Emit everything before it.
+                boundary -= 1
+            } else {
+                boundary = pendingBytes.count
+            }
+            break
+        }
+
+        guard boundary > 0 else { return "" }
+        let ready = pendingBytes.prefix(boundary)
+        pendingBytes.removeFirst(boundary)
+        return String(decoding: ready, as: UTF8.self)
+    }
+
+    /// Emits any bytes still held back. Non-empty only when generation stopped
+    /// mid-character, in which case the replacement character is the honest
+    /// rendering of bytes the model never finished.
+    private func flushDecoder() -> String {
+        guard !pendingBytes.isEmpty else { return "" }
+        let remainder = pendingBytes
+        pendingBytes = []
+        return String(decoding: remainder, as: UTF8.self)
     }
 
     // MARK: - Generation
@@ -280,7 +431,15 @@ final class LlamaContext {
     ) throws -> Result {
         guard let context, let vocab else { throw EngineError.contextCreationFailed }
 
-        let promptTokens = tokenize(prompt)
+        // `parseSpecial: true` because the prompt is already rendered by the
+        // app's template and its control markers must become control tokens.
+        // `addSpecial: true` lets the vocabulary prepend its own BOS: none of
+        // the templates in `src/ai/prompt.ts` emit one, and a Gemma-family
+        // model that never sees BOS degrades quietly.
+        let promptTokens = tokenize(prompt, addSpecial: true, parseSpecial: true)
+        // Each generation decodes its own stream; nothing may carry over from
+        // the last one's trailing bytes.
+        pendingBytes = []
         guard !promptTokens.isEmpty else {
             return Result(text: "", promptTokens: 0, cachedTokens: 0, completionTokens: 0, stopReason: "stop", draftAcceptance: nil)
         }
@@ -364,19 +523,30 @@ final class LlamaContext {
 
             llama_sampler_accept(chain, token)
 
-            let piece = detokenize(token)
-            text += piece
+            let chunk = decode(bytes(of: token))
+            text += chunk
             completionTokens += 1
             // The sampled token is now part of the cache's contents, so the
             // next turn's prefix match can include the model's own reply.
             cachedTokens.append(token)
-            onToken(piece)
+            // A token whose bytes are still being held back for the next one
+            // produces no text; emitting an empty event would make `index`
+            // count steps rather than pieces.
+            if !chunk.isEmpty { onToken(chunk) }
 
             // Stop sequences are checked on the accumulated text rather than
             // per token, because a sequence can straddle a token boundary.
             if let matched = sampler.stopSequences.first(where: { !$0.isEmpty && text.hasSuffix($0) }) {
                 text = String(text.dropLast(matched.count))
                 stopReason = "stop-sequence"
+                break
+            }
+
+            // Checked BEFORE the next decode: reaching the cap means no further
+            // token will be sampled, so evaluating this one is work whose
+            // result is thrown away. The old placement ran it every time.
+            if completionTokens >= Int(sampler.maxTokens) {
+                stopReason = "length"
                 break
             }
 
@@ -387,10 +557,13 @@ final class LlamaContext {
             if llama_decode(context, batch) != 0 {
                 throw EngineError.outOfMemory
             }
+        }
 
-            if completionTokens >= Int(sampler.maxTokens) {
-                stopReason = "length"
-            }
+        // Bytes of a character the model stopped in the middle of.
+        let tail = flushDecoder()
+        if !tail.isEmpty {
+            text += tail
+            onToken(tail)
         }
 
         return Result(
@@ -454,7 +627,11 @@ final class LlamaContext {
         // A synthetic prompt of the requested length: the point is to measure
         // this device, not this prompt.
         let filler = String(repeating: "the quick brown fox jumps over the lazy dog. ", count: max(1, promptTokens / 9))
-        let tokens = Array(tokenize(filler).prefix(promptTokens))
+        // Plain filler text: no BOS, no control markers to parse. Matches
+        // `packages/inference-node`'s `model.tokenize(filler, false)`.
+        let tokens = Array(
+            tokenize(filler, addSpecial: false, parseSpecial: false).prefix(max(2, promptTokens))
+        )
 
         let prefillStart = Date()
         var cursor: Int32 = 0
@@ -491,6 +668,41 @@ final class LlamaContext {
             promptTokensPerSecond: Double(tokens.count) / prefillSeconds,
             generateTokensPerSecond: Double(produced) / decodeSeconds
         )
+    }
+
+    /// A template NAME sniffed from the GGUF's embedded Jinja body.
+    ///
+    /// `llama_model_chat_template` hands back the template source, not a name,
+    /// and the contract's `chatTemplate` field is a name — so this matches on
+    /// the control markers that identify a family. It is a heuristic and says
+    /// nothing when it does not recognise one, which is why the caller's own
+    /// value remains the fallback.
+    ///
+    /// (`packages/inference-node` gets a name for free from
+    /// node-llama-cpp's `model.chatTemplateName`, which does the same kind of
+    /// match against a larger table.)
+    private static func templateName(of model: OpaquePointer) -> String? {
+        guard let raw = llama_model_chat_template(model, nil) else { return nil }
+        let body = String(cString: raw)
+        guard !body.isEmpty else { return nil }
+
+        // Order matters: the more specific marker first. Gemma 4's canonical
+        // template uses `<|turn>role` / `<turn|>`, NOT Gemma 2/3's
+        // `<start_of_turn>` / `<end_of_turn>` — measured on
+        // gemma-4-12B-it-QAT, whose vocabulary has no `<start_of_turn>` at all.
+        let families: [(String, String)] = [
+            ("<|turn>", "gemma4"),
+            ("<start_of_turn>", "gemma"),
+            ("<|im_start|>", "chatml"),
+            ("<|start_header_id|>", "llama3"),
+            ("[INST]", "mistral"),
+            ("<|user|>", "zephyr"),
+            ("<|User|>", "deepseek"),
+        ]
+        for (marker, name) in families where body.contains(marker) {
+            return name
+        }
+        return nil
     }
 
     /// Length of the longest common prefix of two token sequences.

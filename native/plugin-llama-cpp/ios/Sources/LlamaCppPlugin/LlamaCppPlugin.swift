@@ -132,7 +132,11 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
             requestedBackend: call.getString("backend") ?? "gpu-metal",
             threads: call.getInt("threads") ?? max(2, ProcessInfo.processInfo.processorCount - 2),
             useMmap: call.getBool("useMmap") ?? true,
-            chatTemplate: call.getString("chatTemplate")
+            chatTemplate: call.getString("chatTemplate"),
+            // Sent by `src/ai/backends/llama-cpp.ts` and, until now, silently
+            // dropped here: the whole point is that the engine is the only
+            // layer that can tokenize the markers and say the template is wrong.
+            templateMarkers: (call.getArray("templateMarkers") as? [String]) ?? []
         )
 
         queue.async { [weak self] in
@@ -186,12 +190,28 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Generation
 
+    /// Streams `llamaToken` events and always emits **exactly one** `llamaEnd`.
+    ///
+    /// That rule is why this method is shaped the way it is rather than as a
+    /// plain guard-and-dispatch. `src/ai/backends/llama-cpp.ts` awaits the
+    /// terminal event, so a path that resolves, rejects, or throws without one
+    /// leaves the UI streaming forever with no way back. The missing-handle
+    /// guard used to be exactly that path: it called `call.reject` and
+    /// returned, before any listener had been told the request was over.
+    ///
+    /// `finish` is idempotent behind `settled` and is called from the success
+    /// path, from the failure path, and again from a `defer` backstop — the
+    /// last so a future edit that adds a fourth exit cannot quietly break the
+    /// guarantee. It mirrors `packages/inference-node/src/llama-cpp.ts`, where
+    /// the same three call sites exist for the same reason.
     @objc func generate(_ call: CAPPluginCall) {
         guard
             let handle = call.getString("handle"),
             let prompt = call.getString("prompt"),
             let requestId = call.getString("requestId")
         else {
+            // No requestId means no event can be correlated, so there is
+            // nothing to terminate — rejecting is the whole answer.
             call.reject("handle, prompt, and requestId are required.")
             return
         }
@@ -203,14 +223,11 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         stateLock.lock()
+        // A requestId is a conversation turn's id and the app reuses it on
+        // retry, so a stale cancel must not kill the new attempt.
         cancelled.remove(requestId)
         let context = contexts[handle]
         stateLock.unlock()
-
-        guard let context else {
-            call.reject("No model is loaded for that handle.")
-            return
-        }
 
         queue.async { [weak self] in
             guard let self else { return }
@@ -218,6 +235,62 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
             var index = 0
             let started = Date()
             var firstTokenAt: Date?
+            var settled = false
+
+            var text = ""
+            var promptTokens = 0
+            var cachedTokens = 0
+            var completionTokens = 0
+            var draftAcceptance: Double?
+
+            func build(_ stopReason: String) -> [String: Any] {
+                let totalMs = max(1, Int(Date().timeIntervalSince(started) * 1000))
+                var payload: [String: Any] = [
+                    "requestId": requestId,
+                    "text": text,
+                    "promptTokens": promptTokens,
+                    // Emitted here at last. `LlamaContext.Result` has always
+                    // computed it and the Kotlin plugin has always reported it;
+                    // iOS dropped it on the floor, so the one number that makes
+                    // a cache-reuse regression visible was invisible on iOS.
+                    "cachedTokens": cachedTokens,
+                    "completionTokens": completionTokens,
+                    "ttftMs": firstTokenAt.map { Int($0.timeIntervalSince(started) * 1000) } ?? totalMs,
+                    "totalMs": totalMs,
+                    "tokensPerSecond": Double(completionTokens) / (Double(totalMs) / 1000.0),
+                    "stopReason": stopReason,
+                    "peakMemoryBytes": LlamaContext.footprint(),
+                ]
+                if let draftAcceptance { payload["draftAcceptance"] = draftAcceptance }
+                return payload
+            }
+
+            @discardableResult
+            func finish(_ stopReason: String, error: String? = nil) -> [String: Any] {
+                var payload = build(stopReason)
+                if let error { payload["error"] = error }
+                if !settled {
+                    settled = true
+                    self.notifyListeners("llamaEnd", data: payload)
+                }
+                return payload
+            }
+
+            defer {
+                // Backstop. A no-op on every path below, and the reason a new
+                // early return cannot break the terminal-event rule by accident.
+                finish("error", error: "Generation ended without reporting a result.")
+                self.stateLock.lock()
+                self.cancelled.remove(requestId)
+                self.stateLock.unlock()
+            }
+
+            guard let context else {
+                let message = "No model is loaded for that handle."
+                let payload = finish("error", error: message)
+                call.reject(message, nil, nil, payload)
+                return
+            }
 
             do {
                 let result = try context.generate(
@@ -232,6 +305,7 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
                     },
                     onToken: { [weak self] token in
                         if firstTokenAt == nil { firstTokenAt = Date() }
+                        text += token
                         self?.notifyListeners("llamaToken", data: [
                             "requestId": requestId,
                             "token": token,
@@ -241,39 +315,18 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
                     }
                 )
 
-                let totalMs = max(1, Int(Date().timeIntervalSince(started) * 1000))
-                let ttftMs = firstTokenAt.map { Int($0.timeIntervalSince(started) * 1000) } ?? totalMs
+                // The engine's own tallies win: a stop sequence trims `text`
+                // after the pieces have already been streamed.
+                text = result.text
+                promptTokens = result.promptTokens
+                cachedTokens = result.cachedTokens
+                completionTokens = result.completionTokens
+                draftAcceptance = result.draftAcceptance
 
-                var payload: [String: Any] = [
-                    "requestId": requestId,
-                    "text": result.text,
-                    "promptTokens": result.promptTokens,
-                    "completionTokens": result.completionTokens,
-                    "ttftMs": ttftMs,
-                    "totalMs": totalMs,
-                    "tokensPerSecond": Double(result.completionTokens) / (Double(totalMs) / 1000.0),
-                    "stopReason": result.stopReason,
-                    "peakMemoryBytes": LlamaContext.footprint(),
-                ]
-                if let acceptance = result.draftAcceptance {
-                    payload["draftAcceptance"] = acceptance
-                }
-
-                self.notifyListeners("llamaEnd", data: payload)
-                call.resolve(payload)
+                call.resolve(finish(result.stopReason))
             } catch {
                 let message = Self.describe(error)
-                self.notifyListeners("llamaEnd", data: [
-                    "requestId": requestId,
-                    "text": "",
-                    "promptTokens": 0,
-                    "completionTokens": 0,
-                    "ttftMs": 0,
-                    "totalMs": 0,
-                    "tokensPerSecond": 0,
-                    "stopReason": "error",
-                    "error": message,
-                ])
+                finish("error", error: message)
                 call.reject(message, nil, error)
             }
         }
@@ -292,16 +345,29 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Tokenisation
 
+    /// `addSpecial: false` — this counts the caller's text, and silently
+    /// prepending a BOS would make `countTokens` disagree with itself across
+    /// two calls whose texts concatenate. `parseSpecial: true` matches
+    /// `packages/inference-node`'s `model.tokenize(text, true)`, so a control
+    /// marker counts as the one token it will actually become.
+    ///
+    /// Note this differs by one from the `promptTokens` `generate` reports for
+    /// the same string, which does take the vocabulary's BOS.
     @objc func tokenize(_ call: CAPPluginCall) {
         withContext(call) { context in
-            let tokens = context.tokenize(call.getString("text") ?? "")
+            let tokens = context.tokenize(
+                call.getString("text") ?? "", addSpecial: false, parseSpecial: true
+            )
             call.resolve(["tokens": tokens])
         }
     }
 
     @objc func countTokens(_ call: CAPPluginCall) {
         withContext(call) { context in
-            call.resolve(["count": context.tokenize(call.getString("text") ?? "").count])
+            let count = context.tokenize(
+                call.getString("text") ?? "", addSpecial: false, parseSpecial: true
+            ).count
+            call.resolve(["count": count])
         }
     }
 

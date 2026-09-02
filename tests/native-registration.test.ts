@@ -161,3 +161,106 @@ describe('llama.cpp is pinned, not copied into the tree', () => {
     expect(ignore).toMatch(/^\/native\/plugin-llama-cpp\/ios\/llama\.xcframework\/$/m);
   });
 });
+
+/**
+ * Guards on the two Swift invariants that a compiler cannot see and that the
+ * only real check for — running a model on a simulator — is not something
+ * `npm test` can do.
+ *
+ * Both were measured on the iPhone 17 Pro simulator against
+ * gemma-4-12B-it-QAT-Q4_0 via `native/plugin-llama-cpp/tools/prove-ios.sh`,
+ * which is the actual proof; these are the regression fence around it. They
+ * are string assertions on source, so they can only catch the specific shape
+ * coming back — which is precisely the value, because both bugs were
+ * *plausible* code that read fine.
+ */
+describe('the engine wrapper does not tear down process-global state', () => {
+  const SOURCE = readFileSync(
+    resolve(PLUGIN_DIR, 'ios/Sources/LlamaCppPlugin/LlamaContext.swift'),
+    'utf8',
+  );
+
+  it('never calls llama_backend_free()', () => {
+    // `llama_backend_free()` frees the ggml backend registry for the WHOLE
+    // PROCESS and is not reference-counted, so calling it from a per-handle
+    // `free()` — which `deinit` also calls — tore the backend out from under
+    // every other loaded handle. `packages/inference-node` has the shape to
+    // copy: dispose sequence -> context -> model per handle, touch nothing
+    // global.
+    //
+    // Measured by `prove-ios.sh`: two handles loaded, the first unloaded, then
+    // a generate on the second, which now answers instead of dying.
+    const calls = SOURCE.split('\n').filter(
+      (line) => /llama_backend_free\s*\(/.test(line) && !line.trimStart().startsWith('///'),
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it('initialises the backend once for the process, not once per handle', () => {
+    expect(SOURCE).toMatch(/static let backendReady[\s\S]{0,200}llama_backend_init\(\)/);
+  });
+
+  it('makes free() idempotent, because deinit calls it after unload does', () => {
+    // Without the guard `llama_batch_free` runs twice on one allocation.
+    expect(SOURCE).toMatch(/guard !released else \{ return \}/);
+  });
+
+  it('tokenizes the prompt with parse_special on', () => {
+    // With parse_special off, a prompt already rendered by `src/ai/prompt.ts`
+    // reaches the model with its turn markers as ordinary text. Measured:
+    // `<|turn>` tokenized to 1 token (id 105) with it on, and
+    // `<start_of_turn>` to 7 with it off — and the 7-token version made the
+    // model answer "Australia's capital city of Australia's capital city of"
+    // instead of "Canberra".
+    expect(SOURCE).toMatch(/tokenize\(prompt, addSpecial: true, parseSpecial: true\)/);
+  });
+});
+
+describe('generate always emits exactly one terminal event', () => {
+  const SOURCE = readFileSync(
+    resolve(PLUGIN_DIR, 'ios/Sources/LlamaCppPlugin/LlamaCppPlugin.swift'),
+    'utf8',
+  );
+  const GENERATE = SOURCE.slice(
+    SOURCE.indexOf('@objc func generate'),
+    SOURCE.indexOf('@objc func cancel'),
+  );
+
+  it('has the idempotent finish() that packages/inference-node has', () => {
+    expect(GENERATE).toMatch(/var settled = false/);
+    expect(GENERATE).toMatch(/if !settled \{[\s\S]{0,120}notifyListeners\("llamaEnd"/);
+  });
+
+  it('backstops the guarantee in a defer, so a new early return cannot break it', () => {
+    expect(GENERATE).toMatch(/defer \{[\s\S]{0,400}finish\("error"/);
+  });
+
+  it('finishes before rejecting an unknown handle', () => {
+    // This was the measured hang: the guard called `call.reject` and returned
+    // while `src/ai/backends/llama-cpp.ts` was still awaiting `llamaEnd`.
+    // Fault-injected back in and re-run: the harness reported 0 llamaEnd
+    // events for that request and exited 1.
+    const guard = GENERATE.slice(GENERATE.indexOf('guard let context else'));
+    const finishAt = guard.indexOf('finish("error"');
+    const rejectAt = guard.indexOf('call.reject');
+    expect(finishAt).toBeGreaterThanOrEqual(0);
+    expect(rejectAt).toBeGreaterThan(finishAt);
+  });
+
+  it('reports cachedTokens, which the Kotlin plugin already did', () => {
+    // The number that makes a cache-reuse regression visible rather than
+    // merely slow. `LlamaContext.Result` always computed it; iOS dropped it.
+    // Measured: 21 of 22 prompt tokens served from cache on an identical
+    // re-ask — one short of the match, because a token must be re-evaluated
+    // to produce logits to sample from.
+    expect(GENERATE).toMatch(/"cachedTokens": cachedTokens/);
+  });
+
+  it('passes templateMarkers through to the engine', () => {
+    // `src/ai/backends/llama-cpp.ts` has always sent these; iOS dropped them,
+    // so the one layer that can tokenize a marker never got to say the
+    // template was wrong. Measured: the warning fires on this model for
+    // `<start_of_turn>` and is silent for `<|turn>`.
+    expect(SOURCE).toMatch(/templateMarkers: \(call\.getArray\("templateMarkers"\)/);
+  });
+});
