@@ -139,7 +139,11 @@ final class LlamaContext {
     static let engineVersion: String = {
         let reported = String(cString: llama_print_system_info())
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return "llama.cpp \(pinnedTag) | \(reported)"
+        // The pinned tag is NOT part of the identity: it is what the build
+        // intended, and a framework swapped underneath would keep reporting it.
+        // The engine's own system info is the evidence, so it stands alone, and
+        // the intent is labelled as intent.
+        return "llama.cpp \(reported) [built against \(pinnedTag)]"
     }()
 
     static var metalAvailable: Bool {
@@ -572,11 +576,21 @@ final class LlamaContext {
             cachedTokens: reused,
             completionTokens: completionTokens,
             stopReason: stopReason,
-            draftAcceptance: draftContext != nil ? lastDraftAcceptance : nil
+            // Only when it was actually measured. `lastDraftAcceptance` is a
+            // stored 0 that nothing currently writes, so reporting it whenever a
+            // draft context exists would present 0% acceptance as a measurement
+            // — the same shape as the `.prefix(0)` engineVersion this file
+            // already shipped once. `packages/inference-node` derives it from
+            // `sequence.tokenPredictions`; until there is an equivalent here,
+            // absent is the truthful answer.
+            draftAcceptance: measuredDraftAcceptance
         )
     }
 
-    private var lastDraftAcceptance: Double = 0
+    /// Set only when speculative decoding actually ran and was counted.
+    /// `nil` means "not measured", which is different from 0% and must not be
+    /// reported as it.
+    private var measuredDraftAcceptance: Double?
 
     // API drift, b10760: `struct llama_sampler` is a complete type in llama.h,
     // so Swift imports `llama_sampler *` as `UnsafeMutablePointer<llama_sampler>`,
