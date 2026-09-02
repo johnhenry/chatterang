@@ -1,3 +1,4 @@
+import { createElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -12,6 +13,56 @@ import { ChatterangEngine, targetFor, type GenerationEvent } from '@/ai/engine';
 import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { toolRegistry } from '@/ai/tools/registry';
+import type { FallbackReason } from '@/ai/middleware/resilience';
+
+/**
+ * Dexie, stubbed at the table boundary.
+ *
+ * Only the last block in this file needs it: the refusal aimed at the
+ * providers screen is checked by MOUNTING that screen, and `useApp` opens a
+ * real IndexedDB otherwise. Nothing else here touches `@/db` — `@/ai/engine`
+ * and the tool registry do not import it — so the stub cannot change the
+ * behaviour of any test above.
+ */
+vi.mock('@/db', () => ({
+  db: {
+    connections: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+    models: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+    settings: { get: vi.fn(async () => undefined), put: vi.fn(async () => {}) },
+    benchmarks: {
+      put: vi.fn(async () => {}),
+      delete: vi.fn(async () => {}),
+      clear: vi.fn(async () => {}),
+      orderBy: () => ({ reverse: () => ({ toArray: async () => [] }) }),
+    },
+  },
+  deleteChat: vi.fn(async () => {}),
+  readSetting: async (_key: string, fallback: unknown) => fallback,
+  writeSetting: vi.fn(async () => {}),
+}));
+
+/**
+ * The device the engine's pre-flight asks about.
+ *
+ * `null` is a healthy device, which is what every test that does not set it
+ * gets — the real `checkDevicePressure` reads a Capacitor plugin that is not
+ * present under jsdom and returns null anyway, so this changes nothing for the
+ * existing tests and gives the ones below a hot phone to reason about.
+ */
+const devicePressure = vi.hoisted(() => ({
+  value: null as { reason: string; detail: string } | null,
+}));
+
+vi.mock('@/ai/middleware/resilience', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/ai/middleware/resilience')>();
+  return { ...actual, checkDevicePressure: async () => devicePressure.value };
+});
+
+/** A device too hot to start a local generation on. */
+const HOT: { reason: FallbackReason; detail: string } = {
+  reason: 'thermal',
+  detail: 'Thermal state critical (0.95).',
+};
 
 /**
  * Integration tests over `ChatterangEngine.stream`.
@@ -80,6 +131,35 @@ function textOf(events: GenerationEvent[]): string {
     .join('');
 }
 
+/**
+ * Mount a component into a throwaway host, run `body`, then tear it down.
+ *
+ * The refusal below is a sentence about a screen, so it is checked against
+ * that screen rather than against a description of it.
+ */
+async function mounted(
+  element: ReturnType<typeof createElement>,
+  body: (host: HTMLElement) => Promise<void> | void,
+): Promise<void> {
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const host = document.createElement('div');
+  document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => {
+      root.render(element);
+    });
+    await body(host);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+}
+
 function doneEvent(events: GenerationEvent[]) {
   const done = events.at(-1);
   if (done?.type !== 'done') throw new Error(`expected a done event, got ${done?.type}`);
@@ -90,6 +170,7 @@ describe('ChatterangEngine.stream', () => {
   let engine: ChatterangEngine;
 
   beforeEach(() => {
+    devicePressure.value = null;
     engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
   });
 
@@ -294,5 +375,329 @@ describe('ChatterangEngine.stream', () => {
     expect(tool?.tool.output).toContain('teleport');
     expect(doneEvent(events).text).toBe('I cannot do that.');
     spy.mockRestore();
+  });
+
+  /* ── A missing runtime is not a reason to answer from the cloud ────── */
+
+  /**
+   * A target naming an unregistered backend used to reach the tool loop, throw
+   * `Requested backend 'onnx-runtime' is not registered`, and — because
+   * `target.local` is true for every on-device engine — get classified
+   * `engine-error` and RE-RUN against the configured fallback.
+   *
+   * Measured before the guard existed, with a speech model as the chat model
+   * and a cloud provider configured: events were
+   * ["start","fallback","delta","done"] and the cloud answered. The user's
+   * message left the device, over a model chosen precisely because it was
+   * local. The chain only "failed closed" for people who had no fallback set.
+   */
+  describe('a target whose backend this build never registered', () => {
+    it('refuses instead of diverting the turn to the cloud fallback', async () => {
+      engine.router.register('conn_cloud', scriptedBackend(['Sure! Here is an answer.']));
+      engine.setFallbackBackend('conn_cloud');
+
+      const events = await drain(
+        engine.stream({
+          messages: [{ role: 'user', content: 'my private note' }],
+          // Exactly what `targetFor(manifest.engine, ...)` builds for the
+          // speech model in the report.
+          target: targetFor('onnx-runtime', 'whisper-tiny-en-onnx', 'Whisper Tiny (English)'),
+        }),
+      );
+
+      expect(events.map((event) => event.type)).toEqual(['start', 'error']);
+      expect(textOf(events)).toBe('');
+
+      // Refused in terms of the model and the missing runtime — not in
+      // aimatey's vocabulary about a router registration table.
+      const error = events.at(-1);
+      expect(error?.type).toBe('error');
+      expect(error && 'message' in error ? error.message : '').toContain(
+        'Whisper Tiny (English)',
+      );
+      expect(error && 'message' in error ? error.message : '').not.toContain('is not registered');
+    });
+
+    /**
+     * The check has to run before the device-pressure pre-flight, not merely
+     * before the tool loop.
+     *
+     * Measured with the check sitting one block lower — after the pre-flight —
+     * on a hot device with a fallback configured: ["start","fallback","delta",
+     * "delta","done"], text "Sure! Here is an answer.", answered by the cloud.
+     * The identical escape the check exists to close, reached by the other of
+     * the two paths that retarget a local turn.
+     *
+     * The target is the residual class this backstop is the only cover for: a
+     * `text`-capable model on an engine declared in ENGINE_IDS that nothing
+     * registers. `resolveTarget` refuses the reported speech models earlier.
+     */
+    it('refuses before the device-pressure pre-flight can divert it', async () => {
+      devicePressure.value = HOT;
+      engine.router.register('conn_cloud', scriptedBackend(['Sure! Here is an answer.']));
+      engine.setFallbackBackend('conn_cloud');
+
+      const events = await drain(
+        engine.stream({
+          messages: [{ role: 'user', content: 'my private note' }],
+          target: targetFor('mlc-llm', 'some-future-model', 'Some Future Model'),
+        }),
+      );
+
+      expect(events.map((event) => event.type)).toEqual(['start', 'error']);
+      expect(events.some((event) => event.type === 'fallback')).toBe(false);
+      expect(textOf(events)).toBe('');
+    });
+
+    /**
+     * Hoisting the check above the pre-flight must not have disabled the
+     * pre-flight. A REGISTERED local backend on a hot device is exactly what
+     * device-pressure fallback is for, and it still diverts.
+     */
+    it('still diverts a registered local backend on a hot device', async () => {
+      devicePressure.value = HOT;
+      engine.router.register('scripted', scriptedBackend(['should not be used']));
+      engine.router.register('conn_cloud', scriptedBackend(['Answered remotely.']));
+      engine.setFallbackBackend('conn_cloud');
+
+      const events = await drain(
+        engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget }),
+      );
+
+      const fallback = events.find(
+        (event): event is Extract<GenerationEvent, { type: 'fallback' }> =>
+          event.type === 'fallback',
+      );
+      expect(fallback?.event.reason).toBe('thermal');
+      expect(fallback?.event.from).toBe('scripted');
+      expect(textOf(events)).toBe('Answered remotely.');
+    });
+
+    it('still diverts a genuine runtime failure, which fallback is for', async () => {
+      engine.router.register('scripted', failingBackend('CUDA out of memory'));
+      engine.router.register('conn_cloud', scriptedBackend(['Answered remotely.']));
+      engine.setFallbackBackend('conn_cloud');
+
+      const events = await drain(
+        engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget }),
+      );
+
+      // The guard above must not have broken this: a registered backend that
+      // fails at run time is precisely the case fallback exists to rescue.
+      expect(events.map((event) => event.type)).toContain('fallback');
+      expect(textOf(events)).toBe('Answered remotely.');
+    });
+  });
+
+  /* ── What the refusal is allowed to claim ──────────────────────────── */
+
+  /**
+   * The refusal reaches the user verbatim, so it has to be true.
+   *
+   * An unregistered backend has two unrelated causes and the message used to
+   * assert the wrong one for both. Measured, with the single-sentence version:
+   * a connection whose `connectProvider` failed produced "OpenAI · gpt-4o-mini
+   * needs the remote runtime, which this build does not include. Choose
+   * another model." — the build DOES include the remote runtime, the cause is
+   * a key or a network, and picking a different model does not fix either.
+   */
+  describe('what it tells the user', () => {
+    function messageFor(events: GenerationEvent[]): string {
+      const last = events.at(-1);
+      if (last?.type !== 'error') throw new Error(`expected an error event, got ${last?.type}`);
+      return last.message;
+    }
+
+    it('says a remote connection is not connected, and points at Settings', async () => {
+      // A connection left `enabled` in state after `connectProvider` threw —
+      // src/state/app.ts catches that, toasts, and moves on, so the router
+      // never got it.
+      const events = await drain(
+        engine.stream({
+          messages: [{ role: 'user', content: 'hi' }],
+          target: {
+            backendId: 'conn_openai',
+            engine: 'remote',
+            modelId: 'gpt-4o-mini',
+            modelName: 'OpenAI · gpt-4o-mini',
+            local: false,
+          },
+        }),
+      );
+
+      const message = messageFor(events);
+      expect(message).toContain('OpenAI · gpt-4o-mini');
+      expect(message).toContain('Settings');
+      // The two false claims. The build ships every remote adapter it ever
+      // shipped, and nothing here is a missing runtime.
+      expect(message).not.toContain('does not include');
+      expect(message).not.toContain('runtime');
+      // Nor aimatey's vocabulary about a registration table.
+      expect(message).not.toContain('is not registered');
+    });
+
+    /**
+     * The step it names has to work on the screen as that screen actually is.
+     *
+     * "Reconnect it in Settings" did not. Measured by mounting the real
+     * `ProvidersPanel` with a connection whose `connectProvider` threw — which
+     * `initialize` catches and toasts, leaving `enabled` true in state:
+     *
+     *   <button role="switch" aria-checked="true" aria-label="Enable OpenAI">
+     *   <button class="icon-btn" aria-label="Remove OpenAI">   (a trash glyph)
+     *   list__title "OpenAI" · list__sub "gpt-4o-mini"
+     *
+     * Three controls on the whole panel — enable, remove, add — no "Reconnect"
+     * anywhere, no edit control, and a toggle rendering CHECKED, so the screen
+     * the sentence sends the user to reports the provider as on and shows no
+     * problem at all. A user who follows the old sentence arrives, sees a
+     * healthy row, and has nothing to press.
+     *
+     * So the sentence now names the two remedies that do exist, and this test
+     * holds it to them by rendering the panel: toggling off and on re-runs
+     * `connectProvider` (state/app.ts `toggleConnection`), and remove-then-add
+     * is the only way to change a wrong key, because there is nothing to edit.
+     * Delete either control from the panel and this goes red.
+     */
+    it('names remedies that exist on the providers screen, and warns it looks healthy', async () => {
+      const message = messageFor(
+        await drain(
+          engine.stream({
+            messages: [{ role: 'user', content: 'hi' }],
+            target: {
+              backendId: 'conn_openai',
+              engine: 'remote',
+              modelId: 'gpt-4o-mini',
+              modelName: 'OpenAI · gpt-4o-mini',
+              local: false,
+            },
+          }),
+        ),
+      );
+
+      // The same connection, in the state the panel reads: enabled, and never
+      // registered on the router.
+      const { useApp } = await import('@/state/app');
+      const { ProvidersPanel } = await import('@/features/settings/ProvidersPanel');
+      useApp.setState({
+        connections: [
+          {
+            id: 'conn_openai',
+            providerId: 'openai',
+            label: 'OpenAI',
+            apiKey: 'sk-wrong',
+            baseUrl: '',
+            defaultModel: 'gpt-4o-mini',
+            enabled: true,
+            models: [],
+            createdAt: 0,
+          },
+        ],
+      });
+      expect(engine.hasBackend('conn_openai')).toBe(false);
+
+      await mounted(createElement(ProvidersPanel), (host) => {
+        const toggle = host.querySelector('[role="switch"][aria-label="Enable OpenAI"]');
+        // The screen says the provider is on. The sentence must not pretend
+        // the user will arrive to find something visibly broken.
+        expect(toggle?.getAttribute('aria-checked')).toBe('true');
+        expect(message).toContain('still shows as switched on');
+
+        // Remedy one: the toggle. Off and on re-runs `connectProvider`.
+        expect(toggle).not.toBeNull();
+        expect(message).toContain('switch it off and on again');
+
+        // Remedy two: remove and add. It is named because there is no edit
+        // control — a wrong key cannot be corrected in place.
+        expect(host.querySelector('[aria-label="Remove OpenAI"]')).not.toBeNull();
+        expect(message).toContain('remove it and add it again');
+        expect(host.querySelector('[aria-label^="Edit"]')).toBeNull();
+
+        // And no control called "Reconnect" was ever there to point at.
+        expect(host.textContent).not.toContain('Reconnect');
+        expect(message).not.toContain('Reconnect');
+      });
+    });
+
+    it('reserves the missing-build sentence for an absent local engine', async () => {
+      const events = await drain(
+        engine.stream({
+          messages: [{ role: 'user', content: 'hi' }],
+          target: targetFor('onnx-runtime', 'whisper-tiny-en-onnx', 'Whisper Tiny (English)'),
+        }),
+      );
+
+      const message = messageFor(events);
+      expect(message).toContain('Whisper Tiny (English)');
+      expect(message).toContain('this build does not include');
+      // The raw aimatey registration id, which also read back as "the
+      // onnx-runtime runtime".
+      expect(message).not.toContain('onnx-runtime');
+      expect(message).not.toContain('runtime runtime');
+    });
+  });
+
+  /* ── The non-streaming path had no backstop at all ─────────────────── */
+
+  /**
+   * `complete()` is the other public way into a backend, and the sentence this
+   * whole change exists to delete was still live inside it.
+   *
+   * Measured before the guard, by calling it with the two targets below:
+   *
+   *   "Requested backend 'onnx-runtime' is not registered. Registered
+   *    backends: llama-cpp"
+   *   "Requested backend 'conn_openai' is not registered. Registered
+   *    backends: llama-cpp"
+   *
+   * It has no callers under `src/` today and it does not divert to the cloud,
+   * so this is not the reported bug — it is the same string reaching the user
+   * through the other door. Titling, tools, and benchmarks all go through
+   * here, and a caller added later inherits whichever sentence is in place.
+   */
+  describe('complete() on a backend the router does not have', () => {
+    async function rejection(target: Parameters<typeof engine.complete>[0]['target']) {
+      try {
+        await engine.complete({ messages: [{ role: 'user', content: 'hi' }], target });
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+      throw new Error('expected complete() to reject');
+    }
+
+    it('refuses with the same sentence the streamed path uses', async () => {
+      const local = await rejection(
+        targetFor('onnx-runtime', 'whisper-tiny-en-onnx', 'Whisper Tiny (English)'),
+      );
+      expect(local).toContain('Whisper Tiny (English)');
+      expect(local).toContain('this build does not include');
+      expect(local).not.toContain('is not registered');
+      expect(local).not.toContain('Registered backends');
+      expect(local).not.toContain('onnx-runtime');
+
+      const remote = await rejection({
+        backendId: 'conn_openai',
+        engine: 'remote',
+        modelId: 'gpt-4o-mini',
+        modelName: 'OpenAI · gpt-4o-mini',
+        local: false,
+      });
+      expect(remote).toContain('OpenAI · gpt-4o-mini');
+      expect(remote).toContain('Settings');
+      expect(remote).not.toContain('is not registered');
+      expect(remote).not.toContain('Registered backends');
+      expect(remote).not.toContain('runtime');
+    });
+
+    it('still completes on a backend that IS registered', async () => {
+      engine.router.register('scripted', scriptedBackend(['Answered.']));
+
+      const response = await engine.complete({
+        messages: [{ role: 'user', content: 'hi' }],
+        target: localTarget,
+      });
+
+      expect(response.message.content).toBe('Answered.');
+    });
   });
 });

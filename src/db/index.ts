@@ -13,6 +13,11 @@ import type { Chat, Message } from '@/domain/chat';
 import type { Persona } from '@/domain/persona';
 import type { ComputeBackend, EngineId, ModelManifest, SamplerSettings } from '@/domain/manifest';
 import type { ProviderConnection } from '@/ai/providers';
+import { upgradeVariants, type LegacyMessageRow } from '@/db/variants';
+import { upgradeModelTemplates } from '@/db/model-template';
+
+export { upgradeVariants, type LegacyMessageRow, type VariantUpgrade } from '@/db/variants';
+export { supersededTemplate, upgradeModelTemplates, type StoredModelRow } from '@/db/model-template';
 
 export type InstallState = 'available' | 'queued' | 'downloading' | 'installed' | 'failed';
 
@@ -170,6 +175,67 @@ class ChatterangDatabase extends Dexie {
           }
           await tx.table('messages').update(message.id, { attachments: stripped });
         }
+      });
+
+    /*
+     * v4 gives a variant its own provenance.
+     *
+     * Through v3, `Message.variants` was `string[]` — the TEXT of the
+     * generations not on display — while `provenance`, `toolCalls` and `stats`
+     * sat on the row describing whichever generation was made last. Switching
+     * variants moved the text and left the rest, so a reply that came back
+     * from a provider was rendered under the on-device flame and exported as
+     * "(on device)". `MessageVariant` makes that unrepresentable; this brings
+     * existing rows into it.
+     *
+     * The schema is unchanged — no index mentions `variants` — so this version
+     * restates the `messages` store and does its work in `upgrade`.
+     */
+    this.version(4)
+      .stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' })
+      .upgrade(async (tx) => {
+        await tx
+          .table('messages')
+          .toCollection()
+          .modify((message: Record<string, unknown>) => {
+            const upgraded = upgradeVariants(message as LegacyMessageRow);
+            if (!upgraded) return;
+            message.variants = upgraded.variants;
+            message.variantIndex = upgraded.variantIndex;
+            // Deleted rather than set: these three describe a generation this
+            // row can no longer be shown to be displaying. `upgradeVariants`
+            // says when, and why it will not guess instead.
+            if (upgraded.detach) {
+              delete message.provenance;
+              delete message.stats;
+              delete message.toolCalls;
+            }
+          });
+      });
+
+    /*
+     * v5 re-decides a prompt template that was inferred wrongly.
+     *
+     * `install()` copies the manifest into the row verbatim and `load()` reads
+     * it back unexamined, so a manifest field is frozen at install time —
+     * including `promptTemplate`, which `backends/llama-cpp.ts` prefers over
+     * `inferTemplate()`. Fixing the inference therefore fixes nothing for
+     * anyone who already installed the model: a Gemma 4 installed before the
+     * `gemma4` template existed still carries `'gemma'`, still gets markers
+     * that are not in its vocabulary, and still answers "Australia's capital
+     * city of Australia's capital city of".
+     *
+     * {@link upgradeModelTemplates} says which rows that describes and, more
+     * importantly, which it refuses to touch — a catalogue entry's hand-set
+     * template is not a stale guess and must survive this.
+     *
+     * The schema is unchanged; the store is restated so the version has one,
+     * as v4 does.
+     */
+    this.version(5)
+      .stores({ models: 'id, state, lastUsedAt, installedAt' })
+      .upgrade(async (tx) => {
+        await upgradeModelTemplates(tx.table('models'));
       });
   }
 }

@@ -4,7 +4,8 @@ import { AttachmentImage } from '@/features/chat/AttachmentImage';
 import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
-import type { Message, ToolInvocation } from '@/domain/chat';
+import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
+import { currentVariant } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
@@ -63,8 +64,51 @@ export function MessageView({
     );
   }
 
+  // `variants` holds every generation of this turn INCLUDING the one on
+  // screen, so the count is the length — not the length plus the row, which is
+  // what it was when the row stood in for its own generation. The `max` covers
+  // the moment a regenerated turn is still streaming: its record has not been
+  // appended yet, and its index points one past the end at itself.
   const variants = message.variants ?? [];
-  const totalVariants = variants.length + (variants.length > 0 ? 1 : 0);
+  const totalVariants = Math.max(variants.length, (message.variantIndex ?? 0) + 1);
+
+  // THE ONE GENERATION THIS VIEW IS DESCRIBING.
+  //
+  // Everything below reads `shown` and nothing reads the row, because the two
+  // used to disagree and the disagreement was the defect: the text came from
+  // `variants[variantIndex]` and the chip came from `message.provenance`, so a
+  // reply that came back from a provider was rendered under the ember flame —
+  // this app's own mark for a turn that ran on the device. `applyVariant` now
+  // keeps the row in step, but a renderer that reads the row is trusting three
+  // writers to remember; one that reads the record cannot be wrong about which
+  // generation it is labelling.
+  //
+  // The row IS the record in exactly two cases, and `currentVariant` covers
+  // both: a turn that has never been regenerated has no list, and a
+  // regenerated turn that is still streaming has an index one past the end of
+  // the list, pointing at the generation being made on the row right now.
+  //
+  // The `content` test is a runtime one, not a type one. Through v3 this list
+  // held bare strings, and the Dexie v4 upgrade that rewrites them is the one
+  // piece of this change that has never been executed — there is no
+  // IndexedDB under the test environment to run it in. If a row ever reaches
+  // here unupgraded, falling back to the row shows the reply; trusting the
+  // type would render an empty message, which is a worse failure than the one
+  // being fixed. It costs one comparison per assistant turn.
+  const record =
+    !message.streaming && message.variantIndex !== undefined
+      ? variants[message.variantIndex]
+      : undefined;
+  const shown: MessageVariant =
+    typeof record?.content === 'string' ? record : currentVariant(message);
+
+  // Absent provenance means UNKNOWN, and unknown is rendered as unknown: no
+  // chip, no model name, no borrowed label from a neighbouring generation. A
+  // variant recovered by the v4 upgrade from a bare string is the case that
+  // reaches this — its origin was never written down, and the plausible guess
+  // is precisely the confident falsehood the record exists to prevent.
+  const provenance = shown.provenance;
+  const toolCalls = shown.toolCalls;
 
   const toggleSpeech = (): void => {
     if (speaking) {
@@ -74,7 +118,7 @@ export function MessageView({
     }
     setSpeaking(true);
     void speak({
-      text: message.content,
+      text: shown.content,
       strategy: settings.voiceMode === 'neural' ? 'neural' : 'os',
       voiceId: settings.voiceId || undefined,
       rate: settings.speechRate,
@@ -85,46 +129,53 @@ export function MessageView({
     <article className="msg msg--assistant">
       <div className="msg__head">
         <span className="msg__who">
-          {message.provenance?.modelName ?? (message.streaming ? 'Thinking' : 'Assistant')}
+          {provenance?.modelName ?? (message.streaming ? 'Thinking' : 'Assistant')}
         </span>
-        {message.provenance ? (
-          <span className={`chip ${message.provenance.local ? 'chip--local' : 'chip--remote'}`}>
-            <Icon name={message.provenance.local ? 'flame' : 'cloud'} size={10} />
-            {message.provenance.local ? 'On device' : 'Remote'}
+        {provenance ? (
+          <span className={`chip ${provenance.local ? 'chip--local' : 'chip--remote'}`}>
+            <Icon name={provenance.local ? 'flame' : 'cloud'} size={10} />
+            {provenance.local ? 'On device' : 'Remote'}
           </span>
         ) : null}
         {/* The chip says where the reply was made. This says what went with
             the request — a remote turn that carried the contents of your
             conversations is a different event from one that carried only the
-            words you typed, and "Remote" alone cannot tell them apart. */}
-        {message.provenance?.toolEgress ? (
+            words you typed, and "Remote" alone cannot tell them apart.
+
+            It is a per-message record of a consent decision, so it has to
+            follow the generation that decision was made for. Both halves are
+            read off `shown`: the grant from that generation's `toolEgress`,
+            the tool names from that generation's `toolCalls`. Flipping to a
+            local answer that sent nothing must not leave "carried 1 tool
+            result" standing over it, and flipping back must bring it back. */}
+        {provenance?.toolEgress ? (
           <span
-            className={`chip ${message.provenance.toolEgress === 'granted' ? 'chip--remote' : 'chip--local'}`}
+            className={`chip ${provenance.toolEgress === 'granted' ? 'chip--remote' : 'chip--local'}`}
             title={
-              message.provenance.toolEgress === 'granted'
-                ? `Tool output from ${(message.toolCalls ?? []).map((tool) => tool.name).join(', ') || 'a tool'} was sent to ${message.provenance.modelName}, because you allowed it for this conversation. Expand the tool block below to see exactly what.`
+              provenance.toolEgress === 'granted'
+                ? `Tool output from ${(toolCalls ?? []).map((tool) => tool.name).join(', ') || 'a tool'} was sent to ${provenance.modelName}, because you allowed it for this conversation. Expand the tool block below to see exactly what.`
                 : 'Tool output stayed on this device. The model answered without it, and was told so.'
             }
           >
             <Icon name="tool" size={10} />
-            {message.provenance.toolEgress === 'granted'
-              ? `carried ${message.toolCalls?.length ?? 1} tool result${(message.toolCalls?.length ?? 1) === 1 ? '' : 's'}`
+            {provenance.toolEgress === 'granted'
+              ? `carried ${toolCalls?.length ?? 1} tool result${(toolCalls?.length ?? 1) === 1 ? '' : 's'}`
               : 'tool output withheld'}
           </span>
         ) : null}
-        {message.stats?.tokensPerSecond ? (
-          <span className="readout">{message.stats.tokensPerSecond.toFixed(1)} tok/s</span>
+        {shown.stats?.tokensPerSecond ? (
+          <span className="readout">{shown.stats.tokensPerSecond.toFixed(1)} tok/s</span>
         ) : null}
 
         {/* How much prefill the KV cache saved on this turn. Worth showing:
             it is the difference between a long conversation staying responsive
             and degrading with every message. */}
-        {message.stats?.cachedTokens && message.stats.promptTokens ? (
+        {shown.stats?.cachedTokens && shown.stats.promptTokens ? (
           <span
             className="readout"
-            title={`${message.stats.cachedTokens.toLocaleString()} of ${message.stats.promptTokens.toLocaleString()} prompt tokens were reused from the cache instead of re-processed.`}
+            title={`${shown.stats.cachedTokens.toLocaleString()} of ${shown.stats.promptTokens.toLocaleString()} prompt tokens were reused from the cache instead of re-processed.`}
           >
-            {Math.round((message.stats.cachedTokens / message.stats.promptTokens) * 100)}% cached
+            {Math.round((shown.stats.cachedTokens / shown.stats.promptTokens) * 100)}% cached
           </span>
         ) : null}
 
@@ -134,32 +185,32 @@ export function MessageView({
             it. It is the one number that says whether speculation is paying
             for itself — a low rate means the draft model is being run for
             nothing, and the fix is to turn it off or pick a closer draft. */}
-        {typeof message.stats?.draftAcceptance === 'number' ? (
+        {typeof shown.stats?.draftAcceptance === 'number' ? (
           <span
             className="readout"
-            title={`${Math.round(message.stats.draftAcceptance * 100)}% of tokens proposed by the draft model were accepted. Below roughly 60% speculative decoding usually costs more than it saves.`}
+            title={`${Math.round(shown.stats.draftAcceptance * 100)}% of tokens proposed by the draft model were accepted. Below roughly 60% speculative decoding usually costs more than it saves.`}
           >
-            {Math.round(message.stats.draftAcceptance * 100)}% draft
+            {Math.round(shown.stats.draftAcceptance * 100)}% draft
           </span>
         ) : null}
       </div>
 
-      {message.provenance?.fallbackFrom ? (
+      {provenance?.fallbackFrom ? (
         <div className="chip chip--warn" style={{ alignSelf: 'flex-start', whiteSpace: 'normal' }}>
           <Icon name="alert" size={11} />
           Generated remotely — the device could not run this turn locally
           {/* The divert picks the destination, so no sheet could have asked
               about it in time. The rule is applied instead of asked, and the
               chip has to say so or the user learns it the hard way. */}
-          {message.provenance.toolEgress === 'withheld' ? '. Tool output was not sent' : ''}
+          {provenance.toolEgress === 'withheld' ? '. Tool output was not sent' : ''}
         </div>
       ) : null}
 
-      {message.thinking && showThinking ? <Thinking text={message.thinking} /> : null}
+      {shown.thinking && showThinking ? <Thinking text={shown.thinking} /> : null}
 
-      {message.toolCalls?.length ? (
+      {toolCalls?.length ? (
         <div className="stack" style={{ gap: 'var(--s-2)' }}>
-          {message.toolCalls.map((tool) => (
+          {toolCalls.map((tool) => (
             <ToolCall key={tool.id} tool={tool} />
           ))}
         </div>
@@ -184,11 +235,11 @@ export function MessageView({
       ) : (
         <div className="msg__body">
           {settings.renderMarkdown ? (
-            <Suspense fallback={<div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>}>
-              <Markdown text={message.content} />
+            <Suspense fallback={<div style={{ whiteSpace: 'pre-wrap' }}>{shown.content}</div>}>
+              <Markdown text={shown.content} />
             </Suspense>
           ) : (
-            <div style={{ whiteSpace: 'pre-wrap' }}>{message.content}</div>
+            <div style={{ whiteSpace: 'pre-wrap' }}>{shown.content}</div>
           )}
           {message.streaming ? <span className="caret" aria-hidden="true" /> : null}
         </div>
@@ -196,7 +247,7 @@ export function MessageView({
 
       {!message.streaming && !message.error ? (
         <div className="msg__foot">
-          <CopyButton text={message.content} />
+          <CopyButton text={shown.content} />
           <button
             type="button"
             className="icon-btn"

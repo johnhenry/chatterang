@@ -14,6 +14,7 @@
 import { type ReactNode } from 'react';
 
 import { Icon } from '@/ui/Icon';
+import { chatTarget } from '@/ui/target';
 import { useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { useChats } from '@/state/chat';
@@ -48,10 +49,39 @@ export function Rail({ title, actions }: RailProps): ReactNode {
   const context = useChats((state) => state.context);
   const installed = useModels((state) => state.installed);
   const activeModelId = useModels((state) => state.activeModelId);
+  const connections = useApp((state) => state.connections);
 
   const chat = chats.find((entry) => entry.id === activeChatId);
-  const modelId = chat?.modelId ?? activeModelId;
-  const model = modelId ? installed[modelId] : undefined;
+
+  /*
+   * THE SAME RESOLUTION THE CHAT SCREEN AND THE ENGINE USE, NOT A THIRD COPY.
+   *
+   * This was `chat?.modelId ?? activeModelId` followed by `installed[modelId]`,
+   * and the presence of a record was taken as "a local model is loaded here".
+   * Two states falsify that and both are reachable from a persisted chat:
+   *
+   *  - pinned to a model that cannot chat (the reported Whisper case). The rail
+   *    painted the flame chip — the app's own mark for a local model being
+   *    loaded — and Whisper's 448-token window as a filling context readout,
+   *    one line above a screen reading "nothing is loaded and nothing will be
+   *    sent". The rail is the app's honesty instrument; it was the last surface
+   *    still telling the reported user the opposite of the truth.
+   *  - pinned to a model that is still downloading. A `downloading` record
+   *    carries a full manifest and no file, so the chip named a resident model
+   *    and the readout printed a context window for a load that cannot happen.
+   *
+   * `chatTarget` answers both, and answers them the way `resolveTarget` will
+   * when the turn is actually sent.
+   */
+  const target = chatTarget(chat?.modelId ?? activeModelId, installed, connections);
+  /**
+   * The model that would really answer here.
+   *
+   * Every readout below that describes a model rather than the device hangs off
+   * this, so there is one place that decides whether the rail is describing a
+   * live target or a dead pin.
+   */
+  const model = target.kind === 'local' ? target.model : undefined;
 
   const thermalState =
     activity === 'running' || activity === 'loading'
@@ -73,10 +103,28 @@ export function Rail({ title, actions }: RailProps): ReactNode {
 
       <div className="rail__inner" style={{ paddingTop: 0, paddingBottom: 6, minHeight: 0 }}>
         <div className="rail__meta grow" style={{ overflow: 'hidden' }}>
-          {model ? (
+          {/*
+              The flame is the app's mark for "a local model answers here", so
+              only the `local` branch may draw it. `refused` still NAMES the
+              pin — a rail that silently fell back to "No local model" would
+              hide the one fact that explains why the composer is dead — and
+              borrows the engine's own refusal — "cannot answer a chat", the
+              words `resolveTarget` toasts — without promising what it does
+              instead: the rule `nonChatRole` states. `remote` and `none` share
+              "No local model", which is exactly what both mean here.
+          */}
+          {target.kind === 'local' ? (
             <span className="chip chip--local">
               <Icon name="flame" size={11} />
-              {model.manifest.name}
+              {target.model.manifest.name}
+            </span>
+          ) : target.kind === 'refused' ? (
+            <span
+              className="chip chip--warn"
+              title="This chat is pinned to a model that cannot write text, so no turn will be sent."
+            >
+              <Icon name="alert" size={11} />
+              {target.model.manifest.name} cannot answer a chat
             </span>
           ) : (
             <span className="chip">
@@ -101,8 +149,18 @@ export function Rail({ title, actions }: RailProps): ReactNode {
 
           {/* Context fill. Reads as an instrument, and turns warm then red as
               the window fills — the one number that silently ruins a long
-              conversation if nobody is watching it. */}
-          {context && context.contextLength > 0 ? (
+              conversation if nobody is watching it.
+
+              Gated on the target being local because `refreshContext` derives
+              the window from `installed[modelId]?.manifest` — any record with a
+              manifest, whether or not it will ever answer. So the reported chat
+              printed "~0/448 ctx", Whisper's own window, as a live budget for a
+              prompt that cannot be built; a pinned half-downloaded model prints
+              its own the same way. Nothing true is hidden by this: in every
+              non-local case `refreshContext` either finds no manifest and sets
+              `context` to null, or found the one that is not going to be
+              used. */}
+          {model && context && context.contextLength > 0 ? (
             <span
               className="readout"
               title={
@@ -117,7 +175,7 @@ export function Rail({ title, actions }: RailProps): ReactNode {
             </span>
           ) : null}
 
-          {context && context.dropped > 0 ? (
+          {model && context && context.dropped > 0 ? (
             <span className="chip chip--warn" title="Older messages were dropped to fit the context window.">
               <Icon name="alert" size={11} />
               −{context.dropped}

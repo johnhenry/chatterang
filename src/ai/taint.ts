@@ -157,6 +157,17 @@ const KEPT_CONTROLS = new Set(['\n', '\t', '\r']);
 const classEscape = (codePoint: number): string => `\\u{${codePoint.toString(16)}}`;
 
 /**
+ * One invisible character that {@link encodeUntrusted} drops.
+ *
+ * Written once and shared by every regex here that needs it, because two
+ * spellings of "invisible except the three we keep" is two things to keep in
+ * agreement for no benefit.
+ */
+const NON_KEPT_INVISIBLE = `(?![${[...KEPT_CONTROLS]
+  .map((character) => classEscape(character.codePointAt(0) ?? 0))
+  .join('')}])[\\p{Cc}\\p{Cf}]`;
+
+/**
  * Does this string contain anything {@link encodeUntrusted} would change?
  *
  * Derived from the same three data sources the encoder branches on — the
@@ -175,7 +186,7 @@ const ACTIONABLE = new RegExp(
   [
     `[${STRUCTURAL.map((character) => classEscape(character.codePointAt(0) ?? 0)).join('')}]`,
     `[${FOLDS_INTO_STRUCTURE.map(classEscape).join('')}]`,
-    `(?![${[...KEPT_CONTROLS].map((character) => classEscape(character.codePointAt(0) ?? 0)).join('')}])[\\p{Cc}\\p{Cf}]`,
+    NON_KEPT_INVISIBLE,
   ].join('|'),
   'u',
 );
@@ -226,6 +237,170 @@ export function encodeUntrusted(text: string): string {
     out += character;
   }
   return out;
+}
+
+/**
+ * Neutralise one string's structural characters, and the look-alikes that fold
+ * into them, character by character.
+ *
+ * This is the substitution half of {@link encodeUntrusted} without the
+ * invisible-dropping half, exported because the marker escaper in `ai/prompt.ts`
+ * needs exactly it: a denylist may only rewrite the span it matched, but every
+ * character in that span that could BECOME structure has to go, not merely the
+ * ASCII ones.
+ *
+ * Its sufficiency rests on {@link FOLDS_INTO_STRUCTURE} being exhaustive over
+ * Unicode — a character absent from both tables cannot produce a structural
+ * character under any normalisation form, which is the property
+ * `tests/taint.test.ts` scans all 1.1M code points to assert. That is why this
+ * function lives here beside the tables and not next to the markers.
+ */
+export function substituteStructural(text: string): string {
+  let out = '';
+  for (const character of text) {
+    out += SUBSTITUTE[character] ?? FOLDED.get(character) ?? character;
+  }
+  return out;
+}
+
+/**
+ * Printable ASCII plus the whitespace no projection would touch.
+ *
+ * Text made only of these is its own projection, which is the case that has to
+ * stay free: `escapeControlMarkers` runs over every string of every untainted
+ * message, base64 image payloads included.
+ */
+const FLAT_ASCII = /[^\x20-\x7e\n\t\r]/;
+
+/** Invisibles a normalising tokeniser strips, excluding the three kept ones. */
+const HIDDEN = new RegExp(NON_KEPT_INVISIBLE, 'u');
+
+/**
+ * The text as a NORMALISING TOKENISER will read it, with a map back to here.
+ *
+ * `sourceStart[i]` and `sourceEnd[i]` bracket, in the ORIGINAL string, the
+ * character that produced projected code unit `i`. That is the whole point:
+ * matching happens against the projection, and rewriting happens against the
+ * original, so nothing is ever normalised into the output.
+ */
+interface Projection {
+  readonly text: string;
+  readonly sourceStart: readonly number[];
+  readonly sourceEnd: readonly number[];
+}
+
+/**
+ * `undefined` when the text is its own projection, which is most text.
+ *
+ * Two rejections before any per-character work, because this runs over every
+ * string of every untainted message. The first covers printable ASCII — base64
+ * image payloads, code, English prose. The second covers text that is
+ * non-ASCII but already flat: a native `normalize` pass answers for CJK,
+ * Cyrillic and Greek in one go, and only text that genuinely decomposes or
+ * hides something reaches the loop.
+ */
+function project(text: string): Projection | undefined {
+  if (!FLAT_ASCII.test(text)) return undefined;
+  if (text.normalize('NFKD') === text && !HIDDEN.test(text)) return undefined;
+
+  let out = '';
+  const sourceStart: number[] = [];
+  const sourceEnd: number[] = [];
+  for (let index = 0; index < text.length; ) {
+    const character = String.fromCodePoint(text.codePointAt(index) ?? 0);
+    const next = index + character.length;
+
+    // Kept whitespace first: `\r` and `\n` are Cc, and the line-anchored
+    // markers need them where they are.
+    if (!KEPT_CONTROLS.has(character) && INVISIBLE.test(character)) {
+      index = next;
+      continue;
+    }
+
+    // Per code point rather than over the whole string, because a whole-string
+    // decomposition may reorder combining marks and that would break the index
+    // map for no gain: a fold that spans two code points is not a thing.
+    const code = character.codePointAt(0) ?? 0;
+    const folded = code < 0x80 ? character : character.normalize('NFKD');
+    // Pushed per code UNIT, because that is what a regex match index counts.
+    for (let unit = 0; unit < folded.length; unit += 1) {
+      sourceStart.push(index);
+      sourceEnd.push(next);
+    }
+    out += folded;
+    index = next;
+  }
+  return { text: out, sourceStart, sourceEnd };
+}
+
+/**
+ * Apply a denylist pattern to what a tokeniser would read, and rewrite what is
+ * actually there.
+ *
+ * The escaper in `ai/prompt.ts` is a denylist of ASCII marker shapes, and it
+ * has to stay one: its input is text the USER wrote, which must arrive at the
+ * model byte for byte apart from the marker shapes themselves. So it cannot do
+ * what {@link encodeUntrusted} does, and it cannot normalise its input either —
+ * that would rewrite every piece of legitimate CJK and fullwidth text in the
+ * conversation.
+ *
+ * What it can do is match somewhere else. This projects the text into the form
+ * a `nmt_nfkc` SentencePiece tokeniser will read — compatibility folds
+ * resolved, invisibles gone — runs the pattern there, maps each match back to
+ * the characters it came from, and hands those ORIGINAL characters to
+ * `neutralise`. `＜｜turn＞` matches `<\|…>`; the bytes rewritten are the
+ * fullwidth ones; nothing else in the string is touched.
+ *
+ * Every pattern must be global, and the result is exactly
+ * `patterns.reduce((t, p) => t.replace(p, neutralise), text)` whenever the text
+ * is its own projection — which is every pure-ASCII string, so the behaviour
+ * the caller had before folding was considered is unchanged rather than
+ * approximated.
+ *
+ * The patterns arrive as a list rather than one at a time so that the
+ * projection is built once for the whole pass and rebuilt only after a pattern
+ * actually changed something — which, for the escaper's six, is almost never.
+ */
+export function replaceThroughFolds(
+  text: string,
+  patterns: readonly RegExp[],
+  neutralise: (matched: string) => string,
+): string {
+  let out = text;
+  let projection = project(out);
+  for (const pattern of patterns) {
+    const next =
+      projection === undefined
+        ? out.replace(pattern, neutralise)
+        : replaceOne(out, projection, pattern, neutralise);
+    if (next === out) continue;
+    out = next;
+    projection = project(out);
+  }
+  return out;
+}
+
+function replaceOne(
+  text: string,
+  projection: Projection,
+  pattern: RegExp,
+  neutralise: (matched: string) => string,
+): string {
+  let out = '';
+  let cursor = 0;
+  for (const match of projection.text.matchAll(pattern)) {
+    const length = match[0].length;
+    if (length === 0) continue;
+    const index = match.index ?? 0;
+    // The whole span of every ORIGINAL character the match touched, so a
+    // character that projected to several units is rewritten once and whole.
+    const from = projection.sourceStart[index] ?? text.length;
+    const to = projection.sourceEnd[index + length - 1] ?? text.length;
+    if (from < cursor) continue;
+    out += text.slice(cursor, from) + neutralise(text.slice(from, to));
+    cursor = to;
+  }
+  return cursor === 0 ? text : out + text.slice(cursor);
 }
 
 /**

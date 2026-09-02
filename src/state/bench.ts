@@ -12,6 +12,7 @@ import { create } from 'zustand';
 import { db, type BenchmarkRun } from '@/db';
 import { LlamaCpp } from '@/plugins/llama-cpp';
 import { newId } from '@/domain/chat';
+import { benchmarkableEngineList, canBenchmark } from '@/domain/manifest';
 import { useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { publishRun } from '@/lib/leaderboard';
@@ -59,6 +60,44 @@ export const useBench = create<BenchState>((set, get) => ({
     const modelPath = record.paths.model;
     if (!modelPath) {
       app.toast('That model’s file is missing.', 'crit');
+      return;
+    }
+
+    /*
+     * The benchmark is a llama.cpp harness, not a generic one: below this line
+     * the model path goes to `LlamaCpp.load` and the timings come from
+     * `LlamaCpp.benchmark`, which exists on no other plugin contract. Nothing
+     * on this path had ever read `record.manifest.engine` — it was only
+     * recorded, on the run below — so an ONNX model's `.onnx` file was handed
+     * to the GGUF loader and failed inside a native plugin.
+     *
+     * The pickers no longer offer such a model (`benchmarkModels`), so this is
+     * the backstop for the doors a filtered list cannot close: `bench run` in
+     * the shell, which types an id, and a `modelId` read back from storage.
+     * It refuses BEFORE `running` and `setActivity` are set, so a refusal
+     * cannot leave the UI showing a spinner for a benchmark that never began.
+     */
+    if (!canBenchmark(record.manifest)) {
+      /*
+       * The PICKED model's engine id stays out of this sentence, on the same
+       * rule the chat refusal follows: "onnx-runtime" is the name of an adapter
+       * registration, and a person holding a phone did not choose an adapter.
+       * `nonBenchmarkableReason` DOES name it, and the shell uses it — there
+       * the engine is a fact the reader already greps for. Here the actionable
+       * half is where to look instead.
+       *
+       * It said "it runs on a different engine", which is a promise this build
+       * cannot keep: there is no native ONNX plugin on Android or iOS, so the
+       * model the user picked runs on no engine at all there. The stated fact
+       * is now about the BENCHMARK — which engine the stopwatch fits, taken
+       * from `BENCHMARKABLE_ENGINES` — and that is true on every platform.
+       */
+      app.toast(
+        `${record.manifest.name} cannot be benchmarked — the benchmark only measures ` +
+          `${benchmarkableEngineList()} models. ` +
+          'The Benchmarks screen lists the ones this device can measure.',
+        'warn',
+      );
       return;
     }
 

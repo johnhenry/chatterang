@@ -128,6 +128,57 @@ interface TurnResult {
   error?: string;
 }
 
+/**
+ * What to say when a target names a backend the router does not have.
+ *
+ * Two unrelated causes reach here, and only one of them is about the build.
+ *
+ * A remote target's `backendId` is a connection id, not an engine: it is
+ * unregistered because `connectProvider` failed — a rotated key, an offline
+ * self-hosted server, DNS — and `initialize` catches that, toasts it, and
+ * leaves the connection `enabled` in state (src/state/app.ts). The build ships
+ * every remote adapter it ever shipped; nothing is missing. Telling that user
+ * their build lacks a runtime is false, and "choose another model" cannot fix
+ * a wrong API key, so this points at the place that can.
+ *
+ * "Reconnect it in Settings" was the previous attempt at that, and it named a
+ * button that does not exist. Measured by mounting the real `ProvidersPanel`
+ * with exactly this state — a connection whose `connectProvider` threw:
+ *
+ *   <button role="switch" aria-checked="true" aria-label="Enable OpenAI">
+ *   <button class="icon-btn" aria-label="Remove OpenAI">
+ *
+ * Three controls on the whole panel — enable, remove, add. No "Reconnect", no
+ * edit control, and a toggle rendering CHECKED, because `enabled` stays true
+ * when the connection fails. So that screen reports the provider as ON and
+ * shows no problem whatsoever, and a user sent there arrives at a healthy row
+ * with nothing to press. Naming a remedy that is not on the screen is the same
+ * defect as the original bug, one layer in.
+ *
+ * What the screen can actually do is said instead, in the order that costs the
+ * user least: toggling off and back on re-runs `connectProvider`
+ * (`toggleConnection`, src/state/app.ts), which is the whole fix when the
+ * service was merely unreachable; and remove-then-add is named for a wrong key
+ * because with no edit control it is the only way to replace one. The warning
+ * that it still shows as switched on is there so the user does not conclude,
+ * from a screen that looks fine, that the message was wrong.
+ *
+ * The build sentence is reserved for a genuinely absent LOCAL engine, which is
+ * the residual case the backstop exists for. It does not name the engine id:
+ * `onnx-runtime` reads back as "the onnx-runtime runtime", and the id is an
+ * aimatey registration name that means nothing to the person reading it.
+ */
+function unregisteredBackendMessage(target: EngineTarget): string {
+  if (!isLocalEngine(target.engine)) {
+    return (
+      `${target.modelName} is not connected — the key may be wrong, or the service ` +
+      `unreachable. Under Remote providers in Settings it still shows as switched on: ` +
+      `switch it off and on again to retry, or remove it and add it again to enter a new key.`
+    );
+  }
+  return `${target.modelName} needs a runtime this build does not include. Choose another model.`;
+}
+
 /* ── Public surface ─────────────────────────────────────────────────── */
 
 export interface EngineTarget {
@@ -398,6 +449,47 @@ export class ChatterangEngine {
     const started = performance.now();
     yield { type: 'start', requestId };
 
+    /*
+     * ── The backstop, and the one failure that must NOT divert ──────────
+     *
+     * A target naming a backend this build never registered is a
+     * configuration error, not a runtime failure. The difference matters
+     * because of what the rest of this method does with a failure: there are
+     * TWO places that divert a local turn to the configured cloud provider —
+     * the device-pressure pre-flight just below, and the loop's failure
+     * handler further down — and `target.local` is true for every on-device
+     * engine, so either one will retarget the turn at the remote and answer
+     * from there.
+     *
+     * Measured, before this check existed: selecting a speech model and
+     * sending "my private note" with a fallback configured produced
+     * ["start","fallback","delta","done"] — no error, a cloud answer, and the
+     * message off the device — over a model the user chose precisely BECAUSE
+     * it was local. The chain only "failed closed" for users who had no cloud
+     * provider set up.
+     *
+     * It is checked HERE, before the pre-flight, and not merely before the
+     * loop. Measured with the check sitting one block lower: a hot device
+     * (thermal 0.95) plus an unregistered backend plus a configured fallback
+     * produced that same ["start","fallback","delta","done"] and a cloud
+     * answer, because the pre-flight diverted the turn before the check ever
+     * ran. Nothing may retarget `target` above this line.
+     *
+     * Diverting cannot help here in any case: no remote provider can serve a
+     * local model that has no runtime.
+     *
+     * Selection refuses long before this — the pickers do not offer a model
+     * that cannot chat, and `resolveTarget` stops the persisted leftovers. This
+     * stays because it is the only check that covers a target built by a caller
+     * that never touched either: a future `text`-capable model on an engine
+     * declared in ENGINE_IDS (`mlc-llm`, `cactus`, `executorch`) that nothing
+     * registers would pass every capability check upstream and land here.
+     */
+    if (!this.router.has(request.target.backendId)) {
+      yield { type: 'error', message: unregisteredBackendMessage(request.target) };
+      return;
+    }
+
     // ── Pre-flight: can this device take a local generation right now? ──
     let target = request.target;
     if (target.local) {
@@ -664,6 +756,26 @@ export class ChatterangEngine {
    * existing grant is the only thing that allows it.
    */
   async complete(request: GenerationRequest): Promise<IRChatResponse> {
+    /*
+     * The same backstop `stream` has, for the same sentence.
+     *
+     * Not for the same reason, though, and the difference is worth stating so
+     * nobody later "simplifies" one into the other: there is no fallback on
+     * this path, so nothing here can divert a local turn to the cloud. What
+     * was live here was only the string. Measured before this check, calling
+     * `complete` with the reported target: "Requested backend 'onnx-runtime'
+     * is not registered. Registered backends: llama-cpp" — aimatey's
+     * vocabulary about its own registration table, reaching the user through
+     * the other public door.
+     *
+     * It throws rather than returning, because that is already how this method
+     * fails: `bridge.chat` threw that exact error, and every caller is written
+     * around a rejected promise.
+     */
+    if (!this.router.has(request.target.backendId)) {
+      throw new Error(unregisteredBackendMessage(request.target));
+    }
+
     const allowed =
       request.target.local || request.egress?.isGranted(request.target.backendId) === true;
     const outgoing = clearForDestination(request.messages, {

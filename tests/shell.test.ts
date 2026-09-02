@@ -12,6 +12,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatterangShell, assertConfinedBuild, bundledCommandNames, type ShellStores } from '@/shell';
 import { chatterangCommands, renderTranscript, table } from '@/shell/commands';
+import { nonChatRole } from '@/domain/manifest';
 import { normalizePath } from '@/shell/fs';
 import { PROJECTED_PATHS, buildVfs, isProjectedPath, slug } from '@/shell/vfs';
 
@@ -920,5 +921,120 @@ describe('command registry', () => {
     const commands = chatterangCommands(stores());
     expect(commands.find((c) => c.name === 'persona')?.mutating).toBeFalsy();
     expect(commands.find((c) => c.name === 'privacy')?.mutating).toBeFalsy();
+  });
+});
+
+/* ── The selection door a filtered picker cannot close ───────────────── */
+
+/**
+ * The shell TYPES a model id.
+ *
+ * Every other way into `setActive` is a list the app builds — the chat model
+ * picker, the per-chat dropdown, a persona's preferred model, the Models
+ * sheet — and those now offer only models that can chat. `model use <id>` is
+ * the one door where the id comes from a keyboard, so it is the one door a
+ * construction fix cannot close, and it needs its own refusal.
+ *
+ * It lives in this file and not in tests/model-selection.test.ts because that
+ * file is jsdom and this one is `// @vitest-environment node`; the shell needs
+ * a single realm for `just-bash`'s type dispatch (see the header).
+ */
+describe('model use, for a model that cannot answer a chat', () => {
+  /** The model from the bug report, in the shape the shell projection sees. */
+  function whisperStores(setActive: (id: string | null) => Promise<void>): ShellStores {
+    return stores({
+      models: () => ({
+        activeModelId: null,
+        install: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined),
+        setActive,
+        installed: {
+          'whisper-tiny-en-onnx': {
+            id: 'whisper-tiny-en-onnx',
+            state: 'installed',
+            downloadedBytes: 77_691_136,
+            useCount: 0,
+            manifest: {
+              name: 'Whisper Tiny (English)',
+              quantization: 'INT8',
+              capabilities: ['audio-in'],
+              contextLength: 448,
+              sizeBytes: 77_691_136,
+              engine: 'onnx-runtime',
+              license: 'MIT',
+            },
+          },
+          qwen: {
+            id: 'qwen',
+            state: 'installed',
+            downloadedBytes: 2_497_281_120,
+            useCount: 7,
+            manifest: {
+              name: 'Qwen3 4B Instruct',
+              quantization: 'Q4_K_M',
+              capabilities: ['text', 'tools'],
+              contextLength: 32768,
+              sizeBytes: 2_497_281_120,
+              engine: 'llama-cpp',
+              license: 'Apache-2.0',
+            },
+          },
+        },
+      }),
+    });
+  }
+
+  function run(command: string) {
+    const setActive = vi.fn(async (_id: string | null): Promise<void> => undefined);
+    const confirm = vi.fn(async (_message: string): Promise<boolean> => true);
+    const sh = new ChatterangShell({
+      stores: whisperStores(setActive),
+      actor: 'model',
+      confirm,
+    });
+    return { exec: sh.exec(command), setActive, confirm };
+  }
+
+  it('exits non-zero and does not switch the active model', async () => {
+    const { exec, setActive } = run('model use whisper-tiny-en-onnx');
+    const result = await exec;
+
+    // A script that switches models and carries on must stop HERE, not
+    // discover the problem four layers down in a reply it cannot parse.
+    expect(result.exitCode).not.toBe(0);
+    expect(setActive).not.toHaveBeenCalled();
+  });
+
+  it('refuses before it warms up a confirmation prompt', async () => {
+    const { exec, confirm } = run('model use whisper-tiny-en-onnx');
+    await exec;
+
+    // `model use` from the MODEL actor is gated; there is nothing worth
+    // asking a person to approve when the answer is already no.
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('says which model, what kind it is, and where to look next', async () => {
+    const { exec } = run('model use whisper-tiny-en-onnx');
+    const result = await exec;
+
+    const role = nonChatRole({ capabilities: ['audio-in'] });
+    expect(role.length).toBeGreaterThan(0);
+
+    expect(result.stderr).toContain('whisper-tiny-en-onnx');
+    expect(result.stderr, 'the actionable half, not just the id').toContain(role);
+    expect(result.stderr, 'and somewhere to go').toContain('model list');
+    // aimatey's vocabulary is not the user's.
+    expect(result.stderr).not.toContain('is not registered');
+    expect(result.stderr).not.toContain('onnx-runtime');
+  });
+
+  it('still switches to a model that can chat — the guard is not a wall', async () => {
+    const { exec, setActive, confirm } = run('model use qwen');
+    const result = await exec;
+
+    expect(result.exitCode).toBe(0);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'));
+    expect(setActive).toHaveBeenCalledWith('qwen');
   });
 });

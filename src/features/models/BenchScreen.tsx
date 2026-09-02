@@ -4,11 +4,11 @@ import { useShallow } from 'zustand/react/shallow';
 import { Icon } from '@/ui/Icon';
 import { BarChart, Sparkline, ThermalArc } from '@/ui/Chart';
 import { Confirm, Empty, Sheet, Switch } from '@/ui/primitives';
-import { formatBytes } from '@/domain/manifest';
+import { benchmarkableEngineList, formatBytes } from '@/domain/manifest';
 import { buildPayload } from '@/lib/leaderboard';
 import { useApp } from '@/state/app';
 import { useBench, bestPerModel } from '@/state/bench';
-import { useModels, installedModels } from '@/state/models';
+import { useModels, benchmarkModels, installedModels } from '@/state/models';
 import type { BenchmarkRun } from '@/db';
 
 import { Stat } from '@/features/models/ModelDetail';
@@ -24,7 +24,14 @@ export function BenchScreen(): ReactNode {
   const runs = useBench((state) => state.runs);
   const running = useBench((state) => state.running);
   const publishing = useBench((state) => state.publishing);
-  const models = useModels(useShallow(installedModels));
+  /*
+   * `benchmarkModels`, not `installedModels`: this picker offered every
+   * installed model, so tapping Whisper handed a `.onnx` path to the llama.cpp
+   * loader. A model the benchmark cannot drive is not refused here — it is
+   * never offered, and `useBench.run` keeps the refusal as a backstop.
+   */
+  const models = useModels(useShallow(benchmarkModels));
+  const anyInstalled = useModels((state) => installedModels(state).length > 0);
   const thermal = useApp((state) => state.thermal);
 
   const [picker, setPicker] = useState(false);
@@ -69,6 +76,28 @@ export function BenchScreen(): ReactNode {
             </>
           )}
         </button>
+
+        {/*
+          A disabled button with no sentence beside it is a dead end. Filtering
+          the picker means it can now be empty while models ARE installed — a
+          device holding only Whisper and Piper — and that is worth saying
+          rather than leaving the user tapping.
+
+          The second half used to read "speech, voice and image models run on a
+          different engine", which promises those models run somewhere in this
+          app. On Android and iOS they do not: there is no native ONNX plugin in
+          this build. What is said instead is a fact about the benchmark —
+          which engine it measures, read from `BENCHMARKABLE_ENGINES` — and
+          where to check any one model, which is the Engine row of its own
+          sheet, printing the same ids this sentence does.
+        */}
+        {models.length === 0 && anyInstalled ? (
+          <span className="list__sub">
+            None of the installed models can be benchmarked. The benchmark only measures{' '}
+            {benchmarkableEngineList()} models — the Engine row in a model’s own sheet says which
+            engine it is built for.
+          </span>
+        ) : null}
       </div>
 
       {runs.length === 0 ? (

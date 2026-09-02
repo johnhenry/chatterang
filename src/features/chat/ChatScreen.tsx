@@ -3,12 +3,15 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { Icon } from '@/ui/Icon';
 import { Rail } from '@/ui/Rail';
+import { chatTarget, type ChatTarget, type Providerish } from '@/ui/target';
 import { Confirm, Empty, Sheet } from '@/ui/primitives';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
-import { useModels, installedModels } from '@/state/models';
+import { useModels, chatModels, installedModels } from '@/state/models';
 import { usePersonas, personaList } from '@/state/personas';
 import { toolRegistry } from '@/ai/tools/registry';
+import { canChat, nonChatRole } from '@/domain/manifest';
+import type { InstalledModel } from '@/db';
 import type { Attachment, Chat, Message } from '@/domain/chat';
 
 import { Composer } from '@/features/chat/Composer';
@@ -77,10 +80,14 @@ export function ChatScreen(): ReactNode {
   // globally active one. Anything else and the composer disables itself while
   // the engine would happily have generated.
   const effectiveModelId = chat?.modelId ?? activeModelId;
-  const model = effectiveModelId ? installed[effectiveModelId] : undefined;
-  const acceptsImages = Boolean(model?.manifest.capabilities.includes('vision'));
-  const hasTarget =
-    model?.state === 'installed' || connections.some((connection) => connection.enabled);
+  const target = chatTarget(effectiveModelId, installed, connections);
+  // The same selector the picker uses, so the two sentences a whisper-only
+  // user meets — this screen's and the sheet's — name their models in one
+  // order rather than two.
+  const nonChat = useModels(useShallow(nonChatInstalled));
+  const acceptsImages =
+    target.kind === 'local' && target.model.manifest.capabilities.includes('vision');
+  const hasTarget = target.kind === 'local' || target.kind === 'remote';
 
   const send = useCallback((text: string, attachments: Attachment[]) => {
     pinnedToBottom.current = true;
@@ -197,7 +204,11 @@ export function ChatScreen(): ReactNode {
 
         <div className="chat__main">
           {messages.length === 0 ? (
-            <StartState hasTarget={hasTarget} onPickModel={() => setDrawer('model')} />
+            <StartState
+              target={target}
+              nonChat={nonChat}
+              onPickModel={() => setDrawer('model')}
+            />
           ) : (
             <div className="screen__scroll" ref={scroller} onScroll={onScroll}>
               <div className="thread">
@@ -239,7 +250,12 @@ export function ChatScreen(): ReactNode {
                 ? chat?.mode === 'task'
                   ? 'Describe the one-off task…'
                   : 'Message'
-                : 'Install a model or add a provider'
+                : target.kind === 'refused'
+                  ? // 29 characters, shorter than the string measured above and
+                    // shown in the same field at the same width — to a user who
+                    // is being told why the composer will not take their turn.
+                    'Pick a model that writes text'
+                  : 'Install a model or add a provider'
             }
             onSend={send}
             onStop={() => useChats.getState().stop()}
@@ -279,21 +295,266 @@ export function ChatScreen(): ReactNode {
   );
 }
 
+/* ── Where this chat's next turn would actually go ──────────────────── */
+
+/*
+ * `chatTarget` moved to `@/ui/target` so the rail can ask the same question
+ * with the same answer — it was resolving `chat?.modelId ?? activeModelId` and
+ * `installed[modelId]` itself, with no capability check, and painting a chat
+ * pinned to Whisper as a loaded local model directly above this screen saying
+ * nothing is loaded. It is re-exported here because this is where every caller
+ * and every test already reaches for it.
+ */
+export { chatTarget };
+export type { ChatTarget, Providerish };
+
+/**
+ * The two sentences above an armed composer — and they are two, not one.
+ *
+ * "Everything here stays here. The model is running on this device." was
+ * printed whenever anything at all was plugged in, INCLUDING when the only
+ * thing plugged in was a remote provider and nothing local was installed. The
+ * app's central claim is that you are told when a turn leaves the device, and
+ * this was the screen that said the opposite in the configuration where it
+ * mattered most.
+ *
+ * The local half also stopped claiming that a model "is running": nothing is
+ * loaded until the first turn. What is true, and what the user needs, is where
+ * it will run.
+ *
+ * THE REMOTE HALF NO LONGER SAYS ANYTHING ABOUT THE RECORD. It read "No model
+ * on this device is selected", and `remote` does not mean that: `chatTarget`
+ * returns `remote` whenever the pinned id has no INSTALLED record, which
+ * includes a model that is pinned and still downloading, and an id from a
+ * build that had it. Measured on `chat.modelId = 'llama-3.2-3b-instruct-q4km'`
+ * in state `downloading`, this screen said nothing was selected while the
+ * settings sheet two taps away named that exact model as the pin — the same
+ * component contradicting itself about the same record. What IS true in every
+ * `remote` case, and is the half the user actually needs, is that no model on
+ * this device will answer it.
+ *
+ * THE MARKING CLAIM, WHICH BOTH BRANCHES MAKE, IS NOW ONE CLAUSE AND IT IS
+ * SCOPED. It read "when a reply does come from one, it is marked" here and
+ * "Every reply that comes back from a provider is marked as one" four lines
+ * down — the same fact in two wordings, which is how the last three false
+ * sentences on this journey got written. Both were also UNIVERSAL, and one
+ * kind of reply falsifies a universal: a generation the v4 upgrade recovered
+ * from a chat an older build saved. That build stored variants as bare
+ * strings, so the origin of that text was never written down; it comes back
+ * `unrecorded` and `MessageView` renders it with no chip rather than with the
+ * row's — an invented label is the defect the variant record exists to
+ * prevent. Measured through the real thread in
+ * `tests/selection-copy.test.ts`: after `regenerate` and `‹`, a remote
+ * generation reads `Remote`, and a recovered one reads the empty string.
+ *
+ * So the clause says FROM NOW ON — of every reply this build records, which
+ * is what the code guarantees, and which is also the whole of what a user
+ * starting a chat is about to do. The mark then follows that generation's own
+ * text through regenerate, cycle and export, because it travels inside
+ * `MessageVariant` rather than on the row.
+ *
+ * `Onboarding` states it in exactly these words, in both of its paragraphs,
+ * and `tests/selection-copy.test.ts` refuses any collected sentence that
+ * marks a reply in words its ledger does not carry.
+ */
+export function startProse(target: ChatTarget): { heading: string; body: string } | null {
+  if (target.kind === 'local') {
+    return {
+      heading: 'Everything here stays here.',
+      body:
+        `${target.model.manifest.name} answers on this device. Nothing you type is sent ` +
+        'anywhere unless you explicitly connect a remote provider — and from now on, every ' +
+        'reply that comes back from a provider is marked Remote in the thread.',
+    };
+  }
+  if (target.kind === 'remote') {
+    return {
+      heading: 'This chat leaves the device.',
+      body:
+        `No model on this device will answer it, so turns in this chat go to ${target.provider.label}. ` +
+        'What you type, and anything a tool reads for the model, goes with them. From now on, ' +
+        'every reply that comes back from a provider is marked Remote in the thread.',
+    };
+  }
+  return null;
+}
+
+/**
+ * A chat pinned to a model that cannot answer it.
+ *
+ * Names the model and what kind of model it is, in the same vocabulary as the
+ * engine's own refusal — this is the sentence that has to arrive BEFORE the
+ * message is typed rather than as a toast after it is sent.
+ */
+export function refusalCopy(model: InstalledModel): { title: string; body: string } {
+  return {
+    title: 'This chat cannot answer',
+    body:
+      `It is set to ${model.manifest.name}, which ${nonChatRole(model.manifest)} — nothing is ` +
+      'loaded and nothing will be sent. Choose a model that writes text and the conversation ' +
+      'is kept.',
+  };
+}
+
+/**
+ * The pin a shortened list can no longer show, and what to call it.
+ *
+ * `null` when the persisted value is one of the options actually rendered —
+ * an installed chat model, or an enabled connection. Otherwise the record
+ * says something the list cannot, and the control has to say it anyway.
+ *
+ * Every branch names a DIFFERENT reason, because "Choose…" was one label for
+ * four situations and a user cannot act on any of them:
+ *
+ *  - installed and not a chat model (the reported case: Whisper),
+ *  - installed but not finished downloading, so there is no file yet,
+ *  - a provider that has since been switched off,
+ *  - and an id nothing on this device knows, which is the one case where the
+ *    honest label is the id itself: it is the only fact left.
+ */
+export function orphanOption(
+  modelId: string | null,
+  offered: readonly InstalledModel[],
+  pinned: InstalledModel | undefined,
+  connections: readonly Providerish[],
+): { value: string; label: string } | null {
+  if (!modelId) return null;
+  if (offered.some((entry) => entry.id === modelId)) return null;
+  if (connections.some((entry) => entry.enabled && entry.id === modelId)) return null;
+
+  if (pinned) {
+    const label =
+      pinned.state === 'installed'
+        ? `${pinned.manifest.name} ${nonChatRole(pinned.manifest)}`
+        : `${pinned.manifest.name} — not finished downloading`;
+    return { value: modelId, label };
+  }
+
+  const provider = connections.find((entry) => entry.id === modelId);
+  if (provider) return { value: modelId, label: `${provider.label} — switched off` };
+
+  return { value: modelId, label: `${modelId} — not on this device` };
+}
+
+/* ── "You have no chat model" — said without calling the user empty ─── */
+
+/**
+ * The models installed that cannot answer a chat.
+ *
+ * The selection fix swapped both pickers from `installedModels` to
+ * `chatModels`, which is right — and it silently changed what an empty list
+ * MEANS. It used to mean "you have downloaded nothing". It now also means "you
+ * have downloaded something, and none of it can chat", and the two need
+ * different sentences: the whisper-only user in the bug report has a model, was
+ * told they had none, and would have gone and downloaded Whisper again.
+ *
+ * `ModelState` is not exported, so the selector's parameter is taken from the
+ * selector it delegates to rather than by widening another agent's module.
+ */
+type ModelStore = Parameters<typeof installedModels>[0];
+
+export function nonChatInstalled(state: ModelStore): InstalledModel[] {
+  return installedModels(state).filter((entry) => !canChat(entry.manifest));
+}
+
+/** How many non-chat models to name before the sentence stops being readable. */
+const NAMED = 2;
+
+/**
+ * "Whisper Tiny (English) is a speech-to-text model", for as many as fit.
+ *
+ * Naming them is the whole point: the user is being told that what they have
+ * is not what they need, and a sentence that does not say what they have is
+ * the same unactionable refusal as `Requested backend 'onnx-runtime' is not
+ * registered`, one layer up.
+ */
+function rolesOf(models: readonly InstalledModel[]): string {
+  const named = models
+    .slice(0, NAMED)
+    .map((entry) => `${entry.manifest.name} ${nonChatRole(entry.manifest)}`)
+    .join('; ');
+  const rest = models.length - NAMED;
+  return rest > 0 ? `${named}, and ${rest} more like them` : named;
+}
+
+/** The model picker's empty state. `nonChat` is everything installed that can't chat. */
+export function pickerEmptyCopy(nonChat: readonly InstalledModel[]): string {
+  if (nonChat.length === 0) {
+    return 'Nothing is installed yet. Open Models to download one — the smallest is under a gigabyte.';
+  }
+  return `Nothing installed can answer a chat: ${rolesOf(nonChat)}. Open Models to download a chat model — the smallest is under a gigabyte.`;
+}
+
+/**
+ * The first thing a chat with nowhere to send a turn says.
+ *
+ * `load()` now nulls a persisted `activeModelId` that cannot chat, so the
+ * whisper-only user is newly routed HERE on the upgrade that fixes their bug —
+ * which makes "Download a model in Models" the second sentence in a row that
+ * ignores the model they already downloaded.
+ */
+export function startStateCopy(nonChat: readonly InstalledModel[]): {
+  title: string;
+  body: string;
+} {
+  if (nonChat.length === 0) {
+    return {
+      title: 'Nothing to talk to yet',
+      body: 'Download a model in Models, or connect a provider in Settings. Downloaded models run entirely on this device.',
+    };
+  }
+  /*
+   * WHY THIS BRANCH DOES NOT SAY "Downloaded models run entirely on this
+   * device."
+   *
+   * It is the sentence the first branch ends on, and it was copied here. In
+   * the first branch it follows "Download a model in Models" and is a promise
+   * about a download the user has not made yet. Here it lands one sentence
+   * after NAMING A MODEL THE USER ALREADY HAS — and on the platform the bug
+   * was reported from, that model runs nowhere:
+   * `@chatterang/plugin-onnx-runtime` is in none of package.json,
+   * android/app/src/main/assets/capacitor.plugins.json,
+   * android/capacitor.settings.gradle or ios/App/CapApp-SPM/Package.swift,
+   * while `plugin-llama-cpp` is in all four. So "downloaded models run here"
+   * told the whisper-only Android user that the thing they downloaded is
+   * running on their phone, in the same paragraph that told them it cannot
+   * chat. It is the same class of overclaim `nonChatRole` was written to
+   * avoid.
+   *
+   * The promise is kept, narrowed to what it is true of: every chat-capable
+   * entry in the catalogue is `llama-cpp`, whose plugin IS registered on all
+   * four platforms, so the model this sentence is recommending really does
+   * run here. What the user is holding gets no claim at all.
+   */
+  return {
+    title: 'Nothing here can hold a conversation',
+    body: `${rolesOf(nonChat)}. Download a chat model in Models, or connect a provider in Settings. A chat model downloaded there runs entirely on this device; a provider does not.`,
+  };
+}
+
 /* ── Start state ────────────────────────────────────────────────────── */
 
 function StartState({
-  hasTarget,
+  target,
+  nonChat,
   onPickModel,
 }: {
-  hasTarget: boolean;
+  target: ChatTarget;
+  nonChat: readonly InstalledModel[];
   onPickModel: () => void;
 }): ReactNode {
-  if (!hasTarget) {
+  const prose = startProse(target);
+
+  if (!prose) {
+    // Two dead ends, and they are not the same dead end: nothing is plugged
+    // in at all, or this chat is pinned to something that cannot answer.
+    const { title, body } =
+      target.kind === 'refused' ? refusalCopy(target.model) : startStateCopy(nonChat);
     return (
       <Empty
         icon="flame"
-        title="Nothing to talk to yet"
-        body="Download a model in Models, or connect a provider in Settings. Downloaded models run entirely on this device."
+        title={title}
+        body={body}
         action={{ label: 'Choose a model', onClick: onPickModel }}
       />
     );
@@ -303,17 +564,13 @@ function StartState({
     <div className="screen__scroll">
       <div className="screen__pad" style={{ paddingTop: 'var(--s-7)' }}>
         <div style={{ color: 'var(--ember)' }}>
-          <Icon name="flame" size={30} />
+          <Icon name={target.kind === 'remote' ? 'cloud' : 'flame'} size={30} />
         </div>
         <div className="stack" style={{ gap: 'var(--s-2)' }}>
           <h2 style={{ fontSize: 'var(--t-xl)', fontVariationSettings: "'wdth' 112" }}>
-            Everything here stays here.
+            {prose.heading}
           </h2>
-          <p style={{ color: 'var(--ink-2)', maxWidth: '46ch' }}>
-            The model is running on this device. Nothing you type is sent anywhere unless you
-            explicitly connect a remote provider — and when a reply does come from one, it is
-            marked.
-          </p>
+          <p style={{ color: 'var(--ink-2)', maxWidth: '46ch' }}>{prose.body}</p>
         </div>
       </div>
     </div>
@@ -479,7 +736,11 @@ function ChatSettingsSheet({
   onClose: () => void;
 }): ReactNode {
   const personas = usePersonas(useShallow(personaList));
-  const models = useModels(useShallow(installedModels));
+  const models = useModels(useShallow(chatModels));
+  // The pinned record itself, by id — NOT the whole installed map. The list a
+  // user picks from stays `chatModels`; this is one lookup, so the control can
+  // name a value that list has dropped.
+  const pinned = useModels((state) => (chat?.modelId ? state.installed[chat.modelId] : undefined));
   const connections = useApp((state) => state.connections);
   const update = useChats((state) => state.updateChat);
   const toast = useApp((state) => state.toast);
@@ -502,6 +763,8 @@ function ChatSettingsSheet({
   }, [chat, toast]);
 
   if (!chat) return null;
+
+  const orphan = orphanOption(chat.modelId, models, pinned, connections);
 
   return (
     <Sheet open={open} title="This chat" onClose={onClose}>
@@ -536,6 +799,29 @@ function ChatSettingsSheet({
           value={chat.modelId ?? ''}
           onChange={(event) => void update(chat.id, { modelId: event.target.value || null })}
         >
+          {/*
+            THE OPTION THAT KEEPS THE CONTROL HONEST.
+
+            This select is controlled on `chat.modelId`, and its options are
+            now `chatModels` — a strictly shorter list than the one that could
+            have been persisted here. A chat pinned to `whisper-tiny-en-onnx`
+            has a value that matches no option, so the browser falls back to
+            the first one and the control reads "Choose…" for a chat that IS
+            pinned: the record says Whisper, the screen says nothing, and the
+            user's next move is to wonder why an unpinned chat keeps refusing.
+
+            The option is disabled, so it states the pin without offering it
+            back. Nulling the field on open was the alternative and it is
+            worse in the one way that matters: it edits the user's data to
+            make a widget consistent, silently, on a sheet they may only have
+            opened to read. This shows the record and leaves it alone —
+            picking anything else replaces it, which is the fix either way.
+          */}
+          {orphan ? (
+            <option value={orphan.value} disabled>
+              {orphan.label}
+            </option>
+          ) : null}
           <option value="">Choose…</option>
           {models.length > 0 ? (
             <optgroup label="On this device">
@@ -660,14 +946,13 @@ function ModelPickerSheet({
   chat: Chat | null;
   onClose: () => void;
 }): ReactNode {
-  const models = useModels(useShallow(installedModels));
+  const models = useModels(useShallow(chatModels));
+  const nonChat = useModels(useShallow(nonChatInstalled));
 
   return (
     <Sheet open={open} title="Choose a model" onClose={onClose}>
       {models.length === 0 ? (
-        <p className="section__hint">
-          Nothing is installed yet. Open Models to download one — the smallest is under a gigabyte.
-        </p>
+        <p className="section__hint">{pickerEmptyCopy(nonChat)}</p>
       ) : (
         <div className="card card--flush">
           <div className="list">

@@ -16,7 +16,14 @@
  *     mutating command without the user confirming it — see `ShellContext`.
  */
 
-import { formatBytes, type Capability } from '@/domain/manifest';
+import {
+  canBenchmark,
+  canChat,
+  formatBytes,
+  nonBenchmarkableReason,
+  nonChatRole,
+  type Capability,
+} from '@/domain/manifest';
 import { deriveTitle } from '@/domain/chat';
 
 export interface ShellOutput {
@@ -125,11 +132,23 @@ interface ChatRow {
   updatedAt: number;
   mode: string;
 }
-interface MessageRow {
-  role: string;
+/**
+ * One generation of a turn, as much of it as a transcript prints.
+ *
+ * Structurally a `MessageVariant`, and a `MessageRow` is one of these too, so
+ * the row can stand in for its own generation without a conversion.
+ */
+interface TranscriptGeneration {
   content: string;
-  createdAt: number;
   provenance?: { modelName: string; local: boolean };
+}
+interface MessageRow extends TranscriptGeneration {
+  role: string;
+  createdAt: number;
+  /** Every generation of this turn, including the one on display. */
+  variants?: readonly TranscriptGeneration[];
+  variantIndex?: number;
+  streaming?: boolean;
 }
 interface PersonaRow {
   id: string;
@@ -203,15 +222,33 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
 
           if (!showAll) {
             if (installed.length === 0) return ok('No models installed. `model list --all` to browse.');
+            /*
+             * ENGINE and CHAT are here because two refusals point at this
+             * command. `model use` and `bench run` both end "Try: model list",
+             * and the table they sent people to printed ID, NAME, SIZE, CTX
+             * and USES — not one of which answers "why was mine refused, and
+             * which of these would not be". A whisper-only user ran it, saw
+             * their one row, and learned nothing. A refusal whose next step
+             * cannot answer the question is the original bug wearing a
+             * politer sentence.
+             *
+             * CHAT is `canChat`, the same predicate that did the refusing, so
+             * the column cannot drift from the rule. ENGINE is the raw id
+             * because that is what `bench run` names and what the model sheet
+             * prints, and because `model list | grep llama-cpp` is the whole
+             * point of putting app verbs in a shell.
+             */
             return ok(
               table([
-                ['ID', 'NAME', 'SIZE', 'CTX', 'USES', ''],
+                ['ID', 'NAME', 'SIZE', 'CTX', 'USES', 'ENGINE', 'CHAT', ''],
                 ...installed.map((m) => [
                   m.id,
                   m.manifest.name,
                   formatBytes(m.downloadedBytes),
                   String(m.manifest.contextLength),
                   String(m.useCount),
+                  m.manifest.engine,
+                  canChat(m.manifest) ? 'yes' : 'no',
                   m.id === store.activeModelId ? '← active' : '',
                 ]),
               ]),
@@ -253,7 +290,23 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
 
         case 'use': {
           if (!id) return fail('usage: model use <id>');
-          if (store.installed[id]?.state !== 'installed') return fail(`"${id}" is not installed`);
+          const record = store.installed[id];
+          if (record?.state !== 'installed') return fail(`"${id}" is not installed`);
+
+          // The shell types an id rather than picking from a list, so it is the
+          // one selection door a filtered picker cannot close. Refuse with a
+          // non-zero status: a script that switches models and carries on
+          // should stop here, not discover the problem in the reply.
+          if (!canChat(record.manifest)) {
+            // The next step has to answer the question the refusal raises, or
+            // it is decoration: `model list` carries a CHAT column for exactly
+            // this sentence to point at.
+            return fail(
+              `"${id}" ${nonChatRole(record.manifest)} — it cannot answer a chat. ` +
+                `Try: model list — the CHAT column marks the ones that can.`,
+            );
+          }
+
           if (!(await context.confirm(`switch the active model to ${id}`))) {
             return fail('cancelled', 130);
           }
@@ -442,9 +495,27 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
 
         case 'run': {
           if (!id) return fail('usage: bench run <model-id>');
-          if (stores.models().installed[id]?.state !== 'installed') {
+          const record = stores.models().installed[id];
+          if (record?.state !== 'installed') {
             return fail(`"${id}" is not installed`);
           }
+
+          // The same door `model use` needed: the shell types an id, so the
+          // filtered picker in Benchmarks cannot close it. The benchmark is a
+          // llama.cpp harness — handing it an ONNX model's path fails inside a
+          // native plugin — so refuse with a non-zero status, before the
+          // confirmation prompt: there is nothing here worth warming the
+          // device to ask about.
+          if (!canBenchmark(record.manifest)) {
+            // Same rule as `model use` above: the command this points at prints
+            // an ENGINE column, so the reason and the next step are made of the
+            // same fact.
+            return fail(
+              `"${id}" ${nonBenchmarkableReason(record.manifest)} — it cannot be benchmarked. ` +
+                `Try: model list — the ENGINE column.`,
+            );
+          }
+
           if (!(await context.confirm(`benchmark ${id} — this will warm the device`))) {
             return fail('cancelled', 130);
           }
@@ -609,21 +680,38 @@ export function renderTranscript(
   ];
 
   for (const message of messages) {
+    // THE HEADING DESCRIBES THE TEXT UNDER IT, AND THEY COME FROM ONE VALUE.
+    //
+    // Both used to be read off the row, which was only correct while the row
+    // agreed with itself. It did not: flipping between regenerated answers
+    // moved `content` and left `provenance` behind, so this renderer wrote
+    // "## Qwen3 1.7B (on device)" over a reply that came back from OpenAI —
+    // into `chat export`, into `/chats/*.md`, and into the file the user
+    // downloads. Printing the displayed generation prints one turn.
+    // `typeof content === 'string'` is a runtime check, not a type one: this
+    // list held bare strings through v3, and a row that reached here without
+    // the v4 upgrade would otherwise print an empty turn. Falling back to the
+    // row prints the words.
+    const record =
+      message.variantIndex !== undefined && !message.streaming
+        ? message.variants?.[message.variantIndex]
+        : undefined;
+    const shown = typeof record?.content === 'string' ? record : message;
+
     const who =
       message.role === 'user'
         ? 'You'
-        : (message.provenance?.modelName ?? (message.role === 'assistant' ? 'Assistant' : message.role));
+        : (shown.provenance?.modelName ?? (message.role === 'assistant' ? 'Assistant' : message.role));
     // Provenance is preserved in the export: a transcript that hides which
-    // turns left the device would undo the point of marking them.
-    const where = message.provenance
-      ? message.provenance.local
-        ? ' (on device)'
-        : ' (remote)'
-      : '';
+    // turns left the device would undo the point of marking them. Absent is
+    // printed as absent — a generation recovered from a build that stored
+    // variants as bare strings has no recorded origin, and neither label is
+    // true of it, so it gets a bare name rather than a guess.
+    const where = shown.provenance ? (shown.provenance.local ? ' (on device)' : ' (remote)') : '';
     lines.push(
       `## ${escapeTranscriptBody(who)}${where}`,
       '',
-      escapeTranscriptBody(message.content.trim()),
+      escapeTranscriptBody(shown.content.trim()),
       '',
     );
   }

@@ -148,10 +148,160 @@ export interface ModelManifest {
   readonly bestFor?: string;
 }
 
+/**
+ * Anything that declares capabilities.
+ *
+ * Deliberately not `ModelManifest`: the shell's `model` command works from a
+ * read-only projection carrying only the fields it prints, and the rule below
+ * has no business demanding a download URL and a licence string to answer a
+ * question about capabilities. Structural, so both satisfy it.
+ */
+export interface CapabilityBearing {
+  readonly capabilities: readonly Capability[];
+}
+
+/**
+ * Can this model answer a chat turn?
+ *
+ * The rule was already being applied in two places — `install()` picking the
+ * first active model, and `remove()` picking a replacement — as a bare
+ * `capabilities.includes('text')`. Both were the paths where the APP chooses,
+ * and both were correct; every path where the USER chooses skipped it, which is
+ * how a speech model became somebody's chat model.
+ *
+ * It lives here, named, so the question is asked in one vocabulary. Note the
+ * capability is `text`: there is no `text-out`, and a check written against
+ * that name would silently reject the entire catalogue.
+ */
+export function canChat(model: CapabilityBearing): boolean {
+  return model.capabilities.includes('text');
+}
+
+/**
+ * What KIND of model this is, for someone who picked it expecting a chat.
+ *
+ * A refusal has to be actionable, and "not registered" is not. Whisper is not
+ * broken and the user did not do anything wrong — they chose the wrong kind of
+ * model for the job, and the sentence should say which kind it is.
+ *
+ * IT NAMES THE KIND; IT DOES NOT PROMISE THE FEATURE. The first draft of this
+ * function said "turns speech into text", and on the platform the report came
+ * from that is false. `@chatterang/plugin-onnx-runtime` appears in none of
+ * package.json, android/app/src/main/assets/capacitor.plugins.json,
+ * android/capacitor.settings.gradle or ios/App/CapApp-SPM/Package.swift, so
+ * `src/plugins/onnx-runtime` falls through to `registerPlugin`'s `web:`
+ * implementation — which exists only on web. Driving the real `@capacitor/core`
+ * with `androidBridge` set gives `"OnnxRuntime" plugin is not implemented on
+ * android`; every ONNX model in the catalogue is one of these. So on the phone
+ * where the bug was filed, Whisper turns speech into nothing.
+ *
+ * Replacing a false negative claim with a confident affirmative one is worse
+ * than the bug. What a model IS holds on every platform. What it will DO for
+ * you here is a per-device question this function cannot answer and does not
+ * try to; the catalogue description is where that promise belongs, next to the
+ * download button that is the only place it can be acted on.
+ *
+ * There is deliberately no `embedding` branch. `grep -rn embedding src/` finds
+ * the word exactly twice, both in this file — the `Capability` union and the
+ * branch that used to be here. No catalogue entry declares it and there is no
+ * search to index for, so "indexes text for search" described a feature that
+ * does not exist. Such a model now falls to the last line, which claims
+ * nothing.
+ */
+export function nonChatRole(model: CapabilityBearing): string {
+  if (model.capabilities.includes('audio-in')) return 'is a speech-to-text model';
+  if (model.capabilities.includes('audio-out')) return 'is a text-to-speech voice';
+  if (model.capabilities.includes('image-out')) return 'is an image generator';
+  return 'cannot hold a conversation';
+}
+
+/**
+ * Anything that declares which engine must run it.
+ *
+ * Structural for the same reason `CapabilityBearing` is: the shell's model
+ * projection carries `engine` as a plain string, and the rule below has no
+ * business demanding a whole `ModelManifest` to answer a question about one
+ * field. `string` rather than `EngineId` so that projection satisfies it —
+ * a manifest's own `engine` is already narrowed by `ModelManifest`.
+ */
+export interface EngineBearing {
+  readonly engine: string;
+}
+
+/**
+ * Engines with an on-device benchmark harness.
+ *
+ * `benchmark()` is a method on the llama.cpp plugin contract and on no other:
+ * `OnnxRuntimePlugin` has no such call, so there is nothing for the benchmark
+ * to drive. This is a list rather than an equality test because the missing
+ * piece is a harness per engine, and the next engine to grow one (litert-lm,
+ * mlc-llm) joins here rather than by editing every call site.
+ */
+export const BENCHMARKABLE_ENGINES: readonly EngineId[] = ['llama-cpp'];
+
+/**
+ * Can this model be measured by the on-device benchmark?
+ *
+ * Deliberately NOT `canChat`. The benchmark asks a different question: it
+ * loads the file through a specific native plugin and times prefill and
+ * decode, so what matters is which ENGINE will run it, not what the model
+ * emits. Two cases separate the predicates and both are real:
+ *
+ *  - `gemma-3-4b` is `['text', 'vision']` on `llama-cpp`. A vision model
+ *    llama.cpp can load is a legitimate benchmark subject, and a
+ *    capability-shaped check would have to enumerate capabilities to say so.
+ *  - A text model on `litert-lm` or `mlc-llm` would pass `canChat` and still
+ *    hand a `.litertlm` file to the llama.cpp loader.
+ *
+ * `useBench.run` calls `LlamaCpp.load({ modelPath })` unconditionally, so
+ * without this the benchmark hands Whisper's `.onnx` to the GGUF loader and
+ * fails somewhere inside a native plugin — the same class of failure as the
+ * reported chat bug, in a less legible place.
+ */
+export function canBenchmark(model: EngineBearing): boolean {
+  return (BENCHMARKABLE_ENGINES as readonly string[]).includes(model.engine);
+}
+
+/**
+ * The engines the benchmark can drive, as a phrase to put in a sentence.
+ *
+ * Derived from `BENCHMARKABLE_ENGINES` rather than typed out, so the copy
+ * cannot survive the list changing under it, and printed as the engine ID —
+ * `llama-cpp`, not "llama.cpp" — because that is the string the user can match
+ * against: the ENGINE column of `model list` and the "Engine" row of the model
+ * sheet both print the ID.
+ */
+export function benchmarkableEngineList(): string {
+  return BENCHMARKABLE_ENGINES.join(' or ');
+}
+
+/**
+ * Why a model cannot be benchmarked, in terms of the thing the user chose.
+ *
+ * Names the engine the model file is BUILT FOR, because that is the honest
+ * reason and it is printed a few rows up in the model's own detail sheet
+ * ("Engine: onnx-runtime"). The user is not being told their model is broken;
+ * they are being told the stopwatch only fits one kind of runtime.
+ *
+ * IT NAMES THE KIND; IT DOES NOT PROMISE THE MODEL RUNS — the same rule
+ * `nonChatRole` states above, and this sentence broke it. It read "runs on
+ * onnx-runtime, which has no benchmark harness", which says the model runs, on
+ * a runtime this app has, and that only the stopwatch is missing. On the
+ * platform the report came from all three halves are false: there is no native
+ * ONNX plugin on Android or iOS (see `nonChatRole` for the four files that say
+ * so), so the model runs nowhere and there is no runtime to lack a harness.
+ * "is built for X" is a fact about the file, true on every platform; the second
+ * half is a fact about the benchmark, not a promise about the model.
+ */
+export function nonBenchmarkableReason(model: EngineBearing): string {
+  return `is built for ${model.engine}, and the benchmark only measures ${benchmarkableEngineList()} models`;
+}
+
 export type PromptTemplate =
   | 'chatml'
   | 'llama3'
   | 'gemma'
+  | 'gemma4'
   | 'mistral'
   | 'phi'
   | 'qwen'

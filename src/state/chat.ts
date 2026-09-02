@@ -11,7 +11,10 @@ import { create } from 'zustand';
 import { blobToBase64 } from '@/lib/blobs';
 import { db, deleteChat } from '@/db';
 import {
+  applyVariant,
+  currentVariant,
   deriveTitle,
+  displaysUnrecorded,
   newId,
   splitThinking,
   type Attachment,
@@ -19,10 +22,16 @@ import {
   type ChatMode,
   type EgressGrant,
   type Message,
+  type MessageVariant,
   type ToolInvocation,
 } from '@/domain/chat';
 import { renderLore, renderSystemPrompt, selectLore } from '@/domain/persona';
-import { DEFAULT_SAMPLER, type SamplerSettings } from '@/domain/manifest';
+import {
+  DEFAULT_SAMPLER,
+  canChat,
+  nonChatRole,
+  type SamplerSettings,
+} from '@/domain/manifest';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 import { targetFor, type EngineTarget, type ToolEgressPolicy } from '@/ai/engine';
 import { markTainted } from '@/ai/taint';
@@ -307,7 +316,11 @@ export const useChats = create<ChatState>((set, get) => ({
     await runGeneration(set, get, {
       chatId,
       overrideModelId,
-      previousVariants: [...(target.variants ?? []), target.content].filter(Boolean),
+      // Not `target.content`. What is carried forward is the whole generation
+      // — where it ran, what tools it used, what it cost — because the text
+      // alone is what let the new turn's chip end up over the old turn's
+      // words.
+      previousVariants: generationsSoFar(target),
       replaceMessageId: target.id,
     });
     await db.messages.delete(target.id);
@@ -321,7 +334,7 @@ export const useChats = create<ChatState>((set, get) => ({
     const message = messages[index];
     if (!message) return;
 
-    const updated = { ...message, content: text };
+    const updated = editedVariant(message, text);
     await db.messages.put(updated);
 
     // Editing a user turn invalidates everything after it.
@@ -344,28 +357,78 @@ export const useChats = create<ChatState>((set, get) => ({
 
   async cycleVariant(messageId, direction) {
     const message = get().messages.find((entry) => entry.id === messageId);
-    if (!message?.variants?.length) return;
+    // A row that is still streaming has no record of its own generation yet —
+    // `done` writes one and overwrites the row wholesale — so there is nothing
+    // coherent to move between. The arrows are not rendered then either.
+    if (!message || message.streaming) return;
 
-    const all = [...message.variants, message.content];
-    const current = message.variantIndex ?? all.length - 1;
-    const next = (current + direction + all.length) % all.length;
+    const variants = message.variants;
+    if (!variants || variants.length < 2) return;
 
-    const updated: Message = {
-      ...message,
-      content: all[next] ?? message.content,
-      variantIndex: next,
-    };
+    // Clamped rather than trusted: while a regenerated turn is in flight its
+    // index points one past the end, at the generation being made.
+    const current = Math.min(message.variantIndex ?? variants.length - 1, variants.length - 1);
+    const next = (current + direction + variants.length) % variants.length;
+
+    // One call, so text and provenance cannot part company here. This is the
+    // line the defect was on.
+    const updated = applyVariant(message, next);
     await db.messages.put(updated);
     set({ messages: get().messages.map((entry) => (entry.id === messageId ? updated : entry)) });
   },
 }));
+
+/**
+ * Rewrite a message's text, keeping the row and its variant list in agreement.
+ *
+ * The third writer of `content`, and the last one that could put the row out
+ * of step with `variants[variantIndex]`. Today only user turns reach it — the
+ * edit button is rendered on the user branch alone — and a user turn has no
+ * variants, so this is the guard rather than a behaviour anyone sees.
+ *
+ * When there IS a list, the edited text replaces the generation on display and
+ * that generation becomes `unrecorded`, because it is no longer a generation:
+ * a model did not write these words, so no model may be named beside them and
+ * no tok/s claimed for them. The turn then counts as tool-derived for taint,
+ * which is the right way round — the text it was edited from may have been.
+ */
+function editedVariant(message: Message, text: string): Message {
+  const index = message.variantIndex;
+  const variants = message.variants;
+  if (!variants || index === undefined || !variants[index]) {
+    return { ...message, content: text };
+  }
+  return applyVariant(
+    {
+      ...message,
+      variants: variants.map((variant, at) =>
+        at === index ? { content: text, unrecorded: true } : variant,
+      ),
+    },
+    index,
+  );
+}
+
+/**
+ * Every generation this turn has had, oldest first.
+ *
+ * A row that has already been regenerated carries the complete list — the one
+ * on display is in it — so there is nothing to append. A row that has not is
+ * its own only generation. Empty text is dropped: a turn that failed before it
+ * wrote anything is not a version anyone can flip back to.
+ */
+function generationsSoFar(target: Message): MessageVariant[] {
+  const all = target.variants ?? [currentVariant(target)];
+  return all.filter((variant) => variant.content.length > 0);
+}
 
 /* ── Generation ─────────────────────────────────────────────────────── */
 
 interface RunOptions {
   chatId: string;
   overrideModelId?: string;
-  previousVariants?: string[];
+  /** Complete generations this turn has already had — see `generationsSoFar`. */
+  previousVariants?: MessageVariant[];
   replaceMessageId?: string;
 }
 
@@ -384,11 +447,20 @@ async function runGeneration(
   const chat = get().chats.find((entry) => entry.id === options.chatId);
   if (!chat) return;
 
-  const target = resolveTarget(chat, options.overrideModelId);
-  if (!target) {
+  const choice = resolveTarget(chat, options.overrideModelId);
+  if (choice.kind === 'none') {
     app.toast('Choose a model first — none is installed or connected yet.', 'warn');
     return;
   }
+  if (choice.kind === 'refused') {
+    // Refused before anything is spent: no placeholder message, no activity
+    // spinner, and no `noteUse` — a turn that never ran is not a use of the
+    // model, and counting it would push a speech model up the "recently used"
+    // ordering that the pickers sort by.
+    app.toast(choice.message, 'warn');
+    return;
+  }
+  const { target } = choice;
 
   const controller = new AbortController();
   const placeholder: Message = {
@@ -399,6 +471,8 @@ async function runGeneration(
     createdAt: Date.now(),
     streaming: true,
     variants: options.previousVariants,
+    // One past the end while this generation is being made: the row IS the
+    // generation, and its record is appended by `done`.
     variantIndex: options.previousVariants?.length,
   };
 
@@ -517,12 +591,12 @@ async function runGeneration(
           }
 
           const split = splitThinking(event.text || raw);
-          const finished: Message = {
-            ...placeholder,
+          // The generation is assembled as ONE value and then projected onto
+          // the row, so the row cannot end up holding half of it.
+          const own: MessageVariant = {
             content: split.content.trim(),
             thinking: split.thinking || undefined,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            streaming: false,
             provenance: {
               backendId: event.provenance.backendId,
               engine: event.provenance.engine,
@@ -534,6 +608,22 @@ async function runGeneration(
               toolEgress: event.provenance.toolEgress,
             },
             stats: event.stats,
+          };
+          // A first generation needs no list; a regenerated one appends itself
+          // to the generations it was asked to replace.
+          const variants = options.previousVariants
+            ? [...options.previousVariants, own]
+            : undefined;
+          const finished: Message = {
+            ...placeholder,
+            content: own.content,
+            thinking: own.thinking,
+            toolCalls: own.toolCalls,
+            provenance: own.provenance,
+            stats: own.stats,
+            streaming: false,
+            variants,
+            variantIndex: variants ? variants.length - 1 : undefined,
           };
           await db.messages.put(finished);
           patch(() => finished);
@@ -632,8 +722,22 @@ function egressPolicy(chatId: string): ToolEgressPolicy {
   };
 }
 
+/**
+ * What `resolveTarget` concluded.
+ *
+ * "No target" and "that model cannot do this" are different answers and used to
+ * share a `null`. Collapsing them meant the only thing the caller could say was
+ * "none is installed or connected yet" — which is false when a model IS
+ * installed and simply cannot write, so the code instead said nothing and let
+ * the request reach the router. Naming the refusal is what lets it be spoken.
+ */
+type TargetChoice =
+  | { readonly kind: 'target'; readonly target: EngineTarget }
+  | { readonly kind: 'refused'; readonly message: string }
+  | { readonly kind: 'none' };
+
 /** Decide which backend and model serve this chat. */
-function resolveTarget(chat: Chat, overrideModelId?: string): EngineTarget | null {
+function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
   const models = useModels.getState();
   const app = useApp.getState();
   const modelId = overrideModelId ?? chat.modelId ?? models.activeModelId;
@@ -641,7 +745,36 @@ function resolveTarget(chat: Chat, overrideModelId?: string): EngineTarget | nul
   if (modelId) {
     const installed = models.installed[modelId];
     if (installed?.state === 'installed') {
-      return targetFor(installed.manifest.engine, modelId, installed.manifest.name);
+      const { manifest } = installed;
+
+      /*
+       * THE BACKSTOP, AND WHY IT IS NOT REDUNDANT.
+       *
+       * The pickers no longer offer a model that cannot chat, so nobody should
+       * reach this. Three things still can. `chat.modelId` is persisted per
+       * conversation and a chat created by an older build keeps its choice; a
+       * persona's `preferredModelId` is persisted the same way and is copied
+       * into new chats at `newChat`; and `regenerate` passes an
+       * `overrideModelId` straight through. None of those pass a picker.
+       *
+       * It matters that the refusal happens HERE and not one layer down. The
+       * engine treats a local failure as grounds to divert to the configured
+       * cloud provider — measured: a registration error is classified
+       * `engine-error`, and the turn is re-run against the remote, so the
+       * user's message leaves the device and a cloud answer comes back over a
+       * model they picked precisely because it was local. Refusing before the
+       * engine is called means there is no failure to divert.
+       */
+      if (!canChat(manifest)) {
+        return {
+          kind: 'refused',
+          message:
+            `${manifest.name} ${nonChatRole(manifest)} — it cannot answer a chat. ` +
+            `Choose a model that writes text, then send this again.`,
+        };
+      }
+
+      return { kind: 'target', target: targetFor(manifest.engine, modelId, manifest.name) };
     }
   }
 
@@ -649,15 +782,18 @@ function resolveTarget(chat: Chat, overrideModelId?: string): EngineTarget | nul
   const connection = app.connections.find((entry) => entry.enabled);
   if (connection) {
     return {
-      backendId: connection.id,
-      engine: 'remote',
-      modelId: connection.defaultModel,
-      modelName: `${connection.label} · ${connection.defaultModel}`,
-      local: false,
+      kind: 'target',
+      target: {
+        backendId: connection.id,
+        engine: 'remote',
+        modelId: connection.defaultModel,
+        modelName: `${connection.label} · ${connection.defaultModel}`,
+        local: false,
+      },
     };
   }
 
-  return null;
+  return { kind: 'none' };
 }
 
 /** The model's context window, or a conservative default when unknown. */
@@ -739,7 +875,23 @@ export async function buildMessages(
     // its visible answer, then switch to a remote model — by then there is no
     // tool_result block anywhere in the history and the summary goes out
     // unremarked.
-    const derived = message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0;
+    //
+    // `toolCalls` is read off the ROW, and the row is a projection of the
+    // generation on display — `applyVariant` moves the tool list with the text
+    // it belongs to. Before variants carried their own, `regenerate` moved
+    // tool-derived TEXT onto a row whose `toolCalls` belonged to the new turn,
+    // so cycling back to the old text produced an unmarked history and the
+    // bytes reached a remote adapter with no sheet. That is the A8 residual,
+    // and it is closed by the projection rather than by a rule here.
+    //
+    // `displaysUnrecorded` is the one thing the projection cannot supply: a
+    // generation recovered from a build that stored variants as bare strings
+    // has no tool list to move, and an absent list must not read as "no tools
+    // ran". Unknown fails closed here, and silent — no chip — where it is only
+    // a label.
+    const derived =
+      message.role === 'assistant' &&
+      ((message.toolCalls?.length ?? 0) > 0 || displaysUnrecorded(message));
     const carry = (built: IRMessage): IRMessage => (derived ? markTainted(built) : built);
 
     const images = (message.attachments ?? []).filter(

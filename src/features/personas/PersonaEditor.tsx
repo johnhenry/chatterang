@@ -1,11 +1,14 @@
 import { useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
+import type { InstalledModel } from '@/db';
 import { Icon } from '@/ui/Icon';
 import { Segmented, Sheet } from '@/ui/primitives';
 import type { CharacterBook, LoreEntry, Persona, PersonaDraft } from '@/domain/persona';
 import { newId } from '@/domain/chat';
-import { useModels, installedModels } from '@/state/models';
+import { catalogEntry } from '@/data/catalog';
+import { canChat, nonChatRole } from '@/domain/manifest';
+import { useModels, chatModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
 import { toolRegistry } from '@/ai/tools/registry';
 import { Avatar } from '@/features/personas/Avatar';
@@ -24,7 +27,8 @@ export function PersonaEditor({
   persona: Persona | null;
   onClose: () => void;
 }): ReactNode {
-  const models = useModels(useShallow(installedModels));
+  const models = useModels(useShallow(chatModels));
+  const installedById = useModels((state) => state.installed);
 
   const [draft, setDraft] = useState<PersonaDraft>(
     persona ?? {
@@ -45,6 +49,42 @@ export function PersonaEditor({
 
   const isCharacter = draft.kind === 'character';
   const canSave = draft.name.trim().length > 0;
+
+  /*
+   * A PREFERENCE THE LIST ABOVE CANNOT SHOW.
+   *
+   * `chatModels` narrows to installed models that can answer, which is the
+   * right list to CHOOSE from — but `draft.preferredModelId` is a value that
+   * already exists, and a `<select>` whose value matches no option silently
+   * falls back to its first one. Measured with react-dom before this branch
+   * existed, on a persona holding `whisper-tiny-en-onnx`:
+   *
+   *     options            : ["|Whatever is active", "qwen3-4b…|Qwen3 4B Instruct"]
+   *     select.value       : ""      selectedIndex: 0
+   *     DISPLAYED LABEL    : "Whatever is active"
+   *     persisted value    : "whisper-tiny-en-onnx"
+   *
+   * The control stated the opposite of the record, on the one screen someone
+   * opens to find out why their chats refuse — and Save writes `draft`
+   * wholesale, so editing any other field re-persisted the hidden id verbatim.
+   *
+   * So a stranded id gets an option of its own that says why it is not in the
+   * list. The two reasons are different and are not merged:
+   *
+   *  - INSTALLED BUT CANNOT ANSWER — the reported bug. It can never work, and
+   *    the option names the role, the same sentence every other refusal on
+   *    this path uses.
+   *  - NOT INSTALLED — a model that has not been downloaded (or not yet
+   *    finished). The id is still meaningful, so it is shown, not discarded.
+   *
+   * Nothing is rewritten behind the user's back: the draft is their record,
+   * and this makes the control describe it truthfully and let them change it.
+   */
+  const preferredId = draft.preferredModelId ?? '';
+  const strandedPreference =
+    preferredId && !models.some((model) => model.id === preferredId)
+      ? { id: preferredId, label: strandedLabel(installedById[preferredId], preferredId) }
+      : null;
 
   return (
     <Sheet
@@ -220,7 +260,7 @@ export function PersonaEditor({
             <select
               id="persona-model"
               className="select"
-              value={draft.preferredModelId ?? ''}
+              value={preferredId}
               onChange={(event) => set('preferredModelId', event.target.value || undefined)}
             >
               <option value="">Whatever is active</option>
@@ -229,10 +269,50 @@ export function PersonaEditor({
                   {model.manifest.name}
                 </option>
               ))}
+              {/*
+                DISABLED, for the reason the chat sheet's orphan option is.
+
+                Selectedness and selectability are different things: the option
+                exists so the control can DISPLAY a value the list cannot
+                offer, and `value=` still lands on it while `disabled` keeps it
+                out of the user's reach. Without that, this control hands back
+                the very model it just told them cannot chat — one click on the
+                sheet that exists to explain the refusal re-creates it.
+              */}
+              {strandedPreference ? (
+                <option key={strandedPreference.id} value={strandedPreference.id} disabled>
+                  {strandedPreference.label}
+                </option>
+              ) : null}
             </select>
             <span className="field__hint">
-              Used when a chat starts with this persona. If the model is not installed, the active
-              one is used instead.
+              {strandedPreference
+                ? 'This persona still points at the model above, and every new chat it starts ' +
+                  'inherits it. Pick one from the list to fix that, then save.'
+                : /*
+                   * WHERE THE TURN GOES, MEASURED RATHER THAN GUESSED.
+                   *
+                   * Two earlier sentences stood here. "If the model is not
+                   * installed, the active one is used instead." is false:
+                   * `newChat` copies this id into `chat.modelId`, and
+                   * `resolveTarget` reads `chat.modelId ?? activeModelId`, so a
+                   * set-but-uninstalled id short-circuits the active model. Its
+                   * replacement — "it leaves the new chat with nothing to send
+                   * to" — is false in the direction that matters most here:
+                   * `resolveTarget` misses the id in `models.installed`, drops
+                   * out of the whole `if (modelId)` block, and falls through to
+                   * `app.connections.find(entry => entry.enabled)`. Measured end
+                   * to end with a recording engine, the turn was dispatched to
+                   * `conn_openai` — it left the device, on a persona pointing at
+                   * a local model.
+                   *
+                   * So the sentence names the provider route and stops there.
+                   * It does not say "off this device": `ollama` and `lmstudio`
+                   * are connections too, and default to localhost.
+                   */
+                  'Used when a chat starts with this persona. A preference that is not installed ' +
+                  'does not fall back to the active model — the turn goes to the first provider ' +
+                  'you have enabled instead, and is refused if you have none.'}
             </span>
           </div>
 
@@ -294,6 +374,35 @@ export function PersonaEditor({
       </div>
     </Sheet>
   );
+}
+
+/**
+ * Why a preferred model is missing from the picker, in the option's own text.
+ *
+ * The record is the evidence: `chatModels` drops a model for exactly two
+ * reasons, and they need different sentences. "Not installed" covers a model
+ * that was removed, was never downloaded, or is mid-download — from this
+ * screen those are the same fact, that there is no file to run. A model that
+ * IS installed and still missing from the list can only have failed
+ * `canChat`, and that one gets the role sentence, so the person reading it
+ * learns what they picked rather than only that it is unavailable.
+ *
+ * `canChat` is re-checked rather than assumed from the caller's `models.some`
+ * miss: it keeps this label honest if `chatModels` ever narrows on something
+ * else as well, in which case the fall-through says the neutral thing.
+ *
+ * The role reads as a clause, not as an appositive: `nonChatRole` returns a
+ * PREDICATE ("is a speech-to-text model"), so an em dash in front of it gives
+ * "Whisper Tiny (English) — is a speech-to-text model" against the plain
+ * "Whisper Tiny (English) is a speech-to-text model" that `orphanOption` and
+ * the chat refusal both compose. The dash stays on the branches whose tail is
+ * a noun phrase, which is what a dash is for.
+ */
+function strandedLabel(record: InstalledModel | undefined, modelId: string): string {
+  const name = record?.manifest.name ?? catalogEntry(modelId)?.name ?? modelId;
+  if (!record || record.state !== 'installed') return `${name} — not installed`;
+  if (!canChat(record.manifest)) return `${name} ${nonChatRole(record.manifest)}`;
+  return `${name} — unavailable`;
 }
 
 function LoreEditor({

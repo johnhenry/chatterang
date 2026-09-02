@@ -13,7 +13,7 @@
  * all.
  */
 
-import type { ModelManifest } from '@/domain/manifest';
+import { canChat, type ModelManifest } from '@/domain/manifest';
 
 export interface DeviceFit {
   readonly manifest: ModelManifest;
@@ -37,9 +37,26 @@ export function recommendModel(
   catalog: readonly ModelManifest[],
   totalMemory: number | undefined,
 ): DeviceFit | null {
-  if (catalog.length === 0) return null;
+  /*
+   * ONLY MODELS THAT CAN ANSWER. This function's whole job is naming the one
+   * model a new user should download in order to start chatting, and it used to
+   * rank the entire catalogue by size alone.
+   *
+   * That is not a hypothetical. The two smallest entries in the catalogue are a
+   * text-to-speech voice (63.2 MB) and a speech recogniser (64.3 MB), and the
+   * "no device profile" branch below picks the smallest — so a device whose
+   * llama.cpp plugin cannot report its memory, which is exactly an emulator,
+   * was offered "Start with Amy (neural voice, US English)" as its language
+   * model. Measured across memory sizes: the unknown-memory branch was the only
+   * one that picked a non-chat model, and it is the branch an emulator lands on.
+   *
+   * Filtering the candidates rather than checking the winner is the point: the
+   * ranking below cannot pick something wrong if the wrong things are not in it.
+   */
+  const candidates = catalog.filter(canChat);
+  if (candidates.length === 0) return null;
 
-  const bySizeDesc = [...catalog].sort((a, b) => b.sizeBytes - a.sizeBytes);
+  const bySizeDesc = [...candidates].sort((a, b) => b.sizeBytes - a.sizeBytes);
 
   // Without a device profile — the web shim, or before the plugin has
   // reported — recommend the smallest rather than guessing high. Being wrong

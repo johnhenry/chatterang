@@ -9,6 +9,9 @@ import { db, type InstalledModel, type InstallState } from '@/db';
 import { CATALOG } from '@/data/catalog';
 import {
   DEFAULT_SAMPLER,
+  canBenchmark,
+  canChat,
+  nonChatRole,
   type Capability,
   type ModelManifest,
   type SamplerSettings,
@@ -55,8 +58,17 @@ export const useModels = create<ModelState>((set, get) => ({
     const installed: Record<string, InstalledModel> = {};
     for (const row of rows) installed[row.id] = row;
 
-    const activeModelId =
+    const stored =
       (await db.settings.get('activeModelId'))?.value as string | undefined ?? null;
+
+    // A build before the selection rule existed could persist a speech model
+    // here, and this read puts it straight back into service without passing
+    // `setActive`. Drop it rather than carry somebody's broken chat across an
+    // upgrade; an unknown id is left alone, since it is only a model that has
+    // not been re-installed yet — `install()` re-runs this check when it comes
+    // back, which is the half this read cannot cover.
+    const storedManifest = stored ? installed[stored]?.manifest : undefined;
+    const activeModelId = storedManifest && !canChat(storedManifest) ? null : stored;
 
     set({
       loaded: true,
@@ -64,6 +76,23 @@ export const useModels = create<ModelState>((set, get) => ({
       activeModelId,
       storage: await storageEstimate(downloadedBytes(installed)),
     });
+
+    /*
+     * AND WRITE THE DECISION DOWN.
+     *
+     * Rejecting the id in memory alone leaves IndexedDB holding a value the
+     * app has already ruled invalid: every boot reads the speech model back,
+     * re-derives the same null, and the row outlives the reasoning. Benign
+     * while this store is the only reader, which is why it is easy to leave —
+     * but "the database disagrees with the app about what is valid" is the
+     * kind of state the next reader of that row inherits silently.
+     *
+     * Guarded on an actual change so the ordinary boot — a stored id that is
+     * fine, or no stored id at all — does not write on every load.
+     */
+    if (activeModelId !== stored) {
+      await db.settings.put({ key: 'activeModelId', value: activeModelId });
+    }
   },
 
   async install(manifest) {
@@ -113,9 +142,29 @@ export const useModels = create<ModelState>((set, get) => ({
 
       toast(`${manifest.name} is ready.`, 'good');
 
+      /*
+       * THE OTHER HALF OF `load()`'s MIGRATION.
+       *
+       * `load()` deliberately leaves an id it does not recognise alone, since
+       * an unknown id is a model that has merely not been re-installed. That
+       * is right, and it leaves a gap: the id is only unrecognised BECAUSE
+       * the model was absent, so the capability check never ran. Re-install
+       * that model and the record appears with the stale id already active —
+       * and nothing re-checks it, because the branch below only fires when
+       * there is no active model at all.
+       *
+       * This is the moment the manifest becomes knowable, so it is the moment
+       * to judge it. Going through `setActive(null)` rather than `set` keeps
+       * the persisted row in step, which is the whole point of the write in
+       * `load()`.
+       */
+      if (get().activeModelId === manifest.id && !canChat(manifest)) {
+        await get().setActive(null);
+      }
+
       // First installed model becomes the active one, so a new user can chat
       // immediately rather than hunting for a picker.
-      if (!get().activeModelId && manifest.capabilities.includes('text')) {
+      if (!get().activeModelId && canChat(manifest)) {
         await get().setActive(manifest.id);
       }
     } catch (error) {
@@ -189,7 +238,7 @@ export const useModels = create<ModelState>((set, get) => ({
 
     if (get().activeModelId === modelId) {
       const next = Object.values(get().installed).find(
-        (entry) => entry.state === 'installed' && entry.manifest.capabilities.includes('text'),
+        (entry) => entry.state === 'installed' && canChat(entry.manifest),
       );
       await get().setActive(next?.id ?? null);
     }
@@ -198,7 +247,37 @@ export const useModels = create<ModelState>((set, get) => ({
     void get().refreshStorage();
   },
 
+  /**
+   * Choose the model for new chats.
+   *
+   * THE REFUSAL, AT THE POINT SOMEBODY CAN ACT ON IT. A user picked "Whisper
+   * Tiny" here, sent a message, and was told `Requested backend 'onnx-runtime'
+   * is not registered. Registered backends: llama-cpp` — aimatey's sentence,
+   * four layers away, about a router registration table. It is true, it failed
+   * closed, and it is unusable: it names neither the model they picked nor
+   * anything they could do next.
+   *
+   * The pickers no longer offer a model that cannot chat (`chatModels` below),
+   * so in the app this branch is unreachable. It is kept because `setActive`
+   * also takes ids that never passed through a picker: `model use <id>` in the
+   * shell types one, and `load()` reads one back from IndexedDB that an older
+   * build persisted. Those are exactly the cases a rendering change cannot fix.
+   */
   async setActive(modelId) {
+    if (modelId) {
+      const manifest = get().installed[modelId]?.manifest;
+      if (manifest && !canChat(manifest)) {
+        useApp
+          .getState()
+          .toast(
+            `${manifest.name} ${nonChatRole(manifest)} — it cannot answer a chat. ` +
+              `Pick a model that writes text.`,
+            'warn',
+          );
+        return;
+      }
+    }
+
     set({ activeModelId: modelId });
     await db.settings.put({ key: 'activeModelId', value: modelId });
   },
@@ -268,6 +347,36 @@ export function modelsWith(state: ModelState, capability: Capability): Installed
   return installedModels(state).filter((model) =>
     model.manifest.capabilities.includes(capability),
   );
+}
+
+/**
+ * The models that can be chosen for a chat.
+ *
+ * Every OTHER consumer surface already filters by what it needs — the voice
+ * picker asks for `audio-out`, dictation for `audio-in`, the studio for
+ * `image-out`, the draft picker for `draft`. Chat was the one surface that
+ * asked for "everything installed" and then discovered four layers later that
+ * it had been handed a text-to-speech voice.
+ *
+ * Using this instead of `installedModels` is the real fix: a model that cannot
+ * answer is not refused, it is never offered, so the refusal below it is a
+ * backstop rather than the user's first encounter with the rule.
+ */
+export function chatModels(state: ModelState): InstalledModel[] {
+  return installedModels(state).filter((model) => canChat(model.manifest));
+}
+
+/**
+ * The models the on-device benchmark can actually measure.
+ *
+ * The sibling of `chatModels`, and needed for the same reason: the benchmark
+ * picker asked for "everything installed" and then handed a `.onnx` path to
+ * the llama.cpp loader. Note it filters on ENGINE, not capability — see
+ * `canBenchmark`; a vision model llama.cpp can load belongs in this list and a
+ * text model on another runtime does not.
+ */
+export function benchmarkModels(state: ModelState): InstalledModel[] {
+  return installedModels(state).filter((model) => canBenchmark(model.manifest));
 }
 
 export function installStateOf(state: ModelState, modelId: string): InstallState {

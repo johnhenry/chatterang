@@ -51,7 +51,12 @@
  */
 
 import type { PromptTemplate } from '@/domain/manifest';
-import { SUBSTITUTE, encodeUntrusted, isTainted } from '@/ai/taint';
+import {
+  encodeUntrusted,
+  isTainted,
+  replaceThroughFolds,
+  substituteStructural,
+} from '@/ai/taint';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 
 /* ── Control-marker escaping ─────────────────────────────────────────── */
@@ -68,9 +73,52 @@ import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
  */
 const CONTROL_MARKERS: readonly RegExp[] = [
   // `<|im_start|>`, `<|eot_id|>`, `<|end_header_id|>`, `<|user|>`, `<|end|>` …
-  // ChatML, Llama 3, Phi and Zephyr all live in this one shape.
-  /<\|[^|<>\n]{1,40}\|>/g,
-  // Gemma's turn markers, and the Mistral/Zephyr sentence tokens.
+  // ChatML, Llama 3, Phi and Zephyr all live in this one shape. The closing
+  // `|` is optional because Gemma 4 opens its markers `<|turn>`, `<|channel>`,
+  // `<|tool_call>` — pipe on the left only.
+  //
+  // Whitespace is excluded for the same reason the mirror below is restricted
+  // to marker-name characters: it is the same bug, on this pattern. Making the
+  // closing `|` optional changed what BOUNDS this pattern. It used to run from
+  // `<|` to the rare terminator `|>`; it now runs from `<|` to the next `>`,
+  // and `<|` cannot carry that alone — it is F#'s backward pipe and Haskell's
+  // `Data.Sequence (<|)`. So `ignore <| f x > 0` matched `<| f x >` and reached
+  // the model as `ignore ‹∣ f x › 0`; twelve of twelve realistic `<|` snippets
+  // were mangled, and with whitespace excluded none are. No marker is lost:
+  // none of the 33 measured across ChatML, Llama 3, Phi, Zephyr, GPT-OSS
+  // harmony, DeepSeek, Qwen FIM and Gemma 4 contains whitespace. DeepSeek's
+  // `<|begin▁of▁sentence|>` survives — U+2581 is not `\s`.
+  //
+  // `‹∣›` are excluded because they are what `widen` PRODUCES for `<`, `|` and
+  // `>`. Without them an escaped marker is a legal interior for an unescaped
+  // outer one and the function is not idempotent: `<|a<|b|>c|>` gives
+  // `<|a‹∣b∣›c|>` on the first pass and `‹∣a‹∣b∣›c∣›` on the second. Excluding
+  // them makes escaped text a fixed point, measured over every string up to
+  // length 11 in `tests/prompt.test.ts` rather than argued for here.
+  /<\|[^|<>\s‹∣›]{1,40}\|?>/g,
+  // The mirror image: `<turn|>`, `<channel|>`, `<tool_response|>`, `<image|>`.
+  // Gemma 4 CLOSES with the pipe on the right, and `<turn|>` is its EOG token,
+  // so a body that could spell it could end the turn it is sitting in.
+  //
+  // The class is marker-name characters ONLY — not "anything but a bracket".
+  // That distinction is the whole correctness of this line. `|>` is the
+  // pipeline operator in F#, Elixir and OCaml, and `<` is a comparison in
+  // every language there is, so a loose class here has two common characters
+  // to run between. Neither pattern can afford a loose class — the one above
+  // is bounded by a `>` that is just as common, which is why it excludes
+  // whitespace.
+  //
+  // With a loose class this pattern ran from an unrelated `<` across the
+  // intervening text to a distant `|>`: `a < b |> c` matched `< b |>` and
+  // reached the model as `a ‹ b ∣› c`. Measured that way before this class was
+  // narrowed — nine of twelve realistic pipeline snippets were being mangled.
+  //
+  // Requiring `[A-Za-z0-9_]` loses no marker: every mirror-shaped marker in
+  // Gemma 4's vocabulary (`turn`, `channel`, `tool`, `tool_call`,
+  // `tool_response`, `image`, `audio`, `video`) is a bare identifier, and a
+  // body that spells `<turn |>` with a space has not spelled token 106.
+  /<[A-Za-z0-9_]{1,40}\|>/g,
+  // Gemma 2/3's turn markers, and the Mistral/Zephyr sentence tokens.
   /<\/?(?:s|start_of_turn|end_of_turn|begin_of_text|end_of_text)>/g,
   // Mistral instruction brackets.
   /\[\/?INST\]/gi,
@@ -82,22 +130,68 @@ const CONTROL_MARKERS: readonly RegExp[] = [
   /^[ \t]*(?:USER|ASSISTANT|SYSTEM)[ \t]*:/gm,
 ];
 
-/** Neutralise one matched marker, character by character. */
+/**
+ * Neutralise one matched marker, character by character.
+ *
+ * Delegates to `ai/taint.ts` rather than mapping `SUBSTITUTE` itself, because
+ * the span handed here is no longer guaranteed to be ASCII: a marker spelled
+ * `＜｜turn＞` is matched through the fold projection (see
+ * {@link escapeControlMarkers}) and it is those fullwidth bytes that have to be
+ * replaced. `substituteStructural` covers both tables — the seven structural
+ * characters and the seventeen that fold into them — and that second table is
+ * the one a copy here would drift from.
+ */
 function widen(marker: string): string {
-  return Array.from(marker, (character) => SUBSTITUTE[character] ?? character).join('');
+  return substituteStructural(marker);
 }
 
 /**
  * Make text that cannot open or close a turn in any template this file ships.
  *
  * Exported for tests and for anything else that has to put model-influenced
- * text into a prompt-shaped string. Idempotent: escaped text contains no
- * marker, so a second pass is a no-op.
+ * text into a prompt-shaped string.
+ *
+ * Idempotent, though not for the obvious reason. "Escaped text contains no
+ * marker" holds only because each pattern's interior class also excludes the
+ * characters {@link widen} produces; without that, an escaped INNER marker is
+ * a legal interior for an unescaped outer one, and `<|a<|b|>c|>` escapes
+ * further on every pass. `tests/prompt.test.ts` measures the fixed point over
+ * every string up to length 11 in the alphabet that can express one.
+ *
+ * ## Why the matching does not happen against `text`
+ *
+ * The patterns above are ASCII literals, and a marker does not have to be
+ * spelled in ASCII to arrive as one. `＜｜turn＞` is three fullwidth code points
+ * around `turn`; `'＜｜turn＞'.normalize('NFKC')` is `'<|turn>'`, and NFKC is
+ * what a SentencePiece tokeniser configured with `nmt_nfkc` — the default —
+ * applies before it looks a token up. Measured over a sweep built mechanically
+ * by respelling every marker these patterns cover with the fullwidth form of
+ * each of `< > | [ ] # :`: the ASCII-literal escaper blocked NONE of them,
+ * while {@link encodeUntrusted} blocked all of them. Partial disguises worked
+ * too — `<｜turn>`, `＜|turn>`, `<|turn＞`, `﹤|turn>` each fold to the marker.
+ * End to end, one user message rendered a prompt whose literal marker counts
+ * looked benign and which after NFKC carried a forged system turn plus a
+ * pre-filled model turn. `tests/taint.test.ts` runs that sweep.
+ *
+ * The two obvious repairs are both wrong. Adding fullwidth spellings to the
+ * patterns writes a second table beside the exhaustive one in `ai/taint.ts`,
+ * for it to drift from. Normalising the text before escaping fixes the matching
+ * and corrupts the output: this escaper is a denylist BECAUSE user-authored
+ * bytes have to arrive intact, so it may not rewrite a line of Japanese to get
+ * at a marker that is not in it.
+ *
+ * So matching happens against a projection of the text — what a normalising
+ * tokeniser will read — and rewriting happens against the original characters
+ * the match came from. {@link replaceThroughFolds} owns that, in `ai/taint.ts`
+ * beside the fold table rather than here beside the markers. A fullwidth marker
+ * is matched and its own bytes are replaced; a fullwidth character that is not
+ * part of a marker is never touched. On text that is its own projection — every
+ * pure-ASCII string, so every assertion in `tests/prompt.test.ts` about prose
+ * and pipeline operators — this is byte for byte the `String.replace` loop it
+ * used to be.
  */
 export function escapeControlMarkers(text: string): string {
-  let out = text;
-  for (const pattern of CONTROL_MARKERS) out = out.replace(pattern, widen);
-  return out;
+  return replaceThroughFolds(text, CONTROL_MARKERS, widen);
 }
 
 /* ── Sanitised messages ──────────────────────────────────────────────── */
@@ -274,6 +368,79 @@ const gemma: TemplateSpec = {
   },
 };
 
+/**
+ * Gemma 4 — a different marker family from Gemma 2/3, not a newer dialect.
+ *
+ * Read out of `gemma-4-12B-it-QAT-Q4_0.gguf` (`general.architecture =
+ * "gemma4"`), both its `tokenizer.chat_template` and its 262144-entry
+ * `tokenizer.ggml.tokens`, rather than guessed from the family name:
+ *
+ * - `<|turn>` is token 105 and `<turn|>` is token 106; `<turn|>` is the EOG.
+ * - `<start_of_turn>` and `<end_of_turn>` are NOT IN THE VOCABULARY AT ALL —
+ *   `tokens.indexOf` returns -1 for both, so the {@link gemma} spec's markers
+ *   reach this model as seven ordinary text tokens each. That is not a
+ *   near-miss that degrades politely; the measured answer to "What is the
+ *   capital city of Australia?" was "Australia's capital city of Australia's
+ *   capital city of" with the Gemma 2/3 markers and "Canberra" with these.
+ *
+ * The newline after each marker is ordinary text — `<|turn>model\n` and
+ * `<turn|>\n` are not themselves single tokens, only the bracketed parts are —
+ * so the turns concatenate with no separator rather than joining on `\n`.
+ *
+ * ## Gemma 4 HAS a system turn, and this is the one place it diverges from Gemma
+ *
+ * {@link gemma} folds system content into the first user turn because Gemma 2/3
+ * has no system role. Gemma 4 does: its canonical template emits a literal
+ * `<|turn>system\n` block. Copying the fold would have been the safe-looking
+ * choice and the wrong one. As in the canonical template the system content is
+ * hoisted to a single leading turn, so two system messages cannot produce two
+ * system blocks in the middle of a conversation.
+ *
+ * ## Why the prompt ends in an opened-and-closed thought channel
+ *
+ * The canonical template's `add_generation_prompt` branch emits `<|turn>model\n`
+ * and then, when `enable_thinking` is false — which is its default —
+ * `<|channel>thought\n<channel|>`. That is an EMPTY thought channel, opened and
+ * immediately closed: it tells the model its thinking is already done.
+ *
+ * It belongs in the rendered prompt, not in a runtime flag, for three reasons.
+ * Templates are applied here and nowhere else (see this file's header), so no
+ * other layer could add it. This app has no thinking toggle to read. And
+ * `splitThinking` in `domain/chat.ts` recognises `<think>`/`<thinking>`/
+ * `<reasoning>` and NOT `<|channel>`, so a model left free to open its own
+ * thought channel would have its reasoning rendered to the user as the answer.
+ * If a thinking toggle is ever added, this is the line it has to reach — and
+ * enabling thinking also means emitting `<|think|>\n` at the top of the system
+ * turn, which is why the toggle is a spec-shape change rather than a flag here.
+ *
+ * No BOS: `tokenizer.ggml.add_bos_token` is true and the engines tokenize the
+ * rendered prompt with `addSpecial: true`, so the vocabulary prepends its own.
+ */
+const gemma4: TemplateSpec = {
+  label: 'Gemma 4',
+  // Both are single tokens (106 and 105), which also makes them usable as the
+  // `templateMarkers` vocabulary probe the engines run at load time.
+  stopSequences: ['<turn|>', '<|turn>'],
+  render(messages) {
+    const system = messages
+      .filter((message) => message.role === 'system')
+      .map(messageText)
+      .join('\n\n');
+    const turns = messages.filter((message) => message.role !== 'system');
+
+    let output = system ? `<|turn>system\n${system}<turn|>\n` : '';
+    for (const message of turns) {
+      // Only these three role names are ever emitted. The canonical template
+      // wraps tool output in `<|tool_response>` blocks inside the model turn,
+      // machinery a text-only renderer does not model, so tool content folds
+      // into a user turn — the same conservative choice `gemma` makes.
+      const role = message.role === 'assistant' ? 'model' : 'user';
+      output += `<|turn>${role}\n${messageText(message)}<turn|>\n`;
+    }
+    return `${output}<|turn>model\n<|channel>thought\n<channel|>`;
+  },
+};
+
 const mistral: TemplateSpec = {
   label: 'Mistral',
   stopSequences: ['</s>', '[INST]'],
@@ -357,6 +524,7 @@ const TEMPLATES: Record<PromptTemplate, TemplateSpec> = {
   chatml,
   llama3,
   gemma,
+  gemma4,
   mistral,
   phi,
   qwen: chatml, // Qwen ships ChatML
@@ -410,6 +578,25 @@ export function templateLabel(template: PromptTemplate): string {
 export function inferTemplate(modelId: string): PromptTemplate {
   const id = modelId.toLowerCase();
   if (id.includes('llama-3') || id.includes('llama3')) return 'llama3';
+  /*
+   * Gemma 4 before Gemma, because `includes('gemma')` matches both.
+   *
+   * This is a guess from a string, as the doc comment above admits, so it is
+   * written to fail towards `gemma` — the wrong-but-old answer — rather than
+   * towards `gemma4`. Two lookarounds do that work:
+   *
+   * - a digit after the 4 means the 4 was the first digit of a size, so
+   *   `gemma-44b` stays `gemma`;
+   * - a `b` after the 4 means the 4 WAS the size, so `gemma-4b` stays `gemma`.
+   *
+   * And requiring the 4 to sit immediately after `gemma` plus at most one
+   * separator is what keeps `gemma-3-4b-it-q4km` — the id the shipping
+   * catalogue entry uses, which contains three 4s — on `gemma`: its 4s are
+   * preceded by `3-`, `b-it-q` and `m`, never by `gemma`.
+   *
+   * Matches: `gemma-4-12b-it-qat`, `gemma4-12b`, `google/gemma-4`, `gemma_4`.
+   */
+  if (/gemma[-_. ]?4(?![0-9b])/.test(id)) return 'gemma4';
   if (id.includes('gemma')) return 'gemma';
   if (id.includes('qwen')) return 'qwen';
   if (id.includes('mistral') || id.includes('mixtral')) return 'mistral';

@@ -83,6 +83,50 @@ export interface GenerationStats {
   readonly peakMemoryBytes?: number;
 }
 
+/**
+ * One generation of an assistant turn.
+ *
+ * This used to be a bare string, and that is the whole defect: `regenerate`
+ * carried the previous TEXT forward and `cycleVariant` swapped the TEXT back,
+ * while `provenance` — the chip, the model name, the local/remote split — sat
+ * on the row and never moved. So a reply that came back from a provider was
+ * rendered under the ember flame, this app's own mark for a turn that ran on
+ * the device, and written into the exported transcript as "(on device)".
+ *
+ * The fix is not a check at the two call sites. It is that a generation and
+ * where it came from are one value, so there is no longer a way to move one
+ * without the other. Everything a turn is judged by travels in here:
+ * `provenance` for where it ran, `toolCalls` for what it read (which is what
+ * taint is derived from), `stats` for what it cost, `thinking` for the trace.
+ */
+export interface MessageVariant {
+  readonly content: string;
+  readonly thinking?: string;
+  readonly toolCalls?: readonly ToolInvocation[];
+  /**
+   * Where this generation ran.
+   *
+   * Absent means UNKNOWN — never "on device". A generation recovered from a
+   * build that stored variants as bare strings has no recorded origin, and the
+   * plausible guess (the row's own provenance) is precisely the confident
+   * falsehood this record exists to prevent. {@link MessageVariant.unrecorded}
+   * says which kind of absence this is.
+   */
+  readonly provenance?: Provenance;
+  readonly stats?: GenerationStats;
+  /**
+   * Set on text whose origin is not a recorded generation: one recovered by
+   * the v4 upgrade from a bare `string` variant, or one a person has edited by
+   * hand, so that no model can honestly be named beside it.
+   *
+   * It renders as no chip and no model name, which is what the UI already does
+   * for a message with no provenance, and it counts as tool-derived for taint:
+   * its tool use cannot be shown either, and unknown has to fail closed in
+   * that direction while it fails silent in the other.
+   */
+  readonly unrecorded?: true;
+}
+
 export interface Message {
   readonly id: string;
   readonly chatId: string;
@@ -99,8 +143,23 @@ export interface Message {
   streaming?: boolean;
   /** Set when generation failed; content holds the user-facing explanation. */
   error?: string;
-  /** Alternate generations for this turn, newest last. */
-  readonly variants?: readonly string[];
+  /**
+   * Every generation of this turn, oldest last-but-one, newest last —
+   * INCLUDING the one currently projected onto the fields above.
+   *
+   * The list used to hold only the generations that were NOT on display, with
+   * the row itself standing in for the current one. That cost a second defect
+   * as well as the provenance one: `cycleVariant` overwrote `content` in
+   * place, so the row's own newest text was gone the moment you looked at an
+   * older one and could not be got back. Holding every generation as data
+   * makes the row a projection of `variants[variantIndex]` rather than a
+   * participant, so there is nothing left to overwrite.
+   *
+   * Absent on a turn that has never been regenerated: one generation needs no
+   * list, and the row alone is not ambiguous.
+   */
+  readonly variants?: readonly MessageVariant[];
+  /** Which of {@link variants} the fields above are showing. */
   variantIndex?: number;
 }
 
@@ -141,6 +200,59 @@ export interface Chat {
   messageCount: number;
   /** Cached preview line for the chat list. */
   preview: string;
+}
+
+/* ── Variants ───────────────────────────────────────────────────────── */
+
+/**
+ * The row's currently displayed generation, read back as a record.
+ *
+ * Used when a turn that has never been regenerated becomes the first entry of
+ * its own list. Everything {@link applyVariant} writes, this reads.
+ */
+export function currentVariant(message: Message): MessageVariant {
+  return {
+    content: message.content,
+    thinking: message.thinking,
+    toolCalls: message.toolCalls,
+    provenance: message.provenance,
+    stats: message.stats,
+  };
+}
+
+/**
+ * Project one generation onto the row that displays it.
+ *
+ * Every field is written, including the ones that are absent on the incoming
+ * variant — that is the point. A partial projection is how the old code left
+ * `provenance` behind while `content` moved, and `undefined` here means the
+ * chip, the model name, the tool blocks and the tok/s readout all disappear
+ * together rather than describing a turn that is no longer on screen.
+ */
+export function applyVariant(message: Message, index: number): Message {
+  const variant = message.variants?.[index];
+  if (!variant) return message;
+  return {
+    ...message,
+    content: variant.content,
+    thinking: variant.thinking,
+    toolCalls: variant.toolCalls,
+    provenance: variant.provenance,
+    stats: variant.stats,
+    variantIndex: index,
+  };
+}
+
+/**
+ * Is the generation on display one whose origin was never written down?
+ *
+ * Read by the taint derivation, which cannot see a `toolCalls` list that was
+ * never recorded and must therefore treat the turn as tool-derived.
+ */
+export function displaysUnrecorded(message: Message): boolean {
+  const index = message.variantIndex;
+  if (index === undefined) return false;
+  return message.variants?.[index]?.unrecorded === true;
 }
 
 export function newId(prefix: string): string {

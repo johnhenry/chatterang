@@ -9,6 +9,15 @@
  * `renderTranscript` is reused rather than reimplemented. Two renderers would
  * drift, and the one thing an export must not do is quietly disagree with
  * itself about what a conversation contained.
+ *
+ * That reuse is also why this file needed no fix of its own when the chip and
+ * the transcript were made to follow the text. A turn that has been
+ * regenerated holds every generation it has had, and the heading has to name
+ * the one whose words are printed underneath it — `renderTranscript` reads
+ * both out of the displayed generation now, and a second renderer here would
+ * have been a second place to get that wrong. What this file contributes is
+ * the rows: `db.messages`, which is where `cycleVariant` writes the projected
+ * row, so the file the user downloads says what the thread said on screen.
  */
 
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
