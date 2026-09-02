@@ -9,42 +9,98 @@ package app.chatterang.llama
  * back as small data classes constructed on the native side.
  *
  * The corresponding C++ lives in `src/main/cpp/llama-jni.cpp`.
+ *
+ * ## Why nothing here throws during class initialisation
+ *
+ * This used to load the backend from an `init {}` block and throw
+ * `UnsatisfiedLinkError` when none of the variants was present. Because this is
+ * a Kotlin `object`, the first touch of any member runs `<clinit>`, so the very
+ * first `getCapabilities` call threw — and killed the app:
+ *
+ *     FATAL EXCEPTION: CapacitorPlugins
+ *     Caused by: java.lang.UnsatisfiedLinkError: No llama.cpp backend library
+ *       at app.chatterang.llama.LlamaBridge.loadFirstAvailable(LlamaBridge.kt:38)
+ *       at app.chatterang.llama.LlamaBridge.<clinit>(LlamaBridge.kt:19)
+ *       at app.chatterang.llama.LlamaCppPlugin.getCapabilities(LlamaCppPlugin.kt:56)
+ *
+ * Nothing above rescues it. `Bridge.callPluginMethod` runs the plugin method
+ * inside a `Runnable` on the `CapacitorPlugins` handler thread and its handler
+ * is `catch (Exception ex) { ...; throw new RuntimeException(ex); }` — so
+ * ANYTHING that escapes a `@PluginMethod`, `Error` or `Exception`, comes back
+ * out as an uncaught `RuntimeException` on a `Handler` thread. That is a
+ * process kill, not a rejected promise. The rule this file and
+ * `LlamaCppPlugin.kt` follow from that is: a plugin method never lets anything
+ * escape, and initialisation never throws.
+ *
+ * A device that cannot run this engine — an unsupported ABI, a build shipped
+ * without the native library, a stripped APK — is a device the app should
+ * REFUSE on, honestly and per call. It is not a device the app should die on.
+ * So the load result is recorded as data, `loadFailure` is the single place
+ * that says why, and every caller is expected to check `isAvailable` first.
+ *
+ * Checking is not optional politeness: with no library loaded, calling any
+ * `external fun` below still throws `UnsatisfiedLinkError` at the call site.
+ * The gate is what turns that into a message a person can read.
  */
 object LlamaBridge {
+
+    private var loadedLibrary: String = ""
+
+    /**
+     * Why the engine is unusable, or `null` when it loaded.
+     *
+     * User-facing: it is handed to `PluginCall.reject` verbatim.
+     */
+    val loadFailure: String?
+
+    val isAvailable: Boolean get() = loadFailure == null
+
+    /** Which `.so` actually loaded. Empty when none did. */
+    val backendLibrary: String get() = loadedLibrary
 
     init {
         // The runtime picks the variant the device can actually use. A
         // Vulkan-linked library on a device without a conformant driver
         // crashes at load, so each backend ships as its own `.so`.
-        loadFirstAvailable(
+        //
+        // Only the CPU variant is currently built — see `src/main/cpp/
+        // CMakeLists.txt`. The other two names stay in the list so that adding
+        // a variant is a build-system change alone, and so a device that has
+        // one uses it.
+        loadFailure = loadFirstAvailable(
             "chatterang-llama-vulkan",
             "chatterang-llama-opencl",
             "chatterang-llama-cpu",
         )
     }
 
-    private var loadedLibrary: String = ""
-
-    private fun loadFirstAvailable(vararg names: String) {
+    /** Returns null on success, or a user-facing reason on failure. */
+    private fun loadFirstAvailable(vararg names: String): String? {
+        val reasons = mutableListOf<String>()
         for (name in names) {
             try {
                 System.loadLibrary(name)
                 loadedLibrary = name
-                return
-            } catch (_: UnsatisfiedLinkError) {
+                return null
+            } catch (error: UnsatisfiedLinkError) {
                 // Try the next tier down.
+                reasons.add("$name: ${error.message ?: "not present"}")
+            } catch (error: SecurityException) {
+                reasons.add("$name: ${error.message ?: "blocked"}")
             }
         }
-        throw UnsatisfiedLinkError(
-            "No llama.cpp backend library could be loaded for this device.",
-        )
+        return "On-device inference is not available on this device: no " +
+            "llama.cpp backend library could be loaded. Tried " +
+            names.joinToString(", ") + ". (" + reasons.joinToString("; ") + ")"
     }
 
-    fun hasVulkan(): Boolean = loadedLibrary.endsWith("vulkan") && nativeHasVulkan()
+    fun hasVulkan(): Boolean =
+        isAvailable && loadedLibrary.endsWith("vulkan") && nativeHasVulkan()
 
-    fun hasOpenCl(): Boolean = loadedLibrary.endsWith("opencl") && nativeHasOpenCl()
+    fun hasOpenCl(): Boolean =
+        isAvailable && loadedLibrary.endsWith("opencl") && nativeHasOpenCl()
 
-    fun hasHexagon(): Boolean = nativeHasHexagon()
+    fun hasHexagon(): Boolean = isAvailable && nativeHasHexagon()
 
     /** Callback for streaming tokens. Return false to stop generation. */
     interface TokenCallback {

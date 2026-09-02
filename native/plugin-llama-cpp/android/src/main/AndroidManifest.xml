@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Deliberately empty of permissions and components.
+
+    Everything this plugin does is in-process: it reads a GGUF the app already
+    downloaded into its own private storage, and it never touches the network.
+    A library manifest that declares nothing is the honest description of that,
+    and it keeps the plugin from silently widening the host app's permissions.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

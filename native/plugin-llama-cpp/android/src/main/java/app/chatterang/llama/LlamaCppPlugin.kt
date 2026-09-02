@@ -48,6 +48,17 @@ class LlamaCppPlugin : Plugin() {
 
     @PluginMethod
     fun getCapabilities(call: PluginCall) {
+        // Refuse honestly rather than describe an engine that is not there.
+        // Every caller of this method in the web layer already treats a
+        // rejection as "no on-device inference here" (`src/state/app.ts`,
+        // `src/ai/middleware/resilience.ts`, `LlamaCppBackend.healthCheck`),
+        // so refusing degrades the app instead of killing it.
+        val unavailable = LlamaBridge.loadFailure
+        if (unavailable != null) {
+            call.reject(unavailable, ENGINE_UNAVAILABLE)
+            return
+        }
+
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }
 
@@ -75,7 +86,7 @@ class LlamaCppPlugin : Plugin() {
                 .put("backends", backends)
                 .put("preferredBackend", preferred)
                 .put("cpuCores", Runtime.getRuntime().availableProcessors())
-                .put("chipset", Build.SOC_MODEL.takeIf { it != Build.UNKNOWN } ?: Build.HARDWARE)
+                .put("chipset", chipset())
                 .put("simulated", false)
                 .put("engineVersion", LlamaBridge.engineVersion()),
         )
@@ -117,6 +128,8 @@ class LlamaCppPlugin : Plugin() {
 
     @PluginMethod
     fun load(call: PluginCall) {
+        if (rejectIfUnavailable(call)) return
+
         val modelPath = call.getString("modelPath")
         if (modelPath.isNullOrBlank()) {
             call.reject("A model path is required.")
@@ -124,84 +137,86 @@ class LlamaCppPlugin : Plugin() {
         }
 
         executor.execute {
-            val started = System.currentTimeMillis()
-            val warnings = JSArray()
+            rejectOnThrow(call) {
+                val started = System.currentTimeMillis()
+                val warnings = JSArray()
 
-            val file = File(stripFileScheme(modelPath))
-            if (!file.exists()) {
-                call.reject("The model file is missing. Try downloading it again.")
-                return@execute
-            }
+                val file = File(stripFileScheme(modelPath))
+                if (!file.exists()) {
+                    call.reject("The model file is missing. Try downloading it again.")
+                    return@execute
+                }
 
-            val requested = call.getString("backend") ?: "gpu-vulkan"
-            val contextLength = call.getInt("contextLength") ?: 4096
-            val threads = call.getInt("threads")
-                ?: max(2, Runtime.getRuntime().availableProcessors() - 2)
+                val requested = call.getString("backend") ?: "gpu-vulkan"
+                val contextLength = call.getInt("contextLength") ?: 4096
+                val threads = call.getInt("threads")
+                    ?: max(2, Runtime.getRuntime().availableProcessors() - 2)
 
-            var backend = requested
-            var handle = LlamaBridge.loadModel(
-                file.absolutePath,
-                call.getString("mmprojPath")?.let { stripFileScheme(it) },
-                call.getString("draftModelPath")?.let { stripFileScheme(it) },
-                contextLength,
-                call.getInt("gpuLayers") ?: -1,
-                backend,
-                threads,
-                call.getBoolean("useMmap") ?: true,
-            )
-
-            // Hardware-tiered fallback (PRD §3.1): whatever was asked for,
-            // degrade rather than fail.
-            if (handle == 0L && backend != "cpu") {
-                warnings.put(
-                    "The GPU could not load this model, so it is running on the CPU. Expect it to be slower.",
-                )
-                backend = "cpu"
-                handle = LlamaBridge.loadModel(
+                var backend = requested
+                var handle = LlamaBridge.loadModel(
                     file.absolutePath,
                     call.getString("mmprojPath")?.let { stripFileScheme(it) },
-                    null,
+                    call.getString("draftModelPath")?.let { stripFileScheme(it) },
                     contextLength,
-                    0,
+                    call.getInt("gpuLayers") ?: -1,
                     backend,
                     threads,
                     call.getBoolean("useMmap") ?: true,
                 )
-            }
 
-            if (handle == 0L) {
-                call.reject(
-                    "This model could not be loaded. It may be incomplete, or too large for this device.",
+                // Hardware-tiered fallback (PRD §3.1): whatever was asked for,
+                // degrade rather than fail.
+                if (handle == 0L && backend != "cpu") {
+                    warnings.put(
+                        "The GPU could not load this model, so it is running on the CPU. Expect it to be slower.",
+                    )
+                    backend = "cpu"
+                    handle = LlamaBridge.loadModel(
+                        file.absolutePath,
+                        call.getString("mmprojPath")?.let { stripFileScheme(it) },
+                        null,
+                        contextLength,
+                        0,
+                        backend,
+                        threads,
+                        call.getBoolean("useMmap") ?: true,
+                    )
+                }
+
+                if (handle == 0L) {
+                    call.reject(
+                        "This model could not be loaded. It may be incomplete, or too large for this device.",
+                    )
+                    return@execute
+                }
+
+                val id = UUID.randomUUID().toString()
+                val actualContext = LlamaBridge.contextLength(handle)
+                if (actualContext < contextLength) {
+                    warnings.put("The context was reduced to $actualContext tokens to fit in memory.")
+                }
+
+                val info = LoadedInfo(
+                    backend = backend,
+                    contextLength = actualContext,
+                    supportsVision = LlamaBridge.supportsVision(handle),
+                    chatTemplate = call.getString("chatTemplate") ?: "chatml",
                 )
-                return@execute
+
+                contexts[id] = handle
+                contextInfo[id] = info
+
+                call.resolve(
+                    JSObject()
+                        .put("handle", id)
+                        .put("backend", info.backend)
+                        .put("contextLength", info.contextLength)
+                        .put("loadMs", System.currentTimeMillis() - started)
+                        .put("warnings", warnings)
+                        .put("supportsVision", info.supportsVision)
+                        .put("chatTemplate", info.chatTemplate),
+                )
             }
-
-            val id = UUID.randomUUID().toString()
-            val actualContext = LlamaBridge.contextLength(handle)
-            if (actualContext < contextLength) {
-                warnings.put("The context was reduced to $actualContext tokens to fit in memory.")
-            }
-
-            val info = LoadedInfo(
-                backend = backend,
-                contextLength = actualContext,
-                supportsVision = LlamaBridge.supportsVision(handle),
-                chatTemplate = call.getString("chatTemplate") ?: "chatml",
-            )
-
-            contexts[id] = handle
-            contextInfo[id] = info
-
-            call.resolve(
-                JSObject()
-                    .put("handle", id)
-                    .put("backend", info.backend)
-                    .put("contextLength", info.contextLength)
-                    .put("loadMs", System.currentTimeMillis() - started)
-                    .put("warnings", warnings)
-                    .put("supportsVision", info.supportsVision)
-                    .put("chatTemplate", info.chatTemplate),
-            )
         }
     }
 
@@ -214,9 +229,11 @@ class LlamaCppPlugin : Plugin() {
         }
 
         executor.execute {
-            contexts.remove(id)?.let { LlamaBridge.freeModel(it) }
-            contextInfo.remove(id)
-            call.resolve()
+            rejectOnThrow(call) {
+                contexts.remove(id)?.let { LlamaBridge.freeModel(it) }
+                contextInfo.remove(id)
+                call.resolve()
+            }
         }
     }
 
@@ -229,6 +246,8 @@ class LlamaCppPlugin : Plugin() {
 
     @PluginMethod
     fun generate(call: PluginCall) {
+        if (rejectIfUnavailable(call)) return
+
         val id = call.getString("handle")
         val prompt = call.getString("prompt")
         val requestId = call.getString("requestId")
@@ -256,6 +275,29 @@ class LlamaCppPlugin : Plugin() {
             var firstTokenAt = 0L
             var index = 0
             val text = StringBuilder()
+
+            /*
+             * EXACTLY ONE terminal event per request, on success, error and
+             * cancel alike — the rule `packages/inference-node` and the iOS
+             * plugin both enforce, because the web adapter
+             * (`src/ai/backends/llama-cpp.ts`) resolves its stream on
+             * `llamaEnd` and a second one settles an already-settled turn
+             * while a missing one hangs it forever.
+             *
+             * `settled` makes `finish` idempotent, and `finish` is called from
+             * the success path, from the catch, and once more from `finally`
+             * as a backstop — so a future edit that adds a fourth exit cannot
+             * quietly break the guarantee. It mirrors
+             * `LlamaCppPlugin.swift`'s `finish`/`defer` pair exactly.
+             */
+            var settled = false
+            fun finish(payload: JSObject): JSObject {
+                if (!settled) {
+                    settled = true
+                    notifyListeners("llamaEnd", payload)
+                }
+                return payload
+            }
 
             try {
                 val result = LlamaBridge.generate(
@@ -316,20 +358,35 @@ class LlamaCppPlugin : Plugin() {
                     payload.put("draftAcceptance", result.draftAcceptance)
                 }
 
-                notifyListeners("llamaEnd", payload)
-                call.resolve(payload)
+                call.resolve(finish(payload))
             } catch (error: Throwable) {
+                // Throwable, not Exception: an `UnsatisfiedLinkError` or an
+                // `OutOfMemoryError` from the JNI layer is exactly the case
+                // that must become a rejection rather than a dead thread.
                 val message = error.message ?: "Generation failed."
-                notifyListeners(
-                    "llamaEnd",
+                val payload = finish(
                     JSObject()
                         .put("requestId", requestId)
                         .put("text", text.toString())
                         .put("stopReason", "error")
                         .put("error", message),
                 )
-                call.reject(message, error)
+                // `PluginCall.reject` has no `Throwable` overload — only
+                // (String), (String, String), (String, Exception),
+                // (String, JSObject) and wider. Passing a `Throwable` here did
+                // not compile, which is why this file had never been built.
+                call.reject(message, null, error as? Exception, payload)
             } finally {
+                // Backstop. A no-op on both paths above, and the reason a new
+                // early return cannot break the terminal-event rule by
+                // accident.
+                finish(
+                    JSObject()
+                        .put("requestId", requestId)
+                        .put("text", text.toString())
+                        .put("stopReason", "error")
+                        .put("error", "Generation ended without reporting a result."),
+                )
                 cancelled.remove(requestId)
             }
         }
@@ -402,23 +459,73 @@ class LlamaCppPlugin : Plugin() {
     // ── Helpers ─────────────────────────────────────────────────────────
 
     private fun withHandle(call: PluginCall, body: (Long) -> Unit) {
+        if (rejectIfUnavailable(call)) return
+
         val handle = call.getString("handle")?.let { contexts[it] }
         if (handle == null) {
             call.reject("No model is loaded for that handle.")
             return
         }
-        executor.execute {
-            try {
-                body(handle)
-            } catch (error: Throwable) {
-                call.reject(error.message ?: "The engine call failed.", error)
-            }
+        executor.execute { rejectOnThrow(call) { body(handle) } }
+    }
+
+    /**
+     * Turns anything thrown on the worker thread into a rejection.
+     *
+     * Two failures at once without it: the call never settles, so the promise
+     * in the web layer hangs forever; and the exception escapes a plain
+     * `Executor` worker, which kills the single thread every later call is
+     * queued on.
+     *
+     * `inline` so `return@execute` inside `body` still means what it reads as.
+     */
+    private inline fun rejectOnThrow(call: PluginCall, body: () -> Unit) {
+        try {
+            body()
+        } catch (error: Throwable) {
+            call.reject(error.message ?: "The engine call failed.", error as? Exception)
         }
+    }
+
+    /**
+     * Rejects with the honest reason when there is no engine, and reports
+     * whether it did.
+     *
+     * Every method that reaches `LlamaBridge`'s `external fun`s goes through
+     * this or through `getCapabilities`' own check. Without a gate the call
+     * still fails — `System.loadLibrary` never ran, so the method has no
+     * implementation — but it fails as an `UnsatisfiedLinkError`, which
+     * Capacitor turns into a process kill (see `LlamaBridge`'s header).
+     */
+    private fun rejectIfUnavailable(call: PluginCall): Boolean {
+        val reason = LlamaBridge.loadFailure ?: return false
+        call.reject(reason, ENGINE_UNAVAILABLE)
+        return true
+    }
+
+    /**
+     * `Build.SOC_MODEL` is API 31. Capacitor's `minSdkVersion` is 24, so
+     * touching it unguarded is a `NoSuchFieldError` on anything older — and by
+     * the rule in `LlamaBridge`'s header, an `Error` out of a plugin method is
+     * a process kill. `Build.HARDWARE` has existed since API 1 and is the
+     * honest answer when the SoC name is not available.
+     */
+    private fun chipset(): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val soc = Build.SOC_MODEL
+            if (soc != Build.UNKNOWN) return soc
+        }
+        return Build.HARDWARE
     }
 
     /** The web layer stores paths as `file://` URIs from `Filesystem.getUri`. */
     private fun stripFileScheme(value: String): String =
         if (value.startsWith("file://")) value.removePrefix("file://") else value
+
+    private companion object {
+        /** Error code the web layer can match on, distinct from a load failure. */
+        const val ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
+    }
 
     override fun handleOnDestroy() {
         executor.execute {
