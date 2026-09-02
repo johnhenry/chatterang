@@ -25,6 +25,8 @@ import { renderLore, renderSystemPrompt, selectLore } from '@/domain/persona';
 import { DEFAULT_SAMPLER, type SamplerSettings } from '@/domain/manifest';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 import { targetFor, type EngineTarget, type ToolEgressPolicy } from '@/ai/engine';
+import { markTainted } from '@/ai/taint';
+import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
   estimateConversationTokens,
@@ -160,7 +162,14 @@ export const useChats = create<ChatState>((set, get) => ({
       personaId: personaId ?? null,
       modelId: persona?.preferredModelId ?? useModels.getState().activeModelId,
       sampler: null,
-      tools: persona?.tools ? [...persona.tools] : [],
+      // A persona may PREFER tools; it may not grant the sensitive ones. `bash`
+      // reaches this app's own data and every MCP tool leaves the sandbox, so
+      // those stay a decision the user makes in the tool picker. Round 3
+      // verified both supply routes are closed today — MARKETPLACE is a static
+      // in-repo array and `fromCharacterCard` never sets `tools` — so this is
+      // the guard that keeps a future import route from being a privilege
+      // escalation rather than a fix for a live leak.
+      tools: unsensitive(persona?.tools),
       showThinking: persona?.showThinking ?? settings.showThinking,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -674,12 +683,16 @@ export interface BuiltPrompt {
  * recent history, and any post-history instruction the persona defines — then
  * trim the result to fit the model's context window.
  *
+ * Exported so a test can drive the real thing: the taint a turn carries
+ * forward between turns is decided here, and a test that rebuilt this history
+ * itself would be testing its own copy.
+ *
  * Trimming here rather than letting the engine truncate is the whole point:
  * llama.cpp drops from the front, which takes the system prompt and the
  * persona with it. `fitToContext` drops old turns instead and reports how
  * many, so the thread can say so.
  */
-async function buildMessages(
+export async function buildMessages(
   chat: Chat,
   messages: Message[],
   dropTail: number,
@@ -719,13 +732,25 @@ async function buildMessages(
   for (const message of history) {
     if (message.role === 'system') continue;
 
+    // A reply the model wrote WHILE a tool was running is derived from that
+    // tool's output whether or not it quotes it verbatim, so it carries the
+    // mark forward into every later turn. Without this, the leak survives a
+    // turn boundary: run `bash` locally, let the model summarise /chats in
+    // its visible answer, then switch to a remote model — by then there is no
+    // tool_result block anywhere in the history and the summary goes out
+    // unremarked.
+    const derived = message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0;
+    const carry = (built: IRMessage): IRMessage => (derived ? markTainted(built) : built);
+
     const images = (message.attachments ?? []).filter(
       (attachment): attachment is Extract<Attachment, { kind: 'image' }> =>
         attachment.kind === 'image',
     );
 
     if (images.length === 0) {
-      result.push({ role: message.role === 'tool' ? 'user' : message.role, content: message.content });
+      result.push(
+        carry({ role: message.role === 'tool' ? 'user' : message.role, content: message.content }),
+      );
       continue;
     }
 
@@ -749,7 +774,7 @@ async function buildMessages(
           }),
         ),
     ];
-    result.push({ role: 'user', content });
+    result.push(carry({ role: 'user', content }));
   }
 
   if (persona?.postHistoryInstructions?.trim()) {
@@ -778,6 +803,21 @@ async function buildMessages(
   const sampler = resolveSampler(chat, modelId);
   const fit = fitToContext(result, contextBudget(manifest.contextLength, sampler.maxTokens));
   return { messages: fit.messages, fit };
+}
+
+/**
+ * The tools a persona is allowed to pre-enable.
+ *
+ * Sensitive tools are dropped rather than the whole list being refused: a
+ * persona that wants `calculator` and `bash` gets `calculator`, and the user
+ * can still switch `bash` on themselves in the picker, having been asked.
+ */
+export function unsensitive(tools: readonly string[] | undefined): string[] {
+  if (!tools?.length) return [];
+  return tools.filter((id) => {
+    const tool = toolRegistry.get(id) ?? toolRegistry.getByName(id);
+    return tool !== undefined && !tool.sensitive;
+  });
 }
 
 function sortChats(chats: Chat[]): Chat[] {

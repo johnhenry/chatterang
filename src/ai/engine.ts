@@ -40,6 +40,13 @@ import {
   type FallbackEvent,
   type FallbackReason,
 } from '@/ai/middleware/resilience';
+import {
+  carriesTaint,
+  clearForDestination,
+  markTainted,
+  taintedCharacters,
+  type ClearedMessage,
+} from '@/ai/taint';
 import { toolRegistry } from '@/ai/tools/registry';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
 import type { EngineId } from '@/domain/manifest';
@@ -86,45 +93,8 @@ export interface ToolEgressPolicy {
   onGranted?(backendId: string): void;
 }
 
-/** The string the model gets instead of the output. */
-function withheldNote(characters: number): string {
-  return (
-    "The user declined to send this tool's output off-device. It ran locally " +
-    `and produced ${characters.toLocaleString('en-US')} characters. Ask them to run the ` +
-    'command themselves, or answer without it.'
-  );
-}
-
-function isToolResult(block: { type: string }): boolean {
-  return block.type === 'tool_result';
-}
-
-/** Does this message array carry any tool output at all? */
-function carriesToolResults(messages: readonly IRMessage[]): boolean {
-  return messages.some(
-    (message) => Array.isArray(message.content) && message.content.some(isToolResult),
-  );
-}
-
-/** How much tool output the outgoing request would carry. */
-function toolResultCharacters(messages: readonly IRMessage[]): number {
-  let total = 0;
-  for (const message of messages) {
-    if (!Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (!isToolResult(block)) continue;
-      const content = (block as { content?: unknown }).content;
-      if (typeof content === 'string') total += content.length;
-      else if (Array.isArray(content)) {
-        for (const part of content) total += String((part as { text?: string }).text ?? '').length;
-      }
-    }
-  }
-  return total;
-}
-
 /**
- * Replace every tool result with a note, for the outgoing request only.
+ * The string the model gets instead of the bytes.
  *
  * A note rather than a truncation, and rather than dropping the message: a
  * model handed an empty tool result concludes the command failed and runs it
@@ -132,27 +102,12 @@ function toolResultCharacters(messages: readonly IRMessage[]): number {
  * The user still sees the real, complete output in the thread — the shell ran
  * locally and their answer is not what was withheld.
  */
-function withholdToolResults(messages: readonly IRMessage[]): IRMessage[] {
-  return messages.map((message) => {
-    if (!Array.isArray(message.content) || !message.content.some(isToolResult)) return message;
-    return {
-      ...message,
-      content: message.content.map((block) => {
-        if (!isToolResult(block)) return block;
-        const inner = (block as { content?: unknown }).content;
-        const length =
-          typeof inner === 'string'
-            ? inner.length
-            : Array.isArray(inner)
-              ? inner.reduce(
-                  (sum: number, part) => sum + String((part as { text?: string }).text ?? '').length,
-                  0,
-                )
-              : 0;
-        return { ...block, content: withheldNote(length) };
-      }) as IRMessage['content'],
-    };
-  });
+function withheldNote(characters: number): string {
+  return (
+    'The user declined to send this off-device. It came from a tool that ran ' +
+    `locally and produced ${characters.toLocaleString('en-US')} characters. Ask them to run the ` +
+    'command themselves, or answer without it.'
+  );
 }
 
 interface TurnResult {
@@ -476,9 +431,13 @@ export class ChatterangEngine {
       // because that is the only place that knows both — and because `target`
       // is reassigned inside this loop, so consent captured anywhere earlier
       // would be consent for a destination that no longer applies.
-      let outgoing = messages;
-      if (!target.local && carriesToolResults(messages)) {
-        const characters = toolResultCharacters(messages);
+      // Cleared for THIS destination, this iteration. `target` is reassigned
+      // inside the loop, so a clearance computed anywhere earlier would be a
+      // clearance for a backend that no longer applies.
+      let outgoing = clearForDestination(messages, { allowed: true, note: withheldNote });
+
+      if (!target.local && carriesTaint(messages)) {
+        const characters = taintedCharacters(messages);
         let allowed = decided.get(target.backendId);
 
         if (allowed === undefined) {
@@ -508,7 +467,9 @@ export class ChatterangEngine {
           decided.set(target.backendId, allowed);
         }
 
-        if (!allowed) outgoing = withholdToolResults(messages);
+        if (!allowed) {
+          outgoing = clearForDestination(messages, { allowed: false, note: withheldNote });
+        }
         toolEgress = allowed ? 'granted' : 'withheld';
         yield {
           type: 'egress',
@@ -519,7 +480,7 @@ export class ChatterangEngine {
         };
       }
 
-      const irRequest = this.#toIR({ ...request, messages: outgoing, target }, requestId, true);
+      const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
 
       let turn: TurnResult;
       let failure: unknown = null;
@@ -574,16 +535,24 @@ export class ChatterangEngine {
 
       if (calls.length === 0) break;
 
+      // Whether any tool had ALREADY produced output when the model composed
+      // these calls. If one had, the model could have read it — so the call's
+      // arguments are tainted, and that is the exact route measured last
+      // round: read a secret with one tool, paste it into the arguments of the
+      // next, and it rides out in a block type a `tool_result` rule misses.
+      const composedAfterOutput = tools.length > 0;
+
       const batch = await runToolCalls(toolRegistry, calls, { signal: request.signal });
       tools.push(...batch.executed);
       for (const tool of batch.executed) yield { type: 'tool', tool };
 
       if (batch.results.length === 0) break;
 
+      const assistantTurn: IRMessage = { role: 'assistant', content: [...calls] };
       messages = [
         ...messages,
-        { role: 'assistant', content: [...calls] },
-        { role: 'tool', content: batch.results },
+        composedAfterOutput ? markTainted(assistantTurn) : assistantTurn,
+        markTainted({ role: 'tool', content: batch.results }),
       ];
 
       // The visible answer is whatever the model says after the tools ran.
@@ -659,9 +628,21 @@ export class ChatterangEngine {
     return { name: id, adapter, modelId: this.#fallbackModels.get(id) };
   }
 
-  /** Non-streaming completion, used by tools, titling, and benchmarks. */
+  /**
+   * Non-streaming completion, used by tools, titling, and benchmarks.
+   *
+   * It went through the taint gate only once `#toIR` started demanding a
+   * `ClearedMessage[]`: before that it handed `request.messages` straight to
+   * the bridge, so a caller that had assembled a history containing tool
+   * output reached a remote backend without the stream path's check ever
+   * running. There is no interactive moment here to raise a sheet in, so an
+   * existing grant is the only thing that allows it.
+   */
   async complete(request: GenerationRequest): Promise<IRChatResponse> {
-    const irRequest = this.#toIR(request, newId('req'), false);
+    const allowed =
+      request.target.local || request.egress?.isGranted(request.target.backendId) === true;
+    const outgoing = clearForDestination(request.messages, { allowed, note: withheldNote });
+    const irRequest = this.#toIR(request, outgoing, newId('req'), false);
     return (await this.#bridge.chat(irRequest, {
       signal: request.signal,
       backend: request.target.backendId,
@@ -681,11 +662,25 @@ export class ChatterangEngine {
     };
   }
 
-  #toIR(request: GenerationRequest, requestId: string, stream: boolean): IRChatRequest {
+  /**
+   * Build the IR request.
+   *
+   * Takes the messages separately, and takes them BRANDED: `ClearedMessage` is
+   * produced only by `clearForDestination`, so every path that reaches a
+   * backend has decided about taint for this destination. That is the same
+   * enforcement shape `SafeMessage` gives the prompt templates — the unchecked
+   * path does not typecheck rather than being caught by review.
+   */
+  #toIR(
+    request: GenerationRequest,
+    messages: readonly ClearedMessage[],
+    requestId: string,
+    stream: boolean,
+  ): IRChatRequest {
     const tools = request.toolIds?.length ? toolRegistry.toIRTools(request.toolIds) : undefined;
 
     return {
-      messages: request.messages,
+      messages,
       tools,
       toolChoice: tools?.length ? 'auto' : undefined,
       parameters: {

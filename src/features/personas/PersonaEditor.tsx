@@ -249,7 +249,11 @@ export function PersonaEditor({
                     type="button"
                     className="chip chip--button"
                     aria-pressed={enabled}
-                    title={tool.summary}
+                    title={
+                      tool.sensitive
+                        ? `${tool.summary} — asked for per chat, not pre-enabled here`
+                        : tool.summary
+                    }
                     onClick={() =>
                       set(
                         'tools',
@@ -261,10 +265,16 @@ export function PersonaEditor({
                   >
                     <Icon name="tool" size={11} />
                     {tool.name}
+                    {tool.sensitive ? ' *' : ''}
                   </button>
                 );
               })}
             </div>
+            <span className="field__hint">
+              A persona chooses which tools a new chat <em>starts</em> with. Tools marked * reach
+              this app’s own data or leave its sandbox, so a persona cannot switch them on for you
+              — you turn those on yourself, per chat, in the tool picker.
+            </span>
           </div>
         </>
       )}

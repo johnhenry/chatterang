@@ -28,13 +28,30 @@
  * `message.content` would find that already escaped too: the sanitiser rewrites
  * the message, it does not merely wrap the accessor.
  *
- * The escape is a codepoint substitution, not a deletion — `<|im_start|>`
- * becomes `＜｜im_start｜＞`. A reader still sees what the tool printed; a
- * tokeniser can no longer see a special token, because none of the fullwidth
- * forms appear in any of these vocabularies.
+ * ## Two different treatments, because the bytes are not equally trusted
+ *
+ * Text the user typed is escaped: the marker shapes below are neutralised and
+ * everything else is left exactly as written, so a message about `a < b` still
+ * reads as `a < b`. That is a denylist, and it is the right trade for bytes
+ * whose author is the principal — a user who pastes `<|im_start|>` is talking
+ * to their own model.
+ *
+ * Text that came from a tool is ENCODED instead, by {@link encodeUntrusted} in
+ * `ai/taint.ts`. That is not a list of markers; it removes the characters any
+ * marker is built from, so tainted text cannot express structure in a template
+ * this app ships or in one added next year. The cost is that a tool's `:`, `|`
+ * and `#` reach the model as `∶`, `∣` and `♯` — which is why it applies to
+ * tool bytes and not to the whole conversation.
+ *
+ * The substitution table below is shared with the encoder and every entry is
+ * normalisation-stable. It did not used to be: the fullwidth forms this file
+ * shipped in round 3 (`＜｜im_start｜＞`) NFKC-normalise straight back to
+ * `<|im_start|>`, and NFKC is what a SentencePiece tokeniser applies by
+ * default. Measured, not assumed — see `tests/taint.test.ts`.
  */
 
 import type { PromptTemplate } from '@/domain/manifest';
+import { SUBSTITUTE, encodeUntrusted, isTainted } from '@/ai/taint';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 
 /* ── Control-marker escaping ─────────────────────────────────────────── */
@@ -65,24 +82,9 @@ const CONTROL_MARKERS: readonly RegExp[] = [
   /^[ \t]*(?:USER|ASSISTANT|SYSTEM)[ \t]*:/gm,
 ];
 
-/**
- * Fullwidth counterparts. Chosen because they read identically to a human and
- * tokenise as ordinary text: no BPE vocabulary in this catalogue maps a
- * fullwidth run onto a special token.
- */
-const FULLWIDTH: Readonly<Record<string, string>> = {
-  '<': '＜',
-  '>': '＞',
-  '|': '｜',
-  '[': '［',
-  ']': '］',
-  '#': '＃',
-  ':': '：',
-};
-
 /** Neutralise one matched marker, character by character. */
 function widen(marker: string): string {
-  return Array.from(marker, (character) => FULLWIDTH[character] ?? character).join('');
+  return Array.from(marker, (character) => SUBSTITUTE[character] ?? character).join('');
 }
 
 /**
@@ -114,14 +116,24 @@ export type SafeMessage = IRMessage & { readonly [SAFE]: true };
 /** Structural keys that are never rendered as prose, and large opaque blobs. */
 const NOT_TEXT = new Set(['type', 'data']);
 
-/** Deep-escape every string in an arbitrary IR value. */
-function sanitiseValue(value: unknown): unknown {
-  if (typeof value === 'string') return escapeControlMarkers(value);
-  if (Array.isArray(value)) return value.map(sanitiseValue);
+/** How one message's strings are neutralised. */
+type Neutralise = (text: string) => string;
+
+/**
+ * Deep-neutralise every string in an arbitrary IR value.
+ *
+ * Keys as well as values. `messageText` renders a `tool_use` block as
+ * `JSON.stringify(block.input)`, and `JSON.stringify` prints keys — so an
+ * argument *named* `<|im_start|>` reached the prompt unescaped until this
+ * function stopped copying keys through verbatim.
+ */
+function sanitiseValue(value: unknown, neutralise: Neutralise): unknown {
+  if (typeof value === 'string') return neutralise(value);
+  if (Array.isArray(value)) return value.map((inner) => sanitiseValue(inner, neutralise));
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = NOT_TEXT.has(key) ? inner : sanitiseValue(inner);
+      out[neutralise(key)] = NOT_TEXT.has(key) ? inner : sanitiseValue(inner, neutralise);
     }
     return out;
   }
@@ -129,21 +141,38 @@ function sanitiseValue(value: unknown): unknown {
 }
 
 /**
+ * Is this block tool-derived whatever message it arrived in?
+ *
+ * The floor under the message-level taint mark: a caller that assembles a
+ * history containing tool blocks without marking anything still gets them
+ * encoded rather than merely escaped.
+ */
+function isToolBlock(block: MessageContent): boolean {
+  return block.type === 'tool_result' || block.type === 'tool_use';
+}
+
+/**
  * The one producer of {@link SafeMessage}.
  *
- * Escapes generically rather than block type by block type, so a content block
- * added to the IR later is covered on the day it lands instead of on the day
- * somebody remembers this file.
+ * Works over the whole value generically rather than block type by block type,
+ * so a content block added to the IR later is covered on the day it lands
+ * instead of on the day somebody remembers this file.
  */
 export function sanitiseMessages(messages: readonly IRMessage[]): readonly SafeMessage[] {
   return messages.map((message) => {
+    const tainted = isTainted(message);
+    const neutralise: Neutralise = tainted ? encodeUntrusted : escapeControlMarkers;
+
     const content =
       typeof message.content === 'string'
-        ? escapeControlMarkers(message.content)
-        : (sanitiseValue(message.content) as MessageContent[]);
+        ? neutralise(message.content)
+        : (message.content.map((block) =>
+            sanitiseValue(block, tainted || isToolBlock(block) ? encodeUntrusted : neutralise),
+          ) as MessageContent[]);
+
     return {
       ...message,
-      role: escapeControlMarkers(message.role) as IRMessage['role'],
+      role: encodeUntrusted(message.role) as IRMessage['role'],
       content,
     } as SafeMessage;
   });
@@ -337,6 +366,25 @@ const TEMPLATES: Record<PromptTemplate, TemplateSpec> = {
  */
 export function renderPrompt(template: PromptTemplate, messages: readonly IRMessage[]): string {
   return (TEMPLATES[template] ?? chatml).render(sanitiseMessages(messages));
+}
+
+/** Every template family this app can render. Exported so a test can enumerate. */
+export const TEMPLATE_IDS = Object.keys(TEMPLATES) as readonly PromptTemplate[];
+
+/**
+ * What one template contributes to a prompt when every message body is empty.
+ *
+ * In other words: its structure, extracted mechanically instead of restated in
+ * a test fixture. Whatever this returns is exactly the text a hostile body
+ * would have to be able to spell in order to forge a turn — which is what
+ * `tests/taint.test.ts` checks the encoder against, for every template in
+ * {@link TEMPLATE_IDS} including ones added after this comment.
+ */
+export function templateStructure(template: PromptTemplate): string {
+  const probe = (['system', 'user', 'assistant', 'tool'] as const).map(
+    (role) => ({ role, content: '' }) as unknown as SafeMessage,
+  );
+  return (TEMPLATES[template] ?? chatml).render(probe);
 }
 
 export function templateStopSequences(template: PromptTemplate): readonly string[] {
