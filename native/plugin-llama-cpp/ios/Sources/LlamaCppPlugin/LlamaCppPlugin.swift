@@ -68,11 +68,36 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
             backends.append("gpu-metal")
         }
 
+        /*
+         * Chosen FROM the list above, best tier first, so the two fields of
+         * this one payload cannot name different sets.
+         *
+         * It was a separate `backends.contains("gpu-metal") ? "gpu-metal" :
+         * "cpu"`. That reads correctly today only by accident: "cpu" above is
+         * an unconditional literal, so the `else` branch happens to name
+         * something `backends` always contains. Android had the same shape and
+         * it was not an accident there — once `availableBackends()` started
+         * asking the ggml registry for the CPU entry, the twin `else -> "cpu"`
+         * began claiming a backend the same object reported as absent. This
+         * file still has no `hasCpu()` equivalent to ask, so the `["cpu"]`
+         * above remains the one entry a stub and a working engine produce
+         * identically; when it becomes a real query, this line is already
+         * derived from it and needs no second fix.
+         *
+         * `ComputeBackendId` in `packages/contracts/src/llama-cpp.ts` is a
+         * closed union of six real backends with no "none" member, and
+         * `preferredBackend` is not optional, so an empty list still has to be
+         * answered with a backend name. "cpu" is the least dishonest of the
+         * six — the tier everything else degrades to — and widening a shared
+         * contract is a decision for its callers, not for this line.
+         */
+        let preferred = ["gpu-metal", "cpu"].first { backends.contains($0) } ?? "cpu"
+
         call.resolve([
             "totalMemory": info.physicalMemory,
             "availableMemory": LlamaContext.availableMemory(),
             "backends": backends,
-            "preferredBackend": backends.contains("gpu-metal") ? "gpu-metal" : "cpu",
+            "preferredBackend": preferred,
             "cpuCores": info.processorCount,
             "chipset": Self.chipset(),
             "simulated": false,

@@ -448,6 +448,40 @@ type Audit = { methods: string[]; guards: string[]; findings: string[] };
  *
  * Patterns, not a list of method names: a fence that knows the names of
  * today's five defects would go green the moment a sixth method is written.
+ *
+ * The first three read the three ways this file has ALREADY died. The last
+ * four are the rest of the rule the block comment below states — ANY throw out
+ * of a `@PluginMethod` is a process kill — and they exist because the first
+ * three did not enforce it. Measured: three fatal paths added to the body of
+ * `listLoaded` (`contexts.keys.first()`, `call.getLong("handle")!!`, and a bare
+ * `throw IllegalStateException`), adding no new method so the roster assertion
+ * could not fire, left this fence at 67 passed and zero findings — while
+ * `:chatterang-plugin-llama-cpp:compileDebugKotlin` accepted the file with exit
+ * 0 and no diagnostic. Worse than silence: `listLoaded` is a method the
+ * false-positive control below AFFIRMATIVELY vouches for.
+ *
+ * The bar for adding one is that it fires on nothing in the shipped file, and
+ * every entry here was measured against `LlamaCppPlugin.kt` before it went in.
+ * Two candidates were REJECTED for doing so, because a fence that cries wolf
+ * gets deleted by the next person who trips over it:
+ *
+ *   - `\[[^\]\n]+\]`, list indexing — 4 findings, every one a false positive:
+ *     `contexts[id]` and `contextInfo[it]` are `ConcurrentHashMap` reads, and a
+ *     map read returns null rather than throwing.
+ *   - `\.\w+\(\)`, any no-arg call — 3 findings, all harmless:
+ *     `.isNullOrBlank()`, `.toList()`, `.resolve()`.
+ *
+ * Two more were rejected without firing, for being unable to tell a throwing
+ * receiver from a safe one — 0 findings today, but the next `someLong.toInt()`
+ * or length-checked `.substring(0, n)` would be a false positive and the entry
+ * would teach the next reader to distrust the whole list: `\.to(Int|Long|
+ * Double)\(\)` and `\.substring\(`.
+ *
+ * What the four below deliberately DO accept is that `.first()` on a receiver
+ * that is provably non-empty today gets reported anyway. The rule this fence
+ * holds is not "this will throw"; it is "this CAN throw and nothing here would
+ * catch it", and the fix is `firstOrNull()` or the guard every other method in
+ * the file already uses.
  */
 const RISKY: { re: string; needs: Catches; why: string }[] = [
   {
@@ -471,6 +505,39 @@ const RISKY: { re: string; needs: Catches; why: string }[] = [
     why:
       'a Kotlin non-null cast — `NullPointerException` when the platform ' +
       'call returns null on a stripped or vendor ROM',
+  },
+  {
+    re: '\\bthrow\\b',
+    needs: 'all',
+    why:
+      'a throw with nothing above it but Capacitor — `callPluginMethod` posts ' +
+      'the method into a Runnable that rethrows as an uncaught ' +
+      '`RuntimeException` on a HandlerThread, so this is a process kill and ' +
+      'not a rejection',
+  },
+  {
+    re: '!!',
+    needs: 'all',
+    why:
+      "Kotlin's not-null assertion — `NullPointerException` the moment the " +
+      'expression is null, and every argument off a `PluginCall` is nullable ' +
+      'because the web layer can send anything',
+  },
+  {
+    re: '\\.(?:first|last|single)\\s*(?:\\(\\s*\\)|\\{)',
+    needs: 'all',
+    why:
+      '`NoSuchElementException` on an empty collection — `contexts` is empty ' +
+      'until something loads and empty again after `unload`, so this is the ' +
+      'ordinary state of the map, not an edge case',
+  },
+  {
+    re: '(?<![\\w.])(?:checkNotNull|requireNotNull|require|check|error)\\s*\\(',
+    needs: 'all',
+    why:
+      "the stdlib's throw intrinsics — `IllegalStateException` / " +
+      '`IllegalArgumentException` / `NullPointerException`, which read as ' +
+      'assertions and land exactly as hard as an explicit `throw`',
   },
 ];
 
@@ -690,6 +757,32 @@ describe('the fence itself can see an unguarded plugin method', () => {
     '            call.reject("no")',
     '        }',
     '    }',
+    '',
+    // Appended, never inserted: `viaHelper -> payload (Probe.kt:35)` below is
+    // asserted with its line number, and that is the point of `maskCode`
+    // keeping the file's length. Everything new goes after the last line any
+    // assertion names.
+    '    @PluginMethod',
+    '    fun fatalWithoutTouchingNative(call: PluginCall) {',
+    '        // A comment may write throw, x!!, .first() and checkNotNull() freely.',
+    '        val id = contexts.keys.first()',
+    '        val handle = call.getLong("handle")!!',
+    '        val note = JSObject().put("s", "throw, !!, .first() and require( are not code here")',
+    '        if (handle < 0) throw IllegalStateException("negative")',
+    '        checkNotNull(contextInfo[id])',
+    '        call.resolve(note)',
+    '    }',
+    '',
+    '    @PluginMethod',
+    '    fun sameFourInsideAGuard(call: PluginCall) {',
+    '        wrap(call) {',
+    '            val id = contexts.keys.first()',
+    '            val handle = call.getLong("handle")!!',
+    '            if (handle < 0) throw IllegalStateException("negative")',
+    '            checkNotNull(contextInfo[id])',
+    '            call.resolve()',
+    '        }',
+    '    }',
     '}',
   ].join('\n');
 
@@ -718,6 +811,39 @@ describe('the fence itself can see an unguarded plugin method', () => {
     expect(probe.findings.filter((f) => f.startsWith('viaHelper'))).toEqual([
       expect.stringContaining('viaHelper -> payload (Probe.kt:35) runs `as PowerManager`'),
     ]);
+  });
+
+  /**
+   * The four patterns added after the `listLoaded` injection, in both
+   * directions on one pair of methods that reach no native code at all.
+   *
+   * That is the shape the fence was blind to. Every earlier case here goes
+   * through `LlamaBridge`, `executor.execute` or a cast, so a method could be
+   * written entirely out of Kotlin stdlib and still take the process down.
+   */
+  const thrown = (prefix: string): string[] =>
+    probe.findings
+      .filter((f) => f.startsWith(prefix))
+      .map((f) => /runs `([^`]+)`/.exec(f)?.[1] ?? f);
+
+  it('sees a method that kills the app without touching the engine', () => {
+    // In RISKY order, and each one on its own line of the probe. The comment
+    // and the string literal on the lines between them carry the same four
+    // tokens and are absent here, which is `maskCode` doing its job — without
+    // it this widening would have been the noisiest thing in the file.
+    expect(thrown('fatalWithoutTouchingNative')).toEqual([
+      'throw',
+      '!!',
+      '.first()',
+      'checkNotNull(',
+    ]);
+  });
+
+  it('says nothing about the same four inside a guard', () => {
+    // The false-positive direction. `wrap` catches `Throwable`, so none of
+    // these can escape the method, and a fence that reported them anyway
+    // would be telling the author to fix code that is already correct.
+    expect(thrown('sameFourInsideAGuard')).toEqual([]);
   });
 });
 
@@ -1328,6 +1454,93 @@ describe('every backend in the list is a question, not a literal', () => {
   });
 });
 
+/**
+ * The field the fence above made falsifiable, and then left uncovered.
+ *
+ * Once `availableBackends()` stopped asserting `add("cpu")` and started asking
+ * the registry, `backends` could legitimately come back empty. `preferredBackend`
+ * did not move with it: it was a SECOND `when` over `hasHexagon` / `hasVulkan` /
+ * `hasOpenCl` whose `else` branch answered `"cpu"` without ever asking `hasCpu()`.
+ *
+ * So a `.so` that dlopens — `loadFailure` null, `getCapabilities` proceeding all
+ * the way to `resolve` — with a broken or renamed CPU registry entry emitted ONE
+ * object saying `backends: []` and `preferredBackend: "cpu"` in the same breath.
+ * Nothing in the tree caught it: `grep -rn preferredBackend tests/` reached
+ * `packages/inference-node` and two fixtures, and no Android source at all.
+ *
+ * These assertions pin the SHAPE that makes the contradiction unrepresentable —
+ * the preference is a filter over the very list the payload carries — rather than
+ * pinning the four backend names, which the fence above already owns.
+ *
+ * What they deliberately do NOT claim: that the empty list is reported honestly.
+ * `ComputeBackendId` in `packages/contracts/src/llama-cpp.ts` is a closed union of
+ * six real backends with no `none`, and `preferredBackend` is not optional, so
+ * "the engine registered nothing" is a state this contract cannot say. `"cpu"` is
+ * the least dishonest of the six the type allows, and widening a contract shared
+ * with iOS, `inference-node` and the web shim is a decision for its callers.
+ */
+describe('preferredBackend cannot name a backend the same payload omits', () => {
+  const CAPABILITIES = (() => {
+    const start = PLUGIN_CODE.indexOf('fun getCapabilities');
+    const end = PLUGIN_CODE.indexOf('@PluginMethod', start);
+    return PLUGIN_CODE.slice(start, end === -1 ? undefined : end);
+  })();
+
+  it('reads one getCapabilities body, so the sweeps below cannot pass on an empty string', () => {
+    expect(CAPABILITIES).toContain('preferredBackend');
+    expect(CAPABILITIES).toContain('call.resolve');
+    // Scoped to one method: everything after it belongs to `getThermalState`.
+    expect(CAPABILITIES).not.toContain('fun getThermalState');
+  });
+
+  it('resolves backends from the same local the preference filters', () => {
+    const bound = /val (\w+) = availableBackends\(\)/.exec(CAPABILITIES)?.[1];
+    expect(bound).toBeDefined();
+    const list = bound ?? '';
+    // Not a second `availableBackends()` call in the payload: two calls are two
+    // registry sweeps, and a backend that appears or vanishes between them puts
+    // the disagreement straight back.
+    expect(CAPABILITIES).toMatch(new RegExp(`\\.put\\("backends", JSArray\\(${list}\\)\\)`));
+    expect(CAPABILITIES).toMatch(
+      new RegExp(`BACKEND_TIERS\\.firstOrNull \\{ it in ${list} \\}`),
+    );
+  });
+
+  it('never re-asks the registry to pick the preferred one', () => {
+    // The exact fault: a `has*()` chain living beside the list instead of
+    // reading it. `loadFailure` and `engineVersion()` are the only LlamaBridge
+    // reads this body still owes.
+    expect(CAPABILITIES).not.toMatch(/LlamaBridge\.has\w+/);
+  });
+
+  it('orders the tier list as exactly the reverse of the list it filters', () => {
+    const start = PLUGIN_CODE.indexOf('private fun availableBackends');
+    expect(start).toBeGreaterThan(-1);
+    const body = PLUGIN_CODE.slice(start, PLUGIN_CODE.indexOf('\n    }', start));
+    const listed = [...body.matchAll(/add\("([\w-]+)"\)/g)].map((match) => match[1]);
+    expect(listed).toHaveLength(4);
+
+    const declared = /val BACKEND_TIERS = listOf\(([^)]*)\)/.exec(PLUGIN_CODE)?.[1];
+    expect(declared).toBeDefined();
+    const tiers = [...(declared ?? '').matchAll(/"([\w-]+)"/g)].map((match) => match[1]);
+
+    // Same names, opposite order. A tier list that gains a name is a preference
+    // for something `availableBackends()` can never offer; one that loses a name
+    // silently demotes that backend below everything; one that reorders picks
+    // the wrong tier while every other assertion here still passes.
+    expect(tiers).toEqual([...listed].reverse());
+  });
+
+  it('reports the backend a benchmark ran on, never a default for it', () => {
+    // `benchmark` filled its `backend` field from `contextInfo[id]?.backend ?:
+    // "cpu"`. Unreachable — `contexts` and `contextInfo` are written and removed
+    // together on one executor — but a measurement of a GPU run labelled `cpu`
+    // is worse than no measurement, so the fallback is a refusal now.
+    expect(PLUGIN_CODE).not.toMatch(/\.backend \?: "/);
+    expect(PLUGIN_CODE).not.toMatch(/\.put\("backend", [^\n]*\?: "/);
+  });
+});
+
 describe('supportsVision cannot outlive the build it is true for', () => {
   /**
    * It returns `JNI_FALSE` and ignores its handle. That is correct — and only
@@ -1386,3 +1599,4 @@ describe('the thermal level stays a faithful mapping of a measured ordinal', () 
     expect(PLUGIN_CODE).toMatch(/"throttled", status >= PowerManager\.THERMAL_STATUS_SEVERE/);
   });
 });
+

@@ -97,23 +97,42 @@ class LlamaCppPlugin : Plugin() {
                 context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }
 
-            val backends = JSArray(availableBackends())
+            val available = availableBackends()
 
-            // Preferred backend follows the tier order in the PRD: NPU, then
-            // GPU, then CPU. The engine still falls back at load time if the
-            // chosen backend refuses the model.
-            val preferred = when {
-                LlamaBridge.hasHexagon() -> "npu-hexagon"
-                LlamaBridge.hasVulkan() -> "gpu-vulkan"
-                LlamaBridge.hasOpenCl() -> "gpu-opencl"
-                else -> "cpu"
-            }
+            /*
+             * Chosen FROM the list, in the PRD's tier order — NPU, then GPU,
+             * then CPU. The engine still falls back at load time if the
+             * chosen backend refuses the model.
+             *
+             * The point is that the candidates are the list itself, so the
+             * two fields of this one payload cannot contradict each other.
+             * They could before: this was a SECOND `when` over the same
+             * `has*()` queries, and its `else` branch said "cpu" without ever
+             * asking `hasCpu()`. A build whose CPU registry entry is missing
+             * or renamed — the `.so` dlopens, so `loadFailure` is null and we
+             * reach here — emitted `backends: []` beside
+             * `preferredBackend: "cpu"`, naming a backend the same object had
+             * just said was not there.
+             *
+             * The empty list is the one case this still cannot state
+             * honestly. `ComputeBackendId` in
+             * `packages/contracts/src/llama-cpp.ts` is a closed union of six
+             * real backend names with no "none" member, and
+             * `preferredBackend` is not optional, so one of the six has to go
+             * in the field. "cpu" is the least dishonest: it is the tier
+             * every other one degrades to, and it is what `load()` clamps a
+             * request to when the build has nothing better. Teaching the
+             * payload to say "no backend at all" means widening a contract
+             * three implementations and the web shim share, which is a
+             * decision for its callers and not a side effect of this fix.
+             */
+            val preferred = BACKEND_TIERS.firstOrNull { it in available } ?: "cpu"
 
             call.resolve(
                 JSObject()
                     .put("totalMemory", memoryInfo.totalMem)
                     .put("availableMemory", memoryInfo.availMem)
-                    .put("backends", backends)
+                    .put("backends", JSArray(available))
                     .put("preferredBackend", preferred)
                     .put("cpuCores", Runtime.getRuntime().availableProcessors())
                     .put("chipset", chipset())
@@ -654,6 +673,25 @@ class LlamaCppPlugin : Plugin() {
     @PluginMethod
     fun benchmark(call: PluginCall) {
         withHandle(call) { handle ->
+            /*
+             * Read before the measurement, and refused rather than filled in.
+             *
+             * This was `contextInfo[id]?.backend ?: "cpu"` at the resolve. The
+             * fallback is unreachable — `contexts` and `contextInfo` are
+             * written together under `load`, removed together under `unload`,
+             * and both bodies run on the same single-threaded executor as this
+             * one, so `withHandle` finding the handle means the info is there
+             * — but if a future edit ever separates them, "cpu" would report a
+             * measurement of a GPU run as a CPU result, and a benchmark that
+             * lies about which backend it measured is worse than no benchmark.
+             */
+            val id = call.getString("handle")
+            val info = contextInfo[id]
+            if (info == null) {
+                call.reject("No model is loaded for that handle.")
+                return@withHandle
+            }
+
             val promptTokens = call.getInt("promptTokens") ?: 512
             val generateTokens = call.getInt("generateTokens") ?: 128
             val repetitions = max(1, call.getInt("repetitions") ?: 3)
@@ -668,7 +706,6 @@ class LlamaCppPlugin : Plugin() {
                 decode.add(measurement.generateTokensPerSecond)
             }
 
-            val id = call.getString("handle")
             call.resolve(
                 JSObject()
                     .put("promptTokensPerSecond", prefill.average())
@@ -676,7 +713,7 @@ class LlamaCppPlugin : Plugin() {
                     .put("peakMemoryBytes", LlamaBridge.peakFootprint())
                     .put("thermalBefore", before)
                     .put("thermalAfter", thermalPayload())
-                    .put("backend", contextInfo[id]?.backend ?: "cpu")
+                    .put("backend", info.backend)
                     .put("repetitions", repetitions)
                     .put("samples", JSArray(decode)),
             )
@@ -821,6 +858,16 @@ class LlamaCppPlugin : Plugin() {
         if (value.startsWith("file://")) value.removePrefix("file://") else value
 
     private companion object {
+        /**
+         * Backend preference, best first — the PRD §3.1 tier order.
+         *
+         * Exactly the reverse of the order `availableBackends()` builds, and
+         * `native-registration.test.ts` pins it to that so the two cannot
+         * drift into naming different sets. It is a filter over that list,
+         * never a source of names on its own.
+         */
+        val BACKEND_TIERS = listOf("npu-hexagon", "gpu-vulkan", "gpu-opencl", "cpu")
+
         /** Error code the web layer can match on, distinct from a load failure. */
         const val ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
 
