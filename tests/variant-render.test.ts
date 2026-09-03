@@ -520,7 +520,15 @@ describe('the transcript writes down the reply it is printing', () => {
     await useChats.getState().cycleVariant(assistantRow().id, -1);
     tables.rows = useChats.getState().messages;
 
-    const file = await buildTranscript(useChats.getState().chats[0]!);
+    // Pinned rather than `Date.now()`: the header stamps
+    // `new Date(chat.updatedAt).toISOString().slice(0, 10)`, so a live clock
+    // makes this assertion pass only on the day it was written. It did exactly
+    // that — green on the 2nd, red on the 3rd. `Date.UTC` keeps it stable in
+    // every timezone, unlike a local-midnight epoch.
+    const file = await buildTranscript({
+      ...useChats.getState().chats[0]!,
+      updatedAt: Date.UTC(2026, 8, 2),
+    });
 
     expect(file).toBe(
       [
