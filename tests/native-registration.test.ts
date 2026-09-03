@@ -365,6 +365,362 @@ describe('the Android bridge never throws where nothing can catch it', () => {
   });
 });
 
+/**
+ * Source masked so that a brace, a keyword or a `LlamaBridge.` inside a
+ * comment or a string literal cannot be mistaken for code.
+ *
+ * Same LENGTH as the input, on purpose: every index into the mask is an index
+ * into the real file, so a finding can name the line it is really on.
+ * `codeLines` above cannot do this job — it drops whole lines, which moves
+ * every line number after the first comment.
+ */
+const maskCode = (source: string): string => {
+  const out = source.split('');
+  const blank = (from: number, to: number): void => {
+    for (let i = from; i < to && i < out.length; i += 1) {
+      if (out[i] !== '\n') out[i] = ' ';
+    }
+  };
+  let i = 0;
+  while (i < source.length) {
+    const two = source.slice(i, i + 2);
+    if (two === '//') {
+      const nl = source.indexOf('\n', i);
+      const stop = nl < 0 ? source.length : nl;
+      blank(i, stop);
+      i = stop;
+    } else if (two === '/*') {
+      const close = source.indexOf('*/', i + 2);
+      const stop = close < 0 ? source.length : close + 2;
+      blank(i, stop);
+      i = stop;
+    } else if (source[i] === '"') {
+      const triple = source.startsWith('"""', i);
+      const quote = triple ? '"""' : '"';
+      let j = i + quote.length;
+      while (j < source.length) {
+        if (!triple && source[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (source.startsWith(quote, j)) break;
+        if (!triple && source[j] === '\n') break;
+        j += 1;
+      }
+      const stop = Math.min(source.length, j + quote.length);
+      blank(i, stop);
+      i = stop;
+    } else if (source[i] === "'") {
+      let j = i + 1;
+      while (j < source.length && source[j] !== "'" && source[j] !== '\n') {
+        j += source[j] === '\\' ? 2 : 1;
+      }
+      const stop = Math.min(source.length, j + 1);
+      blank(i, stop);
+      i = stop;
+    } else {
+      i += 1;
+    }
+  }
+  return out.join('');
+};
+
+/** Index just past the `}` that closes the `{` at `open`. */
+const blockEnd = (masked: string, open: number): number => {
+  let depth = 0;
+  for (let i = open; i < masked.length; i += 1) {
+    if (masked[i] === '{') depth += 1;
+    else if (masked[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return masked.length;
+};
+
+type Catches = 'all' | 'rejected';
+type Region = { start: number; end: number; catches: Catches };
+type Audit = { methods: string[]; guards: string[]; findings: string[] };
+
+/**
+ * The things that throw out of a plugin method, and what it takes to survive
+ * each one.
+ *
+ * Patterns, not a list of method names: a fence that knows the names of
+ * today's five defects would go green the moment a sixth method is written.
+ */
+const RISKY: { re: string; needs: Catches; why: string }[] = [
+  {
+    re: 'LlamaBridge\\.\\w+',
+    needs: 'all',
+    why:
+      'a native call, or the <clinit> that loads the library — the failures ' +
+      'are `Error`s, so only `catch (Throwable)` sees them',
+  },
+  {
+    re: 'executor\\.execute\\b',
+    needs: 'rejected',
+    why:
+      '`RejectedExecutionException` on the CALLING thread once the executor ' +
+      'is shut down — the throw happens before the runnable ever runs, so the ' +
+      'guard inside the lambda is on the wrong side of it',
+  },
+  {
+    re: 'as +[A-Z]\\w*',
+    needs: 'all',
+    why:
+      'a Kotlin non-null cast — `NullPointerException` when the platform ' +
+      'call returns null on a stripped or vendor ROM',
+  },
+];
+
+/**
+ * Reads a Capacitor plugin source and reports every place a `@PluginMethod`
+ * can let something escape.
+ *
+ * Three things it does that the old `LlamaBridge`-only sweep did not:
+ *
+ *   1. CONTAINMENT, not ordering. The old sweep asked "is this use after the
+ *      first guard token in the body". `generate` opens a `try`, CLOSES it,
+ *      and then calls `executor.execute` — later than the guard, outside it.
+ *      Braces are matched here, so a closed guard guards nothing after it.
+ *   2. Every risky construct, not just `LlamaBridge.*`. Capacitor's
+ *      `Bridge.callPluginMethod` rethrows ANYTHING out of a plugin method as
+ *      an uncaught `RuntimeException` on a `HandlerThread`, so the native
+ *      calls were never the whole surface.
+ *   3. One thread-level hop into the private helpers a method calls before it
+ *      hands off. `getThermalState`'s body is one line; the cast that kills
+ *      the app is in `thermalPayload`.
+ *
+ * The guard vocabulary is DERIVED from the source, not hardcoded: a helper
+ * counts as a guard when it takes a lambda and every call of that lambda in
+ * its own body sits inside something that catches `Throwable`. That finds
+ * `rejectOnThrow` (a literal `try`/`catch (Throwable)`) on the first pass and
+ * `withHandle` (which defers to `rejectOnThrow`) on the second. Rename them
+ * and the fence still works; delete the catch and they stop counting.
+ */
+const auditPlugin = (source: string, file = 'LlamaCppPlugin.kt'): Audit => {
+  const mask = maskCode(source);
+  const lineOf = (index: number): number => mask.slice(0, index).split('\n').length;
+
+  const DECL = /^ {4}(?:(?:private|internal|protected|public|override|open) )*(?:inline )?fun (\w+)\s*\(/gm;
+  const decls: { name: string; start: number; plugin: boolean }[] = [];
+  for (const m of mask.matchAll(DECL)) {
+    decls.push({
+      name: m[1]!,
+      start: m.index!,
+      plugin: /@PluginMethod\s*$/.test(mask.slice(Math.max(0, m.index! - 60), m.index!)),
+    });
+  }
+
+  // A declaration owns everything up to the next class-level declaration, so
+  // `getThermalState` no longer silently absorbs `thermalPayload`'s body the
+  // way an `@PluginMethod`-to-`@PluginMethod` slice does.
+  const stops = [
+    ...decls.map((d) => d.start),
+    ...[...mask.matchAll(/^ {4}(?:private |internal )?companion object/gm)].map((m) => m.index!),
+    mask.length,
+  ].sort((a, b) => a - b);
+  const spanOf = (start: number): { start: number; end: number } => ({
+    start,
+    end: stops.find((s) => s > start) ?? mask.length,
+  });
+
+  const regionsIn = (start: number, end: number, guards: string[]): Region[] => {
+    const regions: Region[] = [];
+    const span = mask.slice(start, end);
+
+    for (const m of span.matchAll(/\btry\s*\{/g)) {
+      const open = start + m.index! + m[0].length - 1;
+      const close = blockEnd(mask, open);
+      let cursor = close;
+      let catches: Catches | null = null;
+      for (;;) {
+        const clause = /^\s*catch\s*\(\s*\w+\s*:\s*(\w+)\s*\)\s*\{/.exec(mask.slice(cursor, cursor + 160));
+        if (!clause) break;
+        if (clause[1] === 'Throwable') catches = 'all';
+        else if (clause[1] === 'RejectedExecutionException' && catches === null) catches = 'rejected';
+        cursor = blockEnd(mask, cursor + clause[0].length - 1);
+      }
+      if (catches) regions.push({ start: open, end: close, catches });
+    }
+
+    for (const name of guards) {
+      // `[^(){}]*` matches a CALL — `rejectOnThrow(call) {` — and not the
+      // declaration, whose parameter list contains its own parentheses.
+      for (const m of span.matchAll(new RegExp(`\\b${name}\\s*\\([^(){}]*\\)\\s*\\{`, 'g'))) {
+        const at = start + m.index!;
+        if (/\bfun\s+$/.test(mask.slice(Math.max(0, at - 20), at))) continue;
+        const open = at + m[0].length - 1;
+        regions.push({ start: open, end: blockEnd(mask, open), catches: 'all' });
+      }
+    }
+    return regions;
+  };
+
+  const covered = (at: number, regions: Region[], needs: Catches): boolean =>
+    regions.some(
+      (r) => at >= r.start && at < r.end && (needs === 'rejected' || r.catches === 'all'),
+    );
+
+  // The fixpoint that derives the guard vocabulary. Two passes are enough for
+  // this file; the loop runs until it stops growing so a third layer would be
+  // found too.
+  let guards: string[] = [];
+  for (let pass = 0; pass < 8; pass += 1) {
+    const found = decls
+      .filter((d) => {
+        const { start, end } = spanOf(d.start);
+        const span = mask.slice(start, end);
+        const signature = span.slice(0, span.indexOf('{') + 1 || 200);
+        const lambdas = [...signature.matchAll(/\b(\w+)\s*:\s*\([^)]*\)\s*->/g)].map((m) => m[1]!);
+        if (lambdas.length === 0) return false;
+        const regions = regionsIn(start, end, guards);
+        return lambdas.every((param) => {
+          const calls = [...span.matchAll(new RegExp(`\\b${param}\\s*\\(`, 'g'))].map(
+            (m) => start + m.index!,
+          );
+          return calls.length > 0 && calls.every((at) => covered(at, regions, 'all'));
+        });
+      })
+      .map((d) => d.name)
+      .sort();
+    if (found.join() === guards.join()) break;
+    guards = found;
+  }
+
+  const byName = new Map(decls.map((d) => [d.name, d]));
+  const helpers = new Set(decls.filter((d) => !d.plugin).map((d) => d.name));
+  const findings: string[] = [];
+
+  for (const method of decls.filter((d) => d.plugin)) {
+    const seen = new Set<string>();
+    const walk = (decl: { name: string; start: number }, trail: string[]): void => {
+      if (seen.has(decl.name)) return;
+      seen.add(decl.name);
+      const { start, end } = spanOf(decl.start);
+      const span = mask.slice(start, end);
+      const regions = regionsIn(start, end, guards);
+      const where = trail.join(' -> ');
+
+      for (const risk of RISKY) {
+        for (const m of span.matchAll(new RegExp(risk.re, 'g'))) {
+          const at = start + m.index!;
+          if (covered(at, regions, risk.needs)) continue;
+          findings.push(
+            `${where} (${file}:${lineOf(at)}) runs \`${m[0].trim()}\` with nothing to catch it — ${risk.why}`,
+          );
+        }
+      }
+
+      // Whatever this body calls before it reaches a guard runs on the same
+      // thread and can throw the same way.
+      for (const m of span.matchAll(/\b(\w+)\s*\(/g)) {
+        const name = m[1]!;
+        const at = start + m.index!;
+        if (name === decl.name || !helpers.has(name)) continue;
+        if (covered(at, regions, 'all')) continue;
+        if (/\bfun\s+$/.test(mask.slice(Math.max(0, at - 20), at))) continue;
+        walk(byName.get(name)!, [...trail, name]);
+      }
+    };
+    walk(method, [method.name]);
+  }
+
+  return { methods: decls.filter((d) => d.plugin).map((d) => d.name), guards, findings };
+};
+
+describe('the fence itself can see an unguarded plugin method', () => {
+  /*
+   * The instrument, measured on Kotlin written to be measured — because the
+   * old fence passed a file with five fatal paths in it and a fence that has
+   * never been shown failing is a guess.
+   *
+   * Nothing here is hardcoded to the real file's method names: the probe
+   * defines its own `rejectOnThrow`, and the audit has to work out from the
+   * `try`/`catch (Throwable)` inside it that calling it is a guard.
+   */
+  const PROBE = [
+    '@CapacitorPlugin(name = "Probe")',
+    'class Probe : Plugin() {',
+    '',
+    '    @PluginMethod',
+    '    fun guarded(call: PluginCall) {',
+    '        wrap(call) {',
+    '            executor.execute {',
+    '                wrap(call) { call.resolve(JSObject().put("v", LlamaBridge.engineVersion())) }',
+    '            }',
+    '        }',
+    '    }',
+    '',
+    '    @PluginMethod',
+    '    fun deferred(call: PluginCall) {',
+    '        onWorker(call) { handle -> call.resolve(JSObject().put("n", LlamaBridge.tokenize(handle))) }',
+    '    }',
+    '',
+    '    @PluginMethod',
+    '    fun afterAClosedTry(call: PluginCall) {',
+    '        val reason = try {',
+    '            LlamaBridge.loadFailure',
+    '        } catch (error: Throwable) {',
+    '            null',
+    '        }',
+    '        executor.execute { call.resolve() }',
+    '    }',
+    '',
+    '    @PluginMethod',
+    '    fun viaHelper(call: PluginCall) {',
+    '        call.resolve(payload())',
+    '    }',
+    '',
+    '    private fun payload(): JSObject {',
+    '        // LlamaBridge.engineVersion() in a comment is not a call.',
+    '        val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager',
+    '        return JSObject().put("s", "as PowerManager in a string is not a cast")',
+    '    }',
+    '',
+    '    private fun onWorker(call: PluginCall, body: (Long) -> Unit) {',
+    '        wrap(call) { body(1L) }',
+    '    }',
+    '',
+    '    private inline fun wrap(call: PluginCall, body: () -> Unit) {',
+    '        try {',
+    '            body()',
+    '        } catch (error: Throwable) {',
+    '            call.reject("no")',
+    '        }',
+    '    }',
+    '}',
+  ].join('\n');
+
+  const probe = auditPlugin(PROBE, 'Probe.kt');
+
+  it('derives the guard vocabulary from the source instead of knowing its names', () => {
+    // `wrap` catches `Throwable` around its own lambda; `onWorker` defers to
+    // `wrap`. Neither is named in the audit — both are worked out.
+    expect(probe.guards).toEqual(['onWorker', 'wrap']);
+  });
+
+  it('says nothing about a method whose body is inside a guard', () => {
+    expect(probe.findings.filter((f) => f.startsWith('guarded'))).toEqual([]);
+    expect(probe.findings.filter((f) => f.startsWith('deferred'))).toEqual([]);
+  });
+
+  it('sees the call that a CLOSED try does not guard', () => {
+    // The bug the old ordering test could not see: the guard is earlier in
+    // the body and the call is still outside it.
+    expect(probe.findings.filter((f) => f.startsWith('afterAClosedTry'))).toEqual([
+      expect.stringContaining('runs `executor.execute`'),
+    ]);
+  });
+
+  it('follows one hop into a private helper called before any guard', () => {
+    expect(probe.findings.filter((f) => f.startsWith('viaHelper'))).toEqual([
+      expect.stringContaining('viaHelper -> payload (Probe.kt:35) runs `as PowerManager`'),
+    ]);
+  });
+});
+
 describe('no plugin method reaches the native library unguarded', () => {
   /**
    * The residual crash the verify phase found, and the reason this block
@@ -388,20 +744,19 @@ describe('no plugin method reaches the native library unguarded', () => {
    *
    * With the guard, the identical injection exits 0, the app is still running,
    * and `getCapabilities` refuses with the message this test names below.
+   *
+   * The sweep is wider than that one crash, because the mechanism is wider.
+   * `Bridge.callPluginMethod` posts the method into a `Runnable` whose handler
+   * is `catch (Exception ex) { throw new RuntimeException(ex); }`, and
+   * `PluginHandle.invoke` is reflective — so an `Error` arrives wrapped in an
+   * `InvocationTargetException` and comes back out uncaught on a
+   * `HandlerThread`. ANY throw out of a `@PluginMethod` is a process kill, not
+   * only the ones that went through `LlamaBridge`.
    */
-  const methods = (): { name: string; body: string }[] => {
-    const out: { name: string; body: string }[] = [];
-    const marker = /@PluginMethod\s+fun (\w+)\(call: PluginCall\) \{/g;
-    for (let m = marker.exec(PLUGIN_CODE); m; m = marker.exec(PLUGIN_CODE)) {
-      const start = m.index + m[0].length;
-      const next = PLUGIN_CODE.indexOf('@PluginMethod', start);
-      out.push({ name: m[1]!, body: PLUGIN_CODE.slice(start, next < 0 ? undefined : next) });
-    }
-    return out;
-  };
+  const audit = auditPlugin(PLUGIN_KT);
 
   it('finds all ten plugin methods, so the sweep below cannot pass by finding none', () => {
-    expect(methods().map((m) => m.name).sort()).toEqual([
+    expect([...audit.methods].sort()).toEqual([
       'benchmark',
       'cancel',
       'countTokens',
@@ -415,37 +770,27 @@ describe('no plugin method reaches the native library unguarded', () => {
     ]);
   });
 
-  it('touches LlamaBridge only after a guard, in every one of them', () => {
-    // The things that make a native call survivable, and the only things: the
-    // worker thread's `executor.execute` (whose body is always wrapped),
-    // `withHandle`, which is `executor.execute { rejectOnThrow(call) { … } }`,
-    // `rejectOnThrow` itself for a call that must stay on this thread, and a
-    // hand-written `try` — but only one that catches `Throwable`, because the
-    // failures worth catching here are all `Error`s and `catch (Exception)`
-    // lets every one of them through.
-    const TOKENS = ['executor.execute {', 'withHandle(call)', 'rejectOnThrow(call)'];
-    const guardsIn = (body: string): number[] => {
-      const found = TOKENS.map((g) => body.indexOf(g)).filter((i) => i >= 0);
-      for (const t of body.matchAll(/try \{/g)) {
-        if (body.slice(t.index!, t.index! + 400).includes('catch (error: Throwable)')) {
-          found.push(t.index!);
-        }
-      }
-      return found.sort((a, b) => a - b);
-    };
+  it('recognises the guards this file actually defines', () => {
+    // Derived, not asserted into existence: `rejectOnThrow` is a
+    // `try`/`catch (Throwable)` around its lambda, and `withHandle` is
+    // `executor.execute { rejectOnThrow(call) { … } }`. If either stopped
+    // catching `Throwable` it would drop out of this list and every body it
+    // wraps would be reported instead.
+    expect(audit.guards).toEqual(['rejectOnThrow', 'withHandle']);
+  });
 
-    for (const method of methods()) {
-      const guardAt = guardsIn(method.body)[0];
+  it('lets nothing in a @PluginMethod body run outside a guard', () => {
+    expect(audit.findings).toEqual([]);
+  });
 
-      const uses = [...method.body.matchAll(/LlamaBridge\.\w+/g)];
-      for (const use of uses) {
-        expect(
-          guardAt !== undefined && use.index! > guardAt,
-          `${method.name} reaches ${use[0]} outside a guard — that is a process kill, ` +
-            `not a rejected promise`,
-        ).toBe(true);
-      }
-    }
+  it('does not fire on the methods that are already guarded', () => {
+    // The false-positive control. `getCapabilities` is one `rejectOnThrow`
+    // over its whole body, and `listLoaded` and `cancel` touch nothing that
+    // can throw — none of them may ever appear above.
+    const named = new Set(audit.findings.map((f) => f.split(' ')[0]));
+    expect(named).not.toContain('getCapabilities');
+    expect(named).not.toContain('listLoaded');
+    expect(named).not.toContain('cancel');
   });
 
   it('turns a broken native surface into ENGINE_UNAVAILABLE, not a crash', () => {
@@ -481,6 +826,49 @@ describe('no plugin method reaches the native library unguarded', () => {
     expect(destroy).toMatch(/catch \(error: RejectedExecutionException\)/);
     // The handles are dropped whether or not freeing them worked.
     expect(destroy).toMatch(/finally \{[\s\S]{0,120}contexts\.clear\(\)/);
+  });
+});
+
+describe('the JNI exports exactly the symbols LlamaBridge declares', () => {
+  /*
+   * The cheapest check in this file, standing over the most expensive
+   * failure.
+   *
+   * A `.so` that builds and dlopens while missing ONE symbol is
+   * indistinguishable from a healthy one until the method is called —
+   * `loadFailure` is null, `getCapabilities` is happy, and the crash arrives
+   * later as an `UnsatisfiedLinkError` at the call site. That is the exact
+   * shape of the injection documented above, and finding it took an emulator,
+   * a rebuild and a device run. Comparing two lists of names finds a typo'd
+   * or dropped export in milliseconds, before anything is built.
+   *
+   * Both sides are read from source and neither list is written down here, so
+   * adding an `external fun` and its `Java_…` definition together keeps this
+   * green and adding either one alone does not.
+   *
+   * Names only, not signatures: JNI resolves by name plus descriptor, and a
+   * changed descriptor is a different failure this cannot see. (No name here
+   * needs JNI's `_1` escaping — none of them contains an underscore — and no
+   * method is overloaded, so no `__`-suffixed long form exists to match.)
+   */
+  const declared = [
+    ...new Set([...maskCode(BRIDGE_KT).matchAll(/\bexternal fun (\w+)/g)].map((m) => m[1]!)),
+  ].sort();
+  const exported = [
+    ...new Set(
+      [...maskCode(JNI).matchAll(/\bJava_app_chatterang_llama_LlamaBridge_(\w+)\s*\(/g)].map(
+        (m) => m[1]!,
+      ),
+    ),
+  ].sort();
+
+  it('finds symbols on both sides, so the comparison cannot pass on two empty lists', () => {
+    expect(declared.length).toBeGreaterThan(10);
+    expect(exported.length).toBeGreaterThan(10);
+  });
+
+  it('has a C++ definition for every external fun, and no export nothing declares', () => {
+    expect(exported).toEqual(declared);
   });
 });
 

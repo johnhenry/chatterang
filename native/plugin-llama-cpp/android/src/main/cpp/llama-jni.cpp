@@ -81,7 +81,15 @@ std::string to_string(JNIEnv *env, jstring value) {
     if (value == nullptr) return {};
     const jsize count = env->GetStringLength(value);
     const jchar *units = env->GetStringChars(value, nullptr);
-    if (units == nullptr) return {};
+    if (units == nullptr) {
+        // Null here means the VM could not pin the array — an OOM, and like
+        // every failed by-name lookup it leaves a PENDING EXCEPTION behind.
+        // The caller carries on making JNI calls with it pending, and the
+        // first of those is the fatal `JNI DETECTED ERROR IN APPLICATION` /
+        // SIGABRT `missing()` exists to prevent. Clear it and answer empty.
+        env->ExceptionClear();
+        return {};
+    }
     std::string out = utf16_to_utf8(units, count);
     env->ReleaseStringChars(value, units);
     return out;
@@ -131,7 +139,12 @@ jstring to_jstring(JNIEnv *env, const std::string &value) {
             units.push_back(static_cast<jchar>(code));
         }
     }
-    return env->NewString(units.data(), static_cast<jsize>(units.size()));
+    jstring out = env->NewString(units.data(), static_cast<jsize>(units.size()));
+    // Same pending-exception rule as `to_string` above, on the allocation
+    // instead of the pin: a null return is an OOM with the throwable already
+    // staged, and every caller here goes on to make more JNI calls.
+    if (out == nullptr) env->ExceptionClear();
+    return out;
 }
 
 void throw_java(JNIEnv *env, const char *message) {

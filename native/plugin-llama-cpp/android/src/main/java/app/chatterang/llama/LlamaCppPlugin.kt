@@ -123,9 +123,23 @@ class LlamaCppPlugin : Plugin() {
         }
     }
 
+    /**
+     * Guarded despite the one-line body, because the body is not where it
+     * dies: `thermalPayload` runs `getSystemService(POWER_SERVICE)` through
+     * a Kotlin non-null cast on Capacitor's own handler thread, and that
+     * platform call returns null on a stripped or vendor ROM. Measured,
+     * after a fully successful `getCapabilities` —
+     *
+     *     FATAL EXCEPTION: CapacitorPlugins
+     *     Caused by: java.lang.NullPointerException: null cannot be cast to
+     *       non-null type android.os.PowerManager
+     *       at LlamaCppPlugin.thermalPayload(LlamaCppPlugin.kt:132)
+     *
+     * — the engine up, the plugin killing the app anyway.
+     */
     @PluginMethod
     fun getThermalState(call: PluginCall) {
-        call.resolve(thermalPayload())
+        rejectOnThrow(call) { call.resolve(thermalPayload()) }
     }
 
     private fun thermalPayload(): JSObject {
@@ -182,161 +196,168 @@ class LlamaCppPlugin : Plugin() {
             return
         }
 
-        executor.execute {
-            rejectOnThrow(call) {
-                val started = System.currentTimeMillis()
-                val warnings = JSArray()
+        // The submit is inside the guard, not outside it:
+        // `executor.execute` throws `RejectedExecutionException` on the
+        // CALLING thread once the executor is shut down, and the
+        // `rejectOnThrow` inside the runnable is on the wrong side of a
+        // throw that happens before the runnable ever runs.
+        rejectOnThrow(call) {
+            executor.execute {
+                rejectOnThrow(call) {
+                    val started = System.currentTimeMillis()
+                    val warnings = JSArray()
 
-                val file = File(stripFileScheme(modelPath))
-                if (!file.exists()) {
-                    call.reject("The model file is missing. Try downloading it again.")
-                    return@execute
-                }
+                    val file = File(stripFileScheme(modelPath))
+                    if (!file.exists()) {
+                        call.reject("The model file is missing. Try downloading it again.")
+                        return@execute
+                    }
 
-                val contextLength = call.getInt("contextLength") ?: 4096
-                val threads = call.getInt("threads")
-                    ?: max(2, Runtime.getRuntime().availableProcessors() - 2)
+                    val contextLength = call.getInt("contextLength") ?: 4096
+                    val threads = call.getInt("threads")
+                        ?: max(2, Runtime.getRuntime().availableProcessors() - 2)
 
-                /*
-                 * Clamp the request to what this build actually has, and say
-                 * so — rather than attempting a GPU load that cannot succeed
-                 * and then reporting "the GPU could not load this model",
-                 * which names the wrong cause. Only the CPU variant is built
-                 * (`src/main/cpp/CMakeLists.txt` says why), so on this build
-                 * `available` is `[cpu]` and every request lands here.
-                 */
-                val requested = call.getString("backend") ?: "gpu-vulkan"
-                val available = availableBackends()
-                var backend = requested
-                if (requested !in available) {
-                    warnings.put(
-                        "This build has no $requested backend, so the model is running on the " +
-                            "CPU. Expect it to be slower.",
-                    )
-                    backend = "cpu"
-                }
+                    /*
+                     * Clamp the request to what this build actually has, and say
+                     * so — rather than attempting a GPU load that cannot succeed
+                     * and then reporting "the GPU could not load this model",
+                     * which names the wrong cause. Only the CPU variant is built
+                     * (`src/main/cpp/CMakeLists.txt` says why), so on this build
+                     * `available` is `[cpu]` and every request lands here.
+                     */
+                    val requested = call.getString("backend") ?: "gpu-vulkan"
+                    val available = availableBackends()
+                    var backend = requested
+                    if (requested !in available) {
+                        warnings.put(
+                            "This build has no $requested backend, so the model is running on the " +
+                                "CPU. Expect it to be slower.",
+                        )
+                        backend = "cpu"
+                    }
 
-                // Neither is compiled in — `LLAMA_BUILD_MTMD` is OFF and no
-                // draft path exists — and the native side ignores both. A
-                // caller that asked for them is told, because a silently
-                // dropped capability reads as a broken model.
-                if (!call.getString("mmprojPath").isNullOrBlank()) {
-                    warnings.put(
-                        "This build has no vision support, so any images in this conversation " +
-                            "will be ignored.",
-                    )
-                }
-                if (!call.getString("draftModelPath").isNullOrBlank()) {
-                    warnings.put(
-                        "This build has no speculative decoding, so the draft model is unused.",
-                    )
-                }
+                    // Neither is compiled in — `LLAMA_BUILD_MTMD` is OFF and no
+                    // draft path exists — and the native side ignores both. A
+                    // caller that asked for them is told, because a silently
+                    // dropped capability reads as a broken model.
+                    if (!call.getString("mmprojPath").isNullOrBlank()) {
+                        warnings.put(
+                            "This build has no vision support, so any images in this conversation " +
+                                "will be ignored.",
+                        )
+                    }
+                    if (!call.getString("draftModelPath").isNullOrBlank()) {
+                        warnings.put(
+                            "This build has no speculative decoding, so the draft model is unused.",
+                        )
+                    }
 
-                var handle = LlamaBridge.loadModel(
-                    file.absolutePath,
-                    call.getString("mmprojPath")?.let { stripFileScheme(it) },
-                    call.getString("draftModelPath")?.let { stripFileScheme(it) },
-                    contextLength,
-                    call.getInt("gpuLayers") ?: -1,
-                    backend,
-                    threads,
-                    call.getBoolean("useMmap") ?: true,
-                )
-
-                // Hardware-tiered fallback (PRD §3.1): a GPU that refuses the
-                // model degrades to CPU rather than failing outright. Reached
-                // only when a GPU backend is actually compiled in — otherwise
-                // the clamp above already chose CPU, and retrying CPU after
-                // CPU would just fail twice and blame the GPU for it.
-                if (handle == 0L && backend != "cpu") {
-                    warnings.put(
-                        "The GPU could not load this model, so it is running on the CPU. Expect it to be slower.",
-                    )
-                    backend = "cpu"
-                    handle = LlamaBridge.loadModel(
+                    var handle = LlamaBridge.loadModel(
                         file.absolutePath,
                         call.getString("mmprojPath")?.let { stripFileScheme(it) },
-                        null,
+                        call.getString("draftModelPath")?.let { stripFileScheme(it) },
                         contextLength,
-                        0,
+                        call.getInt("gpuLayers") ?: -1,
                         backend,
                         threads,
                         call.getBoolean("useMmap") ?: true,
                     )
-                }
 
-                if (handle == 0L) {
-                    call.reject(
-                        "This model could not be loaded. It may be incomplete, or too large for this device.",
+                    // Hardware-tiered fallback (PRD §3.1): a GPU that refuses the
+                    // model degrades to CPU rather than failing outright. Reached
+                    // only when a GPU backend is actually compiled in — otherwise
+                    // the clamp above already chose CPU, and retrying CPU after
+                    // CPU would just fail twice and blame the GPU for it.
+                    if (handle == 0L && backend != "cpu") {
+                        warnings.put(
+                            "The GPU could not load this model, so it is running on the CPU. Expect it to be slower.",
+                        )
+                        backend = "cpu"
+                        handle = LlamaBridge.loadModel(
+                            file.absolutePath,
+                            call.getString("mmprojPath")?.let { stripFileScheme(it) },
+                            null,
+                            contextLength,
+                            0,
+                            backend,
+                            threads,
+                            call.getBoolean("useMmap") ?: true,
+                        )
+                    }
+
+                    if (handle == 0L) {
+                        call.reject(
+                            "This model could not be loaded. It may be incomplete, or too large for this device.",
+                        )
+                        return@execute
+                    }
+
+                    val id = UUID.randomUUID().toString()
+                    val actualContext = LlamaBridge.contextLength(handle)
+                    if (actualContext < contextLength) {
+                        warnings.put("The context was reduced to $actualContext tokens to fit in memory.")
+                    }
+
+                    /*
+                     * The GGUF's own template beats the caller's guess: the caller
+                     * chose by model id, the file knows. llama.cpp hands back the
+                     * raw Jinja body rather than a name, so the native side sniffs
+                     * the family from its markers — a heuristic, which is why it
+                     * returns "" when it recognises nothing and the caller's value
+                     * remains the fallback.
+                     */
+                    val sniffed = LlamaBridge.chatTemplate(handle).ifBlank { null }
+                    val info = LoadedInfo(
+                        backend = backend,
+                        contextLength = actualContext,
+                        supportsVision = LlamaBridge.supportsVision(handle),
+                        chatTemplate = sniffed ?: call.getString("chatTemplate") ?: "chatml",
                     )
-                    return@execute
-                }
 
-                val id = UUID.randomUUID().toString()
-                val actualContext = LlamaBridge.contextLength(handle)
-                if (actualContext < contextLength) {
-                    warnings.put("The context was reduced to $actualContext tokens to fit in memory.")
-                }
+                    /*
+                     * Does the chosen template's vocabulary actually exist in this
+                     * model?
+                     *
+                     * A control marker the model knows tokenizes to exactly ONE
+                     * token. If not one of the template's markers does, the
+                     * template belongs to a different model family and every turn
+                     * is rendered in a language this model cannot read — the
+                     * symptom is incoherent output, which reads as a broken model
+                     * rather than a wrong template.
+                     *
+                     * A warning, not a refusal, matching `packages/inference-node`
+                     * and iOS: some templates legitimately use plain-text markers,
+                     * and one wrong guess should not make a model unloadable.
+                     */
+                    val markers = call.getArray("templateMarkers")
+                        ?.toList<String>()
+                        ?.filter { it.isNotEmpty() }
+                        ?: emptyList()
+                    if (markers.isNotEmpty() &&
+                        markers.none { LlamaBridge.tokenize(handle, it).size == 1 }
+                    ) {
+                        warnings.put(
+                            "The \"${info.chatTemplate}\" chat template does not match this model: " +
+                                "none of its markers (${markers.joinToString(", ")}) exist in its " +
+                                "vocabulary, so they will be sent as ordinary text. Expect incoherent " +
+                                "output until the template is changed.",
+                        )
+                    }
 
-                /*
-                 * The GGUF's own template beats the caller's guess: the caller
-                 * chose by model id, the file knows. llama.cpp hands back the
-                 * raw Jinja body rather than a name, so the native side sniffs
-                 * the family from its markers — a heuristic, which is why it
-                 * returns "" when it recognises nothing and the caller's value
-                 * remains the fallback.
-                 */
-                val sniffed = LlamaBridge.chatTemplate(handle).ifBlank { null }
-                val info = LoadedInfo(
-                    backend = backend,
-                    contextLength = actualContext,
-                    supportsVision = LlamaBridge.supportsVision(handle),
-                    chatTemplate = sniffed ?: call.getString("chatTemplate") ?: "chatml",
-                )
+                    contexts[id] = handle
+                    contextInfo[id] = info
 
-                /*
-                 * Does the chosen template's vocabulary actually exist in this
-                 * model?
-                 *
-                 * A control marker the model knows tokenizes to exactly ONE
-                 * token. If not one of the template's markers does, the
-                 * template belongs to a different model family and every turn
-                 * is rendered in a language this model cannot read — the
-                 * symptom is incoherent output, which reads as a broken model
-                 * rather than a wrong template.
-                 *
-                 * A warning, not a refusal, matching `packages/inference-node`
-                 * and iOS: some templates legitimately use plain-text markers,
-                 * and one wrong guess should not make a model unloadable.
-                 */
-                val markers = call.getArray("templateMarkers")
-                    ?.toList<String>()
-                    ?.filter { it.isNotEmpty() }
-                    ?: emptyList()
-                if (markers.isNotEmpty() &&
-                    markers.none { LlamaBridge.tokenize(handle, it).size == 1 }
-                ) {
-                    warnings.put(
-                        "The \"${info.chatTemplate}\" chat template does not match this model: " +
-                            "none of its markers (${markers.joinToString(", ")}) exist in its " +
-                            "vocabulary, so they will be sent as ordinary text. Expect incoherent " +
-                            "output until the template is changed.",
+                    call.resolve(
+                        JSObject()
+                            .put("handle", id)
+                            .put("backend", info.backend)
+                            .put("contextLength", info.contextLength)
+                            .put("loadMs", System.currentTimeMillis() - started)
+                            .put("warnings", warnings)
+                            .put("supportsVision", info.supportsVision)
+                            .put("chatTemplate", info.chatTemplate),
                     )
                 }
-
-                contexts[id] = handle
-                contextInfo[id] = info
-
-                call.resolve(
-                    JSObject()
-                        .put("handle", id)
-                        .put("backend", info.backend)
-                        .put("contextLength", info.contextLength)
-                        .put("loadMs", System.currentTimeMillis() - started)
-                        .put("warnings", warnings)
-                        .put("supportsVision", info.supportsVision)
-                        .put("chatTemplate", info.chatTemplate),
-                )
             }
         }
     }
@@ -349,11 +370,13 @@ class LlamaCppPlugin : Plugin() {
             return
         }
 
-        executor.execute {
-            rejectOnThrow(call) {
-                contexts.remove(id)?.let { LlamaBridge.freeModel(it) }
-                contextInfo.remove(id)
-                call.resolve()
+        rejectOnThrow(call) {
+            executor.execute {
+                rejectOnThrow(call) {
+                    contexts.remove(id)?.let { LlamaBridge.freeModel(it) }
+                    contextInfo.remove(id)
+                    call.resolve()
+                }
             }
         }
     }
@@ -432,152 +455,167 @@ class LlamaCppPlugin : Plugin() {
 
         cancelled.remove(requestId)
 
-        executor.execute {
-            val started = System.currentTimeMillis()
-            var firstTokenAt = 0L
-            var index = 0
-            val text = StringBuilder()
+        /*
+         * The submit is guarded too, and it REFUSES rather than rejects.
+         *
+         * `executor.execute` throws `RejectedExecutionException` on THIS
+         * thread — Capacitor's — once the executor is shut down, and that
+         * throw is downstream of every refusal above: unguarded it takes
+         * the process and the stream's terminal event with it. A plain
+         * `call.reject` here would trade the crash for a turn that hangs
+         * forever, because the adapter resolves its stream on `llamaEnd`.
+         * `refuse` is the only exit that still emits exactly one.
+         */
+        try {
+            executor.execute {
+                val started = System.currentTimeMillis()
+                var firstTokenAt = 0L
+                var index = 0
+                val text = StringBuilder()
 
-            /*
-             * EXACTLY ONE terminal event per request, on success, error and
-             * cancel alike — the rule `packages/inference-node` and the iOS
-             * plugin both enforce, because the web adapter
-             * (`src/ai/backends/llama-cpp.ts`) resolves its stream on
-             * `llamaEnd` and a second one settles an already-settled turn
-             * while a missing one hangs it forever.
-             *
-             * `settled` makes `finish` idempotent, and `finish` is called from
-             * the success path, from the catch, and once more from `finally`
-             * as a backstop — so a future edit that adds a fourth exit cannot
-             * quietly break the guarantee. It mirrors
-             * `LlamaCppPlugin.swift`'s `finish`/`defer` pair exactly.
-             */
-            var settled = false
-            fun finish(payload: JSObject): JSObject {
-                if (!settled) {
-                    settled = true
-                    notifyListeners("llamaEnd", payload)
+                /*
+                 * EXACTLY ONE terminal event per request, on success, error and
+                 * cancel alike — the rule `packages/inference-node` and the iOS
+                 * plugin both enforce, because the web adapter
+                 * (`src/ai/backends/llama-cpp.ts`) resolves its stream on
+                 * `llamaEnd` and a second one settles an already-settled turn
+                 * while a missing one hangs it forever.
+                 *
+                 * `settled` makes `finish` idempotent, and `finish` is called from
+                 * the success path, from the catch, and once more from `finally`
+                 * as a backstop — so a future edit that adds a fourth exit cannot
+                 * quietly break the guarantee. It mirrors
+                 * `LlamaCppPlugin.swift`'s `finish`/`defer` pair exactly.
+                 */
+                var settled = false
+                fun finish(payload: JSObject): JSObject {
+                    if (!settled) {
+                        settled = true
+                        notifyListeners("llamaEnd", payload)
+                    }
+                    return payload
                 }
-                return payload
-            }
 
-            try {
-                val result = LlamaBridge.generate(
-                    handle,
-                    prompt,
-                    images.toTypedArray(),
-                    sampler.optDouble("temperature", 0.7).toFloat(),
-                    sampler.optDouble("topP", 0.95).toFloat(),
-                    sampler.optInt("topK", 40),
-                    sampler.optDouble("minP", 0.05).toFloat(),
-                    sampler.optDouble("repeatPenalty", 1.1).toFloat(),
-                    sampler.optInt("repeatLastN", 64),
-                    sampler.optDouble("frequencyPenalty", 0.0).toFloat(),
-                    sampler.optDouble("presencePenalty", 0.0).toFloat(),
-                    sampler.optInt("maxTokens", 1024),
-                    sampler.optInt("seed", -1),
-                    sampler.optJSONArray("stopSequences")?.let { array ->
-                        Array(array.length()) { array.getString(it) }
-                    } ?: emptyArray(),
-                    sampler.optInt("draftTokens", 5),
-                    object : LlamaBridge.TokenCallback {
-                        override fun onToken(token: String): Boolean {
-                            if (firstTokenAt == 0L) firstTokenAt = System.currentTimeMillis()
-                            text.append(token)
-                            notifyListeners(
-                                "llamaToken",
-                                JSObject()
-                                    .put("requestId", requestId)
-                                    .put("token", token)
-                                    .put("index", index++),
-                            )
-                            // Returning false asks the native loop to stop —
-                            // cheaper than polling a flag from C++.
-                            return !cancelled.contains(requestId)
-                        }
-                    },
-                )
-
-                val totalMs = max(1L, System.currentTimeMillis() - started)
-                val ttftMs = if (firstTokenAt > 0) firstTokenAt - started else totalMs
-
-                // DECODE throughput, over the decode window alone.
-                //
-                // This was `completionTokens * 1000.0 / totalMs` — every token
-                // divided by the whole wall clock, prefill included.
-                //
-                // Measured on emulator-5554 with the old formula: a 2-token
-                // answer with ttft 69273 ms inside a 83266 ms total reported
-                // 0.0240 tok/s, where the 13993 ms decode window that produced
-                // the second token is 0.0715 — 3.0x, from the divisor alone.
-                // The verify phase measured the same shape against the other
-                // reading: 0.0867 tok/s from `generate` beside 0.3051 tok/s of
-                // decode from `benchmark`, same model, same run.
-                //
-                // Both numbers reach the UI as "tok/s" — the chat rail's
-                // readout and the bench screen's "Generation" stat — so the
-                // disagreement reads as a regression in the engine.
-                //
-                // The first token is produced BY prefill and arrives at
-                // `ttftMs`, so the decode window is what follows it and
-                // carries `completionTokens - 1` tokens. Below two completion
-                // tokens there is no decode window at all, and 0.0 says so
-                // rather than inventing a rate from one prefill.
-                val decodeMs = max(1L, totalMs - ttftMs)
-                val decodedTokens = result.completionTokens - 1
-                val tokensPerSecond =
-                    if (decodedTokens > 0) decodedTokens * 1000.0 / decodeMs else 0.0
-
-                val payload = JSObject()
-                    .put("requestId", requestId)
-                    .put("text", result.text)
-                    .put("promptTokens", result.promptTokens)
-                    .put("cachedTokens", result.cachedTokens)
-                    .put("completionTokens", result.completionTokens)
-                    .put("ttftMs", ttftMs)
-                    .put("totalMs", totalMs)
-                    .put("tokensPerSecond", tokensPerSecond)
-                    .put(
-                        "stopReason",
-                        if (cancelled.contains(requestId)) "cancelled" else result.stopReason,
+                try {
+                    val result = LlamaBridge.generate(
+                        handle,
+                        prompt,
+                        images.toTypedArray(),
+                        sampler.optDouble("temperature", 0.7).toFloat(),
+                        sampler.optDouble("topP", 0.95).toFloat(),
+                        sampler.optInt("topK", 40),
+                        sampler.optDouble("minP", 0.05).toFloat(),
+                        sampler.optDouble("repeatPenalty", 1.1).toFloat(),
+                        sampler.optInt("repeatLastN", 64),
+                        sampler.optDouble("frequencyPenalty", 0.0).toFloat(),
+                        sampler.optDouble("presencePenalty", 0.0).toFloat(),
+                        sampler.optInt("maxTokens", 1024),
+                        sampler.optInt("seed", -1),
+                        sampler.optJSONArray("stopSequences")?.let { array ->
+                            Array(array.length()) { array.getString(it) }
+                        } ?: emptyArray(),
+                        sampler.optInt("draftTokens", 5),
+                        object : LlamaBridge.TokenCallback {
+                            override fun onToken(token: String): Boolean {
+                                if (firstTokenAt == 0L) firstTokenAt = System.currentTimeMillis()
+                                text.append(token)
+                                notifyListeners(
+                                    "llamaToken",
+                                    JSObject()
+                                        .put("requestId", requestId)
+                                        .put("token", token)
+                                        .put("index", index++),
+                                )
+                                // Returning false asks the native loop to stop —
+                                // cheaper than polling a flag from C++.
+                                return !cancelled.contains(requestId)
+                            }
+                        },
                     )
-                    .put("peakMemoryBytes", LlamaBridge.peakFootprint())
 
-                if (result.draftAcceptance >= 0) {
-                    payload.put("draftAcceptance", result.draftAcceptance)
+                    val totalMs = max(1L, System.currentTimeMillis() - started)
+                    val ttftMs = if (firstTokenAt > 0) firstTokenAt - started else totalMs
+
+                    // DECODE throughput, over the decode window alone.
+                    //
+                    // This was `completionTokens * 1000.0 / totalMs` — every token
+                    // divided by the whole wall clock, prefill included.
+                    //
+                    // Measured on emulator-5554 with the old formula: a 2-token
+                    // answer with ttft 69273 ms inside a 83266 ms total reported
+                    // 0.0240 tok/s, where the 13993 ms decode window that produced
+                    // the second token is 0.0715 — 3.0x, from the divisor alone.
+                    // The verify phase measured the same shape against the other
+                    // reading: 0.0867 tok/s from `generate` beside 0.3051 tok/s of
+                    // decode from `benchmark`, same model, same run.
+                    //
+                    // Both numbers reach the UI as "tok/s" — the chat rail's
+                    // readout and the bench screen's "Generation" stat — so the
+                    // disagreement reads as a regression in the engine.
+                    //
+                    // The first token is produced BY prefill and arrives at
+                    // `ttftMs`, so the decode window is what follows it and
+                    // carries `completionTokens - 1` tokens. Below two completion
+                    // tokens there is no decode window at all, and 0.0 says so
+                    // rather than inventing a rate from one prefill.
+                    val decodeMs = max(1L, totalMs - ttftMs)
+                    val decodedTokens = result.completionTokens - 1
+                    val tokensPerSecond =
+                        if (decodedTokens > 0) decodedTokens * 1000.0 / decodeMs else 0.0
+
+                    val payload = JSObject()
+                        .put("requestId", requestId)
+                        .put("text", result.text)
+                        .put("promptTokens", result.promptTokens)
+                        .put("cachedTokens", result.cachedTokens)
+                        .put("completionTokens", result.completionTokens)
+                        .put("ttftMs", ttftMs)
+                        .put("totalMs", totalMs)
+                        .put("tokensPerSecond", tokensPerSecond)
+                        .put(
+                            "stopReason",
+                            if (cancelled.contains(requestId)) "cancelled" else result.stopReason,
+                        )
+                        .put("peakMemoryBytes", LlamaBridge.peakFootprint())
+
+                    if (result.draftAcceptance >= 0) {
+                        payload.put("draftAcceptance", result.draftAcceptance)
+                    }
+
+                    call.resolve(finish(payload))
+                } catch (error: Throwable) {
+                    // Throwable, not Exception: an `UnsatisfiedLinkError` or an
+                    // `OutOfMemoryError` from the JNI layer is exactly the case
+                    // that must become a rejection rather than a dead thread.
+                    val message = error.message ?: "Generation failed."
+                    val payload = finish(
+                        JSObject()
+                            .put("requestId", requestId)
+                            .put("text", text.toString())
+                            .put("stopReason", "error")
+                            .put("error", message),
+                    )
+                    // `PluginCall.reject` has no `Throwable` overload — only
+                    // (String), (String, String), (String, Exception),
+                    // (String, JSObject) and wider. Passing a `Throwable` here did
+                    // not compile, which is why this file had never been built.
+                    call.reject(message, null, error as? Exception, payload)
+                } finally {
+                    // Backstop. A no-op on both paths above, and the reason a new
+                    // early return cannot break the terminal-event rule by
+                    // accident.
+                    finish(
+                        JSObject()
+                            .put("requestId", requestId)
+                            .put("text", text.toString())
+                            .put("stopReason", "error")
+                            .put("error", "Generation ended without reporting a result."),
+                    )
+                    cancelled.remove(requestId)
                 }
-
-                call.resolve(finish(payload))
-            } catch (error: Throwable) {
-                // Throwable, not Exception: an `UnsatisfiedLinkError` or an
-                // `OutOfMemoryError` from the JNI layer is exactly the case
-                // that must become a rejection rather than a dead thread.
-                val message = error.message ?: "Generation failed."
-                val payload = finish(
-                    JSObject()
-                        .put("requestId", requestId)
-                        .put("text", text.toString())
-                        .put("stopReason", "error")
-                        .put("error", message),
-                )
-                // `PluginCall.reject` has no `Throwable` overload — only
-                // (String), (String, String), (String, Exception),
-                // (String, JSObject) and wider. Passing a `Throwable` here did
-                // not compile, which is why this file had never been built.
-                call.reject(message, null, error as? Exception, payload)
-            } finally {
-                // Backstop. A no-op on both paths above, and the reason a new
-                // early return cannot break the terminal-event rule by
-                // accident.
-                finish(
-                    JSObject()
-                        .put("requestId", requestId)
-                        .put("text", text.toString())
-                        .put("stopReason", "error")
-                        .put("error", "Generation ended without reporting a result."),
-                )
-                cancelled.remove(requestId)
             }
+        } catch (error: Throwable) {
+            refuse(describe(error))
         }
     }
 
@@ -655,7 +693,9 @@ class LlamaCppPlugin : Plugin() {
             call.reject("No model is loaded for that handle.")
             return
         }
-        executor.execute { rejectOnThrow(call) { body(handle) } }
+        rejectOnThrow(call) {
+            executor.execute { rejectOnThrow(call) { body(handle) } }
+        }
     }
 
     /**
