@@ -11,7 +11,7 @@
     "@deepseek-ai/dsh-llm": "0.1.1-rc.2"
   },
   "peerDependencies": {
-    "@johnhenry/aimatey-core": "0.3.0",
-    "@johnhenry/aimatey-types": "0.3.0"
+    "@johnhenry/aimatey-core": "0.3.1",
+    "@johnhenry/aimatey-types": "0.4.0"
   }
 }
