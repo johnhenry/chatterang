@@ -1157,7 +1157,7 @@
   color: #fff;
   display: grid;
   place-items: center;
-  font-size: 11px;
+  font-size: var(--t-2xs);
   line-height: 1;
 }
 
@@ -1564,7 +1564,15 @@
 .chart__axis {
   fill: var(--ink-3);
   font-family: var(--font-mono);
-  font-size: 9px;
+  /*
+   * Deliberately no font-size. Chart text lives inside the SVG viewBox, so
+   * its size is in USER UNITS that scale with the chart -- not CSS pixels
+   * and not a rem from the type scale, either of which would hold the text
+   * at a fixed size while the drawing around it grew. Those sizes belong
+   * with the chart's other geometry, so they are named in ui/Chart.tsx
+   * beside rowHeight and labelWidth. The 9px that used to sit here was
+   * dead in any case: all three .chart__axis elements set their own size.
+   */
   letter-spacing: 0.04em;
 }
 
