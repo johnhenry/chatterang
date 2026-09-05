@@ -34,6 +34,27 @@ export default defineConfig({
       '@chatterang/cordis-aimatey': fileURLToPath(
         new URL('./packages/cordis-aimatey/src', import.meta.url),
       ),
+      // The tunnel (#155), aliased ONE ENTRY POINT AT A TIME.
+      //
+      // `'@chatterang/tunnel': …/packages/tunnel/src` would be one line and
+      // would also make `@chatterang/tunnel/host` resolve for anything in
+      // `src/` that asked — a rollup string alias matches the exact specifier
+      // AND every subpath under it. The whole point of this package is that one
+      // of its three halves is not reachable from the web and mobile bundle, so
+      // the alias enumerates what may be reached rather than the directory that
+      // contains it. The `host` line exists so the Node-side tests can drive
+      // the real host code without a build step, exactly as `inference-node`
+      // and `server` do above; `tests/layering.test.ts` is what keeps `src/`
+      // from using it.
+      '@chatterang/tunnel/wire': fileURLToPath(
+        new URL('./packages/tunnel/src/wire/index.ts', import.meta.url),
+      ),
+      '@chatterang/tunnel/client': fileURLToPath(
+        new URL('./packages/tunnel/src/client/index.ts', import.meta.url),
+      ),
+      '@chatterang/tunnel/host': fileURLToPath(
+        new URL('./packages/tunnel/src/host/index.ts', import.meta.url),
+      ),
       // The Electron shell. Desktop-only and never part of a web build —
       // nothing under `src/` imports it, and `tests/layering.test.ts` makes
       // that a rule rather than a habit. The alias exists so the bridge tests

@@ -25,8 +25,34 @@ const SRC = resolve(process.cwd(), 'src');
  * duplicate of the thing under test. Exactly the failure this file keeps
  * re-learning, committed inside the guard against it.
  */
+/*
+ * A3 ADDED `@chatterang/tunnel` — AND ONLY HALF OF IT, WHICH IS NEW HERE.
+ *
+ * Every other name in this regex is banned outright: there is no part of
+ * `onnx-node` the phone may have. `packages/tunnel` (#155) is the first package
+ * that is banned and importable AT ONCE, because a tunnel has two ends and one
+ * of them is the phone. So the ban is written against ENTRY POINTS:
+ *
+ *   @chatterang/tunnel            BANNED — the bare specifier, see below
+ *   @chatterang/tunnel/host       BANNED — this is the half that binds a socket
+ *   @chatterang/tunnel/client     allowed — web globals only
+ *   @chatterang/tunnel/wire       allowed — imports nothing at all
+ *
+ * The BARE specifier is banned even though `packages/tunnel/package.json`
+ * declares no `.` export for it to resolve to. Those are two independent
+ * guards on purpose: the package.json key is asserted absent in the tunnel
+ * block below, and if someone adds a `.` that re-exports both halves — the
+ * obvious convenience, and the thing that silently deletes this boundary — the
+ * bare import still fails here rather than shipping `node:net` to a phone.
+ *
+ * Relative paths get the same treatment, at both plausible layouts
+ * (`packages/tunnel/host` and today's `packages/tunnel/src/host`), because
+ * `../../packages/tunnel/src/host/index` reaches the identical code without
+ * naming the package at all — the door this file's own comments record being
+ * left open twice before.
+ */
 const DESKTOP_LAYER_BAN =
-  /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
+  /^(@deepseek-ai\/|@chatterang\/(cordis-aimatey|inference-node|onnx-node)(\/|$)|@chatterang\/tunnel($|\/host(\/|$))|onnxruntime-(node|common)(\/|$)|node-llama-cpp(\/|$))|(^|\/)(packages\/(cordis-aimatey|inference-node|onnx-node)|packages\/tunnel\/(src\/)?host|node_modules\/(onnxruntime-node|onnxruntime-common|node-llama-cpp))(\/|$)/;
 
 /**
  * Every module specifier a file names, by any of the four doors.
@@ -79,6 +105,64 @@ const NODE_BUILTINS = new Set(builtinModules.flatMap((name) => [name, `node:${na
 /** A specifier that reaches Node's own modules, however it is spelled. */
 function isNodeBuiltin(specifier: string): boolean {
   return NODE_BUILTINS.has(specifier) || specifier.startsWith('node:');
+}
+
+/**
+ * Source with comments removed, and with strings left intact.
+ *
+ * Module scope, not inside one `describe`, because two guards now need it and
+ * this file's oldest lesson is about the copy that drifts from the original.
+ * It was written for the platform-seam rule below; the tunnel block uses it for
+ * a sharper reason.
+ *
+ * The guards that scan for BANNED specifiers can afford to read raw source:
+ * they test the captured specifier against a ban, so a package name mentioned
+ * in prose is not a match unless the prose also spells a whole import. A guard
+ * that asserts a file imports NOTHING has no such luck — every sentence in a
+ * comment is a candidate, and `packages/tunnel/src/wire/index.ts` is a file
+ * whose comments necessarily discuss imports. Stripping comments first is what
+ * makes "imports nothing at all" a rule about code.
+ *
+ * Strings are kept rather than stripped, so a specifier smuggled into an
+ * `eval`-shaped string still counts.
+ */
+function codeOf(source: string): string {
+  let out = '';
+  let i = 0;
+  while (i < source.length) {
+    const two = source.slice(i, i + 2);
+    if (two === '//') {
+      const end = source.indexOf('\n', i);
+      i = end === -1 ? source.length : end;
+      continue;
+    }
+    if (two === '/*') {
+      const end = source.indexOf('*/', i + 2);
+      i = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    const ch = source[i]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < source.length) {
+        const c = source[i]!;
+        out += c;
+        i += 1;
+        if (c === '\\') {
+          out += source[i] ?? '';
+          i += 1;
+          continue;
+        }
+        if (c === quote) break;
+      }
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 
 function sourceFiles(dir: string): string[] {
@@ -268,6 +352,183 @@ describe('contracts package', () => {
   });
 });
 
+/**
+ * THE TUNNEL PACKAGE (#155): the first package that is banned and importable at
+ * the same time.
+ *
+ * Every other package in this repo is one or the other. `contracts` is
+ * platform-agnostic and `src/` may have all of it; `inference-node`,
+ * `onnx-node` and `cordis-aimatey` are Node-only and `src/` may have none of
+ * it. A tunnel has two ends, and one of them is the phone — so
+ * `packages/tunnel` is split at the ENTRY POINT and the boundary runs through
+ * the middle of it:
+ *
+ *   src/wire/    imports nothing at all.               `src/` MAY import it.
+ *   src/client/  web globals only (no `node:`).        `src/` MAY import it.
+ *   src/host/    `node:net`, and a socket to bind.     `src/` MAY NOT.
+ *
+ * WHY THE PACKAGE-NAME BAN ABOVE IS NOT ENOUGH BY ITSELF, and why this block
+ * exists rather than one more name in `DESKTOP_LAYER_BAN`. The dangerous edge
+ * is not `src/` naming the host entry — that is banned and revert-checked. It
+ * is `packages/tunnel/src/client/` importing `../host/index.js`, INSIDE the
+ * package, where the specifier `src/` writes is still `@chatterang/tunnel
+ * /client` and every guard above waves it through while `node:net` rides into
+ * the mobile bundle behind it. A ban that only watches the front door is a ban
+ * on the front door.
+ *
+ * That guard has to be written whether the halves are two entry points or two
+ * packages, which is what settled #155's open question: once it exists, one
+ * package costs strictly less machinery for the same rule, and the wire types —
+ * the entire reason to share anything — stay in one place. See
+ * `packages/tunnel/README.md`.
+ *
+ * Shaped after the `contracts` block above, and asserted against the real files
+ * rather than a copy, for the reason recorded at the top of this file.
+ */
+describe('the tunnel package', () => {
+  const TUNNEL = resolve(process.cwd(), 'packages/tunnel/src');
+  const tunnelFiles = sourceFiles(TUNNEL);
+  const relTunnel = (file: string): string => relative(TUNNEL, file).replaceAll('\\', '/');
+  const half = (name: 'wire' | 'client' | 'host'): string[] =>
+    tunnelFiles.filter((file) => relTunnel(file).startsWith(`${name}/`));
+
+  /** Every specifier a file names, with comments stripped first. */
+  const specifiersOf = (file: string): string[] =>
+    [...codeOf(readFileSync(file, 'utf8')).matchAll(SPECIFIER)].map((m) => m[1] ?? '');
+
+  it('finds all three halves, so none of these rules is vacuous', () => {
+    // A boundary guard that runs against an empty directory passes and proves
+    // nothing — the failure mode of every "no offenders" assertion in this
+    // file, and the reason each block here opens with a count.
+    expect(tunnelFiles.map(relTunnel).sort()).not.toEqual([]);
+    for (const name of ['wire', 'client', 'host'] as const) {
+      expect(half(name).length, `packages/tunnel/src/${name} is empty`).toBeGreaterThan(0);
+    }
+  });
+
+  it('the wire half imports nothing at all', () => {
+    // The bottom of the package, and the one file both ends load. Anything it
+    // imports is imported by the phone AND by the listener, so the rule is not
+    // "no Node builtins" but "nothing": a DOM type, a Capacitor helper and a
+    // utility package are each equally a dependency the other end did not ask
+    // for. It is also what lets the codec live here rather than being split
+    // from its own types across two packages.
+    const offenders = half('wire').flatMap((file) =>
+      specifiersOf(file).map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('the client half imports no Node builtin, no Electron and no Capacitor', () => {
+    // This half is the mobile and web bundle's, so it lives under exactly the
+    // rules `src/` does. `@capacitor/` is banned for the same reason it is
+    // banned in `contracts`: the desktop renderer imports this too, and a
+    // shared contract that needs a mobile framework installed is not shared.
+    const banned = /^(@capacitor\/|electron($|\/))/;
+    const offenders = half('client').flatMap((file) =>
+      specifiersOf(file)
+        .filter((specifier) => banned.test(specifier) || isNodeBuiltin(specifier))
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('the client half never reaches into the host half', () => {
+    // THE EDGE A PACKAGE-NAME BAN CANNOT SEE. `src/` importing
+    // `@chatterang/tunnel/client` is allowed and always will be; if that file
+    // imports `../host/index.js`, `node:net` is in the phone bundle and every
+    // other guard in this file still passes.
+    //
+    // Both spellings, because the relative path is the one someone actually
+    // types from inside the package and the package name is the one a
+    // refactor leaves behind.
+    const offenders = half('client').flatMap((file) =>
+      specifiersOf(file)
+        .filter(
+          (specifier) =>
+            DESKTOP_LAYER_BAN.test(specifier) || /(^|\/)\.\.\/host(\/|$)/.test(`/${specifier}`),
+        )
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('neither shared half imports the app', () => {
+    // A `@/` import would make the tunnel depend on the app that consumes it —
+    // and this package is meant to be consumed by `apps/desktop` as well.
+    const offenders = [...half('wire'), ...half('client'), ...half('host')].flatMap((file) =>
+      specifiersOf(file)
+        .filter((specifier) => specifier.startsWith('@/'))
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('the host half really does name a Node builtin, so its ban is load-bearing', () => {
+    // The half of this boundary that is easy to get wrong by ACCIDENTALLY
+    // GETTING IT RIGHT. If `host/` never touches `node:`, then banning it from
+    // `src/` costs nothing, catches nothing, and reads in review as a boundary
+    // being enforced — until the day the listener is actually written and the
+    // ban's justification arrives after the code it was supposed to constrain.
+    //
+    // So the ban is required to have something behind it, asserted in the
+    // positive direction. `import type { Server } from 'node:net'` in
+    // `host/index.ts` is deliberate for exactly this reason, and the comment
+    // there says so.
+    const named = half('host').flatMap((file) => specifiersOf(file).filter(isNodeBuiltin));
+    expect(named.length, 'packages/tunnel/src/host names no Node builtin').toBeGreaterThan(0);
+  });
+
+  it('declares no "." export, so a bare @chatterang/tunnel resolves to nothing', () => {
+    // The one plausible way this boundary disappears without anyone deciding to
+    // delete it: someone adds `".": "./src/index.ts"` re-exporting both halves
+    // because a bare import is tidier, and `src/` gets `node:net` through a
+    // specifier no ban mentions. `DESKTOP_LAYER_BAN` bans the bare specifier as
+    // well for the same reason — two independent guards, because this one is a
+    // convenience someone will genuinely want.
+    const manifest = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'packages/tunnel/package.json'), 'utf8'),
+    ) as { exports?: Record<string, unknown> };
+    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual(['./client', './host', './wire']);
+  });
+
+  it('the tsconfig and vite aliases enumerate entry points, never the directory', () => {
+    // A wildcard is the back door. `"@chatterang/tunnel/*": ["packages/tunnel
+    // /src/*"]` in tsconfig — or `'@chatterang/tunnel': …/packages/tunnel/src`
+    // in vite, where a string alias matches the specifier AND every subpath
+    // under it — makes `@chatterang/tunnel/host` resolve for anything that
+    // asks. The ban above would still fail the test, but the code would
+    // typecheck and bundle, and the failure would be a lint someone waives
+    // rather than an import that does not exist.
+    for (const [name, source] of [
+      ['tsconfig.json', readFileSync(resolve(process.cwd(), 'tsconfig.json'), 'utf8')],
+      ['vite.config.ts', readFileSync(resolve(process.cwd(), 'vite.config.ts'), 'utf8')],
+    ] as const) {
+      // Comments stripped, both directions. BOTH of these files carry comments
+      // that spell the wildcard out in order to explain why it is not used —
+      // which a raw text search reads as the violation itself, and which is the
+      // exact trap this file's contracts block documents at `SPECIFIER`.
+      const code = codeOf(source);
+      for (const entry of ['wire', 'client', 'host']) {
+        expect(code, `${name} does not map @chatterang/tunnel/${entry}`).toContain(
+          `@chatterang/tunnel/${entry}`,
+        );
+      }
+      expect(code, `${name} maps @chatterang/tunnel with a wildcard`).not.toContain(
+        '@chatterang/tunnel/*',
+      );
+      // The bare key, in either file's quoting.
+      for (const bare of [
+        '"@chatterang/tunnel":',
+        "'@chatterang/tunnel':",
+        '"@chatterang/tunnel" :',
+      ]) {
+        expect(code, `${name} maps a bare @chatterang/tunnel`).not.toContain(bare);
+      }
+    }
+  });
+});
+
 describe('the app never reaches the desktop-only layer', () => {
   it('src/ imports neither DSH nor the Cordis plugin that hosts it', () => {
     // DSH is Node-only and pulls native addons (koffi, node-pty). A single
@@ -381,6 +642,18 @@ describe('the app never reaches the desktop-only layer', () => {
       ["const ort = require(`onnxruntime-node`);", 'onnxruntime-node'],
       ["const ort = require /* sneaky */ ('onnxruntime-node');", 'onnxruntime-node'],
       ["import { getLlama } from 'node-llama-cpp';", 'node-llama-cpp'],
+      // The tunnel's banned half (#155), by every door. The bare specifier is
+      // here because a later `.` export is the one plausible way this boundary
+      // disappears without anyone deciding to delete it.
+      ["import { createTunnelHost } from '@chatterang/tunnel/host';", '@chatterang/tunnel/host'],
+      ["import type { TunnelHost } from '@chatterang/tunnel';", '@chatterang/tunnel'],
+      ["export { listen } from '@chatterang/tunnel/host/listener';", '@chatterang/tunnel/host/listener'],
+      ["import '@chatterang/tunnel/host';", '@chatterang/tunnel/host'],
+      [
+        "const h = await import('../../packages/tunnel/src/host/index');",
+        '../../packages/tunnel/src/host/index',
+      ],
+      ["const h = require(`@chatterang/tunnel/host`);", '@chatterang/tunnel/host'],
     ];
     for (const [form, specifier] of onnxForms) {
       const found = [...form.matchAll(new RegExp(SPECIFIER.source, 'g'))].map((m) => m[1]);
@@ -390,7 +663,22 @@ describe('the app never reaches the desktop-only layer', () => {
 
     // And the control: a name that merely LOOKS like one of them is not banned,
     // so the rule is a rule and not a substring search.
-    for (const allowed of ['onnxruntime-web', '@chatterang/contracts', 'node-llama-cpp-web']) {
+    //
+    // The tunnel's ALLOWED entry points are controls in the strongest sense
+    // here: a ban that swallowed them would not merely be over-broad, it would
+    // make the package useless to `src/`, which is the half of #155 that has to
+    // work. `tunnel-host-web` is the lookalike — a name that starts with the
+    // banned string and is a different package.
+    for (const allowed of [
+      'onnxruntime-web',
+      '@chatterang/contracts',
+      'node-llama-cpp-web',
+      '@chatterang/tunnel/client',
+      '@chatterang/tunnel/wire',
+      '../../packages/tunnel/src/client/index',
+      '../../packages/tunnel/src/wire/index',
+      '@chatterang/tunnel-host-web',
+    ]) {
       expect(onnxBan.test(allowed), allowed).toBe(false);
     }
 
@@ -468,57 +756,14 @@ describe('only the platform seam names a platform', () => {
   const BRANCHES_ON_IDENTITY =
     /\bcapabilities\s*\(\s*\)\s*\.\s*id\b|\{[^}]*\bid\b[^}]*\}\s*=\s*capabilities\s*\(\s*\)/;
 
-  /**
-   * Source with comments removed, and with strings left intact.
-   *
-   * A raw text search is what the guards above deliberately avoid, for a
-   * reason this rule runs straight into: the four sites that USED to name a
-   * platform now carry comments explaining what they used to do and why it was
-   * wrong. Those comments are the documentation this milestone is made of, and
-   * a guard that forbids writing them down is a guard that pushes the
-   * explanation out of the code.
-   *
-   * Strings are kept rather than stripped, so `getPlatform()` smuggled into an
-   * `eval`-shaped string still counts.
+  /*
+   * `codeOf` used to live here. It is at module scope now, unchanged, because
+   * the tunnel guard needs it too — and the reason it exists is still this
+   * rule: the four sites that USED to name a platform now carry comments
+   * explaining what they did and why it was wrong. Those comments are the
+   * documentation this milestone is made of, and a guard that forbids writing
+   * them down is a guard that pushes the explanation out of the code.
    */
-  function codeOf(source: string): string {
-    let out = '';
-    let i = 0;
-    while (i < source.length) {
-      const two = source.slice(i, i + 2);
-      if (two === '//') {
-        const end = source.indexOf('\n', i);
-        i = end === -1 ? source.length : end;
-        continue;
-      }
-      if (two === '/*') {
-        const end = source.indexOf('*/', i + 2);
-        i = end === -1 ? source.length : end + 2;
-        continue;
-      }
-      const ch = source[i]!;
-      if (ch === '"' || ch === "'" || ch === '`') {
-        const quote = ch;
-        out += ch;
-        i += 1;
-        while (i < source.length) {
-          const c = source[i]!;
-          out += c;
-          i += 1;
-          if (c === '\\') {
-            out += source[i] ?? '';
-            i += 1;
-            continue;
-          }
-          if (c === quote) break;
-        }
-        continue;
-      }
-      out += ch;
-      i += 1;
-    }
-    return out;
-  }
 
   it('finds the seam itself, so this guard is not vacuous', () => {
     // A guard that would pass on a repo where nobody calls Capacitor at all is
