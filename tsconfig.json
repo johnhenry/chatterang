@@ -35,6 +35,16 @@
       "@chatterang/inference-node": ["packages/inference-node/src/index.ts"],
       "@chatterang/onnx-node": ["packages/onnx-node/src/index.ts"],
       "@chatterang/cordis-aimatey": ["packages/cordis-aimatey/src/index.ts"],
+      // The tunnel, mapped ONE ENTRY POINT AT A TIME and with no wildcard.
+      // `"@chatterang/tunnel/*": ["packages/tunnel/src/*"]` would be shorter
+      // and would resolve `@chatterang/tunnel/host` for anything that asked —
+      // including `src/`, whose ban on that specifier would then be a rule
+      // TypeScript happily worked around. There is no `.` entry for the same
+      // reason: a bare `@chatterang/tunnel` must have nothing to resolve to.
+      // `tests/layering.test.ts` asserts all three of these facts.
+      "@chatterang/tunnel/wire": ["packages/tunnel/src/wire/index.ts"],
+      "@chatterang/tunnel/client": ["packages/tunnel/src/client/index.ts"],
+      "@chatterang/tunnel/host": ["packages/tunnel/src/host/index.ts"],
       "@chatterang/desktop/*": ["apps/desktop/src/*"],
       "@chatterang/server": ["apps/server/src/index.ts"],
       "@chatterang/server/*": ["apps/server/src/*"]

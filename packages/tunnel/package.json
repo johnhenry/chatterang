@@ -1,0 +1,12 @@
+{
+  "name": "@chatterang/tunnel",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The tunnel between two Chatterangs, split at the entry point: ./wire and ./client are importable from src/, ./host never is. There is deliberately no \".\" export — a single entry point that re-exported both halves would put node:net in the mobile bundle.",
+  "exports": {
+    "./wire": "./src/wire/index.ts",
+    "./client": "./src/client/index.ts",
+    "./host": "./src/host/index.ts"
+  }
+}
