@@ -332,6 +332,106 @@ describe('ChatterangEngine.stream', () => {
     expect(done.provenance.fallbackFrom).toBe('scripted');
   });
 
+  /*
+   * #228. The Router does not honour `fallbackStrategy: 'none'`. When a
+   * backend's circuit opens, selectBackend stops preferring the explicit
+   * backend and falls through to "final fallback: first available backend",
+   * so a turn aimed at a local model was being ANSWERED by whatever else
+   * happened to be registered -- with no fallback event and no egress prompt.
+   *
+   * Both tests drive the real breaker: threshold is 3, so three failures open
+   * the target's circuit and the fourth attempt is the one that used to be
+   * served by the wrong backend.
+   */
+  describe('a divert the user did not consent to', () => {
+    /**
+     * Every local backend failing, one remote one healthy -- so the only
+     * substitution the router can make is off-device. Without that, the
+     * healthy llama-cpp shim answers instead and the assertion about cloud
+     * text is not load-bearing.
+     */
+    function armBreaker(): void {
+      engine.router.register('scripted', failingBackend('local engine died'));
+      engine.router.replace('llama-cpp', failingBackend('local engine died'));
+      engine.router.register('conn_openai', scriptedBackend(Array(16).fill('ANSWERED BY THE CLOUD.')));
+    }
+
+    async function attempt(): Promise<GenerationEvent[]> {
+      return drain(engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget }));
+    }
+
+    it('refuses rather than letting the router pick a backend nobody nominated', async () => {
+      armBreaker();
+      // Nothing nominated: engine is constructed with fallbackBackendId null.
+
+      // Seven attempts, because that is how long the broken path needed to
+      // reach the cloud: three failures open `scripted`, three more open
+      // llama-cpp, and the seventh had nowhere left on-device to go. With the
+      // check in place every attempt after the third simply refuses.
+      let events: GenerationEvent[] = [];
+      const everything: string[] = [];
+      for (let i = 0; i < 7; i += 1) {
+        events = await attempt();
+        everything.push(
+          events
+            .filter((event) => event.type === 'delta')
+            .map((event) => (event as Extract<GenerationEvent, { type: 'delta' }>).text)
+            .join(''),
+        );
+      }
+
+      // The measured defect: attempts 6 and 7 answered 'ANSWERED BY THE CLOUD.'
+      expect(everything.join('')).not.toContain('CLOUD');
+      expect(events.some((event) => event.type === 'done')).toBe(false);
+
+      const last = events.at(-1);
+      expect(last?.type).toBe('error');
+      // And it says something about the model the user chose, not a router id.
+      if (last?.type === 'error') {
+        expect(last.message).toContain(manifest.name);
+        expect(last.message).not.toContain('conn_openai');
+      }
+    });
+
+    it('diverts through the consent path when a fallback IS nominated', async () => {
+      armBreaker();
+      engine.setFallbackBackend('conn_openai');
+
+      let events: GenerationEvent[] = [];
+      for (let i = 0; i < 4; i += 1) events = await attempt();
+
+      // The same destination as before -- but announced, and only because it
+      // was nominated. The chip and the toast hang off this event.
+      const fallback = events.find(
+        (event): event is Extract<GenerationEvent, { type: 'fallback' }> => event.type === 'fallback',
+      );
+      expect(fallback, 'a fallback event is emitted').toBeTruthy();
+      expect(fallback?.event.from).toBe('scripted');
+      expect(fallback?.event.to).toBe('conn_openai');
+
+      const done = doneEvent(events);
+      expect(done.text).toBe('ANSWERED BY THE CLOUD.');
+      expect(done.provenance.local).toBe(false);
+      expect(done.provenance.fallbackFrom).toBe('scripted');
+    });
+
+    it('announces the divert BEFORE the egress gate reads its destination', async () => {
+      // The egress gate keys on target.backendId. A substitution made after it
+      // would have taken consent for one destination and used another, so the
+      // fallback must be the earlier event.
+      armBreaker();
+      engine.setFallbackBackend('conn_openai');
+
+      let events: GenerationEvent[] = [];
+      for (let i = 0; i < 4; i += 1) events = await attempt();
+
+      const fallbackAt = events.findIndex((event) => event.type === 'fallback');
+      const firstDeltaAt = events.findIndex((event) => event.type === 'delta');
+      expect(fallbackAt).toBeGreaterThanOrEqual(0);
+      expect(fallbackAt).toBeLessThan(firstDeltaAt);
+    });
+  });
+
   it('surfaces the failure when no fallback has been nominated — consent is required', async () => {
     engine.router.register('scripted', failingBackend('engine died'));
     engine.router.register('spare', scriptedBackend(['unused']));

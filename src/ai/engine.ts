@@ -612,6 +612,68 @@ export class ChatterangEngine {
       }
     }
 
+    /*
+     * The router will not keep the turn on the backend we asked for.
+     *
+     * When a backend's circuit opens, `selectBackend` (router.js:494) stops
+     * preferring the explicit backend -- `isBackendAvailable()` is false while
+     * the circuit is open -- and falls through to "final fallback: first
+     * available backend". Neither `routingStrategy: 'explicit'` nor
+     * `fallbackStrategy: 'none'` stops that branch, so the promise made at the
+     * Router construction above ("Fallback is a consent decision, not
+     * automatic") was not being kept.
+     *
+     * Measured before this check existed: a turn targeted at a LOCAL model,
+     * once the local circuits were open, was answered by a cloud provider --
+     * `[start, delta, done]`, no fallback event, no egress prompt, nothing on
+     * screen. The conversation left the device and the transcript would later
+     * print `(remote)` for a turn the user had aimed at their own hardware.
+     * That is #228.
+     *
+     * So the decision is made HERE rather than inside the router. It sits
+     * before the egress gate deliberately: that gate keys on
+     * `target.backendId`, so a substitution made after it would have taken
+     * consent for one destination and used another.
+     *
+     * Only a backend the user nominated is diverted to. With none nominated,
+     * the turn fails with a sentence about the model the user chose -- the
+     * same one #187 wrote for the case where nothing can take the turn.
+     *
+     * `has()` guards the check because an unregistered backend is also
+     * "unavailable", and that case has its own message further up.
+     *
+     * The router's own `isBackendAvailable` is `isHealthy && circuit !== open`
+     * and is private, so the public `isCircuitBreakerOpen` is used instead.
+     * That covers the measured defect; a backend the router has marked
+     * unhealthy WITHOUT an open circuit is not observable from here and could
+     * still be substituted. Worth asking upstream to widen the public surface.
+     */
+    if (this.router.has(target.backendId) && this.router.isCircuitBreakerOpen(target.backendId)) {
+      const nominated = target.local ? this.#resolveFallback() : null;
+      if (!nominated || this.router.isCircuitBreakerOpen(nominated.name)) {
+        yield { type: 'error', message: noBackendMessage(target, true) };
+        return;
+      }
+
+      const event: FallbackEvent = {
+        reason: 'engine-error',
+        from: target.backendId,
+        to: nominated.name,
+        detail: 'the backend is paused after repeated failures',
+      };
+      this.#lastFallback = event;
+      this.#options.onFallback?.(event);
+      yield { type: 'fallback', event };
+
+      target = {
+        backendId: nominated.name,
+        engine: 'remote',
+        modelId: nominated.modelId ?? target.modelId,
+        modelName: nominated.modelId ?? nominated.name,
+        local: false,
+      };
+    }
+
     // ── Generate, then run any tools, then generate again ───────────────
     let messages: IRMessage[] = [...request.messages];
     let text = '';
