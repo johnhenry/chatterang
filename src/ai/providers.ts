@@ -11,7 +11,7 @@
  * only ever runs models locally never downloads any of this code.
  */
 
-import type { BackendAdapter, BackendAdapterConfig } from '@johnhenry/aimatey-types';
+import type { ApiKeyBackendAdapterConfig, BackendAdapter } from '@johnhenry/aimatey-types';
 
 export type ProviderKind = 'cloud' | 'self-hosted' | 'aggregator';
 
@@ -29,7 +29,18 @@ export interface ProviderDescriptor {
   readonly defaultModel?: string;
   /** Direct browser calls need an explicit opt-in header on some providers. */
   readonly browserMode?: boolean;
-  load(config: BackendAdapterConfig): Promise<BackendAdapter>;
+  /**
+   * Every adapter here is constructed from a connection the user configured, and
+   * `ProviderConnection.apiKey` is a `string` — empty for the self-hosted ones,
+   * never absent. So the narrower config is always what we actually have.
+   *
+   * aimatey 0.3.0 (ai.matey#104) made `apiKey` optional on the base config and
+   * required on the adapters that authenticate with one. Declaring the loose
+   * type here made those eight call sites unassignable while claiming less than
+   * we know: `needsKey` already says which providers need a key, and the type
+   * said nothing.
+   */
+  load(config: ApiKeyBackendAdapterConfig): Promise<BackendAdapter>;
 }
 
 /** Providers surfaced in Settings, ordered by how people actually reach for them. */
@@ -234,7 +245,7 @@ export interface ProviderConnection {
   readonly createdAt: number;
 }
 
-export function connectionConfig(connection: ProviderConnection): BackendAdapterConfig {
+export function connectionConfig(connection: ProviderConnection): ApiKeyBackendAdapterConfig {
   const descriptor = getProvider(connection.providerId);
   return {
     apiKey: connection.apiKey,
