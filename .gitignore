@@ -51,3 +51,9 @@ tests/**/*.js.map
 # Anchored, so a `build/` directory elsewhere in the tree is not swallowed.
 /native/plugin-llama-cpp/android/build/
 /native/plugin-llama-cpp/android/.cxx/
+
+# Runtime lock for the scheduled-tasks MCP server: a session id, a pid and
+# a start time for one machine at one moment. It was tracked, so every run
+# that acquired or released it showed as a working-tree change in an
+# unrelated branch.
+.claude/scheduled_tasks.lock
