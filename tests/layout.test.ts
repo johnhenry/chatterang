@@ -463,7 +463,7 @@ describe('density', () => {
     }
   });
 
-  it('leaves NO pixel height in the component sheet as a bare number', () => {
+  it('leaves NO pixel size in the component sheet as a bare number', () => {
     /*
      * ZERO OFFENDERS, NOT A LIST OF THEM.
      *
@@ -479,10 +479,18 @@ describe('density', () => {
      * `--ctl-*` for anything a pointer lands on, `--g-*` for marks, tracks,
      * grips and thumbnails, which are the same size for a finger and a mouse
      * because they are drawings rather than targets.
+     *
+     * `font-size` is swept for the same reason, added later: the sheet carried
+     * 11px on a real control and a dead 9px on chart text, and neither size
+     * could be reached by the type scale. Chart text is exempt by
+     * CONSTRUCTION rather than by allowlist -- it carries no font-size in CSS
+     * at all, because inside the viewBox a size is user units that scale with
+     * the drawing. Those sizes live in ui/Chart.tsx beside rowHeight and
+     * labelWidth, which are the same kind of quantity.
      */
     const offenders: string[] = [];
     for (const rule of parseRules(css)) {
-      for (const property of ['height', 'min-height', 'max-height', 'width'] as const) {
+      for (const property of ['height', 'min-height', 'max-height', 'width', 'font-size'] as const) {
         const value = rule.decls.get(property);
         if (/^\d+(?:\.\d+)?px$/.test(value ?? '')) {
           offenders.push(`${rule.selectors.join(', ')} { ${property}: ${value} }`);
@@ -490,6 +498,42 @@ describe('density', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('keeps chart type in user units, not the type scale', () => {
+    /*
+     * The counterpart to the sweep above, and the reason chart text is not
+     * simply tokenised along with everything else.
+     *
+     * Chart text lives inside an SVG viewBox on `.chart`, which is
+     * `width: 100%; height: auto` -- so a size written there is user units
+     * and scales with the drawing. A `--t-*` token is a rem, which does not:
+     * it would hold the labels at a fixed size while the bars around them
+     * grew and shrank, and they would collide at small widths.
+     *
+     * So this asserts the opposite of the sheet-wide rule, deliberately. If
+     * someone reads the sweep above and "fixes" Chart.tsx to match, this
+     * fails and explains why.
+     */
+    const chart = read('src/ui/Chart.tsx');
+
+    // No rem/px/em type sizes: those would stop scaling with the viewBox.
+    expect(chart).not.toMatch(/fontSize:\s*['"][\d.]+(?:rem|px|em)['"]/);
+    expect(chart).not.toMatch(/fontSize:\s*['"]?var\(--t-/);
+
+    // Sizes are named constants, not bare numbers whose unit must be inferred.
+    expect(chart).not.toMatch(/fontSize:\s*[\d.]+/);
+    for (const name of ['AXIS_LABEL', 'AXIS_DETAIL', 'AXIS_VALUE', 'DIAL_READOUT']) {
+      expect(chart, name).toMatch(new RegExp(`const ${name} = [\\d.]+;`));
+      expect(chart, `${name} is used`).toMatch(new RegExp(`fontSize: ${name}`));
+    }
+
+    // And the stylesheet must not reintroduce one: a CSS font-size on
+    // .chart__axis would be overridden by every call site anyway, which is
+    // exactly how the dead 9px went unnoticed.
+    const axis = parseRules(css).find((rule) => rule.selectors.includes('.chart__axis'));
+    expect(axis, '.chart__axis rule exists').toBeTruthy();
+    expect(axis?.decls.get('font-size')).toBeUndefined();
   });
 
   it('keeps the slider thumb at WCAG 2.5.8 for both pointers', () => {

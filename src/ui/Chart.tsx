@@ -9,6 +9,25 @@
 
 import { type ReactNode } from 'react';
 
+/*
+ * Type sizes for chart text, in SVG USER UNITS.
+ *
+ * These are deliberately not `--t-*` tokens. Everything inside the viewBox is
+ * user units that scale with the drawing -- `.chart` is `width: 100%;
+ * height: auto`, so a chart rendered narrow shrinks its labels along with its
+ * bars. A rem from the type scale would not scale: the text would hold a
+ * fixed size while the geometry around it moved, and the labels would collide
+ * at small widths. So these belong with rowHeight and labelWidth below,
+ * which are the same kind of quantity, rather than with the type scale.
+ *
+ * They are named rather than inlined so nothing here is a bare number whose
+ * unit the reader has to infer.
+ */
+const AXIS_LABEL = 10;
+const AXIS_DETAIL = 8.5;
+const AXIS_VALUE = 10;
+const DIAL_READOUT = 17;
+
 /* ── Horizontal bar comparison ──────────────────────────────────────── */
 
 export interface BarDatum {
@@ -50,11 +69,11 @@ export function BarChart({ data, unit, caption }: BarChartProps): ReactNode {
             const barWidth = Math.max(2, (datum.value / max) * trackWidth);
             return (
               <g key={`${datum.label}-${index}`}>
-                <text className="chart__axis" x={0} y={y + 15} style={{ fontSize: 10 }}>
+                <text className="chart__axis" x={0} y={y + 15} style={{ fontSize: AXIS_LABEL }}>
                   {truncate(datum.label, 20)}
                 </text>
                 {datum.detail ? (
-                  <text className="chart__axis" x={0} y={y + 27} style={{ fontSize: 8.5 }}>
+                  <text className="chart__axis" x={0} y={y + 27} style={{ fontSize: AXIS_DETAIL }}>
                     {datum.detail}
                   </text>
                 ) : null}
@@ -79,7 +98,7 @@ export function BarChart({ data, unit, caption }: BarChartProps): ReactNode {
                   className="chart__axis"
                   x={labelWidth + trackWidth + 6}
                   y={y + 19}
-                  style={{ fontSize: 10, fill: 'var(--ink-2)' }}
+                  style={{ fontSize: AXIS_VALUE, fill: 'var(--ink-2)' }}
                 >
                   {datum.value.toFixed(1)}
                 </text>
@@ -195,7 +214,7 @@ export function ThermalArc({ level, label }: { level: number; label: string }): 
           textAnchor="middle"
           style={{
             fontFamily: 'var(--font-mono)',
-            fontSize: 17,
+            fontSize: DIAL_READOUT,
             fill: 'var(--ink)',
             fontVariantNumeric: 'tabular-nums',
           }}
