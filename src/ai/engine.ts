@@ -16,6 +16,7 @@ import { ChromeAIBackendAdapter, LiteRtLmBackendAdapter } from '@johnhenry/aimat
 // (and then fail) inside a webview.
 import { createLoggingMiddleware } from '@johnhenry/aimatey-middleware/logging';
 import { createRetryMiddleware } from '@johnhenry/aimatey-middleware/retry';
+import { ErrorCode } from '@johnhenry/aimatey-types';
 import type {
   BackendAdapter,
   IRChatRequest,
@@ -126,6 +127,15 @@ interface TurnResult {
   text: string;
   stats: GenerationStatsSnapshot;
   error?: string;
+  /**
+   * The IR error chunk's `code`, kept because the message alone is not enough
+   * to say anything useful to the user. Dropping it here is what let
+   * `No available backend for routing` reach a message row: the string was
+   * rewrapped in a plain Error and the code that could have been mapped went
+   * with it. The chunk carries no `isRetryable`, so a code that needs one is
+   * read as the AdapterError default of false.
+   */
+  errorCode?: string;
 }
 
 /**
@@ -168,6 +178,91 @@ interface TurnResult {
  * `onnx-runtime` reads back as "the onnx-runtime runtime", and the id is an
  * aimatey registration name that means nothing to the person reading it.
  */
+/**
+ * Circuit-breaker settings, named because what the user reads is derived from
+ * them. Written inline, the sentence could say "thirty seconds" long after the
+ * timeout had been changed, which is the same class of defect as the vendor
+ * string it replaces.
+ */
+const BREAKER_THRESHOLD = 3;
+const BREAKER_TIMEOUT_MS = 30_000;
+
+/**
+ * What to say when there is no backend able to take the turn.
+ *
+ * The second leak of aimatey's vocabulary through the door
+ * `unregisteredBackendMessage` closed, and the string is not the one it was
+ * expected to be. #187 predicted `Circuit breaker is open for backend
+ * 'conn_openai'` from `checkCircuitBreaker`. Measured, that string is
+ * unreachable on this path: `selectBackend` (router.js:494) only prefers the
+ * explicit backend `if (this.isBackendAvailable(preferredBackend))`, and an
+ * open circuit makes it unavailable -- so selection SKIPS the backend rather
+ * than executing it, and `checkCircuitBreaker` never runs. What the user
+ * actually reads, once every circuit is open, is `No available backend for
+ * routing` (NO_BACKEND_AVAILABLE), which says even less.
+ *
+ * Both codes are mapped, because they arrive by different routes:
+ *
+ *   NO_BACKEND_AVAILABLE  every backend is failing or paused -- the reachable
+ *                         case, measured in tests/engine.test.ts
+ *   PROVIDER_UNAVAILABLE  a specific backend refused. `chrome-ai` throws it
+ *                         when the Prompt API is absent ("requires Chrome
+ *                         138+ ... chrome://flags/#prompt-api-for-gemini-nano")
+ *
+ * TWO OUTCOMES, NOT ONE. A pause is temporary; a missing Prompt API is not.
+ * Telling the second user to try again shortly would be a new false sentence,
+ * so they are told apart STRUCTURALLY rather than by matching message text,
+ * which aimatey is free to reword: a paused backend sets `isRetryable: true`
+ * (router.js `checkCircuitBreaker`), a capability failure leaves it at the
+ * `AdapterError` default of false. That flag is exactly the distinction the
+ * two sentences turn on -- come back later, versus this will not work here.
+ *
+ * Neither sentence names a backend id. `conn_openai` is a registration name;
+ * the model name is what the user chose.
+ *
+ * NOT COVERED, deliberately: which backend actually served a turn after
+ * selection skipped the one that was asked for. That is #228, and it is a
+ * consent defect rather than a wording one.
+ */
+function noBackendMessage(target: EngineTarget, retryable: boolean): string {
+  if (!retryable) {
+    // A capability gap. Nothing to wait for, so the remedy is another model.
+    // "on this device" is only said where it is true: chrome-ai's missing
+    // Prompt API is a property of the device, a refusing provider is not.
+    return isLocalEngine(target.engine)
+      ? `${target.modelName} is not available on this device. Choose another model.`
+      : `${target.modelName} is not available. Choose another model.`;
+  }
+  const seconds = Math.round(BREAKER_TIMEOUT_MS / 1000);
+  if (!isLocalEngine(target.engine)) {
+    return (
+      `${target.modelName} failed ${BREAKER_THRESHOLD} times in a row, so it is paused for ` +
+      `${seconds} seconds. Try again in a moment. If it keeps failing, under Remote ` +
+      `providers in Settings switch it off and on again, or remove it and add it again ` +
+      `to enter a new key.`
+    );
+  }
+  return (
+    `${target.modelName} failed ${BREAKER_THRESHOLD} times in a row, so it is paused for ` +
+    `${seconds} seconds. Try again in a moment, or choose another model.`
+  );
+}
+
+/**
+ * Whether an error means "nothing can take this turn", and if so whether
+ * waiting could help. Null when it is some other failure.
+ *
+ * Matched on `code`, never on the message: the strings are aimatey's to
+ * reword, and #187 exists because one of them reached a user verbatim.
+ */
+function noBackendRetryable(error: unknown): boolean | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const candidate = error as { code?: unknown; isRetryable?: unknown };
+  if (candidate.code === ErrorCode.NO_BACKEND_AVAILABLE) return true;
+  if (candidate.code !== ErrorCode.PROVIDER_UNAVAILABLE) return null;
+  return candidate.isRetryable === true;
+}
+
 function unregisteredBackendMessage(target: EngineTarget): string {
   if (!isLocalEngine(target.engine)) {
     return (
@@ -301,8 +396,8 @@ export class ChatterangEngine {
       fallbackStrategy: 'none', // Fallback is a consent decision, not automatic.
       trackLatency: true,
       enableCircuitBreaker: true,
-      circuitBreakerThreshold: 3,
-      circuitBreakerTimeout: 30_000,
+      circuitBreakerThreshold: BREAKER_THRESHOLD,
+      circuitBreakerTimeout: BREAKER_TIMEOUT_MS,
     });
 
     this.llama = new LlamaCppBackendAdapter({
@@ -606,7 +701,11 @@ export class ChatterangEngine {
         turn = yield* this.#runTurn(irRequest, target, request.signal);
         // A backend may report failure as an error chunk rather than by
         // throwing. Both are the same event as far as diverting goes.
-        if (turn.error) failure = new Error(turn.error);
+        if (turn.error) {
+          failure = turn.errorCode
+            ? Object.assign(new Error(turn.error), { code: turn.errorCode })
+            : new Error(turn.error);
+        }
       } catch (error) {
         turn = { text: '', stats: {} };
         failure = error;
@@ -618,9 +717,15 @@ export class ChatterangEngine {
         // A local failure can still divert, exactly as the middleware would.
         const fallback = target.local ? this.#resolveFallback() : null;
         if (!fallback) {
+          const retryable = noBackendRetryable(failure);
           yield {
             type: 'error',
-            message: failure instanceof Error ? failure.message : String(failure),
+            message:
+              retryable === null
+                ? failure instanceof Error
+                  ? failure.message
+                  : String(failure)
+                : noBackendMessage(target, retryable),
           };
           return;
         }
@@ -727,7 +832,7 @@ export class ChatterangEngine {
           break;
 
         case 'error':
-          return { text, stats, error: chunk.error.message };
+          return { text, stats, error: chunk.error.message, errorCode: chunk.error.code };
 
         default:
           break;
