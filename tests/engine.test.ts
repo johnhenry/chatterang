@@ -8,6 +8,7 @@ import type {
   IRStreamChunk,
 } from '@johnhenry/aimatey-types';
 import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
+import { AdapterError } from '@johnhenry/aimatey-errors';
 
 import { ChatterangEngine, targetFor, type GenerationEvent } from '@/ai/engine';
 import { DEFAULT_SAMPLER } from '@/domain/manifest';
@@ -114,6 +115,35 @@ function failingBackend(message: string): BackendAdapter {
     // eslint-disable-next-line require-yield
     executeStream: async function* (): AsyncGenerator<IRStreamChunk> {
       throw new Error(message);
+    },
+  });
+}
+
+/**
+ * A backend that reports PROVIDER_UNAVAILABLE, as `chrome-ai` does when the
+ * Prompt API is missing. `isRetryable` is the flag the engine reads to tell a
+ * temporary pause from a permanent capability gap.
+ */
+function unavailableBackend(isRetryable: boolean): BackendAdapter {
+  const fail = (): never => {
+    // The real class, and the real message, copied from
+    // aimatey-backend-browser/dist/esm/chrome-ai.js:240-244. A plain object
+    // with a `code` property is not the same test: the bridge only re-throws
+    // genuine AdapterErrors and wraps everything else.
+    throw new AdapterError({
+      code: 'PROVIDER_UNAVAILABLE',
+      message:
+        'Chrome AI (Prompt API) is not available - requires Chrome 138+ with the ' +
+        '`LanguageModel` global (chrome://flags/#prompt-api-for-gemini-nano may be required)',
+      isRetryable,
+      provenance: { backend: 'chrome-ai' },
+    });
+  };
+  return new FunctionBackendAdapter({
+    execute: async () => fail(),
+    // eslint-disable-next-line require-yield
+    executeStream: async function* (): AsyncGenerator<IRStreamChunk> {
+      fail();
     },
   });
 }
@@ -534,6 +564,77 @@ describe('ChatterangEngine.stream', () => {
       expect(message).not.toContain('runtime');
       // Nor aimatey's vocabulary about a registration table.
       expect(message).not.toContain('is not registered');
+    });
+
+    it('says a paused model is paused, in place of aimatey routing vocabulary', async () => {
+      /*
+       * Driven through the REAL breaker, not a hand-thrown error, because the
+       * string that reaches the user is not the one #187 predicted.
+       *
+       * The ticket expected `Circuit breaker is open for backend 'x'` from
+       * checkCircuitBreaker. That is unreachable here: selectBackend only
+       * prefers the explicit backend if isBackendAvailable(), and an open
+       * circuit makes it unavailable -- so selection SKIPS it and the breaker
+       * check never runs. Once every circuit is open, selection has nothing
+       * left and throws NO_BACKEND_AVAILABLE: `No available backend for
+       * routing`, which is what users were actually reading.
+       *
+       * Threshold is 3, so three failures open the target's circuit, three
+       * more open llama-cpp's, and from the seventh attempt nothing is left.
+       */
+      engine.router.register('scripted', failingBackend('local engine died'));
+      engine.router.replace('llama-cpp', failingBackend('local engine died'));
+
+      let message = '';
+      for (let attempt = 0; attempt < 7; attempt += 1) {
+        message = messageFor(
+          await drain(engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget })),
+        );
+      }
+
+      // The vocabulary that was reaching the message row and a `crit` toast.
+      expect(message).not.toContain('No available backend');
+      expect(message).not.toContain('routing');
+      expect(message).not.toContain('Circuit breaker');
+      expect(message).not.toContain('scripted');
+      // What it says instead: the model the user chose, and the wait.
+      expect(message).toContain(manifest.name);
+      expect(message).toContain('30 seconds');
+      expect(message).toContain('choose another model');
+    });
+
+    it('does not tell a user to wait when the backend will never be available', async () => {
+      /*
+       * The other route to "nothing can take this turn", and it must not get
+       * the same sentence. `chrome-ai` throws PROVIDER_UNAVAILABLE when the
+       * Prompt API is absent -- a permanent capability gap carrying "requires
+       * Chrome 138+ ... chrome://flags/#prompt-api-for-gemini-nano". Mapping
+       * the code alone would tell that user to try again in thirty seconds,
+       * forever. `isRetryable` separates them: the breaker sets it, a
+       * capability failure leaves it at the AdapterError default of false.
+       */
+      engine.router.register('chrome-ai', unavailableBackend(false));
+      const message = messageFor(
+        await drain(
+          engine.stream({
+            messages: [{ role: 'user', content: 'hi' }],
+            target: {
+              backendId: 'chrome-ai',
+              engine: 'remote' as const,
+              modelId: 'gemini-nano',
+              modelName: 'Chrome · Gemini Nano',
+              local: false,
+            },
+          }),
+        ),
+      );
+
+      expect(message).toContain('Chrome · Gemini Nano');
+      expect(message).toContain('Choose another model');
+      // No false wait, and none of the vendor detail the adapter carries.
+      expect(message).not.toContain('seconds');
+      expect(message).not.toContain('chrome://');
+      expect(message).not.toContain('Chrome 138');
     });
 
     /**
