@@ -72,6 +72,7 @@ const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { MessageView } = await import('@/features/chat/MessageView');
 const { renderTranscript } = await import('@/shell/commands');
 const { buildTranscript } = await import('@/lib/export');
+const { ranOnDevice, REACH_DEVICE, REACH_REMOTE } = await import('@/domain/chat');
 
 const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
 
@@ -97,7 +98,7 @@ const REMOTE: Provenance = {
   engine: 'remote',
   modelId: 'gpt-4o-mini',
   modelName: 'OpenAI · gpt-4o-mini',
-  local: false,
+  reach: REACH_REMOTE,
 };
 
 const ON_DEVICE: Provenance = {
@@ -105,7 +106,7 @@ const ON_DEVICE: Provenance = {
   engine: 'llama-cpp',
   modelId: QWEN.id,
   modelName: 'Qwen3 4B Instruct',
-  local: true,
+  reach: REACH_DEVICE,
 };
 
 const TOOL: ToolInvocation = {
@@ -114,6 +115,21 @@ const TOOL: ToolInvocation = {
   input: { command: 'ls /chats' },
   output: 'chat_1 — Bank details',
 };
+
+/**
+ * The snapshot the real engine would emit for a stored record.
+ *
+ * The ENGINE still reports a boolean — `ProvenanceSnapshot.local`, which #188
+ * owns — and `state/chat.ts` is where it becomes a `Reach`. The fixtures below
+ * are written as the record the app STORES, so this converts one back into the
+ * shape the engine hands over, `reach` and all removed. Passing the record
+ * through unchanged would let a store that simply copied `event.provenance`
+ * pass a test about deriving it.
+ */
+function snapshotOf(provenance: Provenance): Record<string, unknown> {
+  const { reach: _derived, ...rest } = provenance;
+  return { ...rest, local: ranOnDevice(provenance) };
+}
 
 interface Turn {
   readonly text: string;
@@ -134,7 +150,7 @@ function scriptedEngine(): unknown {
       yield {
         type: 'done',
         text: turn.text,
-        provenance: turn.provenance,
+        provenance: snapshotOf(turn.provenance),
         stats: turn.stats ?? { promptTokens: 8, completionTokens: 4 },
       };
     },

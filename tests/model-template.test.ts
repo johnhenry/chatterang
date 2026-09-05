@@ -122,8 +122,17 @@ describe('the version this migration claims', () => {
     expect([...declared]).toEqual([...declared].sort((a, b) => Number(a) - Number(b)));
   });
 
-  it('is the highest one, so an install on the shipped build upgrades into it', () => {
-    expect(Math.max(...versions.map((version) => Number(version._cfg?.version)))).toBe(5);
+  it('is still reached by an install on the shipped build, whatever follows it', () => {
+    // This used to assert `max === 5`, which was a proxy for "an old install
+    // ends up running this upgrade". v6 (`src/db/reach.ts`) now sits above it
+    // and the proxy has stopped tracking the claim: Dexie runs every version
+    // between the stored one and the newest, in order, so what matters for
+    // THIS migration is that 5 is declared and below the top — not that it is
+    // the top. The top is asserted where the top is written, in
+    // `tests/reach.test.ts`.
+    const declared = versions.map((version) => Number(version._cfg?.version));
+    expect(declared).toContain(5);
+    expect(Math.max(...declared)).toBeGreaterThanOrEqual(5);
   });
 });
 

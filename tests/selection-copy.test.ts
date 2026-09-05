@@ -123,6 +123,7 @@ const {
 const { recommendModel } = await import('@/domain/onboarding');
 const { chatterangCommands, renderTranscript } = await import('@/shell/commands');
 const { upgradeVariants } = await import('@/db/variants');
+const { ranOnDevice, REACH_DEVICE } = await import('@/domain/chat');
 
 const { ChatScreen, orphanOption, pickerEmptyCopy, refusalCopy, startProse, startStateCopy } =
   await import('@/features/chat/ChatScreen');
@@ -1518,7 +1519,10 @@ async function measureTheMark(): Promise<Marks> {
   /* 1. A reply that arrives from the provider, in a chat pinned to it. */
   armed(PROVIDER.id);
   await useChats.getState().send('hello');
-  expect(assistantRow().provenance?.local, 'the turn really did leave the device').toBe(false);
+  expect(
+    ranOnDevice(assistantRow().provenance),
+    'the turn really did leave the device',
+  ).toBe(false);
   let arrivedFromProvider = '';
   await mounted(createElement(LiveAssistant), () => {
     arrivedFromProvider = chipSays();
@@ -1526,7 +1530,7 @@ async function measureTheMark(): Promise<Marks> {
 
   /* 2. Regenerate the same turn on the device, then flip back to the first. */
   await useChats.getState().regenerate(assistantRow().id, QWEN.id);
-  expect(assistantRow().provenance?.local, 'the replacement ran here').toBe(true);
+  expect(ranOnDevice(assistantRow().provenance), 'the replacement ran here').toBe(true);
 
   let regeneratedOnDevice = '';
   let flippedBackToTheProvider = '';
@@ -1549,7 +1553,7 @@ async function measureTheMark(): Promise<Marks> {
   /* 3. A reply that arrives from the device, in a chat pinned to the model. */
   armed(QWEN.id);
   await useChats.getState().send('hello');
-  expect(assistantRow().provenance?.local, 'this one stayed here').toBe(true);
+  expect(ranOnDevice(assistantRow().provenance), 'this one stayed here').toBe(true);
   let arrivedOnDevice = '';
   await mounted(createElement(LiveAssistant), () => {
     arrivedOnDevice = chipSays();
@@ -1562,7 +1566,7 @@ async function measureTheMark(): Promise<Marks> {
     engine: QWEN.engine,
     modelId: QWEN.id,
     modelName: QWEN.name,
-    local: true,
+    reach: REACH_DEVICE,
   };
   // The exact row shape v3 wrote: the TEXT of the older generation, and the
   // newer generation's provenance on the row describing neither of them once

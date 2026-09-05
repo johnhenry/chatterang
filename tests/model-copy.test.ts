@@ -880,7 +880,7 @@ describe('what the welcome screen says leaves this device', () => {
     // `provenance`, not `message.provenance`: the chip is rendered from the
     // generation on display rather than from the row, so that flipping between
     // regenerated answers cannot leave this label over someone else's words.
-    expect(messageView).toContain("{provenance.local ? 'On device' : 'Remote'}");
+    expect(messageView).toContain("{ranOnDevice(provenance) ? 'On device' : 'Remote'}");
     expect(shipped('features/settings/SettingsScreen.tsx')).toContain(
       'every reply that came from one is marked in the thread',
     );
@@ -908,7 +908,7 @@ describe('what the welcome screen says leaves this device', () => {
     // The chip is on the assistant article, and its label is the word the
     // sentence now uses.
     expect(messageView).toContain('<article className="msg msg--assistant">');
-    expect(messageView).toContain("{provenance.local ? 'On device' : 'Remote'}");
+    expect(messageView).toContain("{ranOnDevice(provenance) ? 'On device' : 'Remote'}");
     // The user's row ends before the assistant branch begins, and the chip is
     // in the assistant branch.
     expect(messageView.indexOf('msg--assistant')).toBeLessThan(

@@ -46,6 +46,74 @@ export interface ToolInvocation {
   readonly durationMs?: number;
 }
 
+/**
+ * A device this install has paired with, as it was at the moment of the turn.
+ *
+ * COPIED IN, NEVER LOOKED UP. `src/domain/` may not import `@/db`, and more to
+ * the point a provenance record is permanent while a pairing is not: a
+ * transcript from March has to keep rendering after the desktop it names has
+ * been unpaired, renamed, or thrown away. A record that stored only an id and
+ * resolved the name at render time would go blank exactly when the user most
+ * needs to read it.
+ *
+ * Both fields, because they answer different questions. `name` is the only
+ * thing that can be shown to a person — "your desktop" is not a true label
+ * when a user has paired three of them — and it is a snapshot, which is the
+ * honest thing for it to be: it says what the device was called when the
+ * reply came back. `id` is the stable join key, so a later screen can still
+ * group turns by device across a rename, and so two desktops that share a
+ * name are still two devices.
+ */
+export interface PairedDevice {
+  /** Pairing id. Stable across a rename; not reused after unpairing. */
+  readonly id: string;
+  /** The device's name AS IT WAS when this turn ran. */
+  readonly name: string;
+}
+
+/**
+ * How far a reply travelled. Three destinations, one value.
+ *
+ * This replaces `local: boolean`, which had two answers for a question that
+ * now has three. A paired desktop is neither: the bytes left this phone, so
+ * it is not `local`, and no third party received them, so it is not `remote`
+ * in the sense every surface in this app means by that word. A boolean cannot
+ * hold that, and the failure mode of making it hold that is not cosmetic —
+ * `local: true` for a tunnel removes the egress sheet (#144, #188), and
+ * `local: false` raises a third-party consent prompt for the user's own
+ * machine.
+ *
+ * It is a discriminated union rather than a bare string plus an optional
+ * device field, for the reason {@link MessageVariant} is a record rather than
+ * a string: the invalid state should not be constructible. "Paired, but the
+ * app cannot say which device" is exactly as useless as "Remote", and a
+ * `reach: 'paired'` with a `pairedDevice` someone forgot to set would render
+ * as the label this whole change exists to stop the app printing.
+ *
+ * NOTHING WRITES `paired` YET. The producer is the tunnel (Track B), and the
+ * chip and the copy that render it are #210–#219. What lands here is the shape
+ * those tickets consume, so that none of them has to invent a private third
+ * value of its own.
+ */
+export type Reach =
+  /** Ran on this device. Nothing left it. */
+  | { readonly kind: 'device' }
+  /** Ran on a device the user paired. The bytes left this device; no third party saw them. */
+  | { readonly kind: 'paired'; readonly device: PairedDevice }
+  /** Served by a third party — a provider connection. */
+  | { readonly kind: 'remote' };
+
+/** Ran here. */
+export const REACH_DEVICE: Reach = Object.freeze({ kind: 'device' as const });
+
+/** Went to a third party. */
+export const REACH_REMOTE: Reach = Object.freeze({ kind: 'remote' as const });
+
+/** Ran on one named paired device. */
+export function reachPaired(device: PairedDevice): Reach {
+  return { kind: 'paired', device: { id: device.id, name: device.name } };
+}
+
 /** Where a message was produced. Drives the local/remote colour split. */
 export interface Provenance {
   /** aimatey backend-adapter id that served the request. */
@@ -53,7 +121,11 @@ export interface Provenance {
   readonly engine: EngineId;
   readonly modelId: string;
   readonly modelName: string;
-  readonly local: boolean;
+  /**
+   * How far this reply travelled. Was `local: boolean`; the Dexie v6 upgrade
+   * (`src/db/reach.ts`) rewrites stored rows.
+   */
+  readonly reach: Reach;
   /** Set when the router fell back from another backend. */
   readonly fallbackFrom?: string;
   readonly fallbackReason?: string;
@@ -66,6 +138,80 @@ export interface Provenance {
    * which it was.
    */
   readonly toolEgress?: 'granted' | 'withheld';
+}
+
+/* ── Reading a reach ────────────────────────────────────────────────── */
+
+/**
+ * The four answers a reader can get, including the one the type says is
+ * impossible.
+ *
+ * `unknown` is not a member of {@link Reach} and cannot be written. It is what
+ * a reader gets from a row that reached it without the v6 upgrade having run —
+ * a database restored from a backup, an import from another install, a row
+ * hand-written by a future writer that forgot the field. The alternative to
+ * naming that case is `provenance.reach.kind` throwing inside a renderer,
+ * which takes the whole thread down rather than one label with it.
+ *
+ * A reader that must NAME the destination should switch on this and print
+ * nothing for `unknown`, which is what the app already does with an absent
+ * `provenance` (see {@link MessageVariant.provenance}).
+ */
+export type ReachKind = 'device' | 'paired' | 'remote' | 'unknown';
+
+/** What kind of reach a record carries, tolerating a row that has none. */
+export function reachKind(provenance: { readonly reach?: Reach } | undefined): ReachKind {
+  const kind = provenance?.reach?.kind;
+  return kind === 'device' || kind === 'paired' || kind === 'remote' ? kind : 'unknown';
+}
+
+/**
+ * Did this reply run on THIS device?
+ *
+ * The narrow question, and the only one that may be used to grant something.
+ * Unknown answers `false`: a row whose reach was never written down has not
+ * been shown to have stayed here.
+ */
+export function ranOnDevice(provenance: { readonly reach?: Reach } | undefined): boolean {
+  return reachKind(provenance) === 'device';
+}
+
+/**
+ * Did the bytes leave this device?
+ *
+ * True for `paired` as well as `remote` — a tunnelled turn crossed the network
+ * even though nobody else read it, and every question about egress, consent
+ * and grants is about that crossing rather than about who was at the far end.
+ * Unknown answers `true`, which is the direction unknown has to fail in here.
+ */
+export function leftThisDevice(provenance: { readonly reach?: Reach } | undefined): boolean {
+  return reachKind(provenance) !== 'device';
+}
+
+/**
+ * Did a third party serve this reply?
+ *
+ * The question that gates anything a provider must never see — this app's own
+ * bookkeeping marks, for instance (`src/ai/taint.ts`). `paired` answers
+ * `false`, because the far end is the user's own machine running this same
+ * code. Unknown answers `true`: failing to strip is a leak, and failing to
+ * mark is only a missing chip.
+ *
+ * Both this and {@link leftThisDevice} answer `true` for unknown, so no
+ * caller can use the pair to derive a confident label out of a row that has
+ * none. Labelling goes through {@link reachKind}.
+ */
+export function reachedThirdParty(provenance: { readonly reach?: Reach } | undefined): boolean {
+  const kind = reachKind(provenance);
+  return kind === 'remote' || kind === 'unknown';
+}
+
+/** The paired device a reply ran on, or undefined if it was not a paired one. */
+export function pairedDevice(
+  provenance: { readonly reach?: Reach } | undefined,
+): PairedDevice | undefined {
+  const reach = provenance?.reach;
+  return reach?.kind === 'paired' ? reach.device : undefined;
 }
 
 export interface GenerationStats {
