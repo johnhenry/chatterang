@@ -17,6 +17,8 @@ import {
   displaysUnrecorded,
   newId,
   splitThinking,
+  REACH_DEVICE,
+  REACH_REMOTE,
   type Attachment,
   type Chat,
   type ChatMode,
@@ -602,7 +604,15 @@ async function runGeneration(
               engine: event.provenance.engine,
               modelId: event.provenance.modelId,
               modelName: event.provenance.modelName,
-              local: event.provenance.local,
+              // The engine still reports a boolean: `EngineTarget.local` gates
+              // the fallback and the egress sheet, and widening it is #188's
+              // and #144's, not this record's. So this is the one place the
+              // boolean becomes a `Reach`, and today it can only produce two
+              // of the three — nothing registers a paired target yet. When one
+              // does, the snapshot gains the device and this line reads it;
+              // until then the third value exists in the type and in the
+              // migration, and no runtime path reaches it.
+              reach: event.provenance.local ? REACH_DEVICE : REACH_REMOTE,
               fallbackFrom: event.provenance.fallbackFrom,
               fallbackReason: event.provenance.fallbackReason,
               toolEgress: event.provenance.toolEgress,

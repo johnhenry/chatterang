@@ -24,7 +24,8 @@ import {
   nonChatRole,
   type Capability,
 } from '@/domain/manifest';
-import { deriveTitle } from '@/domain/chat';
+import { deriveTitle, reachKind } from '@/domain/chat';
+import type { Reach } from '@/domain/chat';
 
 export interface ShellOutput {
   readonly stdout: string;
@@ -140,7 +141,7 @@ interface ChatRow {
  */
 interface TranscriptGeneration {
   content: string;
-  provenance?: { modelName: string; local: boolean };
+  provenance?: { modelName: string; reach?: Reach };
 }
 interface MessageRow extends TranscriptGeneration {
   role: string;
@@ -707,7 +708,7 @@ export function renderTranscript(
     // printed as absent — a generation recovered from a build that stored
     // variants as bare strings has no recorded origin, and neither label is
     // true of it, so it gets a bare name rather than a guess.
-    const where = shown.provenance ? (shown.provenance.local ? ' (on device)' : ' (remote)') : '';
+    const where = transcriptWhere(shown.provenance);
     lines.push(
       `## ${escapeTranscriptBody(who)}${where}`,
       '',
@@ -717,4 +718,30 @@ export function renderTranscript(
   }
 
   return lines.join('\n');
+}
+
+/**
+ * The parenthetical after the model name in an exported transcript.
+ *
+ * Three destinations, two phrases — the same coarsening the chip makes, and
+ * for the same reason: the words that tell a paired desktop apart from a
+ * provider are #210–#219's, and nothing writes a `paired` reach yet. A turn
+ * that ran on one would be printed "(remote)", which overstates where it went
+ * rather than hiding it.
+ *
+ * A reach nothing recorded prints NOTHING, which is what an absent provenance
+ * already did: neither phrase is true of a generation whose origin was never
+ * written down, and this file is read by someone checking whether their
+ * conversation left the device.
+ */
+function transcriptWhere(provenance: TranscriptGeneration['provenance']): string {
+  switch (reachKind(provenance)) {
+    case 'device':
+      return ' (on device)';
+    case 'paired':
+    case 'remote':
+      return ' (remote)';
+    case 'unknown':
+      return '';
+  }
 }

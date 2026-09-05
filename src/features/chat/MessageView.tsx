@@ -5,7 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
-import { currentVariant } from '@/domain/chat';
+import { currentVariant, ranOnDevice } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
@@ -131,10 +131,19 @@ export function MessageView({
         <span className="msg__who">
           {provenance?.modelName ?? (message.streaming ? 'Thinking' : 'Assistant')}
         </span>
+        {/* Two labels for a three-valued fact, deliberately, for now.
+            `ranOnDevice` is the narrow question — did this run HERE — so a
+            reply that travelled is never shown under the ember flame, which
+            is the defect this chip has been fixed for twice. A `paired` reach
+            therefore falls in with `remote`: coarse, and wrong only in the
+            safe direction, since it overstates the egress rather than hiding
+            it. Nothing can produce one yet (`state/chat.ts` writes two of the
+            three), and the chip that tells a paired desktop apart from a
+            provider is #210–#219, which owns the copy. */}
         {provenance ? (
-          <span className={`chip ${provenance.local ? 'chip--local' : 'chip--remote'}`}>
-            <Icon name={provenance.local ? 'flame' : 'cloud'} size={10} />
-            {provenance.local ? 'On device' : 'Remote'}
+          <span className={`chip ${ranOnDevice(provenance) ? 'chip--local' : 'chip--remote'}`}>
+            <Icon name={ranOnDevice(provenance) ? 'flame' : 'cloud'} size={10} />
+            {ranOnDevice(provenance) ? 'On device' : 'Remote'}
           </span>
         ) : null}
         {/* The chip says where the reply was made. This says what went with

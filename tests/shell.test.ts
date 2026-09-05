@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatterangShell, assertConfinedBuild, bundledCommandNames, type ShellStores } from '@/shell';
 import { chatterangCommands, renderTranscript, table } from '@/shell/commands';
 import { nonChatRole } from '@/domain/manifest';
+import { REACH_DEVICE, REACH_REMOTE } from '@/domain/chat';
 import { normalizePath } from '@/shell/fs';
 import { PROJECTED_PATHS, buildVfs, isProjectedPath, slug } from '@/shell/vfs';
 
@@ -76,7 +77,7 @@ function stores(overrides: Partial<ShellStores> = {}): ShellStores {
                 role: 'assistant',
                 content: 'It trades a little accuracy for a lot of memory.',
                 createdAt: 1,
-                provenance: { modelName: 'Qwen3 4B', local: true },
+                provenance: { modelName: 'Qwen3 4B', reach: REACH_DEVICE },
               },
             ]
           : [{ role: 'user', content: 'Tell me about the keeper', createdAt: 0 }],
@@ -862,7 +863,7 @@ describe('renderTranscript', () => {
         role: 'assistant',
         content: 'a',
         createdAt: 1,
-        provenance: { modelName: 'GPT', local: false },
+        provenance: { modelName: 'GPT', reach: REACH_REMOTE },
       },
     ]);
     expect(output).toContain('## GPT (remote)');

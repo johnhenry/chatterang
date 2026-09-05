@@ -64,6 +64,7 @@ const { MessageView } = await import('@/features/chat/MessageView');
 const { renderTranscript } = await import('@/shell/commands');
 const { isTainted } = await import('@/ai/taint');
 const { upgradeVariants } = await import('@/db/variants');
+const { ranOnDevice, reachKind, REACH_DEVICE, REACH_REMOTE } = await import('@/domain/chat');
 
 /** A model that can really hold a conversation. */
 const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
@@ -90,7 +91,7 @@ const REMOTE: Provenance = {
   engine: 'remote',
   modelId: 'gpt-4o-mini',
   modelName: 'OpenAI · gpt-4o-mini',
-  local: false,
+  reach: REACH_REMOTE,
 };
 
 const ON_DEVICE: Provenance = {
@@ -98,8 +99,23 @@ const ON_DEVICE: Provenance = {
   engine: 'llama-cpp',
   modelId: QWEN.id,
   modelName: 'Qwen3 4B Instruct',
-  local: true,
+  reach: REACH_DEVICE,
 };
+
+/**
+ * The snapshot the real engine would emit for a stored record.
+ *
+ * The ENGINE still reports a boolean — `ProvenanceSnapshot.local`, which #188
+ * owns — and `state/chat.ts` is where it becomes a `Reach`. The fixtures below
+ * are written as the record the app STORES, so this converts one back into the
+ * shape the engine hands over, `reach` and all removed. Passing the record
+ * through unchanged would let a store that simply copied `event.provenance`
+ * pass a test about deriving it.
+ */
+function snapshotOf(provenance: Provenance): Record<string, unknown> {
+  const { reach: _derived, ...rest } = provenance;
+  return { ...rest, local: ranOnDevice(provenance) };
+}
 
 interface Turn {
   readonly text: string;
@@ -126,7 +142,7 @@ function scriptedEngine(): unknown {
       yield {
         type: 'done',
         text: turn.text,
-        provenance: turn.provenance,
+        provenance: snapshotOf(turn.provenance),
         stats: { promptTokens: 8, completionTokens: 4 },
       };
     },
@@ -264,14 +280,14 @@ describe('a variant carries where it came from', () => {
 
     const row = assistantRow();
     expect(row.content).toBe('LOCAL ANSWER');
-    expect(row.provenance?.local).toBe(true);
+    expect(ranOnDevice(row.provenance)).toBe(true);
 
     await useChats.getState().cycleVariant(row.id, -1);
 
     const cycled = assistantRow();
     expect(cycled.content, 'the older generation is on display').toBe('REMOTE ANSWER');
     expect(
-      cycled.provenance?.local,
+      ranOnDevice(cycled.provenance),
       'the reply that came back from a provider is not marked as on-device',
     ).toBe(false);
     expect(cycled.provenance?.modelName).toBe(REMOTE.modelName);
@@ -374,7 +390,7 @@ describe('cycling does not consume a generation', () => {
 
     await useChats.getState().cycleVariant(id, 1);
     expect(assistantRow().content, 'the newest generation is still there').toBe('LOCAL ANSWER');
-    expect(assistantRow().provenance?.local).toBe(true);
+    expect(ranOnDevice(assistantRow().provenance)).toBe(true);
 
     expect(assistantRow().variants?.map((variant) => variant.content)).toEqual([
       'REMOTE ANSWER',
@@ -393,10 +409,10 @@ describe('cycling does not consume a generation', () => {
       'LOCAL ANSWER',
       'THIRD ANSWER',
     ]);
-    expect(row.variants?.map((variant) => variant.provenance?.local)).toEqual([
-      false,
-      true,
-      false,
+    expect(row.variants?.map((variant) => reachKind(variant.provenance))).toEqual([
+      'remote',
+      'device',
+      'remote',
     ]);
     expect(row.variantIndex).toBe(2);
   });
@@ -586,7 +602,7 @@ describe('editing a turn that has generations', () => {
       'REMOTE ANSWER',
       'WORDS I TYPED',
     ]);
-    expect(row.variants?.[0]?.provenance?.local).toBe(false);
+    expect(reachKind(row.variants?.[0]?.provenance)).toBe('remote');
 
     // The row still projects its own list, which is the invariant at stake.
     expect(row.variants?.[row.variantIndex!]?.content).toBe(row.content);

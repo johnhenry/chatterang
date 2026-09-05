@@ -15,9 +15,16 @@ import type { ComputeBackend, EngineId, ModelManifest, SamplerSettings } from '@
 import type { ProviderConnection } from '@/ai/providers';
 import { upgradeVariants, type LegacyMessageRow } from '@/db/variants';
 import { upgradeModelTemplates } from '@/db/model-template';
+import { upgradeMessageReach } from '@/db/reach';
 
 export { upgradeVariants, type LegacyMessageRow, type VariantUpgrade } from '@/db/variants';
 export { supersededTemplate, upgradeModelTemplates, type StoredModelRow } from '@/db/model-template';
+export {
+  upgradeMessageReach,
+  upgradeReach,
+  type LegacyReachRow,
+  type ReachUpgrade,
+} from '@/db/reach';
 
 export type InstallState = 'available' | 'queued' | 'downloading' | 'installed' | 'failed';
 
@@ -236,6 +243,28 @@ class ChatterangDatabase extends Dexie {
       .stores({ models: 'id, state, lastUsedAt, installedAt' })
       .upgrade(async (tx) => {
         await upgradeModelTemplates(tx.table('models'));
+      });
+
+    /*
+     * v6 replaces the provenance boolean with a three-valued reach.
+     *
+     * Every stored assistant turn carries `provenance.local`, and the readers
+     * — the chip, the transcript heading, the egress gate — now read
+     * `provenance.reach` instead. Widening the type reaches no row on disk, so
+     * without this an existing install renders every one of its past replies
+     * with an unknown destination.
+     *
+     * {@link upgradeMessageReach} says what each row becomes, and what it
+     * refuses to invent: nothing here writes `paired`, because no build that
+     * wrote these rows could tunnel a turn.
+     *
+     * The schema is unchanged — no index mentions `provenance` — so the store
+     * is restated for the version to have one, as v4 and v5 do.
+     */
+    this.version(6)
+      .stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' })
+      .upgrade(async (tx) => {
+        await upgradeMessageReach(tx.table('messages'));
       });
   }
 }
