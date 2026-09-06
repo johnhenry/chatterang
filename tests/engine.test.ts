@@ -333,13 +333,29 @@ describe('ChatterangEngine.stream', () => {
   });
 
   /*
-   * #228. The Router does not honour `fallbackStrategy: 'none'`. When a
-   * backend's circuit opens, selectBackend stops preferring the explicit
-   * backend and falls through to "final fallback: first available backend",
-   * so a turn aimed at a local model was being ANSWERED by whatever else
-   * happened to be registered -- with no fallback event and no egress prompt.
+   * #228. The Router did not honour `fallbackStrategy: 'none'`: when a
+   * backend's circuit opened, selectBackend fell through to "final fallback:
+   * first available backend", so a turn aimed at a local model was ANSWERED by
+   * whatever else happened to be registered -- no fallback event, no egress
+   * prompt.
    *
-   * Both tests drive the real breaker: threshold is 3, so three failures open
+   * THESE NO LONGER DISCRIMINATE, and that is worth saying plainly rather than
+   * leaving them to look like proof. aimatey-core 0.4.0 (ai.matey#134/#135)
+   * fixed the router half, so with the engine's pre-flight guard removed these
+   * still pass: the router now refuses at selection, the engine's own failure
+   * handler catches that error, resolves the nominated fallback and emits the
+   * same FallbackEvent. Same outcome, reached reactively instead of ahead of
+   * time. Measured -- with the guard stubbed to `false`, 24 of 24 pass here,
+   * where before the upgrade three failed.
+   *
+   * The guard is kept for two reasons, neither of which these tests prove:
+   * it refuses before the egress gate reads its destination, and it is the
+   * only thing standing between a config change (an app setting a substituting
+   * `fallbackStrategy`) and the original defect. Whoever next needs to prove
+   * the guard itself will have to construct a Router that substitutes, which
+   * the engine's own configuration no longer does.
+   *
+   * All three drive the real breaker: threshold is 3, so three failures open
    * the target's circuit and the fourth attempt is the one that used to be
    * served by the wrong backend.
    */

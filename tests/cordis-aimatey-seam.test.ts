@@ -359,14 +359,30 @@ describe('tools reach the backend, through the real Router', () => {
 /* ── (c) The route pin ────────────────────────────────────────────────── */
 
 describe('a named route is never served by another backend', () => {
-  it('CONTROL: the raw app Router really does substitute a different backend', async () => {
-    // The load-bearing control. If aimatey ever stops substituting, every
-    // assertion in this block passes for a reason that has nothing to do with
-    // the pin, and the whole block is vacuous.
+  it('CONTROL: a Router really does substitute a different backend', async () => {
+    /*
+     * The load-bearing control. If aimatey ever stops substituting, every
+     * assertion in this block passes for a reason that has nothing to do with
+     * the pin, and the whole block is vacuous.
+     *
+     * IT FIRED. As of aimatey-core 0.4.0 this used `appRouter()` and no longer
+     * substituted, because ai.matey#134/#135 taught `selectBackend` to honour
+     * `fallbackStrategy: 'none'` — which is exactly what the engine configures.
+     * So the app's own router now refuses on its own.
+     *
+     * The control is kept, and moved to a Router carrying the library's
+     * DEFAULT fallback strategy, because that is what the pin defends against
+     * now: not the app's current configuration, but the Router class's
+     * behaviour under any configuration this adapter does not own. The seam
+     * says so itself — its guarantee is a one-backend Router, and it "holds
+     * whatever routingStrategy/fallbackStrategy the app configured, which this
+     * adapter neither owns nor can enforce". Pinning the control to the app's
+     * config would make the block re-vacuous the moment that config changed.
+     */
     const local = recorder();
     const cloud = recorder();
-    const router = appRouter();
-    router.replace('llama-cpp', fixture('llama-cpp', 'hello from llama-cpp', local));
+    const router = new Router({ routingStrategy: 'explicit' });
+    router.register('llama-cpp', fixture('llama-cpp', 'hello from llama-cpp', local));
     router.register('openai', fixture('openai', 'hello from openai', cloud));
     // Public, deterministic, and — with an explicit 0 timeout — schedules no
     // auto-recovery timer (`if (timeoutMs ?? ...)` is falsy at 0), so the
@@ -390,6 +406,54 @@ describe('a named route is never served by another backend', () => {
     expect(text).toBe('hello from llama-cpp');
     expect(cloud.calls).toBe(0);
     expect(local.calls).toBe(1);
+  });
+
+  it('the app Router now refuses on its own, since aimatey 0.4.0', async () => {
+    /*
+     * The other half of the control above, and the reason it had to move.
+     *
+     * ai.matey#134: `selectBackend` fell through to "first available backend"
+     * regardless of `fallbackStrategy: 'none'`, so the strategy the engine
+     * configures was not honoured at selection time. Fixed in #135, shipped in
+     * aimatey-core 0.4.0, which this pins: the same setup as the control, but
+     * on the app's router, now throws instead of substituting.
+     *
+     * Kept separate from the seam's own pin so a regression upstream is
+     * distinguishable from a regression in the adapter.
+     */
+    const local = recorder();
+    const cloud = recorder();
+    const router = appRouter();
+    router.replace('llama-cpp', fixture('llama-cpp', 'hello from llama-cpp', local));
+    router.register('openai', fixture('openai', 'hello from openai', cloud));
+    router.openCircuitBreaker('openai', 0);
+
+    const chunks = await drainIR(
+      router.executeStream({
+        messages: [{ role: 'user', content: 'q' }],
+        parameters: { model: 'm' },
+        metadata: { requestId: 'r', timestamp: 0, custom: { backend: 'openai' } },
+        stream: true,
+        streamMode: 'delta',
+      }),
+    );
+
+    // It reports the refusal as an error CHUNK rather than by throwing, which
+    // is worth pinning: a caller that only wraps the loop in try/catch would
+    // see an empty stream and no exception.
+    const errors = chunks.filter((chunk) => chunk.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { error: { code: string } }).error.code).toBe('NO_BACKEND_AVAILABLE');
+
+    // No renderable output, and neither backend ran: refused at selection,
+    // before any I/O, so no key is used and no prompt leaves the device.
+    const text = chunks
+      .filter((chunk) => chunk.type === 'content')
+      .map((chunk) => (chunk as { delta: string }).delta)
+      .join('');
+    expect(text).toBe('');
+    expect(cloud.calls).toBe(0);
+    expect(local.calls).toBe(0);
   });
 
   it('refuses a breaker-open named route instead of substituting', async () => {

@@ -642,15 +642,23 @@ export class ChatterangEngine {
      * `has()` guards the check because an unregistered backend is also
      * "unavailable", and that case has its own message further up.
      *
-     * The router's own `isBackendAvailable` is `isHealthy && circuit !== open`
-     * and is private, so the public `isCircuitBreakerOpen` is used instead.
-     * That covers the measured defect; a backend the router has marked
-     * unhealthy WITHOUT an open circuit is not observable from here and could
-     * still be substituted. Worth asking upstream to widen the public surface.
+     * `isBackendAvailable` is `isHealthy && circuit !== open` -- the same
+     * predicate selection itself uses, so this asks the router exactly the
+     * question the router is about to answer. It was private when this guard
+     * was written, which forced a narrower check against `isCircuitBreakerOpen`
+     * and left a backend marked unhealthy WITHOUT an open circuit unobservable
+     * from here. ai.matey#134 asked for it; aimatey-core 0.4.0 made it public,
+     * and that gap is now closed.
+     *
+     * 0.4.0 also fixed the router-side half (ai.matey#135): `selectBackend`
+     * now honours `fallbackStrategy: 'none'` for a named backend, so it
+     * refuses rather than substituting. This check is kept regardless. It runs
+     * BEFORE the egress gate, so it is what turns a refusal into a consented
+     * divert with a chip, where the router alone would only produce an error.
      */
-    if (this.router.has(target.backendId) && this.router.isCircuitBreakerOpen(target.backendId)) {
+    if (this.router.has(target.backendId) && !this.router.isBackendAvailable(target.backendId)) {
       const nominated = target.local ? this.#resolveFallback() : null;
-      if (!nominated || this.router.isCircuitBreakerOpen(nominated.name)) {
+      if (!nominated || !this.router.isBackendAvailable(nominated.name)) {
         yield { type: 'error', message: noBackendMessage(target, true) };
         return;
       }
