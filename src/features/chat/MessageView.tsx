@@ -9,6 +9,43 @@ import { currentVariant, ranOnDevice } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
+import { describeFallback, type FallbackReason } from '@/ai/middleware/resilience';
+
+/**
+ * What the divert chip says.
+ *
+ * `provenance.fallbackReason` has been written end to end since the resilience
+ * middleware landed -- `ai/engine.ts` sets it, `state/chat.ts` copies it onto
+ * the stored variant, `domain/chat.ts` declares it -- and nothing read it.
+ * Every divert rendered the same sentence, "the device could not run this turn
+ * locally", which for a thermal divert is false in both halves: the device
+ * could have run it, and was too hot to be asked to. A memory divert, a
+ * timeout and a missing model were equally indistinguishable.
+ *
+ * `describeFallback` already writes an accurate sentence per reason and was
+ * consumed only by the middleware that produced it. This is its missing
+ * reader.
+ *
+ * The stored reason is typed `string` rather than `FallbackReason`, and is
+ * treated that way here on purpose: rows written before the field existed
+ * carry nothing, and a row written by a later build could carry a reason this
+ * one has never heard of. Both take the general sentence, which says only the
+ * part that is true of every divert -- that the turn did not run here.
+ */
+const DESCRIBED_REASONS: ReadonlySet<string> = new Set<FallbackReason>([
+  'thermal',
+  'memory',
+  'engine-error',
+  'model-missing',
+  'timeout',
+]);
+
+function fallbackSentence(reason: string | undefined): string {
+  if (reason !== undefined && DESCRIBED_REASONS.has(reason)) {
+    return describeFallback(reason as FallbackReason);
+  }
+  return 'Generated remotely rather than on this device';
+}
 
 // Syntax highlighting is a large dependency and is not needed to paint the
 // first frame, so it loads with the first rendered reply instead.
@@ -207,7 +244,7 @@ export function MessageView({
       {provenance?.fallbackFrom ? (
         <div className="chip chip--warn" style={{ alignSelf: 'flex-start', whiteSpace: 'normal' }}>
           <Icon name="alert" size={11} />
-          Generated remotely — the device could not run this turn locally
+          {fallbackSentence(provenance.fallbackReason)}
           {/* The divert picks the destination, so no sheet could have asked
               about it in time. The rule is applied instead of asked, and the
               chip has to say so or the user learns it the hard way. */}

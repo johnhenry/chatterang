@@ -564,3 +564,77 @@ describe('the transcript writes down the reply it is printing', () => {
     );
   });
 });
+
+/* ── The divert chip says WHY (#215) ──────────────────────────────────── */
+
+describe('the divert chip', () => {
+  /*
+   * `provenance.fallbackReason` had three writers and no reader. Every divert
+   * rendered "the device could not run this turn locally", which for a
+   * thermal divert is false in both halves -- the device could have run it,
+   * and was too hot to be asked to. A memory divert, a timeout and a missing
+   * model were indistinguishable from each other and from that.
+   *
+   * `describeFallback` had written the accurate sentence per reason since the
+   * resilience middleware landed, and only the middleware ever read it.
+   */
+  function diverted(reason?: string): Message {
+    return {
+      id: 'm1',
+      chatId: 'c1',
+      role: 'assistant',
+      content: 'REMOTE ANSWER',
+      createdAt: 1,
+      variants: [
+        {
+          content: 'REMOTE ANSWER',
+          provenance: { ...REMOTE, fallbackFrom: 'llama-cpp', ...(reason ? { fallbackReason: reason } : {}) },
+        },
+      ],
+      variantIndex: 0,
+    } as unknown as Message;
+  }
+
+  const chipText = (): string =>
+    Array.from(document.querySelectorAll('.chip--warn'))
+      .map((node) => node.textContent?.trim() ?? '')
+      .join(' | ');
+
+  it('gives each reason its own sentence, rather than one for all of them', async () => {
+    const seen: string[] = [];
+    for (const reason of ['thermal', 'memory', 'model-missing', 'timeout', 'engine-error']) {
+      await mounted(fixedMessage(diverted(reason)), () => {
+        seen.push(chipText());
+      });
+    }
+
+    // Every reason reads differently. Before this, all five were one string.
+    expect(new Set(seen).size, `five distinct sentences, got ${JSON.stringify(seen)}`).toBe(5);
+
+    // And each says the true thing about its own cause.
+    expect(seen[0]).toContain('running hot');
+    expect(seen[1]).toContain('memory');
+    expect(seen[2]).toContain('not installed');
+    expect(seen[3]).toContain('too long');
+
+    // The sentence that was false for four of the five is gone.
+    for (const text of seen) {
+      expect(text).not.toContain('could not run this turn locally');
+    }
+  });
+
+  it('says only what it knows when the reason was never recorded', async () => {
+    // Rows written before the field existed, and rows a later build might
+    // write with a reason this one has never heard of.
+    for (const reason of [undefined, 'a-reason-from-the-future']) {
+      await mounted(fixedMessage(diverted(reason)), () => {
+        const text = chipText();
+        expect(text).toContain('Generated remotely');
+        // No invented cause, and not the claim that was false for most diverts.
+        expect(text).not.toContain('could not run this turn locally');
+        expect(text).not.toContain('hot');
+        expect(text).not.toContain('memory');
+      });
+    }
+  });
+});
