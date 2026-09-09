@@ -52,7 +52,7 @@ import { toolRegistry } from '@/ai/tools/registry';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
-import { newId } from '@/domain/chat';
+import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
 
 /** Execute → tools → execute round trips permitted per turn. */
 const TOOL_ITERATIONS = 4;
@@ -283,7 +283,63 @@ export interface EngineTarget {
   /** Model id passed to the backend. */
   readonly modelId: string;
   readonly modelName: string;
-  readonly local: boolean;
+  /**
+   * How far this turn travels.
+   *
+   * Was `local: boolean`. One flag was answering three different questions
+   * (#208), which had the same answer for every destination that existed at
+   * the time and stop having one the moment a paired desktop appears:
+   *
+   *   1. may this turn divert to a cloud fallback?  -> runsOnThisDevice()
+   *   2. do the bytes leave this device?            -> leavesThisDevice()
+   *   3. does this app's taint mark survive?        -> keepsTaintMark()
+   *
+   * Read them through those predicates rather than off `reach.kind`, so the
+   * next destination is a change here and not an audit of every call site.
+   */
+  readonly reach: Reach;
+}
+
+/**
+ * Does this turn execute on this device?
+ *
+ * The fallback question. Only a turn that was going to run here can be
+ * diverted to the configured cloud provider by device pressure or by a
+ * failure, because only then is there something to divert *from*.
+ */
+export function runsOnThisDevice(target: EngineTarget): boolean {
+  return target.reach.kind === 'device';
+}
+
+/**
+ * Do this turn's bytes leave this device?
+ *
+ * The egress question, and the one that made #208 a security ticket rather
+ * than a naming one. A paired desktop is not a third party, but it is another
+ * machine: tool output reaching it has left the phone, and the user is owed
+ * the same sheet a provider raises. Registering the tunnel as "local" because
+ * it is the user's own hardware would silently delete that sheet.
+ */
+export function leavesThisDevice(target: EngineTarget): boolean {
+  return target.reach.kind !== 'device';
+}
+
+/**
+ * Does this app's taint mark survive to the destination?
+ *
+ * Deliberately not the inverse of `leavesThisDevice`. The mark is this app's
+ * private bookkeeping and means nothing to a third-party provider, so it is
+ * stripped for one. A paired desktop is the one destination where the far
+ * side is *this same application*, which runs `renderPrompt` itself and could
+ * act on the mark -- so keeping it there is arguably correct.
+ *
+ * It is stripped today regardless, because nothing writes `paired` yet and a
+ * flag whose only reader does not exist is a flag that will be wrong by the
+ * time one does. The decision belongs with the tunnel adapter that first
+ * produces a paired target; this predicate is where to make it.
+ */
+export function keepsTaintMark(target: EngineTarget): boolean {
+  return target.reach.kind === 'device';
 }
 
 export interface GenerationRequest {
@@ -587,7 +643,7 @@ export class ChatterangEngine {
 
     // ── Pre-flight: can this device take a local generation right now? ──
     let target = request.target;
-    if (target.local) {
+    if (runsOnThisDevice(target)) {
       const pressure = await checkDevicePressure();
       const fallback = pressure ? this.#resolveFallback() : null;
 
@@ -607,7 +663,7 @@ export class ChatterangEngine {
           engine: 'remote',
           modelId: fallback.modelId ?? target.modelId,
           modelName: fallback.modelId ?? fallback.name,
-          local: false,
+          reach: REACH_REMOTE,
         };
       }
     }
@@ -657,7 +713,7 @@ export class ChatterangEngine {
      * divert with a chip, where the router alone would only produce an error.
      */
     if (this.router.has(target.backendId) && !this.router.isBackendAvailable(target.backendId)) {
-      const nominated = target.local ? this.#resolveFallback() : null;
+      const nominated = runsOnThisDevice(target) ? this.#resolveFallback() : null;
       if (!nominated || !this.router.isBackendAvailable(nominated.name)) {
         yield { type: 'error', message: noBackendMessage(target, true) };
         return;
@@ -678,7 +734,7 @@ export class ChatterangEngine {
         engine: 'remote',
         modelId: nominated.modelId ?? target.modelId,
         modelName: nominated.modelId ?? nominated.name,
-        local: false,
+        reach: REACH_REMOTE,
       };
     }
 
@@ -711,10 +767,10 @@ export class ChatterangEngine {
         allowed: true,
         note: withheldNote,
         declaredToolNames: declared,
-        local: target.local,
+        local: keepsTaintMark(target),
       });
 
-      if (!target.local && carriesTaint(messages)) {
+      if (leavesThisDevice(target) && carriesTaint(messages)) {
         const characters = taintedCharacters(messages);
         let allowed = decided.get(target.backendId);
 
@@ -785,7 +841,7 @@ export class ChatterangEngine {
         if (request.signal?.aborted) break;
 
         // A local failure can still divert, exactly as the middleware would.
-        const fallback = target.local ? this.#resolveFallback() : null;
+        const fallback = runsOnThisDevice(target) ? this.#resolveFallback() : null;
         if (!fallback) {
           const retryable = noBackendRetryable(failure);
           yield {
@@ -811,7 +867,7 @@ export class ChatterangEngine {
           engine: 'remote',
           modelId: fallback.modelId ?? target.modelId,
           modelName: fallback.modelId ?? fallback.name,
-          local: false,
+          reach: REACH_REMOTE,
         };
         continue;
       }
@@ -952,12 +1008,13 @@ export class ChatterangEngine {
     }
 
     const allowed =
-      request.target.local || request.egress?.isGranted(request.target.backendId) === true;
+      !leavesThisDevice(request.target) ||
+      request.egress?.isGranted(request.target.backendId) === true;
     const outgoing = clearForDestination(request.messages, {
       allowed,
       note: withheldNote,
       declaredToolNames: declaredToolNames(request.toolIds),
-      local: request.target.local,
+      local: runsOnThisDevice(request.target),
     });
     const irRequest = this.#toIR(request, outgoing, newId('req'), false);
     return (await this.#bridge.chat(irRequest, {
@@ -973,7 +1030,7 @@ export class ChatterangEngine {
       engine: fallback ? 'remote' : target.engine,
       modelId: target.modelId,
       modelName: target.modelName,
-      local: fallback ? false : target.local,
+      local: fallback ? false : runsOnThisDevice(target),
       fallbackFrom: fallback?.from,
       fallbackReason: fallback?.reason,
     };
@@ -1020,7 +1077,7 @@ export class ChatterangEngine {
         custom: {
           // The router reads its backend selection from here.
           backend: request.target.backendId,
-          local: request.target.local,
+          local: runsOnThisDevice(request.target),
           engine: request.target.engine,
         },
       },
@@ -1074,6 +1131,17 @@ export function targetFor(
    *  own generated ids. Defaults to the engine name, which is how the local
    *  engines are registered. */
   backendId: string = engine,
+  /**
+   * Overrides the engine-derived reach. The tunnel adapter passes
+   * `reachPaired(device)` here; nothing else needs it.
+   */
+  reach?: Reach,
 ): EngineTarget {
-  return { backendId, engine, modelId, modelName, local: isLocalEngine(engine) };
+  return {
+    backendId,
+    engine,
+    modelId,
+    modelName,
+    reach: reach ?? (isLocalEngine(engine) ? REACH_DEVICE : REACH_REMOTE),
+  };
 }

@@ -15,6 +15,7 @@ import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { toolRegistry } from '@/ai/tools/registry';
 import type { FallbackReason } from '@/ai/middleware/resilience';
+import { REACH_REMOTE } from '@/domain/chat';
 
 /**
  * Dexie, stubbed at the table boundary.
@@ -471,7 +472,7 @@ describe('ChatterangEngine.stream', () => {
     const events = await drain(
       engine.stream({
         messages: [{ role: 'user', content: 'hi' }],
-        target: { backendId: 'cloud', engine: 'remote', modelId: 'm', modelName: 'Cloud', local: false },
+        target: { backendId: 'cloud', engine: 'remote', modelId: 'm', modelName: 'Cloud', reach: REACH_REMOTE },
       }),
     );
 
@@ -666,7 +667,7 @@ describe('ChatterangEngine.stream', () => {
             engine: 'remote',
             modelId: 'gpt-4o-mini',
             modelName: 'OpenAI · gpt-4o-mini',
-            local: false,
+            reach: REACH_REMOTE,
           },
         }),
       );
@@ -739,7 +740,7 @@ describe('ChatterangEngine.stream', () => {
               engine: 'remote' as const,
               modelId: 'gemini-nano',
               modelName: 'Chrome · Gemini Nano',
-              local: false,
+              reach: REACH_REMOTE,
             },
           }),
         ),
@@ -786,7 +787,7 @@ describe('ChatterangEngine.stream', () => {
               engine: 'remote',
               modelId: 'gpt-4o-mini',
               modelName: 'OpenAI · gpt-4o-mini',
-              local: false,
+              reach: REACH_REMOTE,
             },
           }),
         ),
@@ -897,7 +898,7 @@ describe('ChatterangEngine.stream', () => {
         engine: 'remote',
         modelId: 'gpt-4o-mini',
         modelName: 'OpenAI · gpt-4o-mini',
-        local: false,
+        reach: REACH_REMOTE,
       });
       expect(remote).toContain('OpenAI · gpt-4o-mini');
       expect(remote).toContain('Settings');

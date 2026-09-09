@@ -111,6 +111,7 @@ export const useMcp = create<McpState>((set, get) => ({
       const states: Record<string, McpServerState> = {};
       for (const server of enabled) {
         const tools = byServer.get(server.name) ?? [];
+        let registered = 0;
         for (const descriptor of tools) {
           const tool = createMcpTool(descriptor, {
             serverUrl: server.url,
@@ -119,10 +120,16 @@ export const useMcp = create<McpState>((set, get) => ({
             confirm: async (action) => (await import('@/state/app')).useApp.getState().requestApproval(action),
             call: (s, n, args, signal) => mcpManager.callTool(s, n, args, signal),
           });
+          // `null` when the server's schema failed validation. Skipped rather
+          // than registered with a trimmed one -- see src/ai/mcp/schema.ts --
+          // and not counted, so the server's tool count reflects what the
+          // model can actually call.
+          if (!tool) continue;
           toolRegistry.register(tool);
           registeredIds.push(tool.id);
+          registered += 1;
         }
-        states[server.id] = { id: server.id, status: 'ready', toolCount: tools.length };
+        states[server.id] = { id: server.id, status: 'ready', toolCount: registered };
       }
       set({ states, connecting: false });
     } catch (error) {

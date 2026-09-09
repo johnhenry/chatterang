@@ -20,6 +20,7 @@ import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
 import type { GenerationEvent } from '@/ai/engine';
 import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
+import { REACH_REMOTE } from '@/domain/chat';
 
 /** The canary. If it is in a request, conversation bytes left the device. */
 export const SECRET = 'PASSPHRASE-ORTHOGONAL-PANGOLIN-7731';
@@ -52,7 +53,7 @@ export const cloudTarget = {
   engine: 'remote' as const,
   modelId: 'gpt-4o-mini',
   modelName: 'GPT-4o mini',
-  local: false,
+  reach: REACH_REMOTE,
 };
 
 /** A backend that records every request it is handed, then replies to script. */

@@ -16,7 +16,7 @@
     "typecheck": "tsc -b --pretty",
     "test": "vitest run",
     "test:watch": "vitest",
-    "sync": "npm run build:web && cap sync",
+    "sync": "npm run build:web && cap sync && node scripts/patch-native.mjs",
     "ios": "npm run sync && cap open ios",
     "android": "npm run sync && cap open android",
     "android:apk": "npm run sync && cd android && JAVA_HOME=\"$(/usr/libexec/java_home -v 21)\" ./gradlew assembleDebug",

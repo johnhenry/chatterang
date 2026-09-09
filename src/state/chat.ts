@@ -35,7 +35,12 @@ import {
   type SamplerSettings,
 } from '@/domain/manifest';
 import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
-import { targetFor, type EngineTarget, type ToolEgressPolicy } from '@/ai/engine';
+import {
+  runsOnThisDevice,
+  targetFor,
+  type EngineTarget,
+  type ToolEgressPolicy,
+} from '@/ai/engine';
 import { markTainted } from '@/ai/taint';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
@@ -479,7 +484,7 @@ async function runGeneration(
   };
 
   set({ generating: true, controller, messages: [...get().messages, placeholder] });
-  app.setActivity(target.local ? 'loading' : 'remote');
+  app.setActivity(runsOnThisDevice(target) ? 'loading' : 'remote');
 
   const started = performance.now();
   let raw = '';
@@ -540,7 +545,7 @@ async function runGeneration(
         case 'delta': {
           if (firstDelta) {
             firstDelta = false;
-            app.setActivity(target.local ? 'running' : 'remote');
+            app.setActivity(runsOnThisDevice(target) ? 'running' : 'remote');
           }
           raw += event.text;
           const split = splitThinking(raw);
@@ -668,7 +673,7 @@ async function runGeneration(
     app.setActivity('idle');
     app.setLiveRate(null);
 
-    if (target.local) void useModels.getState().noteUse(target.modelId);
+    if (runsOnThisDevice(target)) void useModels.getState().noteUse(target.modelId);
 
     const chatNow = get().chats.find((entry) => entry.id === chat.id);
     if (chatNow) {
@@ -798,7 +803,7 @@ function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
         engine: 'remote',
         modelId: connection.defaultModel,
         modelName: `${connection.label} · ${connection.defaultModel}`,
-        local: false,
+        reach: REACH_REMOTE,
       },
     };
   }

@@ -2,10 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   ChatterangEngine,
+  leavesThisDevice,
+  runsOnThisDevice,
   targetFor,
+  type EngineTarget,
   type ToolEgressPolicy,
   type ToolEgressRequest,
 } from '@/ai/engine';
+import { reachPaired } from '@/domain/chat';
 import { toolRegistry } from '@/ai/tools/registry';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
@@ -268,7 +272,13 @@ describe('tool output does not leave the device without a grant', () => {
     const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
     const cloud = recordingBackend(turns);
     engine.router.register('cloud', cloud.adapter);
-    return { engine, cloud };
+    // A stand-in for the tunnel adapter Track B will register. Present so a
+    // paired target reaches the egress gate rather than the unregistered-
+    // backend backstop that sits above it -- which would "pass" the assertion
+    // for entirely the wrong reason.
+    const paired = recordingBackend(turns);
+    engine.router.register('tunnel:pair_0091', paired.adapter);
+    return { engine, cloud, paired };
   }
 
   it('is a real probe: the tool really does return the user’s data', async () => {
@@ -432,4 +442,83 @@ describe('tool output does not leave the device without a grant', () => {
     expect(done?.type === 'done' && done.provenance.toolEgress).toBeUndefined();
     toolRegistry.unregister('leaky');
   });
+
+  /**
+   * #208. `EngineTarget.local` was one boolean answering three questions, and a
+   * paired desktop is the destination that separates them: it is the user's own
+   * hardware, but the bytes still leave this phone.
+   *
+   * The tempting registration for a tunnel adapter is `local: true` — it is my
+   * machine, after all — and that would have silently deleted the sheet, sending
+   * tool output to a second computer with no prompt, no grant and no receipt, in
+   * an app whose `privacy` command promises otherwise. `leavesThisDevice()`
+   * exists so that reading is not available.
+   *
+   * Nothing writes a `paired` reach yet; the tunnel is Track B. Constructing one
+   * here is the point — the gate has to be right *before* the producer lands,
+   * because the producer's author is exactly who would reach for `local: true`.
+   */
+  describe('a turn tunnelled to a paired desktop', () => {
+    const STUDIO = { id: 'pair_0091', name: "John's Studio" };
+
+    const pairedTarget: EngineTarget = {
+      backendId: 'tunnel:pair_0091',
+      engine: 'remote',
+      modelId: 'qwen3-4b-instruct-q4km',
+      modelName: "Qwen3 4B · John's Studio",
+      reach: reachPaired(STUDIO),
+    };
+
+    it('counts as leaving the device, and as not running here', () => {
+      expect(leavesThisDevice(pairedTarget)).toBe(true);
+      expect(runsOnThisDevice(pairedTarget)).toBe(false);
+      // The control: an on-device target answers the opposite way, so these are
+      // not two functions that always agree.
+        const here = targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted');
+      expect(leavesThisDevice(here)).toBe(false);
+      expect(runsOnThisDevice(here)).toBe(true);
+    });
+
+    it('raises the same tool-egress sheet a provider raises', async () => {
+      const { engine } = setUp();
+      const request = vi.fn(async (_: ToolEgressRequest) => 'conversation' as const);
+
+      await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: pairedTarget,
+          toolIds: ['leaky'],
+          egress: { isGranted: () => false, request },
+        }),
+      );
+
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(request.mock.calls[0]?.[0]).toMatchObject({
+        backendId: 'tunnel:pair_0091',
+        modelName: "Qwen3 4B · John's Studio",
+      });
+      toolRegistry.unregister('leaky');
+    });
+
+    it('raises no sheet for the same turn run on this device', async () => {
+      // The control for the test above: same messages, same tool, same rig —
+      // only the destination differs. Without this, a sheet raised for every
+      // turn would pass the assertion above just as well.
+      const { engine } = setUp();
+      const request = vi.fn(async (_: ToolEgressRequest) => 'conversation' as const);
+
+      await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted'),
+          toolIds: ['leaky'],
+          egress: { isGranted: () => false, request },
+        }),
+      );
+
+      expect(request).not.toHaveBeenCalled();
+      toolRegistry.unregister('leaky');
+    });
+  });
+
 });

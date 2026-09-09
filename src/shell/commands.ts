@@ -642,6 +642,11 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
           '  - conversations, personas, generated images, settings and benchmark',
           '    runs are stored here and nowhere else. There is no account and',
           '    nothing syncs. What can leave a conversation is the list above.',
+          '  - platform backup is off, which is what makes the line above true.',
+          '    Android auto-backup and phone-to-phone transfer are both',
+          '    disabled; on iOS the WebView store is marked excluded from',
+          '    iCloud and iTunes backup. A new phone does not inherit your',
+          '    chats. That is the cost, and it is the point.',
         ].join('\n'),
       );
     },

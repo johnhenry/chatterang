@@ -52,6 +52,7 @@ import type { InstalledModel } from '@/db';
 import type { Chat, Message, Provenance } from '@/domain/chat';
 import type { ModelManifest } from '@/domain/manifest';
 import type { Persona } from '@/domain/persona';
+import { runsOnThisDevice, type EngineTarget } from '@/ai/engine';
 import type { ProviderConnection } from '@/ai/providers';
 import type { DeviceCapabilities } from '@chatterang/contracts';
 import type { ShellStores } from '@/shell/commands';
@@ -412,8 +413,12 @@ async function dispatchIn(state: Arrangement): Promise<Dispatch> {
   let seen: { backendId: string; modelId: string; local: boolean } | null = null;
   useApp.setState({
     engine: {
-      async *stream({ target }: { target: { backendId: string; modelId: string; local: boolean } }) {
-        seen = { backendId: target.backendId, modelId: target.modelId, local: target.local };
+      async *stream({ target }: { target: EngineTarget }) {
+        seen = {
+          backendId: target.backendId,
+          modelId: target.modelId,
+          local: runsOnThisDevice(target),
+        };
         yield {
           type: 'done',
           text: 'ok',
@@ -1446,16 +1451,16 @@ const EITHER_WAY = { installed: [installedRecord(QWEN)], connections: [PROVIDER]
  */
 function markingEngine(): unknown {
   return {
-    async *stream({ target }: { target: { backendId: string; modelId: string; local: boolean } }) {
+    async *stream({ target }: { target: EngineTarget }) {
       yield {
         type: 'done',
-        text: target.local ? 'ANSWERED HERE' : 'ANSWERED THERE',
+        text: runsOnThisDevice(target) ? 'ANSWERED HERE' : 'ANSWERED THERE',
         provenance: {
           backendId: target.backendId,
-          engine: target.local ? QWEN.engine : 'remote',
+          engine: runsOnThisDevice(target) ? QWEN.engine : 'remote',
           modelId: target.modelId,
-          modelName: target.local ? QWEN.name : `${PROVIDER.label} · ${target.modelId}`,
-          local: target.local,
+          modelName: runsOnThisDevice(target) ? QWEN.name : `${PROVIDER.label} · ${target.modelId}`,
+          local: runsOnThisDevice(target),
         },
         stats: { promptTokens: 8, completionTokens: 4 },
       };

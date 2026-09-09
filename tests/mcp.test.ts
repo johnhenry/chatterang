@@ -4,6 +4,20 @@ import { destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
 import type { McpToolDescriptor } from '@/ai/mcp/client';
 
+/**
+ * `createMcpTool` returns `null` for a schema it will not vouch for. Every
+ * fixture here has a valid one, so a `null` is a bug in the fixture rather
+ * than a branch under test -- throw instead of asserting it away with `!`,
+ * which would turn a broken fixture into a confusing downstream failure.
+ * Rejection itself is covered in `tests/mcp-schema.test.ts`.
+ */
+function mustCreateMcpTool(...args: Parameters<typeof createMcpTool>) {
+  const tool = createMcpTool(...args);
+  if (!tool) throw new Error('createMcpTool refused a fixture schema it should have accepted');
+  return tool;
+}
+
+
 const context = { now: () => new Date('2026-08-30T12:00:00Z') };
 
 function descriptor(patch: Partial<McpToolDescriptor> = {}): McpToolDescriptor {
@@ -50,23 +64,23 @@ describe('an MCP tool always declares that it leaves the device', () => {
     // read-only describes the SERVER's state, not your data. The arguments
     // still travel. If this ever becomes conditional, an off-device call can be
     // made without the per-chat opt-in.
-    const tool = createMcpTool(descriptor({ readOnly: true }), options);
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), options);
     expect(tool.sensitive).toBe(true);
   });
 
   it('names the destination host in what the user sees', () => {
-    const tool = createMcpTool(descriptor(), options);
+    const tool = mustCreateMcpTool(descriptor(), options);
     expect(tool.summary).toContain('api.acme.com');
   });
 
   it('tells the model the call is remote, so it can say so', () => {
-    const tool = createMcpTool(descriptor(), options);
+    const tool = mustCreateMcpTool(descriptor(), options);
     expect(tool.description).toContain('api.acme.com');
     expect(tool.description).toMatch(/not on this device/i);
   });
 
   it('namespaces the tool by server so two servers can both expose "search"', () => {
-    expect(createMcpTool(descriptor(), options).name).toBe('acme.search');
+    expect(mustCreateMcpTool(descriptor(), options).name).toBe('acme.search');
     expect(qualifiedToolName('other', 'search')).toBe('other.search');
   });
 });
@@ -75,7 +89,7 @@ describe('confirmation', () => {
   it('asks before a call the server has not declared read-only', async () => {
     const confirm = vi.fn(async (_action: string) => true);
     const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] }));
-    const tool = createMcpTool(descriptor({ readOnly: false }), {
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call,
@@ -88,7 +102,7 @@ describe('confirmation', () => {
 
   it('does not call the server when the user declines', async () => {
     const call = vi.fn();
-    const tool = createMcpTool(descriptor({ readOnly: false }), {
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
       serverUrl: 'https://api.acme.com/mcp',
       confirm: async () => false,
       call,
@@ -102,7 +116,7 @@ describe('confirmation', () => {
   it('treats a missing annotation as destructive, not as safe', async () => {
     // The server is the party we can verify least. Absent must mean "ask".
     const confirm = vi.fn(async (_action: string) => true);
-    const tool = createMcpTool(descriptor({ readOnly: false }), {
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call: async () => ({}),
@@ -113,7 +127,7 @@ describe('confirmation', () => {
 
   it('does not prompt per call for a read-only tool — the per-chat opt-in is the boundary', async () => {
     const confirm = vi.fn(async (_action: string) => true);
-    const tool = createMcpTool(descriptor({ readOnly: true }), {
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
