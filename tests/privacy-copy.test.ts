@@ -9,6 +9,12 @@ import { renderPrompt } from '@/ai/prompt';
 import { getProvider } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
 import { toolRegistry } from '@/ai/tools/registry';
+import {
+  BACKUP_RULES_XML,
+  DATA_EXTRACTION_RULES_XML,
+  patchAndroidManifest,
+  patchAppDelegate,
+} from '../scripts/patch-native.mjs';
 import { isLocalEngine } from '@/domain/manifest';
 import type { IRMessage } from '@johnhenry/aimatey-types';
 import {
@@ -30,6 +36,20 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
+
+/**
+ * `createMcpTool` returns `null` for a schema it will not vouch for. Every
+ * fixture here has a valid one, so a `null` is a bug in the fixture rather
+ * than a branch under test -- throw instead of asserting it away with `!`,
+ * which would turn a broken fixture into a confusing downstream failure.
+ * Rejection itself is covered in `tests/mcp-schema.test.ts`.
+ */
+function mustCreateMcpTool(...args: Parameters<typeof createMcpTool>) {
+  const tool = createMcpTool(...args);
+  if (!tool) throw new Error('createMcpTool refused a fixture schema it should have accepted');
+  return tool;
+}
+
 
 /**
  * The sentences the app says about privacy, each pinned to the measurement
@@ -225,7 +245,7 @@ describe('the privacy command', () => {
     // server can ask for, and the arguments are the model's own words.
     const confirm = vi.fn(async () => true);
     const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
-    const tool = createMcpTool(
+    const tool = mustCreateMcpTool(
       {
         server: 'notes',
         name: 'note',
@@ -253,7 +273,7 @@ describe('the privacy command', () => {
 
     const confirm = vi.fn(async () => true);
     const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'done' }] }));
-    const tool = createMcpTool(
+    const tool = mustCreateMcpTool(
       {
         server: 'notes',
         name: 'mutate',
@@ -538,7 +558,7 @@ describe('the tools hint in a chat', () => {
     // The measurement is in `the privacy command` above, against the same
     // `createMcpTool`. What this half pins is that the sentence can be applied
     // to the list the user is reading: an MCP tool is identifiable in it.
-    const tool = createMcpTool(
+    const tool = mustCreateMcpTool(
       {
         server: 'notes',
         name: 'note',
@@ -664,5 +684,90 @@ describe('the taint gate’s note about non-local destinations', () => {
     expect(getProvider('ollama')?.kind).toBe('self-hosted');
     expect(getProvider('lmstudio')?.kind).toBe('self-hosted');
     expect(isLocalEngine('remote')).toBe(false);
+  });
+});
+
+/* ── The backup claim, measured rather than asserted ─────────────────── */
+
+/**
+ * `privacy` now says platform backup is off. That sentence was false before
+ * #126 — `android:allowBackup="true"` meant Android auto-backup was eligible
+ * to copy the WebView's IndexedDB, which holds every conversation and, in
+ * `ProviderConnection.apiKey`, provider keys in plain text, to the user's
+ * Google Drive. iOS backed the same store up to iCloud by default.
+ *
+ * These check `scripts/patch-native.mjs` rather than `android/` and `ios/`,
+ * because those directories are gitignored and generated: a test that read
+ * them would pass on the machine that ran `cap sync` and fail everywhere
+ * else, including CI. The script is the tracked artefact and therefore the
+ * thing that can actually be guarded.
+ */
+describe('the backup claim in `privacy`', () => {
+  it('says platform backup is off, and the sync step is what makes it so', async () => {
+    const output = await privacyOutput({});
+    expect(output).toContain('platform backup is off');
+
+    // The claim is only true if the patch step actually runs on every sync.
+    const pkg = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+    expect(pkg.scripts.sync).toContain('scripts/patch-native.mjs');
+  });
+
+  it('turns Android auto-backup off, from whichever state the template is in', () => {
+    // Capacitor generates `allowBackup="true"`.
+    const patched = patchAndroidManifest('<application android:allowBackup="true" />');
+    expect(patched).toContain('android:allowBackup="false"');
+    expect(patched).toContain('android:dataExtractionRules="@xml/data_extraction_rules"');
+    expect(patched).toContain('android:fullBackupContent="@xml/backup_rules"');
+    expect(patched).not.toContain('android:allowBackup="true"');
+
+    // Idempotent: a second sync must not double the attributes.
+    expect(patchAndroidManifest(patched)).toBe(patched);
+
+    // And it refuses to be a silent no-op if the template ever changes shape,
+    // which is the failure mode that would quietly reinstate the leak.
+    expect(() => patchAndroidManifest('<application />')).toThrow(/allowBackup/);
+  });
+
+  it('excludes both extraction paths, not just the cloud one', () => {
+    // A phone-to-phone transfer would carry this device's identity onto
+    // another handset, where revoking the original would not revoke the copy.
+    const withoutComments = DATA_EXTRACTION_RULES_XML.replace(/<!--[\s\S]*?-->/g, '');
+    for (const tag of ['cloud-backup', 'device-transfer']) {
+      const body = withoutComments.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))?.[1] ?? '';
+      expect(body, `<${tag}> is missing or empty`).not.toBe('');
+      expect(body).toContain('<exclude domain="root"');
+      expect(body).toContain('<exclude domain="database"');
+    }
+    // The API 24-30 mechanism, which dataExtractionRules does not cover.
+    expect(BACKUP_RULES_XML).toContain('<full-backup-content>');
+    expect(BACKUP_RULES_XML).toContain('<exclude domain="root"');
+  });
+
+  it('excludes the WebView store from iOS backup, on both entry points', () => {
+    const stock = [
+      'class AppDelegate: UIResponder, UIApplicationDelegate {',
+      '    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {',
+      '        return true',
+      '    }',
+      '',
+      '    func applicationDidBecomeActive(_ application: UIApplication) {',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+
+    const patched = patchAppDelegate(stock);
+    expect(patched).toContain('isExcludedFromBackup = true');
+    expect(patched).toContain('appendingPathComponent("WebKit"');
+    // Called from both, because Library/WebKit does not exist on a first launch.
+    // Call sites only -- the bare regex also matches the `private func`
+    // declaration, which would make this read 3 and mean nothing.
+    expect(patched.match(/^\s+excludeWebViewStorageFromBackup\(\)$/gm)).toHaveLength(2);
+    expect(patched).toContain('private func excludeWebViewStorageFromBackup()');
+
+    expect(patchAppDelegate(patched)).toBe(patched);
+    expect(() => patchAppDelegate('class AppDelegate {}')).toThrow(/AppDelegate/);
   });
 });

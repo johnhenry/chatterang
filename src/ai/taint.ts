@@ -573,6 +573,28 @@ export interface ClearOptions {
    * here. The flag's job is the mark; encoding for a destination that renders
    * somebody else's template is a separate piece of work. This comment says so
    * rather than explaining why it does not need doing.
+   *
+   * ## A paired desktop (#208)
+   *
+   * This flag is *not* "did the bytes stay on this device". Since #208 the
+   * caller computes it with `keepsTaintMark()` in `src/ai/engine.ts`, which is
+   * deliberately a different question from `leavesThisDevice()` -- the one
+   * that gates the egress sheet.
+   *
+   * They diverge for exactly one destination. A third-party provider has no
+   * idea what `chatterangTaint` means, so carrying it there leaks this app's
+   * bookkeeping for no benefit: strip it. A paired desktop is the same
+   * application on another machine -- it runs `renderPrompt` itself, so it is
+   * the one non-local destination that could *act* on the mark, and where
+   * keeping it may close the hole described above rather than widen it.
+   *
+   * It is stripped for a paired desktop today, because nothing writes a
+   * `paired` reach yet and a flag whose only reader does not exist is a flag
+   * that will be wrong by the time one does. Whoever writes the tunnel adapter
+   * makes that call, in `keepsTaintMark()`, with this paragraph as the
+   * argument. Note the asymmetry if you change it: keeping the mark is only
+   * safe because the far side is trusted to honour it, which is a claim about
+   * the pairing, not about the mark.
    */
   readonly local?: boolean;
 }

@@ -51,6 +51,7 @@ import { ChatterangEngine, targetFor, type GenerationEvent, type ToolEgressPolic
 import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { catalogEntry } from '@/data/catalog';
 import { DEFAULT_SAMPLER } from '@/domain/manifest';
+import { REACH_REMOTE } from '@/domain/chat';
 
 /* ══ A1. The encoder's alphabet, derived rather than asserted ═══════════ */
 
@@ -726,7 +727,7 @@ const cloudTarget = {
   engine: 'remote' as const,
   modelId: 'gpt-4o-mini',
   modelName: 'GPT-4o mini',
-  local: false,
+  reach: REACH_REMOTE,
 };
 
 describe('a secret copied into a tool ARGUMENT is still withheld', () => {

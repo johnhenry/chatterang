@@ -33,6 +33,8 @@ import { resolve } from 'node:path';
 import type { ProviderConnection } from '@/ai/providers';
 import type { InstalledModel } from '@/db';
 import type { Persona } from '@/domain/persona';
+import { REACH_REMOTE } from '@/domain/chat';
+import { runsOnThisDevice, type EngineTarget } from '@/ai/engine';
 
 /* ── The database, stubbed at the table boundary ────────────────────── */
 
@@ -889,12 +891,15 @@ describe('what the hint promises about an uninstalled preference', () => {
       engine: 'remote',
       modelId: PROVIDER.defaultModel,
       modelName: `${PROVIDER.label} · ${PROVIDER.defaultModel}`,
-      local: false,
+      reach: REACH_REMOTE,
     });
     // And the destination is a connection the user configured, not a model.
     const backendId = sent.target!.backendId as string;
     expect(useApp.getState().connections.some((entry) => entry.id === backendId)).toBe(true);
-    expect(sent.target!.local, 'nothing about this ran on the device').toBe(false);
+    expect(
+      runsOnThisDevice(sent.target! as unknown as EngineTarget),
+      'nothing about this ran on the device',
+    ).toBe(false);
 
     // ── Now the sentence. ─────────────────────────────────────────────
     for (const preference of [undefined, QWEN.id]) {

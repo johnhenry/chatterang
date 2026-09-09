@@ -126,11 +126,65 @@ describe('sandbox boundaries', () => {
     expect(result.stderr).toMatch(/not found/i);
   });
 
-  it('never mounts provider API keys', async () => {
-    const files = await buildVfs(stores());
+  it('never mounts provider API keys or device key material', async () => {
+    /*
+     * A grep for absence is not a test until something is present to find.
+     * This one used to be `expect(dump).not.toMatch(/apiKey|.../)` against the
+     * default fixture -- whose provider rows have no `apiKey` field, because
+     * `ProviderRow` does not declare one. It asserted that a string absent by
+     * construction was absent, and would have passed just as happily on an
+     * empty projection or on a `buildVfs` that threw and returned nothing.
+     *
+     * The type is one guard and `src/shell/stores.ts` is the other: the real
+     * adapter narrows a full `ProviderConnection` down to four fields, with a
+     * comment saying it deliberately never projects `apiKey`. What follows
+     * tests that second guard, by handing the projection rows that DO carry
+     * secrets and asserting they do not come out the far side. The casts are
+     * the point -- a regression here looks like someone spreading
+     * `...connection` into the row, which type-checks against a wider type.
+     */
+    const CANARY_API_KEY = 'sk-canary-3f9a2b7c1d4e5f60718293a4b5c6d7e8';
+    const CANARY_DEVICE_KEY = 'canary-device-private-scalar-9f8e7d6c5b4a3928';
+
+    const seeded = stores({
+      providers: () => ({
+        toggle: vi.fn(async () => undefined),
+        list: [
+          {
+            id: 'conn_1',
+            label: 'OpenAI',
+            enabled: true,
+            defaultModel: 'gpt-4o-mini',
+            apiKey: CANARY_API_KEY,
+            privateKey: CANARY_DEVICE_KEY,
+          },
+        ] as unknown as ShellStores['providers'] extends () => { list: infer L }
+          ? L
+          : never,
+      }),
+    });
+
+    // Positive control 1: the canaries really are in what buildVfs is given.
+    const input = JSON.stringify(seeded.providers().list);
+    expect(input).toContain(CANARY_API_KEY);
+    expect(input).toContain(CANARY_DEVICE_KEY);
+
+    const files = await buildVfs(seeded);
     const dump = JSON.stringify(files);
+
+    // Positive control 2: the projection ran and produced the provider file.
+    // Without this, an empty or thrown buildVfs would pass every line below.
+    expect(Object.keys(files).some((path) => path.startsWith('/providers/'))).toBe(true);
+    expect(dump).toContain('OpenAI');
+
     // A model with filesystem access must not be one `cat` away from a credential.
-    expect(dump).not.toMatch(/apiKey|api_key|sk-|Bearer/i);
+    expect(dump).not.toContain(CANARY_API_KEY);
+    expect(dump).not.toContain(CANARY_DEVICE_KEY);
+    // Shapes, not just these two strings -- device key material does not look
+    // like `sk-`, so the original pattern would not have caught a pairing key.
+    expect(dump).not.toMatch(
+      /apiKey|api_key|privateKey|private_key|secretKey|secret_key|pairingToken|passkey|sk-|Bearer/i,
+    );
   });
 
   it('mounts only app data, nothing resembling a device path', async () => {

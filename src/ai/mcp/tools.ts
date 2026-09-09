@@ -29,6 +29,7 @@
 import type { JSONSchema } from '@johnhenry/aimatey-types';
 
 import { destinationHost, qualifiedToolName } from '@/domain/mcp';
+import { checkToolSchema } from '@/ai/mcp/schema';
 import type { ChatterangTool, ToolResult } from '@/ai/tools/registry';
 import type { McpToolDescriptor } from '@/ai/mcp/client';
 
@@ -45,12 +46,31 @@ export interface McpToolOptions {
   ): Promise<unknown>;
 }
 
+/**
+ * Wrap a remote MCP tool, or refuse to.
+ *
+ * `null` means the server's `inputSchema` did not survive
+ * {@link checkToolSchema} — too deep, too large, cyclic, or carrying a key
+ * that is dangerous for a downstream decoder to walk. The tool is then not
+ * offered at all rather than offered with a trimmed schema, because a model
+ * calling a tool against a schema its server did not write is worse than a
+ * tool that is missing. See `src/ai/mcp/schema.ts`.
+ */
 export function createMcpTool(
   descriptor: McpToolDescriptor,
   options: McpToolOptions,
-): ChatterangTool {
+): ChatterangTool | null {
   const host = destinationHost(options.serverUrl);
   const qualified = qualifiedToolName(descriptor.server, descriptor.name);
+
+  const check = checkToolSchema(descriptor.inputSchema);
+  if (!check.ok) {
+    console.warn(
+      `[mcp] refusing tool ${qualified} from ${host}: its inputSchema is ${check.reason}` +
+        (check.at ? ` at ${check.at}` : ''),
+    );
+    return null;
+  }
 
   return {
     id: `mcp:${qualified}`,
@@ -67,7 +87,7 @@ export function createMcpTool(
         ? 'The server describes it as read-only.'
         : 'The server does not describe it as read-only, so it may change data.',
     ].join('\n'),
-    parameters: descriptor.inputSchema as JSONSchema,
+    parameters: descriptor.inputSchema as JSONSchema, // checked above, not asserted
 
     async execute(input, context): Promise<ToolResult> {
       // Only destructive calls interrupt. A read-only remote call is still
