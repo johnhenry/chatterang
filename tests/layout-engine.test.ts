@@ -258,6 +258,18 @@ beforeAll(async () => {
     await promisify(execFile)(
       ELECTRON,
       [
+        /*
+         * Chromium's SUID sandbox helper has to be owned by root with mode
+         * 4755, which it is not inside a CI container -- Electron sees the
+         * helper, refuses to run unsandboxed, and aborts before any of our
+         * code executes. It is a flag to the binary rather than something
+         * `app.commandLine` can set, because the check happens before JS runs.
+         *
+         * Linux only. On a developer machine the sandbox works and there is no
+         * reason to give it up; this test renders nothing but our own local
+         * dev server either way.
+         */
+        ...(process.platform === 'linux' ? ['--no-sandbox'] : []),
         resolve(process.cwd(), 'tests/support/layout-probe.mjs'),
         `--url=${url}`,
         `--out=${out}`,
