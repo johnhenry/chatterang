@@ -25,7 +25,7 @@
  */
 
 import { createElement } from 'react';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -173,13 +173,37 @@ const NATIVE_CONFIG = {
 
 describe('the platform fact the benchmark copy has to respect', () => {
   it('has no native ONNX runtime on either mobile platform', () => {
+    /*
+     * `/android/` and `/ios/` are gitignored and generated, so on a clean
+     * checkout -- CI, or a fresh clone -- three of these four files do not
+     * exist and `readFileSync` threw. The assertions were sound; the file
+     * list assumed a machine that had run `cap sync`.
+     *
+     * The native files are corroboration, not the signal. A Capacitor plugin
+     * reaches `capacitor.plugins.json` by first being a dependency, so
+     * `package.json` is where an ONNX runtime shows up earliest and is
+     * checked unconditionally. Skipping it is not an option, and the
+     * assertion below makes that structural rather than a matter of care.
+     */
+    const checked: string[] = [];
     for (const [label, path] of Object.entries(NATIVE_CONFIG)) {
-      const text = readFileSync(resolve(process.cwd(), path), 'utf8');
+      const full = resolve(process.cwd(), path);
+      if (!existsSync(full)) {
+        // Only the generated projects may be absent. package.json is tracked.
+        expect(path.startsWith('android/') || path.startsWith('ios/')).toBe(true);
+        continue;
+      }
+      const text = readFileSync(full, 'utf8');
       expect({ label, onnx: /onnx/i.test(text) }).toEqual({ label, onnx: false });
       // The control: llama-cpp IS registered in every one of these, so a
       // vacuous read of an empty or moved file cannot pass this test.
       expect({ label, llama: /llama/i.test(text) }).toEqual({ label, llama: true });
+      checked.push(label);
     }
+    // The control for the skip itself: a checkout with no native projects
+    // still has to have read package.json, or this whole test is a no-op
+    // wherever it matters most.
+    expect(checked).toContain('package.json');
   });
 });
 
