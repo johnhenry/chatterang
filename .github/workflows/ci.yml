@@ -1,0 +1,75 @@
+# Where jobs run is a repository variable, switchable without a PR:
+#   gh variable set CI_RUNS_ON --body '["self-hosted","chatterang"]'   # your own runner
+#   gh variable set CI_RUNS_ON --body '"ubuntu-latest"'                # GitHub-hosted (default)
+#
+# Defaults to ubuntu-latest rather than self-hosted, unlike clawser: no runner
+# is registered for this repository yet, and a workflow whose default is a
+# runner that does not exist queues forever instead of failing, which reads as
+# "CI is slow" rather than "CI never ran".
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # package.json says >=20; the repo is developed on 24 and the test
+          # suite uses APIs that landed after 20. Pin the one that is actually
+          # exercised rather than the floor the manifest tolerates.
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # `vitest run` — 1701 tests. This is the gate that was missing: every
+      # check on this repository was being run by hand on one machine.
+      - name: Unit tests
+        run: npm test
+
+      - name: Build web
+        run: npm run build:web
+
+      # The workspaces are not covered by `npm run verify`, and a change to
+      # `packages/contracts` that breaks the desktop app currently fails
+      # nowhere. Separate steps so the log says which one broke.
+      - name: Build desktop
+        run: npm run desktop:build
+
+      - name: Build server
+        run: npm --workspace @chatterang/server run build
+
+      # `/android/` and `/ios/` are gitignored and regenerated, so the backup
+      # exclusions in #126 live in a script that `npm run sync` runs. Nothing
+      # in CI can check the generated projects, but it can check the script
+      # still parses and still refuses to be a silent no-op — which is the
+      # failure mode that would quietly reinstate the leak.
+      - name: Native patch script is loadable and still bites
+        run: |
+          node -e "
+            import('./scripts/patch-native.mjs').then((m) => {
+              const patched = m.patchAndroidManifest('<application android:allowBackup=\"true\" />');
+              if (!patched.includes('android:allowBackup=\"false\"')) {
+                throw new Error('patchAndroidManifest did not disable auto-backup');
+              }
+              let threw = false;
+              try { m.patchAndroidManifest('<application />'); } catch { threw = true; }
+              if (!threw) throw new Error('patchAndroidManifest no-ops on an unexpected template');
+              console.log('patch-native: ok');
+            }).catch((error) => { console.error(error); process.exit(1); });
+          "
