@@ -971,13 +971,20 @@ export class ChatterangEngine {
           );
           break;
 
-        case 'done':
+        case 'done': {
           // `StreamDoneChunk` carries no `metadata`, so warnings arrive only on
           // the `metadata` chunk above. Checked against ir.d.ts:1213 rather
           // than assumed -- reading a field that does not exist would have been
           // a silent no-op that looked like coverage.
           stats = { ...stats, ...readUsage(chunk.usage) };
+          // #148: `chunk.message` used to be dropped here. It is the far side's
+          // own accumulation, which makes it a free checksum on ours.
+          const mismatch = streamIntegrityWarning(text, chunk.message);
+          if (mismatch) {
+            this.#responseWarnings = mergeWarnings(this.#responseWarnings, [mismatch]);
+          }
           break;
+        }
 
         case 'error':
           return { text, stats, error: chunk.error.message, errorCode: chunk.error.code };
@@ -1163,6 +1170,62 @@ function readUsage(
 }
 
 /** Build an engine target from a model id and the engine that serves it. */
+/**
+ * The text of an assembled reply, for comparison against accumulated deltas.
+ *
+ * Deliberately NOT `messageText` from `src/ai/prompt.ts`. That one renders
+ * non-text blocks as placeholders -- `[image]`, `[tool foo({...})]` -- because
+ * it builds a prompt for a model to read. Comparing that against a stream of
+ * `delta` text would report a mismatch every time a reply contained anything
+ * but plain text, which is a checksum that cries wolf.
+ */
+export function streamedTextOf(message: IRMessage): string {
+  if (typeof message.content === 'string') return message.content;
+  return message.content
+    .map((block) => (block.type === 'text' ? block.text : ''))
+    .join('');
+}
+
+/**
+ * Did the far side's own accumulation agree with ours? (#148)
+ *
+ * `done.message` is the only place assembled tool calls can be read, and this
+ * app has always ignored it -- so a free checksum was being thrown away. In
+ * one process the two cannot disagree: the same generator writes both from one
+ * buffer. Over a wire they can, and the way they disagree matters:
+ *
+ *   - a DROPPED content frame makes delta-accumulation short
+ *   - a REORDERED pair makes delta-accumulation scrambled
+ *
+ * and `done.message`, assembled by the far side, is right in both cases. The
+ * user currently reads a scrambled reply as the MODEL failing. It is the
+ * transport, and blaming the wrong component is the actual defect.
+ *
+ * Returns null when they agree or when there is nothing to compare -- `message`
+ * is optional and most in-process turns omit it.
+ */
+export function streamIntegrityWarning(
+  accumulated: string,
+  message: IRMessage | undefined,
+): TurnWarning | null {
+  if (!message) return null;
+  const assembled = streamedTextOf(message);
+  // An empty assembled message is a far side that sent no text blocks, not a
+  // far side reporting that we received nothing. Comparing against it would
+  // fail every turn whose reply was entirely tool calls.
+  if (assembled === '' || assembled === accumulated) return null;
+  const shortfall = assembled.length - accumulated.length;
+  return {
+    category: 'transport-degraded',
+    severity: 'warning',
+    message:
+      shortfall > 0
+        ? `This reply arrived incomplete: ${shortfall} characters did not reach this device.`
+        : 'This reply did not arrive in the order it was sent, so what is shown may be scrambled.',
+    source: 'stream',
+  };
+}
+
 export function targetFor(
   engine: EngineId,
   modelId: string,

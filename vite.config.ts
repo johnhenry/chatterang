@@ -49,6 +49,9 @@ export default defineConfig({
       '@chatterang/tunnel/wire': fileURLToPath(
         new URL('./packages/tunnel/src/wire/index.ts', import.meta.url),
       ),
+      '@chatterang/tunnel/codec': fileURLToPath(
+        new URL('./packages/tunnel/src/codec/index.ts', import.meta.url),
+      ),
       '@chatterang/tunnel/client': fileURLToPath(
         new URL('./packages/tunnel/src/client/index.ts', import.meta.url),
       ),

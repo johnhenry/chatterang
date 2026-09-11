@@ -611,7 +611,15 @@ describe('the tunnel package', () => {
     const manifest = JSON.parse(
       readFileSync(resolve(process.cwd(), 'packages/tunnel/package.json'), 'utf8'),
     ) as { exports?: Record<string, unknown> };
-    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual(['./client', './host', './wire']);
+    // `./codec` joins wire and client on the importable side: it is the IR
+    // serialization policy (#142), and the phone is one of the two ends that
+    // has to apply it. It names no Node builtin, which the ban above checks.
+    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([
+      './client',
+      './codec',
+      './host',
+      './wire',
+    ]);
   });
 
   it('the tsconfig and vite aliases enumerate entry points, never the directory', () => {
@@ -631,7 +639,7 @@ describe('the tunnel package', () => {
       // which a raw text search reads as the violation itself, and which is the
       // exact trap this file's contracts block documents at `SPECIFIER`.
       const code = codeOf(source);
-      for (const entry of ['wire', 'client', 'host']) {
+      for (const entry of ['wire', 'codec', 'client', 'host']) {
         expect(code, `${name} does not map @chatterang/tunnel/${entry}`).toContain(
           `@chatterang/tunnel/${entry}`,
         );

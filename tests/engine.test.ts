@@ -107,6 +107,35 @@ function scriptedBackend(turns: string[]): BackendAdapter {
   });
 }
 
+/**
+ * A backend that drops a content frame but still reports the full text in its
+ * `done.message` — what a lossy tunnel looks like from this side (#148).
+ *
+ * The far side assembled the whole reply; some of it did not arrive. Before
+ * the checksum, this produced a short reply with nothing to say so, and the
+ * user read it as the model stopping early.
+ */
+function lossyBackend(text: string, dropFrom: number): BackendAdapter {
+  return new FunctionBackendAdapter({
+    execute: async (request) => ({
+      message: { role: 'assistant', content: text },
+      finishReason: 'stop',
+      metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
+    }),
+    executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+      yield { type: 'start', sequence: 0, metadata: request.metadata };
+      yield { type: 'content', sequence: 1, delta: text.slice(0, dropFrom) };
+      // sequence 2 is dropped in flight — that is the whole point.
+      yield {
+        type: 'done',
+        sequence: 3,
+        finishReason: 'stop',
+        message: { role: 'assistant', content: text },
+      };
+    },
+  });
+}
+
 /** A backend whose stream always fails, to exercise the fallback path. */
 function failingBackend(message: string): BackendAdapter {
   return new FunctionBackendAdapter({
@@ -350,6 +379,30 @@ describe('ChatterangEngine.stream', () => {
     });
     // The sentence is the one a person reads, not a code.
     expect(warnings[0]?.message).toMatch(/memory/i);
+  });
+
+  it('catches a dropped content frame against done.message, and blames the transport', async () => {
+    engine.router.register('scripted', lossyBackend('The full answer is here.', 9));
+
+    const events = await drain(
+      engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget }),
+    );
+
+    const done = doneEvent(events);
+    // What the user sees is short — that part is unavoidable, the bytes are
+    // gone. Trailing space trimmed by `stripToolSyntax` on the way out; the
+    // checksum ran against the raw 9 accumulated characters, which is why the
+    // shortfall below is 15 and not 14.
+    expect(done.text).toBe('The full');
+
+    // What is new is that something says so, and says it is the link.
+    const warnings = done.provenance.warnings ?? [];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.category).toBe('transport-degraded');
+    expect(warnings[0]?.message).toContain('15 characters');
+    // The defect this fixes: a short or scrambled reply read as the model
+    // failing. The sentence must not point at the model.
+    expect(warnings[0]?.message).not.toMatch(/model/i);
   });
 
   it('reports no warning on a clean turn, so the field means something', async () => {
