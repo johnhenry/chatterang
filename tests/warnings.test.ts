@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { fallbackWarning, mergeWarnings, projectWarning, warningsOf } from '@/ai/warnings';
+import { streamIntegrityWarning } from '@/ai/engine';
 
 /**
  * #149. The engine's coverage of this channel drives a real degraded turn and
@@ -84,5 +85,74 @@ describe('turn warnings', () => {
     const a = fallbackWarning('thermal', 'llama-cpp');
     const b = fallbackWarning('thermal', 'onnx');
     expect(mergeWarnings([a!], [b!])).toHaveLength(2);
+  });
+});
+
+/* ── #148: done.message as a checksum on delta accumulation ──────────── */
+
+describe('stream integrity', () => {
+  it('says nothing when there is no assembled message to compare against', () => {
+    // `message` is optional and most in-process turns omit it, so this is the
+    // common path — it must not warn.
+    expect(streamIntegrityWarning('hello', undefined)).toBeNull();
+  });
+
+  it('says nothing when the two accumulations agree', () => {
+    expect(
+      streamIntegrityWarning('hello world', { role: 'assistant', content: 'hello world' }),
+    ).toBeNull();
+  });
+
+  it('reports a DROPPED frame as transport, with the shortfall', () => {
+    const warning = streamIntegrityWarning('hello ', {
+      role: 'assistant',
+      content: 'hello world',
+    });
+    expect(warning).toMatchObject({ category: 'transport-degraded', source: 'stream' });
+    // The number matters: 'something went wrong' is not actionable.
+    expect(warning?.message).toContain('5 characters');
+    // And it must not read as the model's fault, which is the defect.
+    expect(warning?.message).not.toMatch(/model/i);
+  });
+
+  it('reports a REORDERED stream differently from a truncated one', () => {
+    // Same length, different order — the case that renders as a scrambled
+    // reply and currently reads to the user as the model failing.
+    const warning = streamIntegrityWarning('world hello', {
+      role: 'assistant',
+      content: 'hello world',
+    });
+    expect(warning?.category).toBe('transport-degraded');
+    expect(warning?.message).toMatch(/order/i);
+    expect(warning?.message).not.toContain('characters did not reach');
+  });
+
+  it('does not compare against placeholders for non-text blocks', () => {
+    /*
+     * The trap this avoids: `messageText` in src/ai/prompt.ts renders an image
+     * as `[image]` and a tool call as `[tool name({...})]`, because it builds a
+     * prompt. Comparing THAT against a delta stream would report a mismatch on
+     * every reply containing anything but plain text.
+     */
+    const warning = streamIntegrityWarning('Here you go.', {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Here you go.' },
+        { type: 'tool_use', id: 't1', name: 'search', input: { q: 'x' } },
+      ],
+    });
+    expect(warning).toBeNull();
+  });
+
+  it('says nothing when the far side sent no text at all', () => {
+    // A reply that is entirely tool calls has an empty assembled text. That is
+    // not a report that nothing arrived, and warning here would fire on every
+    // such turn.
+    expect(
+      streamIntegrityWarning('', {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'search', input: {} }],
+      }),
+    ).toBeNull();
   });
 });
