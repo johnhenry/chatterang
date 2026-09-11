@@ -18,6 +18,7 @@
  */
 
 import { canChat } from '@/domain/manifest';
+import { REACH_DEVICE, REACH_REMOTE, reachPaired, type PairedDevice, type Reach } from '@/domain/chat';
 import type { InstalledModel } from '@/db';
 
 /**
@@ -44,9 +45,40 @@ export interface Providerish {
  */
 export type ChatTarget =
   | { readonly kind: 'local'; readonly model: InstalledModel }
+  /**
+   * A device the user paired (#191). Neither `local` nor `remote`: the bytes
+   * leave this phone, and no third party receives them. Filing it under either
+   * existing arm makes that arm's label false for at least one row in the list.
+   */
+  | { readonly kind: 'paired'; readonly device: PairedDevice }
   | { readonly kind: 'remote'; readonly provider: Providerish }
   | { readonly kind: 'refused'; readonly model: InstalledModel }
   | { readonly kind: 'none' };
+
+/**
+ * The {@link Reach} a target will produce, or undefined if it will produce none.
+ *
+ * This is what stops the picker and the provenance becoming two taxonomies of
+ * the same thing (#112, #191). The chat screen groups its `<optgroup>`s by the
+ * DESTINATION axis of this rather than by `kind`, so "what the user is
+ * choosing between" and "what the reply will be labelled" cannot drift — and
+ * a fifth destination is a row here rather than a new group everywhere.
+ *
+ * `refused` and `none` produce nothing because no turn runs.
+ */
+export function reachOf(target: ChatTarget): Reach | undefined {
+  switch (target.kind) {
+    case 'local':
+      return REACH_DEVICE;
+    case 'paired':
+      return reachPaired(target.device);
+    case 'remote':
+      return REACH_REMOTE;
+    case 'refused':
+    case 'none':
+      return undefined;
+  }
+}
 
 /**
  * WHERE THE TURN GOES, DECIDED THE SAME WAY THE ENGINE DECIDES IT.

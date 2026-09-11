@@ -31,18 +31,9 @@
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  REACH_DEVICE,
-  REACH_REMOTE,
-  leftThisDevice,
-  pairedDevice,
-  ranOnDevice,
-  reachKind,
-  reachPaired,
-  reachedThirdParty,
-  type Provenance,
-} from '@/domain/chat';
-import { db, upgradeReach } from '@/db';
+import { REACH_DEVICE, REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE, leftThisDevice, pairedDevice, ranOnDevice, reachKind, reachPaired, reachedThirdParty, type Provenance } from '@/domain/chat';
+import { db, upgradeMessageReachAxes, upgradeReach, upgradeReachValue } from '@/db';
+import { reachOf } from '@/ui/target';
 import { renderTranscript } from '@/shell/commands';
 
 /* ── Fixtures ───────────────────────────────────────────────────────── */
@@ -169,7 +160,13 @@ describe('a reach is three answers where a boolean had two', () => {
     expect(Object.isFrozen(REACH_REMOTE)).toBe(true);
 
     expect(() => {
-      (REACH_DEVICE as { kind: string }).kind = 'remote';
+      (REACH_DEVICE as { reached: string }).reached = 'third-party';
+    }).toThrow(TypeError);
+    // The nested host too — freezing only the outer object would leave every
+    // on-device turn one assignment away from claiming it ran elsewhere.
+    expect(Object.isFrozen(REACH_DEVICE.host)).toBe(true);
+    expect(() => {
+      (REACH_DEVICE.host as { kind: string }).kind = 'third-party';
     }).toThrow(TypeError);
     expect(reachKind(ON_DEVICE)).toBe('device');
   });
@@ -286,22 +283,33 @@ function fakeTx(rows: Record<string, unknown>[]): unknown {
 }
 
 const v6 = versions.find((version) => version._cfg?.version === 6)?._cfg?.contentUpgrade;
+const v7 = versions.find((version) => version._cfg?.version === 7)?._cfg?.contentUpgrade;
 
-describe('the version this migration claims', () => {
-  it('is 6, declared once, and the highest', () => {
-    // Two `.version(n)` calls sharing an n is worse than the bug being fixed:
-    // Dexie keeps the last and the other migration silently never runs.
-    // Parallel work on this file is exactly how that happens.
+describe('the versions these migrations claim', () => {
+  it('are 6 and 7, each declared once, in order, with 7 the highest', () => {
+    /*
+     * Two `.version(n)` calls sharing an n is worse than the bug being fixed:
+     * Dexie keeps the last and the other migration silently never runs.
+     *
+     * This is not hypothetical here. #133 (a paired-device table) and #195 (a
+     * durable queue) BOTH describe themselves as version 7 in their own
+     * bodies, written before either was built. This assertion is what stops
+     * the second one to land from erasing the first.
+     */
     const declared = versions.map((version) => Number(version._cfg?.version));
 
     expect(declared).toContain(6);
+    expect(declared).toContain(7);
     expect(new Set(declared).size).toBe(declared.length);
-    expect(Math.max(...declared)).toBe(6);
+    expect(Math.max(...declared)).toBe(7);
     expect([...declared]).toEqual([...declared].sort((a, b) => a - b));
   });
 
-  it('is wired to the upgrade, not merely declared', () => {
+  it('are wired to their upgrades, not merely declared', () => {
+    // A `.version(n)` with no `.upgrade()` bumps the schema and converts
+    // nothing, which reads in review as a migration and is not one.
     expect(typeof v6).toBe('function');
+    expect(typeof v7).toBe('function');
   });
 });
 
@@ -435,5 +443,153 @@ describe('a conversation saved by yesterday’s build', () => {
         paired as unknown as Parameters<typeof renderTranscript>[1],
       ),
     ).toContain('## Qwen3 32B (remote)');
+  });
+});
+
+/* ── 4. v7: one axis becomes two ─────────────────────────────────────── */
+
+describe('the two axes', () => {
+  it('says the thing one axis could not: ran here, reached a third party', () => {
+    /*
+     * #112, and the whole reason for the reshape. A `claude` CLI is a process
+     * on this machine whose tokens reach a vendor API. Under three arms it had
+     * to be `device` or `remote`, and both got something wrong that mattered.
+     */
+    expect(REACH_LOCAL_VIA_THIRD_PARTY.host.kind).toBe('device');
+    expect(REACH_LOCAL_VIA_THIRD_PARTY.reached).toBe('third-party');
+
+    // And the projections now answer correctly, which is the point — under
+    // `device` the first two were wrong, under `remote` the first one was.
+    const cli = { reach: REACH_LOCAL_VIA_THIRD_PARTY };
+    expect(ranOnDevice(cli)).toBe(true);
+    expect(reachKind(cli)).toBe('remote');
+  });
+
+  it('keeps the old three as the diagonal', () => {
+    // Nothing about the existing destinations changed meaning; they are the
+    // cases where the two axes happen to agree.
+    expect(REACH_DEVICE).toMatchObject({ host: { kind: 'device' }, reached: 'device' });
+    expect(REACH_REMOTE).toMatchObject({ host: { kind: 'third-party' }, reached: 'third-party' });
+    expect(reachPaired({ id: 'p1', name: 'Studio' })).toMatchObject({
+      host: { kind: 'paired' },
+      reached: 'paired',
+    });
+  });
+
+  it('reports the destination, not the host, as the label', () => {
+    // `reachKind` decides what a reply is CALLED, and what a reader is owed is
+    // where their words went — not which process typed them.
+    expect(reachKind({ reach: REACH_LOCAL_VIA_THIRD_PARTY })).toBe('remote');
+    expect(pairedDevice({ reach: REACH_LOCAL_VIA_THIRD_PARTY })).toBeUndefined();
+  });
+});
+
+describe('the v7 conversion', () => {
+  it('converts each old arm losslessly', () => {
+    expect(upgradeReachValue({ kind: 'device' })).toEqual(REACH_DEVICE);
+    expect(upgradeReachValue({ kind: 'remote' })).toEqual(REACH_REMOTE);
+    expect(upgradeReachValue({ kind: 'paired', device: { id: 'p1', name: 'Studio' } })).toEqual(
+      reachPaired({ id: 'p1', name: 'Studio' }),
+    );
+  });
+
+  it('leaves an already-converted reach alone, so a replay changes nothing', () => {
+    // Dexie can replay an upgrade. Returning undefined here is what makes that
+    // safe — a second run must not re-derive from a shape it already wrote.
+    expect(upgradeReachValue(REACH_DEVICE)).toBeUndefined();
+    expect(upgradeReachValue(REACH_LOCAL_VIA_THIRD_PARTY)).toBeUndefined();
+  });
+
+  it('prefers an existing two-axis reach over a stale one-axis kind beside it', () => {
+    /*
+     * The case that makes the `reached` check load-bearing rather than
+     * decorative: a row carrying BOTH shapes. A clean v7 value has no `kind`
+     * and would fall through the switch to `undefined` anyway — but a row
+     * half-written, or written by a build mid-transition, can have both, and
+     * then `kind` would win and overwrite a CORRECT two-axis value with one
+     * derived from a stale single axis.
+     *
+     * `{ kind: 'device' }` next to `reached: 'third-party'` is exactly the CLI
+     * case being downgraded back to the wrong label this whole change exists
+     * to fix.
+     */
+    const both = { ...REACH_LOCAL_VIA_THIRD_PARTY, kind: 'device' };
+    expect(upgradeReachValue(both)).toBeUndefined();
+  });
+
+  it('refuses a paired row whose device it cannot read', () => {
+    // "Paired, but the app cannot say which device" is the invalid state
+    // Reach's own comment says must not be constructible.
+    expect(upgradeReachValue({ kind: 'paired' })).toBeUndefined();
+    expect(upgradeReachValue({ kind: 'paired', device: { id: 'p1' } })).toBeUndefined();
+  });
+
+  it('refuses a shape it does not recognise rather than guessing', () => {
+    for (const bad of [undefined, null, 42, 'device', {}, { kind: 'elsewhere' }]) {
+      expect(upgradeReachValue(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
+  it('rewrites a row and its variants together', () => {
+    // A reader that found one shape on the row and another on a variant would
+    // render two different labels for one message.
+    const row = {
+      provenance: { backendId: 'llama-cpp', reach: { kind: 'device' } },
+      variants: [{ provenance: { backendId: 'conn_1', reach: { kind: 'remote' } } }],
+    };
+    const upgraded = upgradeMessageReachAxes(row as never);
+    expect(upgraded.provenance?.reach).toEqual(REACH_DEVICE);
+    expect((upgraded.variants?.[0] as { provenance?: { reach?: unknown } })?.provenance?.reach).toEqual(
+      REACH_REMOTE,
+    );
+  });
+
+  it('drops a provenance whose reach it cannot read, rather than inventing one', () => {
+    // The rule inherited from v4 and v6: a generation whose origin was not
+    // recorded gets NO label rather than a plausible one.
+    const upgraded = upgradeMessageReachAxes({
+      provenance: { backendId: 'x', reach: { kind: 'elsewhere' } },
+    } as never);
+    expect(upgraded.dropProvenance).toBe(true);
+    expect(upgraded.provenance).toBeUndefined();
+  });
+});
+
+/* ── 5. #191: the picker and the provenance share one vocabulary ──────── */
+
+describe('what a chat target will produce', () => {
+  const model = {
+    id: 'qwen',
+    state: 'installed' as const,
+    manifest: { name: 'Qwen3 4B', capabilities: ['text'] },
+  };
+
+  it('maps every target that runs to the reach it will be labelled with', () => {
+    // The point of `reachOf`: the picker groups by the same value the reply is
+    // labelled with, so "what the user chose between" and "what came back"
+    // cannot drift into two taxonomies of one thing.
+    expect(reachOf({ kind: 'local', model } as never)).toEqual(REACH_DEVICE);
+    expect(reachOf({ kind: 'remote', provider: { id: 'c1', enabled: true } } as never)).toEqual(
+      REACH_REMOTE,
+    );
+    expect(reachOf({ kind: 'paired', device: { id: 'p1', name: 'Studio' } })).toEqual(
+      reachPaired({ id: 'p1', name: 'Studio' }),
+    );
+  });
+
+  it('produces nothing for the targets where no turn runs', () => {
+    // `refused` and `none` are not destinations; giving them one would put a
+    // label on a reply that never came back.
+    expect(reachOf({ kind: 'refused', model } as never)).toBeUndefined();
+    expect(reachOf({ kind: 'none' })).toBeUndefined();
+  });
+
+  it('gives paired its own group rather than folding it into an existing label', () => {
+    // #191's whole argument: filing a paired desktop under either existing
+    // label makes that label false for at least one row in the list.
+    const paired = reachOf({ kind: 'paired', device: { id: 'p1', name: 'Studio' } })!;
+    expect(reachKind({ reach: paired })).toBe('paired');
+    expect(reachKind({ reach: REACH_DEVICE })).toBe('device');
+    expect(reachKind({ reach: REACH_REMOTE })).toBe('remote');
   });
 });

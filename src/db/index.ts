@@ -15,13 +15,19 @@ import type { ComputeBackend, EngineId, ModelManifest, SamplerSettings } from '@
 import type { ProviderConnection } from '@/ai/providers';
 import { upgradeVariants, type LegacyMessageRow } from '@/db/variants';
 import { upgradeModelTemplates } from '@/db/model-template';
-import { upgradeMessageReach } from '@/db/reach';
+import {
+  upgradeMessageReachAxes,
+  upgradeMessageReachRows,
+  upgradeMessageReach,
+} from '@/db/reach';
 
 export { upgradeVariants, type LegacyMessageRow, type VariantUpgrade } from '@/db/variants';
 export { supersededTemplate, upgradeModelTemplates, type StoredModelRow } from '@/db/model-template';
 export {
   upgradeMessageReach,
+  upgradeMessageReachAxes,
   upgradeReach,
+  upgradeReachValue,
   type LegacyReachRow,
   type ReachUpgrade,
 } from '@/db/reach';
@@ -265,6 +271,34 @@ class ChatterangDatabase extends Dexie {
       .stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' })
       .upgrade(async (tx) => {
         await upgradeMessageReach(tx.table('messages'));
+      });
+
+    /**
+     * v7: a reach says where it RAN as well as how far the bytes WENT.
+     *
+     * v6 gave every turn a three-arm `Reach`. #112 showed one axis cannot hold
+     * a locally-hosted process with a vendor upstream — a `claude` CLI is on
+     * this machine AND reaches api.anthropic.com, and labelling it either
+     * `device` or `remote` gets something wrong that matters: `device` removes
+     * the egress sheet and ships taint marks to a vendor; `remote` is secure
+     * and silent about the machine.
+     *
+     * The conversion is lossless — the old three arms are the diagonal of the
+     * new pair — so this is a rewrite and not a judgement call.
+     *
+     * ON THE VERSION NUMBER. #133 (a paired-device table) and #195 (a durable
+     * queue) both describe themselves as v7. They cannot all be. This one is
+     * v7 because it landed; both of those are unbuilt and blocked on substrate
+     * that does not exist, and each will need re-reading against this before it
+     * picks its own number. Whoever goes next takes v8.
+     *
+     * Schema unchanged — no index mentions `provenance` — so the store is
+     * restated for the version to have one, as v4, v5 and v6 do.
+     */
+    this.version(7)
+      .stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' })
+      .upgrade(async (tx) => {
+        await upgradeMessageReachRows(tx.table('messages'), upgradeMessageReachAxes);
       });
   }
 }

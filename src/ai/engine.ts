@@ -295,8 +295,12 @@ export interface EngineTarget {
    *   2. do the bytes leave this device?            -> leavesThisDevice()
    *   3. does this app's taint mark survive?        -> keepsTaintMark()
    *
-   * Read them through those predicates rather than off `reach.kind`, so the
-   * next destination is a change here and not an audit of every call site.
+   * Since #112 those are PROJECTIONS of two axes rather than switches over one
+   * value: (1) reads `reach.host`, (2) and (3) read `reach.reached`. A local
+   * CLI with a vendor upstream is the case that separates them — it runs here
+   * AND the bytes reach a third party, and the old single axis could only say
+   * one of those. Read them through the predicates rather than off `reach`, so
+   * the next destination is a change there and not an audit of every call site.
    */
   readonly reach: Reach;
 }
@@ -309,7 +313,7 @@ export interface EngineTarget {
  * failure, because only then is there something to divert *from*.
  */
 export function runsOnThisDevice(target: EngineTarget): boolean {
-  return target.reach.kind === 'device';
+  return target.reach.host.kind === 'device';
 }
 
 /**
@@ -322,7 +326,7 @@ export function runsOnThisDevice(target: EngineTarget): boolean {
  * it is the user's own hardware would silently delete that sheet.
  */
 export function leavesThisDevice(target: EngineTarget): boolean {
-  return target.reach.kind !== 'device';
+  return target.reach.reached !== 'device';
 }
 
 /**
@@ -340,7 +344,7 @@ export function leavesThisDevice(target: EngineTarget): boolean {
  * produces a paired target; this predicate is where to make it.
  */
 export function keepsTaintMark(target: EngineTarget): boolean {
-  return target.reach.kind === 'device';
+  return target.reach.reached === 'device';
 }
 
 export interface GenerationRequest {
