@@ -96,6 +96,13 @@
 import type { ShellCommand, ShellContext, ShellOutput, ShellStores } from '@/shell/commands';
 import { chatterangCommands, table } from '@/shell/commands';
 import { guardProjection, type GuardedFs } from '@/shell/fs';
+import {
+  mountReal,
+  resolveGrant,
+  type MountGrant,
+  type RealFsPort,
+  type ResolvedMount,
+} from '@/shell/mount';
 import { buildVfs, type VfsSnapshot } from '@/shell/vfs';
 
 export type { ShellCommand, ShellContext, ShellOutput, ShellStores } from '@/shell/commands';
@@ -113,6 +120,24 @@ export interface ShellOptions {
   /** Who is driving. The model may not run mutating commands unconfirmed. */
   actor: 'user' | 'model';
   confirm(action: string): Promise<boolean>;
+  /**
+   * Real folders the user has granted, mounted under `/mnt` (#246).
+   *
+   * Absent or empty means the shell reaches nothing outside the app, which is
+   * what it did before this existed and what it still does until somebody
+   * picks a folder. `mountReal` returns the filesystem untouched for an empty
+   * list, so an ungranted shell is not merely equivalent to the old one — it
+   * is the same object graph.
+   */
+  mounts?: readonly MountGrant[];
+  /**
+   * How to reach a real filesystem. Required only if `mounts` is non-empty.
+   *
+   * Injected rather than imported because `src/` may not name a Node builtin,
+   * and because the same port is Capacitor's interface on iOS and Android —
+   * so this file never learns which platform it is on.
+   */
+  realFs?: RealFsPort;
 }
 
 /**
@@ -217,12 +242,62 @@ export class ChatterangShell {
     // than inside any command, so it holds for every route into the FS — a
     // redirection, `cp`, `mv`, a symlink whose parent points somewhere else,
     // and any command a future version of this file registers.
-    const guarded = guardProjection(new InMemoryFs());
+    /*
+     * Order is load-bearing: the mount goes BELOW the projection guard.
+     *
+     * `guardProjection` resolves a write's parent through `realpath` before
+     * deciding whether it is projected. Above the mount, that call would ask
+     * the in-memory filesystem about a path that lives on disk and be told
+     * about nothing. Below it, the guard's own resolution flows through the
+     * mount and is answered by the real filesystem — so a symlink under a
+     * granted folder cannot be used to reach a projected path either.
+     */
+    const mounted = mountReal(new InMemoryFs(), await this.#resolveMounts());
+    const guarded = guardProjection(mounted);
     const bash = new Bash({ fs: guarded.fs, customCommands, cwd: '/' });
 
     this.#fs = guarded;
     this.#bash = bash;
     await this.#project();
+  }
+
+  /**
+   * The `/mnt` lines of `help`, or nothing when no folder is granted.
+   *
+   * Absent rather than "none granted": a shell with no mounts is the shell
+   * this app has always had, and advertising a capability that is not there
+   * invites the model to try it and read a refusal.
+   */
+  #mountHelp(): readonly string[] {
+    const grants = this.#options.mounts ?? [];
+    if (grants.length === 0) return [];
+    return [
+      '',
+      'Granted folders (real, on this device):',
+      ...grants.map(
+        (grant) =>
+          `  /mnt/${grant.name}`.padEnd(15) +
+          `${grant.writable ? 'read and write' : 'read-only'} — you granted this folder`,
+      ),
+      'Nothing outside a granted folder is reachable, including through a symlink.',
+    ];
+  }
+
+  /**
+   * Resolve every grant once, at start.
+   *
+   * A grant whose root does not resolve — deleted, renamed, permission gone,
+   * or not a directory — is dropped rather than mounted against the string it
+   * was granted by. Mounting it anyway would make every later containment
+   * decision for that folder a comparison against a path the kernel does not
+   * agree exists.
+   */
+  async #resolveMounts(): Promise<readonly ResolvedMount[]> {
+    const grants = this.#options.mounts ?? [];
+    const port = this.#options.realFs;
+    if (grants.length === 0 || !port) return [];
+    const resolved = await Promise.all(grants.map((grant) => resolveGrant(grant, port)));
+    return resolved.filter((mount): mount is ResolvedMount => mount !== null);
   }
 
   /**
@@ -335,6 +410,7 @@ export class ChatterangShell {
             '',
             'Everything outside /workspace is read-only: the filesystem refuses',
             'the write, so nothing here can invent a conversation and quote it back.',
+            ...(this.#mountHelp()),
             '',
             'Standard tools are available: grep, sed, awk, jq, find, sort, wc, diff …',
             'Network access is not available, by design.',

@@ -9,11 +9,18 @@
  * {@link PROJECTED_PATHS} is the list it enforces.
  *
  * Everything here is data the user already owns and can already see in the
- * UI. Nothing is mounted that the app itself does not hold: no device
- * filesystem, no keychain, no other app's data. Notably absent are provider
- * API keys — they exist in the settings store and are deliberately not
- * projected, because a model with filesystem access should not be one `cat`
- * away from a credential.
+ * UI. Nothing is PROJECTED that the app itself does not hold: no keychain, no
+ * other app's data. Notably absent are provider API keys — they exist in the
+ * settings store and are deliberately not projected, because a model with
+ * filesystem access should not be one `cat` away from a credential.
+ *
+ * THIS ONCE SAID "no device filesystem" AND NO LONGER CAN (#246). A folder the
+ * user explicitly grants is mounted at `/mnt/<name>` by `shell/mount.ts`. That
+ * is a real directory, reached by real syscalls, and the only thing standing
+ * between it and the rest of the disk is that module's containment check —
+ * which is why it resolves symlinks on the real side rather than comparing
+ * strings. Nothing is mounted that the user did not pick, one folder at a
+ * time, and a shell with no grants behaves exactly as this file describes.
  */
 
 import type { ShellStores } from '@/shell/commands';
