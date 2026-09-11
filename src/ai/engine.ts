@@ -49,6 +49,7 @@ import {
   type ClearedMessage,
 } from '@/ai/taint';
 import { toolRegistry } from '@/ai/tools/registry';
+import { fallbackWarning, mergeWarnings, warningsOf, type TurnWarning } from '@/ai/warnings';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
@@ -412,6 +413,14 @@ export interface ProvenanceSnapshot {
   fallbackFrom?: string;
   fallbackReason?: FallbackReason;
   /**
+   * What went wrong on the way, if anything (#149).
+   *
+   * Absent when the turn was clean, which is almost every turn. Present means
+   * there is a sentence to show the user -- `metadata.warnings` from the
+   * response, plus the engine's own view of a divert, merged and deduplicated.
+   */
+  warnings?: readonly TurnWarning[];
+  /**
    * Whether this reply's request carried tool output off the device.
    *
    * Absent when no tool output was in play — which is every turn that used no
@@ -443,6 +452,8 @@ export class ChatterangEngine {
   #fallbackModels = new Map<string, string>();
   #pendingTools: ExecutedTool[] = [];
   #lastFallback: FallbackEvent | null = null;
+  /** `metadata.warnings` from the response this turn produced (#149). */
+  #responseWarnings: readonly TurnWarning[] = [];
 
   constructor(options: EngineOptions) {
     this.#options = options;
@@ -596,6 +607,7 @@ export class ChatterangEngine {
     const requestId = newId('req');
     this.#pendingTools = [];
     this.#lastFallback = null;
+    this.#responseWarnings = [];
 
     const started = performance.now();
     yield { type: 'start', requestId };
@@ -951,9 +963,19 @@ export class ChatterangEngine {
 
         case 'metadata':
           stats = { ...stats, ...readStats(chunk.metadata?.custom), ...readUsage(chunk.usage) };
+          // #149: a backend that sets `metadata.warnings` is telling us the
+          // turn was degraded. Nothing read this before.
+          this.#responseWarnings = mergeWarnings(
+            this.#responseWarnings,
+            warningsOf(chunk.metadata?.warnings),
+          );
           break;
 
         case 'done':
+          // `StreamDoneChunk` carries no `metadata`, so warnings arrive only on
+          // the `metadata` chunk above. Checked against ir.d.ts:1213 rather
+          // than assumed -- reading a field that does not exist would have been
+          // a silent no-op that looked like coverage.
           stats = { ...stats, ...readUsage(chunk.usage) };
           break;
 
@@ -1025,6 +1047,21 @@ export class ChatterangEngine {
 
   #provenance(target: EngineTarget): ProvenanceSnapshot {
     const fallback = this.#lastFallback;
+    /*
+     * Warnings from two sources, merged (#149).
+     *
+     * `#responseWarnings` is whatever the response's own `metadata.warnings`
+     * carried -- which on the streaming path is nothing, because the
+     * resilience middleware that writes them early-returns on every streamed
+     * request and every chat turn streams.
+     *
+     * So the divert the engine performed itself is converted here, and the two
+     * paths describe it identically instead of one saying it in metadata and
+     * the other in an event nobody reads. `mergeWarnings` deduplicates, for
+     * the non-streaming case where both sources describe the same divert.
+     */
+    const diverted = fallback ? fallbackWarning(fallback.reason, fallback.from) : null;
+    const warnings = mergeWarnings(this.#responseWarnings, diverted ? [diverted] : []);
     return {
       backendId: fallback?.to ?? target.backendId,
       engine: fallback ? 'remote' : target.engine,
@@ -1033,6 +1070,9 @@ export class ChatterangEngine {
       local: fallback ? false : runsOnThisDevice(target),
       fallbackFrom: fallback?.from,
       fallbackReason: fallback?.reason,
+      // Omitted rather than empty: a chip that renders `warnings` should not
+      // have to distinguish "none" from "an empty list someone built anyway".
+      ...(warnings.length ? { warnings } : {}),
     };
   }
 

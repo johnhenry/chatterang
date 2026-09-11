@@ -331,6 +331,39 @@ describe('ChatterangEngine.stream', () => {
     expect(done.text).toBe('Answered remotely.');
     expect(done.provenance.local).toBe(false);
     expect(done.provenance.fallbackFrom).toBe('scripted');
+
+    /*
+     * #149. Before this, the only thing that ever said "this turn was
+     * degraded" was `metadata.warnings`, written by middleware that
+     * early-returns on every streamed request -- so on THIS path, the one
+     * every chat turn takes, nothing said it at all. The fallback event above
+     * carried the fact and nothing converted it.
+     */
+    const warnings = done.provenance.warnings ?? [];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      // Not `capability-unsupported`: the backend was capable, it was
+      // replaced. The upstream doc names that misuse directly.
+      category: 'model-substituted',
+      severity: 'warning',
+      source: 'scripted',
+    });
+    // The sentence is the one a person reads, not a code.
+    expect(warnings[0]?.message).toMatch(/memory/i);
+  });
+
+  it('reports no warning on a clean turn, so the field means something', async () => {
+    // The control. A `warnings` array present on every turn would make the
+    // assertion above pass for a reason that has nothing to do with fallback.
+    engine.router.register('scripted', scriptedBackend(['All fine.']));
+
+    const events = await drain(
+      engine.stream({ messages: [{ role: 'user', content: 'hi' }], target: localTarget }),
+    );
+
+    const done = doneEvent(events);
+    expect(done.text).toBe('All fine.');
+    expect(done.provenance.warnings).toBeUndefined();
   });
 
   /*

@@ -233,7 +233,15 @@ function annotate(
       warnings: [
         ...(response.metadata.warnings ?? []),
         {
-          category: 'capability-unsupported',
+          // `model-substituted`, not `capability-unsupported` (#149). Every
+          // FallbackReason ends with a different model serving the turn, which
+          // is what that member means. The upstream doc for
+          // `transport-degraded` names this misuse directly: reaching for
+          // `capability-unsupported` to describe "a fallback forced by device
+          // pressure rather than by a missing capability" is how a category
+          // stops carrying information -- and device pressure is exactly what
+          // `thermal` and `memory` are.
+          category: 'model-substituted',
           severity: 'warning',
           message: describeFallback(reason),
           source: from,
