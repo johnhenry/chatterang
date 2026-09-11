@@ -22,6 +22,38 @@
  * only the shape of the envelope and the fact that a version travels in it, so
  * that a phone and a desktop on different builds disagree LOUDLY at frame one
  * rather than quietly at chunk four hundred.
+ *
+ * ── #159 RESOLVED THE ABOVE ───────────────────────────────────────────
+ *
+ * `kind` is a union now. The transport is a native socket plugin on both
+ * platforms (#181) and the frames are JSON text with a transport-owned
+ * correlation id (#159), so the two things this file was waiting on have
+ * answers.
+ *
+ * WHY A CORRELATION ID AT ALL. `IRStreamChunk` describes one response and
+ * carries `sequence` from `BaseStreamChunk`. A socket carries more than one
+ * thing at once — a request going up, chunks coming down, a cancel mid-stream,
+ * a heartbeat both ways, and a queued request being drained — and two
+ * concurrent turns multiplexed on one `sequence` counter interleave into
+ * nonsense. `turn` is that id.
+ *
+ * WHY NOT `IRMetadata.requestId`. It is documented as "stable across retries
+ * and fallbacks for correlation", and a far-side Router retry keeps it BY
+ * DESIGN. A value deliberately stable across retries cannot identify a stream.
+ * Tempting and wrong, which is why it is written down rather than left for
+ * someone to rediscover.
+ *
+ * WHY THE CHUNK IS A `body` AND NOT THE FRAME. `{ kind: 'chunk', turn, body }`
+ * keeps the IR union on the far side of this envelope, so aimatey can add a
+ * seventh chunk type without touching the wire. It is also why this file still
+ * imports nothing, not even a type: the wire does not know what a chunk IS.
+ * Whoever reads `body` applies `@chatterang/tunnel/codec` to it.
+ *
+ * WHY `kind` AND NOT A ONE-CHARACTER `k`. `apps/server/src/wire.ts` uses `k`
+ * and is the precedent for the rest of this shape, but `kind` is already what
+ * this envelope ships. Renaming a wire field for terseness is a breaking change
+ * across two independently-updated binaries in exchange for three bytes a
+ * frame, against payloads where base64 images dominate. Not worth it.
  */
 
 /**
@@ -34,19 +66,92 @@
  */
 export const TUNNEL_WIRE_VERSION = 1;
 
-/** One frame on the tunnel. */
-export interface TunnelFrame {
-  /** Always {@link TUNNEL_WIRE_VERSION} on send; checked on receive. */
-  readonly v: number;
+/**
+ * The id that ties frames to one turn.
+ *
+ * Minted by whichever side starts the turn and echoed by the other. Opaque:
+ * nothing may parse meaning out of it.
+ */
+export type TurnId = string;
+
+/**
+ * The largest frame this build will decode.
+ *
+ * Sized the way `apps/server/src/wire.ts:117` sizes its own: against the one
+ * payload that is genuinely large. A turn carries base64 images inline until
+ * they move to by-reference, and 8 MiB leaves room for several while refusing
+ * anything an order of magnitude past it — so a peer cannot make this process
+ * hold a gigabyte by announcing one. Smaller than the server's 32 MiB because
+ * model weights do not cross a tunnel; turns do.
+ */
+export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+
+/** Frames that belong to one turn, and carry its id. */
+export type TurnFrame =
+  /** A turn going up. `body` is the request; the codec decides what may cross. */
+  | { readonly v: number; readonly kind: 'turn'; readonly turn: TurnId; readonly body: unknown }
+  /** One `IRStreamChunk` coming down, as a payload rather than as the frame. */
+  | { readonly v: number; readonly kind: 'chunk'; readonly turn: TurnId; readonly body: unknown }
+  /** Stop this turn. Mid-stream, which is why it needs the id. */
+  | { readonly v: number; readonly kind: 'cancel'; readonly turn: TurnId };
+
+/** Frames about the connection rather than about a turn. */
+export type ControlFrame =
   /**
-   * What this frame is.
-   *
-   * Open on purpose — see the file comment. The set of kinds is defined by the
-   * protocol work in #156/#157, not by the envelope.
+   * First frame, both directions. `protocol` is checked and a mismatch is a
+   * refusal with a number in it — see {@link TUNNEL_WIRE_VERSION}.
    */
-  readonly kind: string;
-  /** The payload, whatever this `kind` says it is. */
-  readonly body?: unknown;
+  | {
+      readonly v: number;
+      readonly kind: 'hello';
+      readonly body: { readonly protocol: number; readonly build?: string };
+    }
+  | { readonly v: number; readonly kind: 'ping' }
+  | { readonly v: number; readonly kind: 'pong' }
+  /** Going away on purpose, so the far side can tell it from a dropped link. */
+  | { readonly v: number; readonly kind: 'bye'; readonly body?: { readonly reason?: string } }
+  /**
+   * A TRANSPORT-level failure.
+   *
+   * Deliberately distinct from `StreamErrorChunk`, which is a model-level error
+   * the far side produced and which travels inside a `chunk` frame. Collapsing
+   * the two is exactly how a transport failure gets reported to the user as a
+   * model failure — the defect #148 was ruled on. `turn` is present when the
+   * failure belongs to one.
+   */
+  | {
+      readonly v: number;
+      readonly kind: 'error';
+      readonly turn?: TurnId;
+      readonly body: { readonly code: string; readonly message: string };
+    };
+
+/** One frame on the tunnel. */
+export type TunnelFrame = TurnFrame | ControlFrame;
+
+/** Every `kind` this build knows, for validation and for exhaustive tests. */
+export const FRAME_KINDS = [
+  'turn',
+  'chunk',
+  'cancel',
+  'hello',
+  'ping',
+  'pong',
+  'bye',
+  'error',
+] as const;
+
+export type FrameKind = (typeof FRAME_KINDS)[number];
+
+/**
+ * The kinds that must carry a {@link TurnId}.
+ *
+ * A type predicate rather than a `Set.has` call, because `has` returns a
+ * boolean and narrows nothing — the decoder below would then be building a
+ * union member from a `kind` the compiler still believes could be `ping`.
+ */
+function isTurnScoped(kind: FrameKind): kind is 'turn' | 'chunk' | 'cancel' {
+  return kind === 'turn' || kind === 'chunk' || kind === 'cancel';
 }
 
 /** Raised when bytes on the wire are not a frame this build can read. */
@@ -78,6 +183,14 @@ export function encodeFrame(frame: TunnelFrame): Uint8Array {
  * really a string.
  */
 export function decodeFrame(bytes: Uint8Array): TunnelFrame {
+  // Size first, before parsing. A peer that announces 900 MiB should not get
+  // this process to allocate it in order to find out the frame was invalid.
+  if (bytes.byteLength > MAX_FRAME_BYTES) {
+    throw new TunnelWireError(
+      `frame is ${String(bytes.byteLength)} bytes, over the ${String(MAX_FRAME_BYTES)} limit`,
+    );
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(TEXT.decode.decode(bytes));
@@ -87,16 +200,103 @@ export function decodeFrame(bytes: Uint8Array): TunnelFrame {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new TunnelWireError('frame is not an object');
   }
-  const frame = parsed as Partial<TunnelFrame>;
+
+  const frame = parsed as Record<string, unknown>;
   if (frame.v !== TUNNEL_WIRE_VERSION) {
     throw new TunnelWireError(
       `frame version ${String(frame.v)} is not ${String(TUNNEL_WIRE_VERSION)}`,
     );
   }
-  if (typeof frame.kind !== 'string' || frame.kind === '') {
-    throw new TunnelWireError('frame has no kind');
+
+  const kind = frame.kind;
+  if (typeof kind !== 'string' || !FRAME_KINDS.includes(kind as FrameKind)) {
+    // Naming what arrived, because the common cause is a peer on a build that
+    // knows a kind this one does not — and the number alone does not say which.
+    throw new TunnelWireError(`unknown frame kind ${JSON.stringify(kind)}`);
   }
-  return 'body' in frame
-    ? { v: frame.v, kind: frame.kind, body: frame.body }
-    : { v: frame.v, kind: frame.kind };
+  const k = kind as FrameKind;
+
+  /*
+   * Per-arm validation, not a cast.
+   *
+   * The previous version checked `kind` was a non-empty string and returned
+   * `body` unexamined, which is fine for an open envelope and wrong for a
+   * union: downstream code that switches on `kind` would then be trusting a
+   * shape nothing checked. Bytes here have been on a network and are from
+   * another build.
+   */
+  if (isTurnScoped(k)) {
+    const turn = frame.turn;
+    if (typeof turn !== 'string' || turn === '') {
+      throw new TunnelWireError(`${k} frame has no turn id`);
+    }
+    if (k === 'cancel') return { v: TUNNEL_WIRE_VERSION, kind: k, turn };
+    return { v: TUNNEL_WIRE_VERSION, kind: k, turn, body: frame.body };
+  }
+
+  if (k === 'hello') {
+    const body = frame.body;
+    if (typeof body !== 'object' || body === null) {
+      throw new TunnelWireError('hello frame has no body');
+    }
+    const { protocol, build } = body as Record<string, unknown>;
+    if (typeof protocol !== 'number' || !Number.isInteger(protocol)) {
+      throw new TunnelWireError('hello frame has no protocol number');
+    }
+    return {
+      v: TUNNEL_WIRE_VERSION,
+      kind: 'hello',
+      body: typeof build === 'string' ? { protocol, build } : { protocol },
+    };
+  }
+
+  if (k === 'error') {
+    const body = frame.body;
+    if (typeof body !== 'object' || body === null) {
+      throw new TunnelWireError('error frame has no body');
+    }
+    const { code, message } = body as Record<string, unknown>;
+    if (typeof code !== 'string' || typeof message !== 'string') {
+      throw new TunnelWireError('error frame has no code and message');
+    }
+    const turn = frame.turn;
+    return typeof turn === 'string' && turn !== ''
+      ? { v: TUNNEL_WIRE_VERSION, kind: 'error', turn, body: { code, message } }
+      : { v: TUNNEL_WIRE_VERSION, kind: 'error', body: { code, message } };
+  }
+
+  if (k === 'bye') {
+    const body = frame.body;
+    const reason =
+      typeof body === 'object' && body !== null
+        ? (body as Record<string, unknown>).reason
+        : undefined;
+    return typeof reason === 'string'
+      ? { v: TUNNEL_WIRE_VERSION, kind: 'bye', body: { reason } }
+      : { v: TUNNEL_WIRE_VERSION, kind: 'bye' };
+  }
+
+  // ping and pong carry nothing, and must not be given anything on the way out.
+  return { v: TUNNEL_WIRE_VERSION, kind: k };
+}
+
+/**
+ * Is a peer's `hello` one this build can talk to? (#159)
+ *
+ * Separate from {@link decodeFrame} because they answer different questions: a
+ * frame can be perfectly well-formed and still come from a build this one
+ * cannot speak to. Both sides call this, and a refusal is an `error` frame with
+ * a number in it rather than a dropped connection — a phone and a desktop will
+ * be on different app versions constantly, and "it just stopped working" is the
+ * outcome this exists to prevent.
+ */
+export function checkPeerProtocol(protocol: number): { ok: true } | { ok: false; reason: string } {
+  if (protocol === TUNNEL_WIRE_VERSION) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      protocol > TUNNEL_WIRE_VERSION
+        ? `the other device speaks tunnel protocol ${String(protocol)}; this one speaks ${String(TUNNEL_WIRE_VERSION)}. Update this app.`
+        : `the other device speaks tunnel protocol ${String(protocol)}; this one speaks ${String(TUNNEL_WIRE_VERSION)}. Update the other device.`,
+  };
 }
