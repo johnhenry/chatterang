@@ -268,14 +268,31 @@
  *
  *   --rail-w                                      232
  *   --history-w                                   304
- *   --measure (66ch, MEASURED at 9.448px/ch)   623.58
+ *   --measure (66ch)                          see below
  *   2 × --pad-screen (the thread's own gutters)    48
- *                                              ———————
- *                                              1207.58
  *
- * 1208 is the next multiple of 8 above that floor. At 1207 the thread sits at
- * its cap with dead gutter either side; at 1208 the thread is exactly as wide
- * as it was and the gutter has become the session list.
+ * THE MEASURE IS PER-FACE, AND 1208 WAS SIZED AGAINST ONE FACE (#238). The
+ * 66ch term is whatever the font that actually renders makes it, and the
+ * fallback face — which is what paints offline, on a cold first paint, and for
+ * anyone blocking web fonts — is different on every platform. Measured:
+ *
+ *   platform                     px/ch     66ch     total
+ *   Android (Roboto)             8.992   593.49   1177.49
+ *   macOS                        9.448   623.57   1207.57
+ *   Linux                        9.543   629.87   1213.87   <- widest known
+ *
+ * 1208 was the next multiple of 8 above the macOS sum, and it is 5.87px under
+ * the Linux one — so on Linux the third column opened before all three fit and
+ * the reading measure NARROWED as the window got wider, which is the one thing
+ * this ladder promises never happens. CI found it; macOS never could.
+ *
+ * 1224, NOT 1216. The next multiple of 8 above the widest measured is 1216,
+ * which leaves 2.13px of headroom — and Windows has never been measured, so
+ * Segoe UI is a plausible fourth answer nobody has checked. This defect exists
+ * because a number was reasoned about rather than measured; picking the
+ * tightest value that fits three data points repeats that method. 1224 spends
+ * 8px to stop doing it. If Windows is ever measured and comes in above 1224,
+ * this comment is wrong and the number moves again.
  *
  * IT WAS 1184, AND 1184 WAS TOO NARROW. The old sum reasoned about a ~594px
  * fallback measure, from an assumed 0.60em digit. The digit was never
@@ -307,7 +324,7 @@
  * one, which is the whole point of the column — the scrollbar. It also counted
  * characters with the advance of "0", which is 29% wider than a letter.
  *
- * Measured at 1208 with 200 chats seeded and a fine pointer:
+ * Measured at the tier with 200 chats seeded and a fine pointer:
  *
  *   --history-w                                   304
  *   .history__body padding-inline (2 × 12)        -24
@@ -331,7 +348,7 @@
  * Electron window at 800px gets the modal, and a tablet in landscape at 1194px
  * gets the modal too, because 1194 is not enough room for three columns.
  */
-@media (min-width: 1208px) {
+@media (min-width: 1224px) {
   :root {
     --history-w: 304px;
   }
