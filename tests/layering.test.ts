@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { builtinModules } from 'node:module';
 import { describe, expect, it } from 'vitest';
@@ -302,6 +302,128 @@ describe('import layering', () => {
  * `@capacitor/core` — a mobile framework, in a contract a Node backend has to
  * satisfy. These assertions stop it drifting back.
  */
+/**
+ * A package `src/` imports but nothing declares does not exist as far as the
+ * bundle is concerned — it is there because something else happened to pull it
+ * in. #239.
+ *
+ * The guards above ban by NAME: Node builtins, `electron`, the
+ * `@chatterang/desktop|server` specifiers, the packages in
+ * `DESKTOP_LAYER_BAN`. Each was added after the specific thing it names bit
+ * us. That leaves the whole category they are instances of: an ordinary npm
+ * package that only works in Node. `ws` is not a builtin, not `electron`, not
+ * `@chatterang/*` and its specifier contains no path, so
+ * `import WebSocket from 'ws'` in `src/` passed every one of them — and Vite
+ * answers an unresolvable import by externalising it with a warning while the
+ * build still exits 0, which is the blank-page-in-a-webview failure
+ * `import layering`'s own header describes.
+ *
+ * This one bans by DERIVATION instead: `src/` may import what this app
+ * declares, plus the workspace packages, and nothing else. A dependency of
+ * `apps/desktop` is not a dependency of the bundle, so `ws` fails here without
+ * anybody having to remember to name it — which is the point, because the
+ * failure mode of a denylist is the entry nobody thought to add.
+ */
+describe('src/ imports only what this app declares', () => {
+  const manifest = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as {
+    dependencies?: Record<string, string>;
+    workspaces?: string[];
+  };
+
+  /** `@scope/name` or `name`, dropping any subpath. */
+  function packageOf(specifier: string): string {
+    const parts = specifier.split('/');
+    return specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]!;
+  }
+
+  const workspacePackages = new Set(
+    ['packages', 'apps'].flatMap((group) => {
+      const dir = resolve(process.cwd(), group);
+      if (!existsSync(dir)) return [];
+      return readdirSync(dir)
+        .map((name) => resolve(dir, name, 'package.json'))
+        .filter((file) => existsSync(file))
+        .map((file) => (JSON.parse(readFileSync(file, 'utf8')) as { name?: string }).name)
+        .filter((name): name is string => Boolean(name));
+    }),
+  );
+
+  const declared = new Set([...Object.keys(manifest.dependencies ?? {}), ...workspacePackages]);
+
+  it('finds the manifest, the workspaces, and the imports it is meant to read', () => {
+    // Without these, an empty `declared` would report every import as an
+    // offender and an empty specifier list would report none. Both are a broken
+    // test reading as a result, and the third assertion is the one that matters:
+    // the first draft of this guard used `importsOf`, which only matches `@/`
+    // specifiers, so it read nothing and passed.
+    expect(declared.size).toBeGreaterThan(5);
+    expect(workspacePackages.size).toBeGreaterThan(1);
+    expect(sourceFiles(SRC).length).toBeGreaterThan(20);
+
+    const seen = sourceFiles(SRC).flatMap((file) =>
+      [...codeOf(readFileSync(file, 'utf8')).matchAll(new RegExp(SPECIFIER.source, 'g'))].map(
+        (match) => match[1] ?? '',
+      ),
+    );
+    // Bare packages this app certainly imports. If the extractor stops seeing
+    // these, it has stopped seeing everything.
+    expect(seen).toContain('react');
+    expect(seen).toContain('zustand');
+
+    // And the shape filter keeps them. A filter tight enough to drop prose and
+    // also drop `@scope/pkg` would make this guard silently vacuous again.
+    const shaped = (specifier: string) => /^[@a-zA-Z.][^\n]*$/.test(specifier);
+    for (const real of ['react', '@capacitor/core', '@johnhenry/aimatey-types', './x', '@/domain/chat']) {
+      expect(shaped(real), real).toBe(true);
+    }
+    expect(shaped(',\n          ')).toBe(false);
+  });
+
+  it('names no package the manifest does not', () => {
+    const offenders = sourceFiles(SRC)
+      .flatMap((file) =>
+        // `SPECIFIER` over `codeOf`, NOT `importsOf` — that helper only matches
+        // `@/` specifiers, because it exists for the contracts test. Used here
+        // it returned nothing at all and this assertion passed against an empty
+        // list, which is the exact failure this file keeps re-learning. The
+        // control below is what caught it.
+        [...codeOf(readFileSync(file, 'utf8')).matchAll(new RegExp(SPECIFIER.source, 'g'))]
+          .map((match) => match[1] ?? '')
+          // `SPECIFIER` matches the WORD `from`/`import`/`require` before any
+          // quote, which is deliberate — it is how `require ( 'electron' )` is
+          // caught. The cost is that prose ending in "from" followed by the
+          // next string in an array literal matches too; `shell/commands.ts`
+          // has exactly that in the privacy copy. The neighbouring guards
+          // never noticed because a non-specifier matches no ban. This one
+          // treats anything undeclared as an offender, so it has to tell a
+          // specifier from a sentence: real ones have no newline and begin
+          // with a letter, `@` or `.`.
+          .filter((specifier) => /^[@a-zA-Z.][^\n]*$/.test(specifier))
+          // Relative paths and the `@/` alias resolve inside `src/` itself.
+          .filter((specifier) => !specifier.startsWith('.') && !specifier.startsWith('@/'))
+          // Builtins are the neighbouring guard's job; leaving them out keeps a
+          // failure here pointing at one cause rather than two.
+          .filter((specifier) => !isNodeBuiltin(specifier))
+          .map((specifier) => packageOf(specifier))
+          .filter((name) => !declared.has(name))
+          .map((name) => `${relative(SRC, file)} -> ${name}`),
+      )
+      .filter((entry, index, all) => all.indexOf(entry) === index);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it('would catch a Node-only dependency of another workspace', () => {
+    // The control. `ws` is what #157 chose for the WebSocket server, and it
+    // belongs to apps/desktop and apps/server — never to the bundle. If this
+    // assertion ever fails it means `ws` reached the root manifest, and the
+    // protection this guard exists to give is gone.
+    expect(declared.has('ws')).toBe(false);
+    expect(packageOf('ws')).toBe('ws');
+    expect(packageOf('@modelcontextprotocol/client/streamable')).toBe('@modelcontextprotocol/client');
+  });
+});
+
 describe('contracts package', () => {
   const CONTRACTS = resolve(process.cwd(), 'packages/contracts/src');
   const contractFiles = sourceFiles(CONTRACTS);
