@@ -23,7 +23,7 @@
  */
 
 import type { MessageVariant, Provenance, Reach } from '@/domain/chat';
-import { REACH_DEVICE, REACH_REMOTE } from '@/domain/chat';
+import { REACH_DEVICE, REACH_REMOTE, reachPaired } from '@/domain/chat';
 
 /** A message row as it may be found on disk, before or after the upgrade. */
 export interface LegacyReachRow {
@@ -84,8 +84,18 @@ function convert(value: unknown): Converted {
 
   // Idempotence. `modify` runs over every row and Dexie can replay an upgrade;
   // a reach that is already there is never re-derived from a stale `local`.
-  const kind = (stored.reach as Reach | undefined)?.kind;
-  if (kind === 'device' || kind === 'paired' || kind === 'remote') return { outcome: 'unchanged' };
+  // Since #112 a reach is `{ host, reached }`. A row carrying either shape has
+  // already been converted once -- the v7 upgrade below handles the older of
+  // the two -- so neither is re-derived from a stale `local`.
+  const existing = stored.reach as { kind?: unknown; reached?: unknown } | undefined;
+  const converted =
+    existing?.reached === 'device' ||
+    existing?.reached === 'paired' ||
+    existing?.reached === 'third-party' ||
+    existing?.kind === 'device' ||
+    existing?.kind === 'paired' ||
+    existing?.kind === 'remote';
+  if (converted) return { outcome: 'unchanged' };
 
   if (typeof stored.local !== 'boolean') return { outcome: 'unrecorded' };
 
@@ -149,9 +159,23 @@ export interface ModifiableMessageTable {
 
 /** Run {@link upgradeReach} over every message row. */
 export async function upgradeMessageReach(messages: ModifiableMessageTable): Promise<void> {
+  await upgradeMessageReachRows(messages, (row) => upgradeReach(row) ?? { dropProvenance: false });
+}
+
+/**
+ * Apply one row-level reach upgrade across the whole table.
+ *
+ * Extracted so v6 and v7 share the write half rather than each owning a copy.
+ * The two differ in what a row BECOMES; how a row is written back — and in
+ * particular that an unreadable provenance is deleted rather than set to
+ * `undefined` — is one decision and belongs in one place.
+ */
+export async function upgradeMessageReachRows(
+  messages: ModifiableMessageTable,
+  convert: (row: LegacyReachRow) => ReachUpgrade,
+): Promise<void> {
   await messages.toCollection().modify((row) => {
-    const upgraded = upgradeReach(row as LegacyReachRow);
-    if (!upgraded) return;
+    const upgraded = convert(row as LegacyReachRow);
     // Deleted rather than set to undefined: `provenance === undefined` and
     // "no provenance key" read the same to every consumer, but only the
     // delete leaves a row that looks like one this build would write.
@@ -159,4 +183,104 @@ export async function upgradeMessageReach(messages: ModifiableMessageTable): Pro
     else if (upgraded.provenance) row.provenance = upgraded.provenance;
     if (upgraded.variants) row.variants = upgraded.variants;
   });
+}
+
+/* ── v7: one axis becomes two ─────────────────────────────────────────── */
+
+/**
+ * The v7 upgrade: a reach says where it RAN and how far the bytes WENT.
+ *
+ * v6 gave every stored turn a three-arm `Reach`. #112 showed one axis is not
+ * enough: a `claude` or `codex` CLI is a process on this machine whose tokens
+ * reach a vendor API, and neither `device` nor `remote` can say both halves of
+ * that. So `Reach` is `{ host, reached }` now, and the three old arms are the
+ * diagonal of the pair.
+ *
+ * THE CONVERSION IS LOSSLESS AND INVENTS NOTHING, which is why it can be a
+ * plain rewrite rather than a judgement call:
+ *
+ *   { kind: 'device' }  ->  { host: device,      reached: 'device' }
+ *   { kind: 'remote' }  ->  { host: third-party, reached: 'third-party' }
+ *   { kind: 'paired' }  ->  { host: paired,      reached: 'paired' }
+ *
+ * Every row on disk is `device` or `remote`: the v6 upgrade above never wrote
+ * `paired`, and no build that could tunnel a turn has shipped. The `paired`
+ * row is handled anyway because writing a migration that cannot survive a
+ * shape it will meet the moment Track B lands is a migration written twice.
+ *
+ * A row this cannot read keeps the v6 rule: no label rather than a plausible
+ * one.
+ */
+type StoredReachV6 = { readonly kind?: unknown; readonly device?: unknown };
+
+/** Convert one stored reach, or return undefined if it is already v7 or unreadable. */
+export function upgradeReachValue(stored: unknown): Reach | undefined {
+  if (typeof stored !== 'object' || stored === null) return undefined;
+  const value = stored as StoredReachV6 & { readonly reached?: unknown };
+
+  // Already two axes. Dexie can replay an upgrade, so this must be idempotent.
+  if (typeof value.reached === 'string') return undefined;
+
+  switch (value.kind) {
+    case 'device':
+      return REACH_DEVICE;
+    case 'remote':
+      return REACH_REMOTE;
+    case 'paired': {
+      const device = value.device as { id?: unknown; name?: unknown } | undefined;
+      // A `paired` with no readable device is the invalid state `Reach`'s own
+      // comment says must not be constructible -- "paired, but the app cannot
+      // say which device" renders as the label this all exists to prevent. Drop
+      // the provenance rather than write it.
+      if (typeof device?.id !== 'string' || typeof device.name !== 'string') return undefined;
+      return reachPaired({ id: device.id, name: device.name });
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Rewrite every stored provenance from a one-axis reach to a two-axis one.
+ *
+ * Same shape as {@link upgradeMessageReach}: it walks the row's own provenance
+ * and each variant's, because a variant carries its own and a reader that
+ * found one shape on the row and another on a variant would render two
+ * different labels for one message.
+ */
+export function upgradeMessageReachAxes(row: LegacyReachRow): ReachUpgrade {
+  const convert = (provenance: unknown): Provenance | undefined | 'drop' => {
+    if (typeof provenance !== 'object' || provenance === null) return undefined;
+    const stored = provenance as StoredProvenance;
+    if (stored.reach === undefined) return undefined;
+    const reach = upgradeReachValue(stored.reach);
+    if (reach === undefined) {
+      // Either already v7 -- leave it -- or unreadable, in which case the v6
+      // rule applies and the row loses its provenance rather than gaining a
+      // guess. Told apart by whether it already has the new shape.
+      const already = (stored.reach as { reached?: unknown }).reached;
+      return typeof already === 'string' ? undefined : 'drop';
+    }
+    return { ...(stored as unknown as Provenance), reach };
+  };
+
+  const own = convert(row.provenance);
+  const variants = row.variants?.map((variant) => {
+    const entry = variant as { provenance?: unknown };
+    const converted = convert(entry.provenance);
+    if (converted === undefined) return variant as MessageVariant;
+    if (converted === 'drop') {
+      const { provenance: _dropped, ...rest } = entry;
+      return rest as MessageVariant;
+    }
+    return { ...entry, provenance: converted } as MessageVariant;
+  });
+
+  const variantsChanged = variants?.some((variant, index) => variant !== row.variants?.[index]);
+
+  return {
+    ...(own !== undefined && own !== 'drop' ? { provenance: own } : {}),
+    dropProvenance: own === 'drop',
+    ...(variantsChanged ? { variants } : {}),
+  };
 }

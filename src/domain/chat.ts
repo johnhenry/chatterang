@@ -95,23 +95,92 @@ export interface PairedDevice {
  * those tickets consume, so that none of them has to invent a private third
  * value of its own.
  */
-export type Reach =
-  /** Ran on this device. Nothing left it. */
+/**
+ * Where the process that produced the reply was running.
+ *
+ * Half of {@link Reach}. See there for why this is not one axis.
+ */
+export type ReachHost =
+  /** A process on this device. */
   | { readonly kind: 'device' }
-  /** Ran on a device the user paired. The bytes left this device; no third party saw them. */
+  /** A process on a device the user paired. */
   | { readonly kind: 'paired'; readonly device: PairedDevice }
-  /** Served by a third party — a provider connection. */
-  | { readonly kind: 'remote' };
+  /** A third party's infrastructure. */
+  | { readonly kind: 'third-party' };
 
-/** Ran here. */
-export const REACH_DEVICE: Reach = Object.freeze({ kind: 'device' as const });
+/**
+ * The furthest the bytes travelled. The other half of {@link Reach}.
+ *
+ * Ordered by distance, and that order is the whole point: `device` is the only
+ * value for which nothing left, and `third-party` is the only one where someone
+ * other than the user received anything.
+ */
+export type ReachDestination = 'device' | 'paired' | 'third-party';
 
-/** Went to a third party. */
-export const REACH_REMOTE: Reach = Object.freeze({ kind: 'remote' as const });
+/**
+ * How far a reply travelled: WHERE IT RAN, and HOW FAR THE BYTES WENT.
+ *
+ * Two axes, because one is not enough and we know exactly which case proves it
+ * (#112). A `claude` or `codex` CLI is a process ON THIS MACHINE, reading this
+ * filesystem — and its tokens reach a vendor API. Under the old three-arm
+ * union that turn had to be labelled `device` or `remote`, and both are wrong
+ * in a way that matters:
+ *
+ *   labelled `device`  -> no egress sheet for a turn reaching a third party,
+ *                         and this app's taint marks ship to a vendor
+ *   labelled `remote`  -> correct security, and the app can no longer say the
+ *                         thing the user most needs to know: a program on YOUR
+ *                         machine, with YOUR filesystem, made that call
+ *
+ * The old three arms are the diagonal of the pair, and the CLI case is the
+ * first off-diagonal one. Keeping them as one axis meant every new destination
+ * was another member — a fifth, then a sixth — until the union stopped being
+ * legible, which is the accretion #191's ruling warned about.
+ *
+ * INVALID PAIRS ARE NOT CONSTRUCTIBLE BY THE EXPORTED API. `host` third-party
+ * with `reached: 'device'` is nonsense — someone else's machine cannot serve a
+ * turn without the bytes leaving. The type does not forbid it; the four
+ * constructors below are the only supported way to build one, the same
+ * discipline `MessageVariant` uses.
+ *
+ * NOTHING WRITES `paired` YET. The producer is the tunnel (Track B). What
+ * lands here is the shape #210-#219 consume, so none of them invents its own.
+ */
+export interface Reach {
+  readonly host: ReachHost;
+  readonly reached: ReachDestination;
+}
 
-/** Ran on one named paired device. */
+/** Ran here, and nothing left. */
+export const REACH_DEVICE: Reach = Object.freeze({
+  host: Object.freeze({ kind: 'device' as const }),
+  reached: 'device' as const,
+});
+
+/** Ran on a third party's machine, which therefore received the bytes. */
+export const REACH_REMOTE: Reach = Object.freeze({
+  host: Object.freeze({ kind: 'third-party' as const }),
+  reached: 'third-party' as const,
+});
+
+/**
+ * Ran HERE, and reached a third party anyway (#112).
+ *
+ * A locally-hosted process with a vendor upstream — an agent CLI signed in to
+ * an API. The one combination the old union could not say, and the reason
+ * there are two axes.
+ */
+export const REACH_LOCAL_VIA_THIRD_PARTY: Reach = Object.freeze({
+  host: Object.freeze({ kind: 'device' as const }),
+  reached: 'third-party' as const,
+});
+
+/** Ran on one named paired device, which therefore received the bytes. */
 export function reachPaired(device: PairedDevice): Reach {
-  return { kind: 'paired', device: { id: device.id, name: device.name } };
+  return {
+    host: { kind: 'paired', device: { id: device.id, name: device.name } },
+    reached: 'paired',
+  };
 }
 
 /** Where a message was produced. Drives the local/remote colour split. */
@@ -161,19 +230,37 @@ export type ReachKind = 'device' | 'paired' | 'remote' | 'unknown';
 
 /** What kind of reach a record carries, tolerating a row that has none. */
 export function reachKind(provenance: { readonly reach?: Reach } | undefined): ReachKind {
-  const kind = provenance?.reach?.kind;
-  return kind === 'device' || kind === 'paired' || kind === 'remote' ? kind : 'unknown';
+  /*
+   * Since #112 this projects the two axes back onto the three names the
+   * surfaces still speak. It is DESTINATION, not host: every existing caller
+   * asks this to decide what a reply is labelled, and what a reader is owed is
+   * where their words went, not which process typed them.
+   *
+   * That is exactly why the CLI case needs more than this function: it reports
+   * `remote` for a turn that ran here, which is true about the bytes and
+   * silent about the machine. The chip that says both is #210/#211's, and it
+   * reads `reach` rather than this.
+   */
+  const reached = provenance?.reach?.reached;
+  if (reached === 'device' || reached === 'paired') return reached;
+  return reached === 'third-party' ? 'remote' : 'unknown';
 }
 
 /**
  * Did this reply run on THIS device?
  *
- * The narrow question, and the only one that may be used to grant something.
+ * Reads the HOST axis, and since #112 that is not the same question as
+ * "nothing left". A local agent CLI runs here and reaches a vendor API: this
+ * answers `true` for it, {@link leftThisDevice} answers `true` as well, and
+ * both are correct. Deriving this from `reachKind` — which reports the
+ * destination — made it answer `false` for a process that is demonstrably
+ * here, which is one of the two wrong answers #112 was filed about.
+ *
  * Unknown answers `false`: a row whose reach was never written down has not
  * been shown to have stayed here.
  */
 export function ranOnDevice(provenance: { readonly reach?: Reach } | undefined): boolean {
-  return reachKind(provenance) === 'device';
+  return provenance?.reach?.host.kind === 'device';
 }
 
 /**
@@ -185,6 +272,8 @@ export function ranOnDevice(provenance: { readonly reach?: Reach } | undefined):
  * Unknown answers `true`, which is the direction unknown has to fail in here.
  */
 export function leftThisDevice(provenance: { readonly reach?: Reach } | undefined): boolean {
+  // The DESTINATION axis. Unchanged in meaning: it was already the question
+  // about where the bytes went, and `reachKind` still projects that.
   return reachKind(provenance) !== 'device';
 }
 
@@ -200,6 +289,12 @@ export function leftThisDevice(provenance: { readonly reach?: Reach } | undefine
  * Both this and {@link leftThisDevice} answer `true` for unknown, so no
  * caller can use the pair to derive a confident label out of a row that has
  * none. Labelling goes through {@link reachKind}.
+ *
+ * The DESTINATION axis, like {@link leftThisDevice}. A locally-hosted process
+ * with a vendor upstream answers `true` here and `true` to
+ * {@link ranOnDevice} — which is the pair of answers the old single axis could
+ * not give, and the reason the taint mark is now stripped for a CLI turn that
+ * would previously have kept it.
  */
 export function reachedThirdParty(provenance: { readonly reach?: Reach } | undefined): boolean {
   const kind = reachKind(provenance);
@@ -210,8 +305,9 @@ export function reachedThirdParty(provenance: { readonly reach?: Reach } | undef
 export function pairedDevice(
   provenance: { readonly reach?: Reach } | undefined,
 ): PairedDevice | undefined {
-  const reach = provenance?.reach;
-  return reach?.kind === 'paired' ? reach.device : undefined;
+  const host = provenance?.reach?.host;
+  // The HOST, not the destination: this answers "which machine ran it".
+  return host?.kind === 'paired' ? host.device : undefined;
 }
 
 export interface GenerationStats {
