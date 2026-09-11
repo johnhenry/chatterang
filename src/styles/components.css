@@ -1878,7 +1878,7 @@
  * number — because the number (`--history-w`) already moved in the token
  * layer, and the grid that consumes it is written unconditionally above.
  */
-@media (min-width: 1208px) {
+@media (min-width: 1224px) {
   .history {
     display: flex;
   }
