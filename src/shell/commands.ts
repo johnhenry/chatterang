@@ -102,6 +102,40 @@ export interface ShellStores {
    * MCP paragraph is printed only when there is a named server to print.
    */
   mcpServers?: () => readonly McpRow[];
+  /**
+   * Folders the user granted, and how to grant or withdraw one (#246).
+   *
+   * Optional for the same reason `mcpServers` is: it arrived after the
+   * interface, and every test builds this object by hand. Its absence means
+   * NO FOLDERS ARE GRANTED — never "we could not tell", because the `mount`
+   * command's whole job is to say what the shell can reach and an unwired
+   * caller must not turn that into a claim about the disk.
+   */
+  mounts?: () => MountStore;
+}
+
+/** What `mount` needs. The shell's own grants live behind `src/shell/real-fs.ts`. */
+export interface MountStore {
+  readonly list: readonly MountRow[];
+  /**
+   * Can a folder be granted on this platform at all?
+   *
+   * Separate from an empty `list`, and the difference is the whole message:
+   * "no folders granted" invites the user to grant one, and on a platform with
+   * no chooser that invitation leads to a picker that never opens.
+   */
+  readonly canGrant: boolean;
+  /** Opens the OS chooser. `null` when the user declined or cannot be asked. */
+  grant(writable: boolean): Promise<MountRow | null>;
+  revoke(id: string): Promise<boolean>;
+}
+
+export interface MountRow {
+  readonly id: string;
+  readonly name: string;
+  readonly root: string;
+  readonly writable: boolean;
+  readonly grantedAt: number;
 }
 
 interface ModelRow {
@@ -590,6 +624,8 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
     async run() {
       const enabled = stores.providers().list.filter((p) => p.enabled);
       const servers = (stores.mcpServers?.() ?? []).filter((s) => s.enabled);
+      const granted = stores.mounts?.().list ?? [];
+      const writable = granted.filter((row) => row.writable);
 
       return ok(
         [
@@ -615,8 +651,23 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
               ]
             : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
-          '    what the tool read, which for `bash` is this app’s own data —',
-          '    /chats, /models, /personas. The app asks before it does, and',
+          // WAS "this app's own data — /chats, /models, /personas", full stop,
+          // and #246 made that false the moment anyone grants a folder. The
+          // granted case is printed only when a folder IS granted, and names
+          // it: an unconditional paragraph about folders would describe
+          // something that is not happening, and the ungranted sentence is
+          // still exactly true for every shell that has not been given one.
+          granted.length > 0
+            ? '    what the tool read — this app’s own data (/chats, /models,'
+            : '    what the tool read, which for `bash` is this app’s own data —',
+          granted.length > 0
+            ? `    /personas) AND anything it read in ${granted
+                .map((row) => `/mnt/${row.name}`)
+                .join(', ')}, which is ${granted.map((row) => row.root).join(', ')}.`
+            : '    /chats, /models, /personas. The app asks before it does, and',
+          ...(granted.length > 0
+            ? ['    The app asks before it does, and']
+            : []),
           '    withholds it if you decline. “Send for this conversation” is the',
           '    answer that stops the asking; “Send this turn” is asked again on',
           '    the next turn. Every grant is dropped when the provider it named',
@@ -637,6 +688,22 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
           '  - flipping between regenerated answers moves the older text out of',
           '    the turn whose tool produced it. From then on it is sent as',
           '    ordinary text: nothing withheld, nothing asked.',
+          // A READ grant changes what leaves; a WRITE grant changes what can
+          // be CHANGED, which nothing else in this command describes because
+          // until #246 the shell could not alter anything outside the app.
+          // Named separately rather than folded into the line above: they are
+          // different harms and a person deciding whether to keep a grant is
+          // weighing them separately.
+          ...(writable.length > 0
+            ? [
+                '',
+                'Can be changed on this device:',
+                `  - files in ${writable.map((row) => row.root).join(', ')}. You granted`,
+                '    write access to that folder, so the shell — and a model driving',
+                '    it — can create, edit and delete files there. `mount rm <name>`',
+                '    withdraws it; closing the app withdraws every grant.',
+              ]
+            : []),
           '',
           'Stays on this device:',
           '  - conversations, personas, generated images, settings and benchmark',
@@ -652,7 +719,123 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
     },
   };
 
-  return [model, chat, persona, provider, bench, device, privacy];
+  /**
+   * `mount` — the folders this shell can reach, and who said so (#246).
+   *
+   * THE COMMAND IS THE REVOCATION UI. The issue asks for grants "listed
+   * somewhere the user can see and revoke", and the shell is where a person
+   * is standing when they care: they are looking at `/mnt/notes` in `ls`
+   * output and want to know what it is and how to make it stop. A settings
+   * pane the folder does not appear in until you go looking for it answers a
+   * question nobody asked there.
+   *
+   * `mutating: true` so the MODEL cannot grant or withdraw a folder without
+   * the user seeing the sheet. Two gates then stand in front of `mount add`
+   * when a model runs it — the approval sheet, and the OS chooser itself,
+   * which no amount of prompt injection can click. `mount list` is not gated,
+   * because reading which folders are already granted tells the model nothing
+   * it could not learn by running `ls /mnt`.
+   *
+   * ADDING IS GATED EVEN FOR THE USER. `#invoke` waives confirmation for a
+   * person typing a local state change, which is right for `provider disable`
+   * and wrong here only in the sense that the chooser asks anyway; the real
+   * consent is the modal, and it is not skippable by anyone.
+   */
+  const mount: ShellCommand = {
+    name: 'mount',
+    summary: 'Folders you granted this shell, and how to withdraw them',
+    usage: 'mount list | mount add [--write] | mount rm <name>',
+    mutating: true,
+    async run(args, context) {
+      const store = stores.mounts?.();
+      const [sub, ...rest] = args;
+
+      switch (sub ?? 'list') {
+        case 'list': {
+          if (!store || store.list.length === 0) {
+            return ok(
+              [
+                'No folders are granted. Everything the shell can see is inside this app.',
+                store?.canGrant === true
+                  ? 'Run `mount add` to grant one — it opens a folder chooser.'
+                  : 'This platform cannot grant folders; nothing outside the app is reachable here.',
+              ].join('\n'),
+            );
+          }
+          return ok(
+            [
+              table([
+                ['MOUNT', 'ACCESS', 'GRANTED', 'FOLDER'],
+                ...store.list.map((row) => [
+                  `/mnt/${row.name}`,
+                  row.writable ? 'read+write' : 'read-only',
+                  new Date(row.grantedAt).toISOString().slice(0, 16).replace('T', ' '),
+                  row.root,
+                ]),
+              ]),
+              '',
+              'Withdraw one with `mount rm <name>`. Grants end when the app closes.',
+            ].join('\n'),
+          );
+        }
+
+        case 'add': {
+          if (!store) return fail('mount: granting folders is not wired up in this build');
+          if (!store.canGrant) {
+            return fail(
+              'mount: this platform cannot grant a folder. A grant needs a chooser the ' +
+                'person is sitting in front of, and there is none here.',
+            );
+          }
+          const writable = rest.includes('--write');
+          const unknown = rest.find((arg) => arg !== '--write');
+          if (unknown !== undefined) return fail(`mount: unknown option "${unknown}"`);
+
+          if (
+            !(await context.confirm(
+              writable
+                ? 'open a folder chooser, to grant read AND WRITE access to a folder on this device'
+                : 'open a folder chooser, to grant read access to a folder on this device',
+            ))
+          ) {
+            return fail('cancelled', 130);
+          }
+
+          const granted = await store.grant(writable);
+          if (granted === null) return ok('No folder was granted.');
+          // What was AGREED, not what was asked: the host asks about writing
+          // separately and defaults to no, so a `--write` request can come
+          // back read-only and the user must be told which one they have.
+          return ok(
+            `/mnt/${granted.name} → ${granted.root}\n` +
+              `${granted.writable ? 'Read and write.' : 'Read-only.'}` +
+              (writable && !granted.writable ? ' Write access was not granted.' : ''),
+          );
+        }
+
+        case 'rm': {
+          const name = rest[0];
+          if (!name) return fail(`usage: ${this.usage}`);
+          const row = store?.list.find((entry) => entry.name === name.replace(/^\/mnt\//, ''));
+          if (!row) return fail(`mount: no folder is granted as "${name}"`);
+          if (!(await context.confirm(`withdraw access to ${row.root}`))) {
+            return fail('cancelled', 130);
+          }
+          // The store's answer, not an assumption: a grant already withdrawn
+          // elsewhere reports honestly rather than claiming this call did it.
+          const revoked = await store!.revoke(row.id);
+          return revoked
+            ? ok(`/mnt/${row.name} is no longer mounted.`)
+            : fail(`mount: "${row.name}" was already withdrawn`);
+        }
+
+        default:
+          return fail(`mount: unknown subcommand "${sub}"\nusage: ${this.usage}`);
+      }
+    },
+  };
+
+  return [model, chat, persona, provider, bench, device, privacy, mount];
 }
 
 /**

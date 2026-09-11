@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatterangShell, assertConfinedBuild, bundledCommandNames, type ShellStores } from '@/shell';
+import { fakePort } from './support/fake-real-fs';
 import { chatterangCommands, renderTranscript, table } from '@/shell/commands';
 import { nonChatRole } from '@/domain/manifest';
 import { REACH_DEVICE, REACH_REMOTE } from '@/domain/chat';
@@ -1091,5 +1092,546 @@ describe('model use, for a model that cannot answer a chat', () => {
     expect(result.exitCode).toBe(0);
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'));
     expect(setActive).toHaveBeenCalledWith('qwen');
+  });
+});
+
+/* ── #246: granted folders, as the shell and its user see them ───────── */
+
+describe('the mount command', () => {
+  /**
+   * The grant plumbing lives in three places and each is tested where it can
+   * actually be wrong: `tests/desktop-mounts.test.ts` drives a real kernel,
+   * `tests/shell-mount.test.ts` drives the routing proxy, and this drives the
+   * COMMAND — what a person types and what they are told back.
+   *
+   * The store here is a stand-in for the host, so these assert the command's
+   * behaviour and never the containment. Confusing the two is how a feature
+   * ends up with a green suite that proves only the mock agrees with itself.
+   */
+  function mountStores(
+    rows: { id: string; name: string; root: string; writable: boolean; grantedAt: number }[],
+    options: {
+      canGrant?: boolean;
+      grant?: (writable: boolean) => Promise<(typeof rows)[number] | null>;
+      revoke?: (id: string) => Promise<boolean>;
+    } = {},
+  ): ShellStores {
+    return stores({
+      mounts: () => ({
+        list: rows,
+        canGrant: options.canGrant ?? true,
+        grant: options.grant ?? (async () => null),
+        revoke: options.revoke ?? (async () => true),
+      }),
+    });
+  }
+
+  const NOTES = {
+    id: 'm1',
+    name: 'notes',
+    root: '/Users/me/notes',
+    writable: false,
+    grantedAt: Date.UTC(2026, 0, 2, 3, 4),
+  };
+
+  async function run(
+    line: string,
+    store: ShellStores,
+    actor: 'user' | 'model' = 'user',
+    confirm = vi.fn(async () => true),
+  ) {
+    const sh = new ChatterangShell({ stores: store, actor, confirm });
+    return { result: await sh.exec(line), confirm };
+  }
+
+  it('says nothing is granted, and how to grant one', async () => {
+    const { result } = await run('mount list', mountStores([]));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('No folders are granted');
+    expect(result.stdout).toContain('mount add');
+  });
+
+  it('does not offer `mount add` where no chooser can be shown', async () => {
+    // The difference between "none granted" and "none grantable" is the whole
+    // message: inviting someone to open a picker that cannot open is worse
+    // than saying plainly that this platform has none.
+    const { result } = await run('mount list', mountStores([], { canGrant: false }));
+    expect(result.stdout).not.toContain('mount add');
+    expect(result.stdout).toContain('cannot grant folders');
+  });
+
+  it('lists the mount point, the real folder, and which access it has', async () => {
+    const { result } = await run(
+      'mount list',
+      mountStores([NOTES, { ...NOTES, id: 'm2', name: 'drafts', writable: true }]),
+    );
+    expect(result.stdout).toContain('/mnt/notes');
+    expect(result.stdout).toContain('/Users/me/notes');
+    expect(result.stdout).toContain('read-only');
+    expect(result.stdout).toContain('read+write');
+    // The grant's lifetime is part of what the list is for.
+    expect(result.stdout).toContain('Grants end when the app closes');
+  });
+
+  it('asks the user before the model can open a folder chooser', async () => {
+    const grant = vi.fn(async () => null);
+    const confirm = vi.fn(async () => false);
+    const { result } = await run('mount add', mountStores([], { grant }), 'model', confirm);
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('folder chooser'));
+    expect(grant).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(130);
+  });
+
+  it('says which access was actually granted, not which was asked for', async () => {
+    // The host asks about writing separately and defaults to no, so `--write`
+    // can come back read-only. Telling the user they have write access they
+    // do not have is the failure this pins.
+    const grant = vi.fn(async () => ({ ...NOTES, writable: false }));
+    const { result } = await run('mount add --write', mountStores([], { grant }));
+
+    expect(grant).toHaveBeenCalledWith(true);
+    expect(result.stdout).toContain('Read-only.');
+    expect(result.stdout).toContain('Write access was not granted.');
+  });
+
+  it('reports a granted folder by both its names', async () => {
+    const grant = vi.fn(async () => ({ ...NOTES, writable: true }));
+    const { result } = await run('mount add --write', mountStores([], { grant }));
+    expect(result.stdout).toContain('/mnt/notes → /Users/me/notes');
+    expect(result.stdout).toContain('Read and write.');
+    expect(result.stdout).not.toContain('Write access was not granted.');
+  });
+
+  it('treats a cancelled chooser as an outcome, not an error', async () => {
+    const { result } = await run('mount add', mountStores([], { grant: async () => null }));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('No folder was granted.');
+  });
+
+  it('withdraws a grant by name, with or without the /mnt prefix', async () => {
+    for (const spelling of ['notes', '/mnt/notes']) {
+      const revoke = vi.fn(async () => true);
+      const { result } = await run(`mount rm ${spelling}`, mountStores([NOTES], { revoke }));
+      expect(revoke, spelling).toHaveBeenCalledWith('m1');
+      expect(result.stdout).toContain('no longer mounted');
+    }
+  });
+
+  it('confirms before withdrawing, and names the folder being withdrawn', async () => {
+    const revoke = vi.fn(async () => true);
+    const confirm = vi.fn(async () => false);
+    const { result } = await run('mount rm notes', mountStores([NOTES], { revoke }), 'model', confirm);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('/Users/me/notes'));
+    expect(revoke).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(130);
+  });
+
+  it('reports the store’s answer rather than assuming the revoke worked', async () => {
+    const { result } = await run('mount rm notes', mountStores([NOTES], { revoke: async () => false }));
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('already withdrawn');
+  });
+
+  it('refuses a name that is not granted, and an unknown subcommand', async () => {
+    const missing = await run('mount rm nope', mountStores([NOTES]));
+    expect(missing.result.stderr).toContain('no folder is granted as "nope"');
+    const unknown = await run('mount frobnicate', mountStores([NOTES]));
+    expect(unknown.result.stderr).toContain('unknown subcommand');
+    const badOption = await run('mount add --recursive', mountStores([]));
+    expect(badOption.result.stderr).toContain('unknown option');
+  });
+
+  it('works through a pipe, like every other Chatterang command', async () => {
+    // The point of these being real commands rather than a UI: `mount list |
+    // grep` is how anyone actually checks a long list.
+    const { result } = await run(
+      'mount list | grep drafts',
+      mountStores([NOTES, { ...NOTES, id: 'm2', name: 'drafts', writable: true }]),
+    );
+    expect(result.stdout).toContain('drafts');
+    expect(result.stdout).not.toContain('/mnt/notes ');
+  });
+
+  it('is absent from the shell’s reach when nothing wired it up', async () => {
+    // `stores()` has no `mounts`, which is what every pre-#246 caller looks
+    // like. That must read as "no folders", never as a claim about the disk.
+    const { result } = await run('mount list', stores());
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('No folders are granted');
+  });
+});
+
+describe('the shell re-reads its grants', () => {
+  /**
+   * `ShellOptions.mounts` takes a GETTER, and this is why. `mount add` and
+   * `mount rm` are typed into the shell that is being changed, so a snapshot
+   * captured when it started would leave a withdrawn folder mounted until the
+   * component remounted — "your consent applies until this UI next rebuilds"
+   * is not an answer to give someone who just said to stop.
+   *
+   * The port here is a stand-in. What it proves is that the shell ASKS again,
+   * not that the asking lands anywhere safe; `tests/desktop-mounts.test.ts`
+   * is where the real filesystem answers.
+   */
+  function port() {
+    const seen: string[] = [];
+    return {
+      seen,
+      realpath: async (path: string) => {
+        seen.push(path);
+        if (path === '/real/notes' || path.startsWith('/real/notes/')) return path;
+        throw new Error(`ENOENT: ${path}`);
+      },
+      readFile: async () => 'granted content',
+      readdir: async () => ['a.md'],
+      // The ROOT must report a directory or `resolveGrant` drops the grant —
+      // which it should, and which cost a puzzling "No such file or directory"
+      // while this fixture said otherwise.
+      stat: async (path: string) => ({
+        isDirectory: path === '/real/notes',
+        isSymbolicLink: false,
+        size: 15,
+        mtimeMs: 0,
+        mode: 0o100644,
+      }),
+      lstat: async (path: string) => ({
+        isDirectory: path === '/real/notes',
+        isSymbolicLink: false,
+        size: 15,
+        mtimeMs: 0,
+        mode: 0o100644,
+      }),
+      writeFile: async () => undefined,
+      mkdir: async () => undefined,
+      rm: async () => undefined,
+    };
+  }
+
+  it('mounts a folder granted after it started, and drops one withdrawn', async () => {
+    let grants: { name: string; root: string; writable: boolean }[] = [];
+    const realFs = port();
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => grants,
+      realFs,
+    });
+
+    // Before: /mnt/notes is an ordinary unknown path in the in-memory tree.
+    const before = await sh.exec('cat /mnt/notes/a.md');
+    expect(before.exitCode).not.toBe(0);
+
+    grants = [{ name: 'notes', root: '/real/notes', writable: false }];
+    const after = await sh.exec('cat /mnt/notes/a.md');
+    expect(after.stdout.trim()).toBe('granted content');
+
+    grants = [];
+    const withdrawn = await sh.exec('cat /mnt/notes/a.md');
+    expect(withdrawn.exitCode).not.toBe(0);
+    expect(withdrawn.stdout).not.toContain('granted content');
+  });
+
+  it('does not re-resolve when the grants have not changed', async () => {
+    // Called before every command, so it has to be cheap when nothing
+    // happened — which is almost always. A caller reading from React state
+    // hands back a NEW ARRAY every render, so identity comparison would
+    // re-`realpath` every folder on every keystroke.
+    const realFs = port();
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      // A fresh array each call, same contents — the React shape exactly.
+      mounts: () => [{ name: 'notes', root: '/real/notes', writable: false }],
+      realFs,
+    });
+
+    await sh.exec('true');
+    const afterFirst = realFs.seen.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    await sh.exec('true');
+    await sh.exec('true');
+    expect(realFs.seen.length).toBe(afterFirst);
+  });
+
+  it('lists granted folders in help, and says nothing when there are none', async () => {
+    const realFs = port();
+    const ungranted = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+    });
+    const quiet = await ungranted.exec('chatterang');
+    expect(quiet.stdout).not.toContain('Granted folders');
+
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => [{ name: 'notes', root: '/real/notes', writable: true }],
+      realFs,
+    });
+    const loud = await sh.exec('chatterang');
+    expect(loud.stdout).toContain('Granted folders');
+    expect(loud.stdout).toContain('/mnt/notes');
+    expect(loud.stdout).toContain('read and write');
+    expect(loud.stdout).toContain('including through a symlink');
+  });
+
+  it('drops a grant whose root no longer resolves rather than mounting the string', async () => {
+    // A folder deleted, renamed, or with its permissions withdrawn since it
+    // was granted. Mounting it anyway would make every later containment
+    // decision a comparison against a path the kernel does not agree exists.
+    const realFs = port();
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => [{ name: 'gone', root: '/real/deleted', writable: false }],
+      realFs,
+    });
+
+    const help = await sh.exec('chatterang');
+    // Still ADVERTISED — the grant is real and the user made it — but nothing
+    // routes there, so a read falls through to the in-memory tree.
+    expect(help.stdout).toContain('/mnt/gone');
+    const read = await sh.exec('cat /mnt/gone/a.md');
+    expect(read.exitCode).not.toBe(0);
+    expect(read.stdout).not.toContain('granted content');
+  });
+});
+
+/* ── #246 end to end: a real `just-bash` over a mounted folder ───────── */
+
+describe('a granted folder, driven by the actual shell', () => {
+  /**
+   * THE TESTS THAT WOULD HAVE CAUGHT ALL OF IT.
+   *
+   * `tests/shell-mount.test.ts` calls the filesystem methods directly and was
+   * fully green while `ls /mnt/notes` could not work at all. Every defect it
+   * could not see came from the same place: what `just-bash` actually calls,
+   * with what arguments, expecting what shape back. Six of them, all found by
+   * running a real shell for the first time —
+   *
+   *   - the proxy was `async`, so `resolvePath` and `getAllPaths` — declared
+   *     SYNCHRONOUS by `IFileSystem` — returned Promises to callers that use
+   *     the value directly
+   *   - `resolvePath(base, path)` was routed on args[0], the BASE, so every
+   *     absolute access to a mount from a cwd outside it was refused as a
+   *     cross-filesystem operation, and `dispatch` returned the base anyway
+   *   - `stat` answered Node's `fs.Stats` shape (`isFile: () => …`); a
+   *     function is truthy, so every entry read as file AND directory AND
+   *     symlink at once
+   *   - `readFileBytes`/`readFileBuffer`/`readdirWithFileTypes`/`readlink`
+   *     were listed as reads with no `dispatch` case, so plain reads failed
+   *     with `EROFS: read-only mount`
+   *   - `writeFile`'s CONTENT was scanned for `/` and treated as a second path
+   *   - `String(args[1])` turned a byte write into the decimal spelling of
+   *     the bytes
+   *
+   * So this block asserts through `sh.exec`, with the shell's own commands,
+   * and the port underneath is the shared POSIX-faithful fake.
+   */
+  const TREE = {
+    dirs: ['/home/me', '/home/me/notes', '/home/me/notes/sub', '/home/me/private'],
+    files: {
+      '/home/me/notes/a.md': 'alpha\n',
+      '/home/me/notes/b.md': 'beta\n',
+      '/home/me/notes/sub/c.md': 'gamma\n',
+      '/home/me/private/key': 'PRIVATE KEY\n',
+    },
+  };
+
+  function mounted(
+    writable = false,
+    overrides: Parameters<typeof fakePort>[0] = {},
+  ): { sh: ChatterangShell; port: ReturnType<typeof fakePort> } {
+    const port = fakePort({
+      ...TREE,
+      ...overrides,
+      dirs: [...TREE.dirs, ...(overrides.dirs ?? [])],
+      files: { ...TREE.files, ...(overrides.files ?? {}) },
+      links: { ...(overrides.links ?? {}) },
+    });
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => [{ name: 'notes', root: '/home/me/notes', writable }],
+      realFs: port,
+    });
+    return { sh, port };
+  }
+
+  it('lists a granted folder', async () => {
+    // The first thing anyone types, and it returned "No such file or
+    // directory" for the entire first draft of this feature.
+    const { sh } = mounted();
+    const result = await sh.exec('ls /mnt/notes');
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('a.md');
+    expect(result.stdout).toContain('b.md');
+  });
+
+  it('reads a file out of it', async () => {
+    const { sh } = mounted();
+    const result = await sh.exec('cat /mnt/notes/a.md');
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('alpha');
+  });
+
+  it('greps across it, which is the point of mounting it at all', async () => {
+    const { sh } = mounted();
+    const result = await sh.exec('grep -rl beta /mnt/notes');
+    expect(result.stdout).toContain('b.md');
+  });
+
+  it('pipes a mounted file into the app’s own commands', async () => {
+    const { sh } = mounted();
+    const result = await sh.exec('cat /mnt/notes/a.md | wc -l');
+    expect(result.stdout.trim()).toBe('1');
+  });
+
+  it('leaves everything outside the mount exactly as it was', async () => {
+    // The regression that twenty-five tests caught once already: wrapping the
+    // filesystem must not change a single thing about /workspace or /chats.
+    const { sh } = mounted(true);
+    expect((await sh.exec('echo hello > /workspace/x.txt')).exitCode).toBe(0);
+    expect((await sh.exec('cat /workspace/x.txt')).stdout).toContain('hello');
+    const forged = await sh.exec('echo FORGED > /chats/planted.md');
+    expect(forged.exitCode).not.toBe(0);
+    expect(forged.stderr).toContain('EROFS');
+  });
+
+  it('refuses a write to a read-only grant, and performs one to a writable grant', async () => {
+    const readOnly = mounted(false);
+    const refused = await readOnly.sh.exec('echo new > /mnt/notes/new.md');
+    expect(refused.exitCode).not.toBe(0);
+    expect(readOnly.port.written).toEqual({});
+
+    const writable = mounted(true);
+    expect((await writable.sh.exec('echo new > /mnt/notes/new.md')).exitCode).toBe(0);
+    expect(writable.port.written['/home/me/notes/new.md']).toContain('new');
+    expect((await writable.sh.exec('cat /mnt/notes/new.md')).stdout).toContain('new');
+  });
+
+  it('appends, because `>>` is too ordinary to refuse', async () => {
+    const { sh, port } = mounted(true);
+    expect((await sh.exec('echo more >> /mnt/notes/a.md')).exitCode).toBe(0);
+    expect(port.written['/home/me/notes/a.md']).toBe('alpha\nmore\n');
+  });
+
+  it('does not treat file CONTENT that looks like a path as a path', async () => {
+    // `writeFile(path, "/etc/passwd\n")` — args[1] is content, and scanning
+    // every string that starts with `/` turned an ordinary write into a
+    // refused two-path operation.
+    const { sh, port } = mounted(true);
+    const result = await sh.exec('echo /etc/passwd > /mnt/notes/note.md');
+    expect(result.exitCode).toBe(0);
+    expect(port.written['/home/me/notes/note.md']).toBe('/etc/passwd\n');
+  });
+
+  it('reports a directory as a directory and a file as a file', async () => {
+    // `isFile: () => …` is a truthy function, so every entry was all three at
+    // once and nothing downstream could tell them apart.
+    const { sh } = mounted();
+    const file = await sh.exec('test -f /mnt/notes/a.md && echo FILE');
+    expect(file.stdout).toContain('FILE');
+    const dir = await sh.exec('test -d /mnt/notes/sub && echo DIR');
+    expect(dir.stdout).toContain('DIR');
+    const notDir = await sh.exec('test -d /mnt/notes/a.md && echo WRONG');
+    expect(notDir.stdout).not.toContain('WRONG');
+  });
+
+  it('refuses a symlink out of the grant without naming where it points', async () => {
+    const { sh } = mounted(false, { links: { '/home/me/notes/escape': '/home/me/private/key' } });
+    const result = await sh.exec('cat /mnt/notes/escape');
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain('PRIVATE KEY');
+    // The message may say the request was refused. It may not say where the
+    // link pointed — that is a location outside the grant, and an error that
+    // names it is a working `readlink` for anything the folder points at.
+    expect(`${result.stdout}${result.stderr}`).not.toContain('/home/me/private');
+  });
+
+  it('refuses a write through a DANGLING symlink, which is a create outside the grant', async () => {
+    /*
+     * The escape an adversarial review found in this code and reproduced
+     * against a real filesystem. `realpath` rejects a dangling link exactly
+     * the way it rejects an absent file, so the leaf was treated as "not there
+     * yet", its NAME was re-attached to the resolved parent, and the kernel
+     * followed the link on create. The check was inverted: it held whenever
+     * the target already existed and failed exactly when the write would make
+     * something new.
+     */
+    const { sh, port } = mounted(true, {
+      links: { '/home/me/notes/pwn': '/home/me/private/authorized_keys' },
+    });
+    const result = await sh.exec('echo ssh-ed25519-attacker > /mnt/notes/pwn');
+    expect(result.exitCode).not.toBe(0);
+    expect(port.written).toEqual({});
+  });
+
+  it('writes through a symlink that stays inside the grant — the paired control', async () => {
+    // Without this, the test above passes on an adapter that refuses every
+    // symlink, or every write, or everything.
+    const { sh, port } = mounted(true, { links: { '/home/me/notes/here': '/home/me/notes/b.md' } });
+    expect((await sh.exec('echo ok > /mnt/notes/here')).exitCode).toBe(0);
+    expect(port.written['/home/me/notes/b.md']).toContain('ok');
+  });
+
+  it('refuses `rm -rf` of the granted folder itself', async () => {
+    /*
+     * `/mnt/notes` resolves to the granted root, and removing it is not
+     * emptying the folder the user granted — it unlinks an entry in the
+     * folder's PARENT, which nobody granted. `isInside` admits the root
+     * because reading it is the first thing anyone does; unlinking it is the
+     * one shape where that admission is wrong.
+     */
+    const { sh } = mounted(true);
+    const refused = await sh.exec('rm -r /mnt/notes');
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain('unlink it from its parent');
+    // The mount point survives `-f` too, which SWALLOWS the error rather than
+    // avoiding it — that is `rm -f`'s job, and the folder still being there is
+    // the property under test, not the exit code.
+    await sh.exec('rm -rf /mnt/notes');
+    expect((await sh.exec('ls /mnt')).stdout).toContain('notes');
+
+    /*
+     * Its CONTENTS do go, and that is the grant working rather than failing:
+     * write access to a folder is permission to delete the files in it. What
+     * is refused is the one operation that reaches outside — removing the
+     * directory entry, which lives in a parent nobody granted.
+     */
+    const inside = await sh.exec('rm /mnt/notes/a.md');
+    expect(inside.exitCode).toBe(0);
+  });
+
+  it('refuses `..` out of the mount', async () => {
+    const { sh } = mounted();
+    const result = await sh.exec('cat /mnt/notes/../private/key');
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain('PRIVATE KEY');
+  });
+
+  it('refuses copying across the mount boundary rather than half-doing it', async () => {
+    const { sh, port } = mounted(true);
+    const inward = await sh.exec('echo x > /workspace/x && cp /workspace/x /mnt/notes/y');
+    expect(inward.exitCode).not.toBe(0);
+    expect(port.written['/home/me/notes/y']).toBeUndefined();
+
+    const outward = await sh.exec('cp /mnt/notes/a.md /workspace/leak.md');
+    expect(outward.exitCode).not.toBe(0);
+    expect((await sh.exec('cat /workspace/leak.md')).exitCode).not.toBe(0);
+  });
+
+  it('answers pwd with the virtual path, never the folder’s place on disk', async () => {
+    const { sh } = mounted();
+    const result = await sh.exec('cd /mnt/notes && pwd -P');
+    expect(result.stdout.trim()).toBe('/mnt/notes');
+    expect(result.stdout).not.toContain('/home/me');
   });
 });

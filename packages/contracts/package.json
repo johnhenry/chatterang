@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./llama-cpp": "./src/llama-cpp.ts",
+    "./mount-host": "./src/mount-host.ts",
     "./onnx-runtime": "./src/onnx-runtime.ts"
   }
 }

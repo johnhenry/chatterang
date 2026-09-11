@@ -82,6 +82,11 @@ describe('the capability table', () => {
       offlineCache: true,
       fileHandoff: 'browser-download',
       purchases: false,
+      // #246. The File System Access API could genuinely grant a directory
+      // here, and the row still says no: it hands out a HANDLE with no path,
+      // and `src/shell/mount.ts`'s containment is "resolve, then check where
+      // it landed". A handle cannot answer the resolve half.
+      folderGrants: false,
     });
   });
 
@@ -93,6 +98,10 @@ describe('the capability table', () => {
         offlineCache: false,
         fileHandoff: 'share-sheet',
         purchases: true,
+        // False until a document-picker grant is wired to `MountHost`.
+        // Capacitor's Filesystem reaches app-private storage, which is not a
+        // folder the person chose.
+        folderGrants: false,
       });
     });
   }
@@ -114,6 +123,10 @@ describe('the capability table', () => {
       offlineCache: false,
       fileHandoff: 'browser-download',
       purchases: false,
+      // #246's one true row: `apps/desktop/src/main.ts` puts Electron's own
+      // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal
+      // a person accepted.
+      folderGrants: true,
     });
   });
 
@@ -146,6 +159,16 @@ describe('the capability table', () => {
      *   operator upgrades the server is a stale-page bug for somebody else.
      *
      * `purchases: false`  there is no store here.
+     *
+     * `folderGrants: false`  NOT because the plugin is missing. `apps/server`
+     *   could serve `MountHost` as readily as it serves `Filesystem`, and
+     *   every call would succeed — against the OPERATOR's disk, with the
+     *   chooser opening on the operator's screen. The person clicking "grant
+     *   a folder" is somewhere else and would be granting a folder they have
+     *   never seen. There is nobody at the other end to consent, so there is
+     *   no consent event and no grant. This is also the field that makes the
+     *   row NOT redundant with `unknownPlatform` — see below; it agrees by
+     *   value and for a different reason.
      */
     expect(on('server', capabilities)).toEqual({
       id: 'server',
@@ -153,6 +176,7 @@ describe('the capability table', () => {
       offlineCache: false,
       fileHandoff: 'browser-download',
       purchases: false,
+      folderGrants: false,
     });
 
     /*
@@ -186,6 +210,10 @@ describe('the capability table', () => {
     expect(unknown.modelStore).toBe('filesystem');
     expect(unknown.offlineCache).toBe(false);
     expect(unknown.purchases).toBe(false);
+    // And grants no folder. The one field where "no" is the safe answer as
+    // well as the honest one: an unknown shell's chooser, if it has one, is
+    // in front of nobody this app can reason about.
+    expect(unknown.folderGrants).toBe(false);
     // It reports its own id rather than claiming to be one of the four.
     expect(unknown.id).toBe('some-future-shell');
   });

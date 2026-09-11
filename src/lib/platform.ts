@@ -143,6 +143,31 @@ export interface PlatformCapabilities {
    * controls, a StoreKit failure), which is a different question from this one.
    */
   readonly purchases: boolean;
+  /**
+   * Can a person here grant this app a folder — an OS chooser that answers
+   * with a REAL PATH (#246)?
+   *
+   * A TABLE ROW RATHER THAN A PLUGIN QUESTION, and `server` is why. The rule
+   * in the header permits delegating to a plugin whose web fallback refuses
+   * honestly, and `MountHostWeb` does exactly that — `pick()` answers `null`,
+   * `list()` answers empty. But on `server` the plugin would answer honestly
+   * too and be useless: `pick` opens a chooser in the SERVER's window manager,
+   * on a machine the person is not sitting at, and the folder they would be
+   * granting is the operator's disk rather than their own. A live probe cannot
+   * tell those apart, because from the browser both are "the plugin worked".
+   *
+   * `web` is false for a different reason worth keeping distinct: the File
+   * System Access API can genuinely grant a directory, but it hands out a
+   * HANDLE with no path and no `realpath`, and `src/shell/mount.ts`'s
+   * containment is "resolve, then check where it landed". Handle-based
+   * containment is structural instead. That is a design to do properly, not a
+   * shim, so this says no rather than half-yes.
+   *
+   * `ios`/`android` are false until a document-picker grant is wired to the
+   * same contract. Capacitor's Filesystem reaches app-private storage, which
+   * is not a folder the person chose.
+   */
+  readonly folderGrants: boolean;
 }
 
 /**
@@ -153,6 +178,7 @@ export interface PlatformCapabilities {
  *   offlineCache true             false            false             false
  *   fileHandoff  browser-download share-sheet      browser-download  browser-download
  *   purchases    false            true             false             false
+ *   folderGrants false            false            true              false
  */
 const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.freeze({
   web: {
@@ -161,6 +187,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     offlineCache: true,
     fileHandoff: 'browser-download',
     purchases: false,
+    folderGrants: false,
   },
   ios: {
     id: 'ios',
@@ -168,6 +195,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     offlineCache: false,
     fileHandoff: 'share-sheet',
     purchases: true,
+    folderGrants: false,
   },
   android: {
     id: 'android',
@@ -175,6 +203,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     offlineCache: false,
     fileHandoff: 'share-sheet',
     purchases: true,
+    folderGrants: false,
   },
   electron: {
     id: 'electron',
@@ -182,6 +211,10 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     offlineCache: false,
     fileHandoff: 'browser-download',
     purchases: false,
+    // The one true row. `apps/desktop/src/main.ts` puts Electron's own
+    // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal a
+    // person dismissed or accepted.
+    folderGrants: true,
   },
   /*
    * A9: the bundle served by `apps/server`, running in an ordinary browser
@@ -234,6 +267,16 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     offlineCache: false,
     fileHandoff: 'browser-download',
     purchases: false,
+    /*
+     * FALSE, AND NOT BECAUSE THE PLUGIN IS MISSING. `apps/server` could serve
+     * `MountHost` as readily as it serves `Filesystem`, and every call would
+     * succeed — against the OPERATOR's disk, with the chooser opening on the
+     * operator's screen. The person clicking "grant a folder" is somewhere
+     * else entirely, and would be granting a folder they have never seen to a
+     * shell they are driving. There is nobody at the other end to consent, so
+     * there is no consent event, so there is no grant.
+     */
+    folderGrants: false,
   },
 });
 
@@ -255,6 +298,9 @@ function unknownPlatform(id: string): PlatformCapabilities {
     offlineCache: false,
     fileHandoff: 'browser-download',
     purchases: false,
+    // No claims made on an unknown shell's behalf, and this is the one row
+    // where "no" is also the safe answer rather than only the honest one.
+    folderGrants: false,
   };
 }
 

@@ -43,9 +43,20 @@ import { dirname, relative, resolve, sep } from 'node:path';
  *   macOS hands out `/var/folders/…`, which is a symlink to `/private/var`, so
  *   resolving only the candidate would refuse every legitimate path.
  * @param resolvedCandidate an absolute path that already passed the lexical gate.
+ * @param options `allowRoot` admits the root directory ITSELF. Default false,
+ *   which is what every model path wants — a root is a directory, never a
+ *   model. #246's mounts want the opposite: `ls /mnt/notes` is the first thing
+ *   anyone does with a granted folder, and refusing the root would make the
+ *   mount point the one path inside it that cannot be read. It is a parameter
+ *   rather than a second copy of this function because a copy is how the
+ *   dangling-symlink branch below gets fixed in one place and not the other.
  * @returns the real absolute path, or null if it escapes the root.
  */
-export function confineRealPath(modelRoot: string, resolvedCandidate: string): string | null {
+export function confineRealPath(
+  modelRoot: string,
+  resolvedCandidate: string,
+  options?: { readonly allowRoot?: boolean },
+): string | null {
   let realRoot: string;
   try {
     realRoot = realpathSync(modelRoot);
@@ -100,10 +111,10 @@ export function confineRealPath(modelRoot: string, resolvedCandidate: string): s
   }
 
   const real = missing.length === 0 ? existing : resolve(existing, ...missing);
-  // Strictly inside, with the separator: the root itself is a directory, never
-  // a model, and `/models` must not prefix-match `/models-evil`.
+  // With the separator, always: `/models` must not prefix-match `/models-evil`.
+  // Strictly inside unless `allowRoot` says otherwise — see the parameter.
   const prefix = realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`;
-  if (!real.startsWith(prefix)) return null;
+  if (!real.startsWith(prefix) && !(options?.allowRoot === true && real === realRoot)) return null;
   // `resolve` cannot leave a `..` behind, but assert it rather than assume it.
   if (relative(realRoot, real).split(sep).includes('..')) return null;
   return real;

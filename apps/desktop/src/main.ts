@@ -49,7 +49,7 @@ import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
-import { BrowserWindow, Menu, app, ipcMain, protocol, shell, utilityProcess } from 'electron';
+import { BrowserWindow, Menu, app, dialog, ipcMain, protocol, shell, utilityProcess } from 'electron';
 import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
@@ -61,6 +61,7 @@ import {
   HostFleet,
   LLAMA_ENGINE,
   LLAMA_PLUGIN,
+  MOUNT_PLUGIN,
   ONNX_ENGINE,
   ONNX_PLUGIN,
   PluginHost,
@@ -83,8 +84,43 @@ import {
   resolveBundleUrl,
 } from './security.js';
 import { createFilesystemPlugin } from './fs/filesystem.js';
+import { createMountPlugin } from './fs/mounts.js';
 import { buildMenuTemplate } from './menu.js';
 import type { MenuTemplateItem } from './menu.js';
+
+/**
+ * The folder chooser #246's mounts are granted through.
+ *
+ * `createDirectory` is ABSENT on purpose: granting is choosing something that
+ * exists, and a chooser that can make a folder turns a read grant into a write
+ * primitive before the read grant has even been decided.
+ */
+const MOUNT_PICKER = {
+  title: 'Choose a folder the shell may read',
+  buttonLabel: 'Grant access',
+  properties: ['openDirectory' as const],
+};
+
+/** The second consent: changing files is not the same as reading them. */
+function writePrompt(root: string): {
+  type: 'question';
+  buttons: string[];
+  defaultId: number;
+  cancelId: number;
+  message: string;
+  detail: string;
+} {
+  return {
+    type: 'question',
+    buttons: ['Read only', 'Allow changes'],
+    // Both point at the lesser grant, so dismissing the dialog — Escape, or
+    // closing it — grants reading and not writing.
+    defaultId: 0,
+    cancelId: 0,
+    message: 'Allow the shell to change files in this folder?',
+    detail: `${root}\n\nThe shell — and any model driving it — could create, edit and delete files here. Reading is already allowed.`,
+  };
+}
 
 /** Set only in development; a packaged build must never carry one. */
 const DEV_SERVER_URL = process.env['CHATTERANG_DEV_SERVER_URL'] ?? '';
@@ -469,6 +505,42 @@ function start(): void {
    * than shrink the surface. They are not dead code to be tidied away.
    */
   pluginHost.register(FILESYSTEM_PLUGIN, createFilesystemPlugin({ roots }));
+  /*
+   * `MountHost` — the folder-granting half of #246.
+   *
+   * THE CHOOSER IS THE SECURITY BOUNDARY, which is why it lives here and is
+   * injected rather than reached for inside the plugin. `fs/mounts.ts` calls no
+   * Electron, so nothing in it can produce a grant without this function having
+   * put a modal in front of a person.
+   *
+   * TWO CONSENTS, not one. Choosing a folder is consent to READ it; being able
+   * to change the files in it is a different thing to agree to, and a picker
+   * has no way to express it. So write access is a second dialog, defaulting to
+   * read-only — `cancelId` and `defaultId` both point at "Read only", so a
+   * dismissed dialog grants the lesser thing. The plugin ANDs what was asked
+   * with what came back, so this may grant less than the renderer requested and
+   * can never grant more.
+   */
+  pluginHost.register(
+    MOUNT_PLUGIN,
+    createMountPlugin({
+      pick: async ({ writable }) => {
+        const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+        const chosen = await (parent
+          ? dialog.showOpenDialog(parent, MOUNT_PICKER)
+          : dialog.showOpenDialog(MOUNT_PICKER));
+        const root = chosen.canceled ? undefined : chosen.filePaths[0];
+        if (root === undefined) return null;
+        if (!writable) return { root, writable: false };
+
+        const answer = await (parent
+          ? dialog.showMessageBox(parent, writePrompt(root))
+          : dialog.showMessageBox(writePrompt(root)));
+        return { root, writable: answer.response === 1 };
+      },
+    }),
+  );
+
   pluginHost.register(DSH_PLUGIN, {
     // THE LLAMA HOST, deliberately and by name. The Cordis tree mounts only
     // where the Router and the llama backend are (`host/llama-engine.ts`);

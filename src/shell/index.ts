@@ -97,6 +97,7 @@ import type { ShellCommand, ShellContext, ShellOutput, ShellStores } from '@/she
 import { chatterangCommands, table } from '@/shell/commands';
 import { guardProjection, type GuardedFs } from '@/shell/fs';
 import {
+  MOUNT_ROOT,
   mountReal,
   resolveGrant,
   type MountGrant,
@@ -125,11 +126,17 @@ export interface ShellOptions {
    *
    * Absent or empty means the shell reaches nothing outside the app, which is
    * what it did before this existed and what it still does until somebody
-   * picks a folder. `mountReal` returns the filesystem untouched for an empty
-   * list, so an ungranted shell is not merely equivalent to the old one — it
-   * is the same object graph.
+   * picks a folder. `mountReal` returns the filesystem untouched for a fixed
+   * empty list, so an ungranted shell is not merely equivalent to the old one
+   * — it is the same object graph.
+   *
+   * THE FUNCTION FORM IS WHAT MAKES REVOKING WORK. Grants change while the
+   * shell is open: `mount add` and `mount rm` are commands typed INTO it. A
+   * captured array would mean a folder the user withdrew stayed mounted until
+   * the component remounted, which is the wrong answer to give someone who
+   * has just said to stop. The getter is re-read before every command.
    */
-  mounts?: readonly MountGrant[];
+  mounts?: readonly MountGrant[] | (() => readonly MountGrant[]);
   /**
    * How to reach a real filesystem. Required only if `mounts` is non-empty.
    *
@@ -187,6 +194,30 @@ function loadJustBash(): Promise<JustBashModule> {
   return modulePromise;
 }
 
+/**
+ * Are these the same grants, by value?
+ *
+ * Field by field rather than a JSON round trip, because the three fields ARE
+ * the grant and a fourth added later should fail this comparison loudly rather
+ * than be silently included by a stringifier — a `revokedAt` that compared
+ * equal would be a withdrawn folder that stayed mounted.
+ */
+function sameGrants(a: readonly MountGrant[], b: readonly MountGrant[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((grant, index) => {
+    const other = b[index]!;
+    return (
+      grant.name === other.name && grant.root === other.root && grant.writable === other.writable
+    );
+  });
+}
+
+/** The two methods the shell calls on the raw in-memory tree itself. */
+interface InnerTree {
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+  rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+}
+
 export class ChatterangShell {
   #options: ShellOptions;
   #bash: BashInstance | null = null;
@@ -195,6 +226,24 @@ export class ChatterangShell {
   #projected = new Set<string>();
   #commands: ShellCommand[];
   #starting: Promise<void> | null = null;
+  /**
+   * The live mount table the filesystem proxy reads, and the grants it came
+   * from — kept together so `#refreshMounts` can tell "nothing changed" from
+   * "changed back", and skip the resolution round-trip for the common case.
+   */
+  #mounts: readonly ResolvedMount[] = [];
+  #resolvedFrom: readonly MountGrant[] = [];
+  /**
+   * The in-memory filesystem, held BELOW the mount and the guard.
+   *
+   * `/mnt` and each `/mnt/<name>` have to exist as ordinary directories in
+   * the virtual tree, or the mount point has no parent: `cd /mnt/notes`
+   * answered "No such file or directory" while `ls /mnt/notes` worked,
+   * because the mount claims `/mnt/notes` and deeper and nothing at all
+   * claims `/mnt`. They are created here, below both decorators, so creating
+   * them is not itself a write anything could intercept or route.
+   */
+  #inner: InnerTree | null = null;
 
   constructor(options: ShellOptions) {
     this.#options = options;
@@ -252,7 +301,13 @@ export class ChatterangShell {
      * mount and is answered by the real filesystem — so a symlink under a
      * granted folder cannot be used to reach a projected path either.
      */
-    const mounted = mountReal(new InMemoryFs(), await this.#resolveMounts());
+    const inner = new InMemoryFs();
+    this.#inner = inner as unknown as InnerTree;
+    await this.#refreshMounts();
+    // The SUPPLIER form, not the resolved array: `#mounts` is replaced when a
+    // grant is added or withdrawn, and the proxy must be reading the table the
+    // user last agreed to rather than the one that existed at startup.
+    const mounted = mountReal(inner, () => this.#mounts);
     const guarded = guardProjection(mounted);
     const bash = new Bash({ fs: guarded.fs, customCommands, cwd: '/' });
 
@@ -269,7 +324,7 @@ export class ChatterangShell {
    * invites the model to try it and read a refusal.
    */
   #mountHelp(): readonly string[] {
-    const grants = this.#options.mounts ?? [];
+    const grants = this.#grants();
     if (grants.length === 0) return [];
     return [
       '',
@@ -293,11 +348,80 @@ export class ChatterangShell {
    * agree exists.
    */
   async #resolveMounts(): Promise<readonly ResolvedMount[]> {
-    const grants = this.#options.mounts ?? [];
+    const grants = this.#grants();
     const port = this.#options.realFs;
     if (grants.length === 0 || !port) return [];
     const resolved = await Promise.all(grants.map((grant) => resolveGrant(grant, port)));
     return resolved.filter((mount): mount is ResolvedMount => mount !== null);
+  }
+
+  /** The grants as they are RIGHT NOW. See `ShellOptions.mounts`. */
+  #grants(): readonly MountGrant[] {
+    const mounts = this.#options.mounts;
+    return (typeof mounts === 'function' ? mounts() : mounts) ?? [];
+  }
+
+  /**
+   * Re-resolve the mount table if, and only if, the grants changed.
+   *
+   * Called before every command, so it has to be cheap when nothing happened
+   * — which is almost always. The comparison is on the grant VALUES rather
+   * than array identity: a caller reading from React state hands back a new
+   * array on every render, and re-`realpath`ing three folders per keystroke
+   * to discover they are the same three is a round trip per command for
+   * nothing.
+   *
+   * REVOKING TAKES EFFECT HERE, and that is the reason this is not merely an
+   * optimisation with a cache. `resolveGrant` re-resolves the root, so a
+   * folder that has been deleted, renamed, or had its permissions withdrawn
+   * since it was granted drops out of the table rather than staying mounted
+   * against a path that no longer means anything.
+   */
+  async #refreshMounts(): Promise<void> {
+    const grants = this.#grants();
+    if (sameGrants(grants, this.#resolvedFrom)) return;
+    this.#resolvedFrom = grants;
+    const previous = this.#mounts;
+    this.#mounts = await this.#resolveMounts();
+    await this.#reconcileMountPoints(previous);
+  }
+
+  /**
+   * Make each `/mnt/<name>` exist as a directory in the virtual tree, and
+   * remove the ones that no longer should.
+   *
+   * A MOUNT POINT NEEDS A PARENT. `mountFor` claims `/mnt/notes` and
+   * everything under it, and nothing claims `/mnt` — so with no directory
+   * there, `cd /mnt/notes` failed with "No such file or directory" while `ls
+   * /mnt/notes` worked, because they ask different questions about the path
+   * above. These are created on the raw in-memory filesystem, BELOW the mount
+   * and below the projection guard, for the same reason `project` writes
+   * there: a directory the shell can see but not reach around.
+   *
+   * `/mnt` is created only when something is granted. An empty `/mnt` sitting
+   * in every shell would advertise a capability that is not there, which is
+   * the argument `#mountHelp` already makes about the help text.
+   */
+  async #reconcileMountPoints(previous: readonly ResolvedMount[]): Promise<void> {
+    const inner = this.#inner;
+    if (!inner) return;
+    const current = this.#mounts;
+
+    for (const stale of previous) {
+      if (current.some((mount) => mount.virtualRoot === stale.virtualRoot)) continue;
+      // A withdrawn grant leaves no trace: a leftover empty directory reads
+      // as a folder that is still granted and merely empty.
+      await inner.rm(stale.virtualRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
+    if (current.length === 0) {
+      if (previous.length > 0) {
+        await inner.rm(MOUNT_ROOT, { recursive: true, force: true }).catch(() => undefined);
+      }
+      return;
+    }
+    for (const mount of current) {
+      await inner.mkdir(mount.virtualRoot, { recursive: true }).catch(() => undefined);
+    }
   }
 
   /**
@@ -335,6 +459,10 @@ export class ChatterangShell {
   async exec(commandLine: string, signal?: AbortSignal): Promise<ShellResult> {
     const started = performance.now();
     await this.ready();
+    // Before the command, not after: a folder granted or withdrawn by the
+    // PREVIOUS command is in force for this one, which is what anyone who
+    // just typed `mount rm notes` expects of the next thing they type.
+    await this.#refreshMounts();
 
     if (!this.#bash) {
       return { stdout: '', stderr: 'shell failed to start', exitCode: 1, durationMs: 0 };

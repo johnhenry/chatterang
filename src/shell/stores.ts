@@ -15,6 +15,7 @@ import { useMcp } from '@/state/mcp';
 import { useBench } from '@/state/bench';
 import { useChats } from '@/state/chat';
 import { useModels } from '@/state/models';
+import { useMounts } from '@/shell/real-fs';
 import { usePersonas, personaList } from '@/state/personas';
 
 export function liveStores(): ShellStores {
@@ -111,5 +112,20 @@ export function liveStores(): ShellStores {
         host: destinationHost(server.url),
         enabled: server.enabled,
       })),
+
+    // `mount` lists and withdraws these; `privacy` names them, because a file
+    // read out of a granted folder reaches the model exactly as a projected
+    // chat does. Read from the store rather than the host on every call: the
+    // store is a mirror the host refreshes, and `list` has to be synchronous
+    // for `ShellStores`.
+    mounts: () => {
+      const store = useMounts.getState();
+      return {
+        list: store.grants,
+        canGrant: store.canGrant,
+        grant: (writable) => store.grant(writable),
+        revoke: (id) => store.revoke(id),
+      };
+    },
   };
 }
