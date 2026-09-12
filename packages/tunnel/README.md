@@ -1,7 +1,9 @@
 # `@chatterang/tunnel`
 
 Transport code for two Chatterangs on one network (epic #153). This package is
-the **boundary**; the transport that goes inside it is #156, #157 and #181.
+the **boundary**; the transport that goes inside it is a **native socket
+plugin on both platforms** (#181, ruled 2026-09-11), built by #156 (client)
+and #157/#158 (listener).
 
 ## The split, and why it is one package with three entry points
 
@@ -46,15 +48,34 @@ the drift the contracts guard exists to prevent.
 
 ## What is deliberately not here
 
-- **A transport.** #181 has not chosen between plaintext LAN with an
-  application-layer handshake and a native socket plugin. Both seams
-  (`createTunnelClient`, `createTunnelHost`) throw with the ticket number.
+- **A transport.** Not built. No longer *undecided* — #181 chose a native
+  socket plugin on both platforms. Both seams (`createTunnelClient`,
+  `createTunnelHost`) throw, naming the ticket that would build them (#156,
+  #157/#158) rather than one that would decide them.
 - **`TunnelBinding`.** It belongs in `src/host/`, modelled on
   `apps/server/src/binding.ts` — bind address and credentials as one union, so
-  the unsafe combination cannot be written down. Its *arms* are #181's decision,
-  and arms invented for both options would sanction whichever loses.
-- **Frame kinds.** `TunnelFrame['kind']` is an open `string`. The frames are
-  #156's and #157's to name.
+  the unsafe combination cannot be written down. There is one arm to write now;
+  writing it is #157/#158's job. It must be its own union and **not** a third
+  arm of `ServerBinding`: #135's ruling is explicit that a third arm puts an
+  arm-dependent branch back into `checkToken`'s gate 1, whose absence is that
+  file's documented strength.
+- **Frame kinds.** `TunnelFrame['kind']` became a union in #159.
+
+### Why plaintext `ws://` lost
+
+Recorded because a rejected option nobody wrote down is one somebody
+re-proposes. `network_security_config.xml` is static, baked at build time, and
+the desktop's LAN IP is not knowable when the APK is built — so the narrow
+Android exception degrades to a global `cleartextTrafficPermitted="true"`. The
+hostname that would have rescued it, an mDNS name resolving inside a WebView,
+has never been measured. Two transports lost on its own warning: two threat
+models, two negative tests, two failure classifications for #186's adapter.
+
+The chosen option's cost, stated in the ruling rather than discovered later:
+~800 KB of OkHttp + okio on Android, a bridge crossing per frame, a new
+registered surface that inherits #170's `assertServerSurface` question, and the
+deletion of the plan's "no plugin" promise. The QR carries a certificate
+fingerprint rather than a key-agreement public key.
 
 ## The guard
 

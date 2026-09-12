@@ -17,10 +17,15 @@
  * NO `.` export at all, so there is nothing for a bare import to resolve to —
  * belt and braces, both asserted.
  *
- * NOT IMPLEMENTED HERE, ON PURPOSE. Node ships a WebSocket client and no
- * WebSocket server (#157), and whether this listens in plaintext on the LAN
- * behind an application-layer handshake or behind a native socket plugin is
- * #181's undecided call. This file is the shape, not the server.
+ * NOT IMPLEMENTED HERE, AND THE REASON CHANGED. Node ships a WebSocket client
+ * and no WebSocket server (#157) — that half still holds. What no longer holds
+ * is the other half this comment used to carry: whether the listener sits
+ * behind plaintext LAN plus an application-layer handshake or behind a native
+ * socket plugin was #181's call, and #181 made it on 2026-09-11: **a native
+ * socket plugin, on both platforms. One transport, not two.**
+ *
+ * This file is still the shape rather than the server, because the server is
+ * #157 and #158. It is not waiting on anybody.
  */
 
 import type { Server } from 'node:net';
@@ -55,22 +60,37 @@ export interface TunnelHost {
  * without auth" is not a check someone can forget but a value TypeScript will
  * not accept. The tunnel needs the same union, and it belongs in this file.
  *
- * It cannot be written yet, because its ARMS are the decision in #181. A
- * plaintext-LAN tunnel with an application-layer handshake and a native socket
- * plugin do not have the same fields, and inventing arms for both would hand
- * the reader a union that sanctions whichever option loses. Blocked, named, and
- * left alone.
+ * IT IS NO LONGER BLOCKED. This said its ARMS were the decision in #181, and
+ * that a union with arms for both would sanction whichever option lost. #181
+ * ruled on 2026-09-11 — a native socket plugin, one transport — so there is
+ * one arm to write, and the thing standing between here and it is #157/#158
+ * building the listener, not a question anyone still has to answer.
+ *
+ * Two constraints the ruling carries into whoever writes it. `apps/server/src/
+ * binding.ts`'s pattern is the one to copy: the bind address and its
+ * credentials are ONE union, so "listening beyond loopback without auth" is a
+ * value TypeScript refuses rather than a check someone forgets. And #135's
+ * ruling is explicit that this must NOT become a third arm of `ServerBinding`
+ * — that would put an arm-dependent branch back into `checkToken`'s gate 1,
+ * whose absence is that file's documented strength. A separate `TunnelBinding`
+ * union, here.
+ *
+ * The trust field is a certificate fingerprint, not a key-agreement public
+ * key: that is a consequence of the ruling, stated in it, and #134 owns the
+ * QR byte that names which.
  */
 
 /**
  * The seam the listener will be built behind.
  *
  * Throws today. See the file comment: the package's deliverable in #155 is the
- * boundary and the guard, not the transport.
+ * boundary and the guard, not the transport — and the transport is now a
+ * decided thing that has not been built, which is a different sentence from
+ * the one this used to print.
  */
 export function createTunnelHost(): never {
   throw new Error(
-    'tunnel host is not implemented: the transport option is undecided (#181); ' +
-      'the WebSocket server question is #157',
+    'tunnel host is not implemented: the transport is a native socket plugin ' +
+      '(#181, ruled 2026-09-11) and the listener is #157/#158',
   );
 }
