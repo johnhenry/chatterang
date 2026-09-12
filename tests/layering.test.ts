@@ -511,19 +511,19 @@ describe('the tunnel package', () => {
   const TUNNEL = resolve(process.cwd(), 'packages/tunnel/src');
   const tunnelFiles = sourceFiles(TUNNEL);
   const relTunnel = (file: string): string => relative(TUNNEL, file).replaceAll('\\', '/');
-  const half = (name: 'wire' | 'client' | 'host'): string[] =>
+  const half = (name: 'wire' | 'codec' | 'pairing' | 'client' | 'host'): string[] =>
     tunnelFiles.filter((file) => relTunnel(file).startsWith(`${name}/`));
 
   /** Every specifier a file names, with comments stripped first. */
   const specifiersOf = (file: string): string[] =>
     [...codeOf(readFileSync(file, 'utf8')).matchAll(SPECIFIER)].map((m) => m[1] ?? '');
 
-  it('finds all three halves, so none of these rules is vacuous', () => {
+  it('finds every half, so none of these rules is vacuous', () => {
     // A boundary guard that runs against an empty directory passes and proves
     // nothing — the failure mode of every "no offenders" assertion in this
     // file, and the reason each block here opens with a count.
     expect(tunnelFiles.map(relTunnel).sort()).not.toEqual([]);
-    for (const name of ['wire', 'client', 'host'] as const) {
+    for (const name of ['wire', 'codec', 'pairing', 'client', 'host'] as const) {
       expect(half(name).length, `packages/tunnel/src/${name} is empty`).toBeGreaterThan(0);
     }
   });
@@ -539,6 +539,37 @@ describe('the tunnel package', () => {
       specifiersOf(file).map((specifier) => `${relTunnel(file)} -> ${specifier}`),
     );
     expect(offenders).toEqual([]);
+  });
+
+  it('the pairing half imports nothing, and reaches for no global either', () => {
+    /*
+     * THE SAME RULE AS `wire`, FOR A DIFFERENT AND STRONGER REASON (#134).
+     *
+     * `wire` imports nothing because both ends load it. `pairing` imports
+     * nothing AND uses no global, because #223 is an open ticket recording
+     * that every mobile capability this app relies on was measured on the
+     * NEWEST runtimes while the app supports the oldest — and this is the one
+     * component that has to work on all of them. A pairing parser that needs
+     * `TextDecoder` or `crypto.subtle` fails on exactly the old phone whose
+     * owner is trying to pair it, at the moment they are trying.
+     *
+     * So base64url and UTF-8 are implemented in the file. That is a cost, and
+     * this guard is what stops someone paying it and then quietly reaching for
+     * `btoa` in the next edit.
+     */
+    const offenders = half('pairing').flatMap((file) =>
+      specifiersOf(file).map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+
+    const globals = ['btoa', 'atob', 'Buffer', 'TextEncoder', 'TextDecoder', 'crypto'];
+    const reached = half('pairing').flatMap((file) => {
+      const code = codeOf(readFileSync(file, 'utf8'));
+      return globals
+        .filter((name) => new RegExp(`\\b${name}\\b`).test(code))
+        .map((name) => `${relTunnel(file)} -> ${name}`);
+    });
+    expect(reached).toEqual([]);
   });
 
   it('the client half imports no Node builtin, no Electron and no Capacitor', () => {
@@ -578,7 +609,13 @@ describe('the tunnel package', () => {
   it('neither shared half imports the app', () => {
     // A `@/` import would make the tunnel depend on the app that consumes it —
     // and this package is meant to be consumed by `apps/desktop` as well.
-    const offenders = [...half('wire'), ...half('client'), ...half('host')].flatMap((file) =>
+    const offenders = [
+      ...half('wire'),
+      ...half('codec'),
+      ...half('pairing'),
+      ...half('client'),
+      ...half('host'),
+    ].flatMap((file) =>
       specifiersOf(file)
         .filter((specifier) => specifier.startsWith('@/'))
         .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
@@ -614,10 +651,14 @@ describe('the tunnel package', () => {
     // `./codec` joins wire and client on the importable side: it is the IR
     // serialization policy (#142), and the phone is one of the two ends that
     // has to apply it. It names no Node builtin, which the ban above checks.
+    // `./pairing` joins the importable side (#134): the phone is the half that
+    // SCANS a pairing code, so the parser has to be in its bundle. It imports
+    // nothing and reaches for no global, which the rule above checks.
     expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([
       './client',
       './codec',
       './host',
+      './pairing',
       './wire',
     ]);
   });
