@@ -496,6 +496,11 @@ export class ChatterangShell {
   async #invoke(command: ShellCommand, args: readonly string[]): Promise<ShellOutput> {
     const context: ShellContext = {
       actor: this.#options.actor,
+      // What THIS shell resolved, not what the process has been granted. A
+      // command describing what the shell can reach must not read the grant
+      // registry, which knows nothing about whether this shell was wired to a
+      // filesystem at all.
+      mounts: this.#mounts.map((mount) => ({ name: mount.name, writable: mount.writable })),
       confirm: async (action, options) => {
         // A person typing a command has already expressed intent for local
         // state changes; only egress is worth interrupting them for. The
@@ -525,7 +530,22 @@ export class ChatterangShell {
         ({
           exitCode: 0,
           stdout: [
-            'Chatterang shell — a sandbox, not your device.',
+            /*
+             * ONE COMMAND MUST NOT CONTRADICT ITSELF. With a folder granted,
+             * this line said "a sandbox, not your device" twenty lines above
+             * "Granted folders (real, on this device)". The test that pins the
+             * first sentence — 'reports the sandbox honestly in its own help'
+             * — builds a shell with no mounts, so it could never see the case
+             * where its own subject is false.
+             *
+             * The sandbox sentence is still true of everything the shell
+             * reaches by default, so it stays for a shell with no grants
+             * rather than being softened for every shell to cover a case most
+             * of them are not in.
+             */
+            this.#grants().length === 0
+              ? 'Chatterang shell — a sandbox, not your device.'
+              : 'Chatterang shell — a sandbox, plus the folders you granted it.',
             '',
             'App commands:',
             table(this.#commands.map((c) => [`  ${c.name}`, c.summary])),

@@ -200,6 +200,34 @@ describe('sandbox boundaries', () => {
     expect(result.stdout).toContain('sandbox, not your device');
     expect(result.stdout).toContain('Network access is not available');
   });
+
+  it('stops calling itself a sandbox-not-your-device once a folder is granted', async () => {
+    /*
+     * THE TEST ABOVE COULD NEVER SEE THIS. Its helper builds a shell with no
+     * `mounts`, so the case where its own subject sentence goes false is out
+     * of reach — and with a folder granted, `chatterang` printed "a sandbox,
+     * not your device" twenty lines above "Granted folders (real, on this
+     * device)". One command contradicting itself, pinned by a test named for
+     * honesty.
+     *
+     * The sandbox sentence stays for a shell with no grants, because it is
+     * still exactly true there.
+     */
+    const sh = new ChatterangShell({
+      stores: stores(),
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => [{ name: 'notes', root: '/real/notes', writable: false }],
+      realFs: fakePort({ dirs: ['/real', '/real/notes'], files: { '/real/notes/a.md': 'x' } }),
+    });
+    const result = await sh.exec('chatterang');
+
+    expect(result.stdout).not.toContain('sandbox, not your device');
+    expect(result.stdout).toContain('plus the folders you granted');
+    expect(result.stdout).toContain('Granted folders');
+    // The claims that are still true stay: the shell still has no network.
+    expect(result.stdout).toContain('Network access is not available');
+  });
 });
 
 /* ── The desktop invariant ───────────────────────────────────────────── */
@@ -1134,6 +1162,10 @@ describe('the mount command', () => {
     grantedAt: Date.UTC(2026, 0, 2, 3, 4),
   };
 
+  /** Enough of a port for a grant to RESOLVE, which is what `context.mounts` needs. */
+  const mountPort = () =>
+    fakePort({ dirs: ['/real', '/real/notes'], files: { '/real/notes/a.md': 'alpha\n' } });
+
   async function run(
     line: string,
     store: ShellStores,
@@ -1160,17 +1192,68 @@ describe('the mount command', () => {
     expect(result.stdout).toContain('cannot grant folders');
   });
 
+  it('says a grant is not mounted HERE rather than describing it as if it were', async () => {
+    /*
+     * The store is the process-wide grant registry; `context.mounts` is what
+     * this shell resolved. They differ, and the difference was a disclosure:
+     * `createBashTool` built its shell with no `realFs`, so the model's
+     * `mount list` named the user's real folder for a path where `ls` exited
+     * 2. A shell with no filesystem wiring now says so.
+     */
+    const { result } = await run('mount list', mountStores([NOTES]));
+    expect(result.stdout).toContain('/mnt/notes');
+    expect(result.stdout).toContain('not mounted here');
+    expect(result.stdout).not.toContain('read-only');
+  });
+
   it('lists the mount point, the real folder, and which access it has', async () => {
-    const { result } = await run(
-      'mount list',
-      mountStores([NOTES, { ...NOTES, id: 'm2', name: 'drafts', writable: true }]),
-    );
+    // A shell that ACTUALLY mounted them — the paired control for the test
+    // above, and the case a person is in.
+    const store = mountStores([NOTES, { ...NOTES, id: 'm2', name: 'drafts', writable: true }]);
+    const sh = new ChatterangShell({
+      stores: store,
+      actor: 'user',
+      confirm: vi.fn(async () => true),
+      mounts: () => [
+        { name: 'notes', root: '/real/notes', writable: false },
+        { name: 'drafts', root: '/real/notes', writable: true },
+      ],
+      realFs: mountPort(),
+    });
+    const result = await sh.exec('mount list');
     expect(result.stdout).toContain('/mnt/notes');
     expect(result.stdout).toContain('/Users/me/notes');
     expect(result.stdout).toContain('read-only');
     expect(result.stdout).toContain('read+write');
+    expect(result.stdout).not.toContain('not mounted here');
     // The grant's lifetime is part of what the list is for.
     expect(result.stdout).toContain('Grants end when the app closes');
+  });
+
+  it('shows the folder’s place on disk to a person and not to a model', async () => {
+    /*
+     * `mount.ts` keeps the host path out of `realpath` and out of every error
+     * message so the folder's location does not leak. A table printing it is
+     * the same leak with a header.
+     */
+    const store = mountStores([NOTES]);
+    const build = (actor: 'user' | 'model') =>
+      new ChatterangShell({
+        stores: store,
+        actor,
+        confirm: vi.fn(async () => true),
+        mounts: () => [{ name: 'notes', root: '/real/notes', writable: false }],
+        realFs: mountPort(),
+      });
+
+    const asModel = await build('model').exec('mount list');
+    expect(asModel.stdout).toContain('/mnt/notes');
+    expect(asModel.stdout).toContain('read-only');
+    expect(asModel.stdout).not.toContain('/Users/me/notes');
+    expect(asModel.stdout).toContain('not shown here');
+
+    const asUser = await build('user').exec('mount list');
+    expect(asUser.stdout).toContain('/Users/me/notes');
   });
 
   it('asks the user before the model can open a folder chooser', async () => {

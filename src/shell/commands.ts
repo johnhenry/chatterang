@@ -46,6 +46,26 @@ export interface ShellContext {
   /** Who is driving: the person at the keyboard, or the model. */
   readonly actor: 'user' | 'model';
   readonly signal?: AbortSignal;
+  /**
+   * The folders THIS shell actually mounted — not the folders the user has
+   * granted somewhere in the process (#246).
+   *
+   * The two differ, and the difference was a disclosure. `ShellStores.mounts`
+   * is the process-wide grant registry; a shell that was never handed
+   * `mounts`/`realFs` still reads it, so `mount list` named a real folder in a
+   * shell where `ls /mnt` exits 2. A command that describes what the shell can
+   * reach has to ask the shell, and this is how.
+   *
+   * Defaults to empty when a caller does not supply it, which is the same
+   * answer a shell with no mounts gives — never "we could not tell".
+   */
+  readonly mounts?: readonly MountedFolder[];
+}
+
+/** One folder a shell has actually resolved and routed. */
+export interface MountedFolder {
+  readonly name: string;
+  readonly writable: boolean;
 }
 
 export interface ShellCommand {
@@ -621,11 +641,30 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
     name: 'privacy',
     summary: 'What leaves this device',
     usage: 'privacy',
-    async run() {
+    async run(_args, context) {
       const enabled = stores.providers().list.filter((p) => p.enabled);
       const servers = (stores.mcpServers?.() ?? []).filter((s) => s.enabled);
-      const granted = stores.mounts?.().list ?? [];
+      /*
+       * WHAT THIS SHELL MOUNTED, not what the process has been granted, and
+       * for two reasons that are both bugs this command had.
+       *
+       * A shell with no filesystem wiring still reads `stores.mounts`, so this
+       * used to tell a model that tool output includes a folder the shell
+       * cannot open — a false sentence in the one command whose entire purpose
+       * is not to shade the truth.
+       *
+       * And it printed the folder's ABSOLUTE HOST PATH, twice, to whoever ran
+       * it. `mount.ts` keeps that path out of `realpath` and out of every
+       * error message precisely so the folder's location on disk does not
+       * leak; the honesty command was the one place it did. The person is told
+       * where their folder is, because they chose it. The model is told which
+       * mount point, which is what governs the bytes.
+       */
+      const mountedHere = new Set((context.mounts ?? []).map((entry) => entry.name));
+      const granted = (stores.mounts?.().list ?? []).filter((row) => mountedHere.has(row.name));
       const writable = granted.filter((row) => row.writable);
+      const nameFolder = (row: MountRow): string =>
+        context.actor === 'user' ? row.root : `/mnt/${row.name}`;
 
       return ok(
         [
@@ -663,7 +702,11 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
           granted.length > 0
             ? `    /personas) AND anything it read in ${granted
                 .map((row) => `/mnt/${row.name}`)
-                .join(', ')}, which is ${granted.map((row) => row.root).join(', ')}.`
+                .join(', ')}${
+                context.actor === 'user'
+                  ? `, which is ${granted.map((row) => row.root).join(', ')}.`
+                  : ', which are folders the person granted.'
+              }`
             : '    /chats, /models, /personas. The app asks before it does, and',
           ...(granted.length > 0
             ? ['    The app asks before it does, and']
@@ -698,7 +741,7 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
             ? [
                 '',
                 'Can be changed on this device:',
-                `  - files in ${writable.map((row) => row.root).join(', ')}. You granted`,
+                `  - files in ${writable.map(nameFolder).join(', ')}. You granted`,
                 '    write access to that folder, so the shell — and a model driving',
                 '    it — can create, edit and delete files there. `mount rm <name>`',
                 '    withdraws it; closing the app withdraws every grant.',
@@ -732,14 +775,39 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
    * `mutating: true` so the MODEL cannot grant or withdraw a folder without
    * the user seeing the sheet. Two gates then stand in front of `mount add`
    * when a model runs it — the approval sheet, and the OS chooser itself,
-   * which no amount of prompt injection can click. `mount list` is not gated,
-   * because reading which folders are already granted tells the model nothing
-   * it could not learn by running `ls /mnt`.
+   * which no amount of prompt injection can click.
    *
    * ADDING IS GATED EVEN FOR THE USER. `#invoke` waives confirmation for a
    * person typing a local state change, which is right for `provider disable`
    * and wrong here only in the sense that the chooser asks anyway; the real
    * consent is the modal, and it is not skippable by anyone.
+   *
+   * ## `mount list` shows the FOLDER column to a person and not to a model
+   *
+   * THE COMMENT THAT USED TO BE HERE WAS MEASURABLY FALSE. It said `mount
+   * list` needs no gate "because reading which folders are already granted
+   * tells the model nothing it could not learn by running `ls /mnt`". In the
+   * only shell a model drives, `ls /mnt` exited 2 — `createBashTool` built its
+   * shell without `mounts` or `realFs`, so the grant was in the registry this
+   * command reads and nowhere in the filesystem. A model got the user's
+   * absolute host path, unconfirmed, for a folder it could not open; and
+   * `privacy`, the app's own honesty command, printed it twice.
+   *
+   * Two rules now, because that was two bugs:
+   *
+   *   1. This command describes what THIS shell mounted — `context.mounts` —
+   *      not what the process has been granted. A folder the shell cannot
+   *      reach is shown as not mounted rather than silently listed as if it
+   *      were.
+   *   2. The real path on disk is shown to the PERSON and not to the model,
+   *      which is the rule `mount.ts` already follows everywhere else: its
+   *      `realpath` answers with the virtual path, and `MountEscapeError`
+   *      keeps the host path out of its message, both so the folder's location
+   *      does not leak. A table that prints it is the same leak with a header.
+   *
+   * The model still sees the mount point, the access and when it was granted.
+   * That is everything it needs to use the folder and nothing it could not
+   * work out from `ls /mnt`.
    */
   const mount: ShellCommand = {
     name: 'mount',
@@ -762,19 +830,33 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
               ].join('\n'),
             );
           }
+          // The real path is the person's to see. See the block comment above
+          // `mount` for why the model is shown the mount point instead.
+          const showFolder = context.actor === 'user';
+          const mountedHere = new Set((context.mounts ?? []).map((entry) => entry.name));
           return ok(
             [
               table([
-                ['MOUNT', 'ACCESS', 'GRANTED', 'FOLDER'],
+                ['MOUNT', 'ACCESS', 'GRANTED', ...(showFolder ? ['FOLDER'] : [])],
                 ...store.list.map((row) => [
                   `/mnt/${row.name}`,
-                  row.writable ? 'read+write' : 'read-only',
+                  // What the shell can DO here, not what was granted somewhere
+                  // else: a grant this shell never resolved is reachable for
+                  // nothing, and calling it "read-only" would overstate it.
+                  mountedHere.has(row.name)
+                    ? row.writable
+                      ? 'read+write'
+                      : 'read-only'
+                    : 'not mounted here',
                   new Date(row.grantedAt).toISOString().slice(0, 16).replace('T', ' '),
-                  row.root,
+                  ...(showFolder ? [row.root] : []),
                 ]),
               ]),
               '',
               'Withdraw one with `mount rm <name>`. Grants end when the app closes.',
+              ...(showFolder
+                ? []
+                : ['Where each folder lives on disk is not shown here; ask the person.']),
             ].join('\n'),
           );
         }
