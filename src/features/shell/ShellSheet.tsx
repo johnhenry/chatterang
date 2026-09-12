@@ -6,6 +6,7 @@ import { hasFinePointer } from '@/lib/platform';
 import { commandFor } from '@/lib/keys';
 import { ChatterangShell, type ShellResult } from '@/shell';
 import { liveStores } from '@/shell/stores';
+import { mountHostPort, shellMounts, useMounts } from '@/shell/real-fs';
 
 /**
  * The shell, for the person holding the phone.
@@ -57,7 +58,22 @@ export function ShellSheet({ open, onClose }: { open: boolean; onClose: () => vo
       stores: liveStores(),
       actor: 'user',
       confirm: (action) => new Promise<boolean>((resolve) => setPending({ action, resolve })),
+      /*
+       * A GETTER, NOT THE ARRAY. `mount add` and `mount rm` are typed into
+       * this very shell, so the grants change while it is open; handing it a
+       * snapshot taken when the sheet first opened would leave a withdrawn
+       * folder mounted until the component remounted. The shell re-reads this
+       * before every command.
+       */
+      mounts: shellMounts,
+      realFs: mountHostPort,
     });
+
+    // What the host already holds, before the first prompt is drawn. A grant
+    // made in an earlier sheet is still in force — the host outlives this
+    // component — and a shell that showed no /mnt until something happened to
+    // refresh it would be lying about what it can reach.
+    void useMounts.getState().refresh();
 
     setBooting(true);
     void shell.current

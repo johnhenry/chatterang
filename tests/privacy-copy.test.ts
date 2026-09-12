@@ -116,9 +116,18 @@ interface McpRow {
 }
 
 /** The smallest `ShellStores` `privacy` can run against. */
+interface GrantRow {
+  id: string;
+  name: string;
+  root: string;
+  writable: boolean;
+  grantedAt: number;
+}
+
 function stores(overrides: {
   providers?: { id: string; label: string; enabled: boolean; defaultModel: string }[];
   mcp?: McpRow[];
+  mounts?: GrantRow[];
 }): ShellStores {
   const base: ShellStores = {
     models: () => ({
@@ -142,16 +151,49 @@ function stores(overrides: {
     benchmarks: () => [],
     runBenchmark: async () => undefined,
   };
-  return overrides.mcp ? { ...base, mcpServers: () => overrides.mcp! } : base;
+  const withMcp = overrides.mcp ? { ...base, mcpServers: () => overrides.mcp! } : base;
+  // Absent rather than empty when no grants are passed, so the default fixture
+  // exercises the path a caller that never wired `mounts` up takes.
+  return overrides.mounts
+    ? {
+        ...withMcp,
+        mounts: () => ({
+          list: overrides.mounts!,
+          canGrant: true,
+          grant: async () => null,
+          revoke: async () => false,
+        }),
+      }
+    : withMcp;
 }
 
-const context: ShellContext = { confirm: async () => true, actor: 'user' };
+/**
+ * `mounts` is what THIS shell resolved, and the fixture has to say so.
+ *
+ * `privacy` used to read the process-wide grant registry, which meant a shell
+ * with no filesystem wiring told a model that tool output includes a folder it
+ * cannot open. Making the context carry it is what forces every caller — this
+ * fixture included — to state which shell it is describing.
+ */
+function contextFor(
+  overrides: Parameters<typeof stores>[0] = {},
+  actor: 'user' | 'model' = 'user',
+): ShellContext {
+  return {
+    confirm: async () => true,
+    actor,
+    mounts: (overrides.mounts ?? []).map((row) => ({ name: row.name, writable: row.writable })),
+  };
+}
 
-async function privacyOutput(overrides: Parameters<typeof stores>[0] = {}): Promise<string> {
+async function privacyOutput(
+  overrides: Parameters<typeof stores>[0] = {},
+  actor: 'user' | 'model' = 'user',
+): Promise<string> {
   const command = chatterangCommands(stores(overrides)).find(
     (entry: ShellCommand) => entry.name === 'privacy',
   );
-  const result = await command!.run([], context);
+  const result = await command!.run([], contextFor(overrides, actor));
   return reads(result.stdout);
 }
 
@@ -188,6 +230,64 @@ describe('the privacy command', () => {
     expect(await privacyOutput({ providers: [] })).toContain(
       'no provider is enabled, so nothing you type is sent to one',
     );
+  });
+
+  /**
+   * #246 made a shipped sentence false, and these are what stop it shipping.
+   *
+   * The line said tool output is "what the tool read, which for `bash` is this
+   * app's own data — /chats, /models, /personas". A granted folder is read by
+   * the same tool and goes to the same model. The ungranted sentence is still
+   * exactly true, so it stays; the granted case is a different sentence that
+   * NAMES the folder, and the writable case is a third thing entirely — the
+   * first time anything in this app could change a file outside itself.
+   *
+   * Three tests rather than one, because the interesting failure is not "the
+   * new words are missing" but "the OLD words are still there in the new
+   * situation", and only a per-case assertion catches that.
+   */
+  it('says the shell reads only app data when no folder is granted', async () => {
+    const output = await privacyOutput({ providers: [] });
+    expect(output).toContain('which for `bash` is this app’s own data — /chats, /models, /personas');
+    expect(output).not.toContain('/mnt');
+    expect(output).not.toContain('Can be changed on this device');
+  });
+
+  it('names a granted folder, and drops the claim that it reads only app data', async () => {
+    const output = await privacyOutput({
+      providers: [],
+      mounts: [
+        { id: 'm1', name: 'notes', root: '/Users/me/notes', writable: false, grantedAt: 0 },
+      ],
+    });
+
+    // The folder is named twice on purpose: as the shell path the user will
+    // see in output, and as the real folder they chose.
+    expect(output).toContain('/mnt/notes');
+    expect(output).toContain('/Users/me/notes');
+    // THE HALF THAT MATTERS: the old, now-false sentence is gone.
+    expect(output).not.toContain('which for `bash` is this app’s own data');
+    // A READ grant changes what leaves, not what can be altered.
+    expect(output).not.toContain('Can be changed on this device');
+  });
+
+  it('says plainly that a writable grant can be changed, and names it', async () => {
+    const output = await privacyOutput({
+      providers: [],
+      mounts: [
+        { id: 'm1', name: 'notes', root: '/Users/me/notes', writable: false, grantedAt: 0 },
+        { id: 'm2', name: 'drafts', root: '/Users/me/drafts', writable: true, grantedAt: 0 },
+      ],
+    });
+
+    expect(output).toContain('Can be changed on this device');
+    expect(output).toContain('files in /Users/me/drafts');
+    // The read-only grant is NOT listed as changeable — the section would be
+    // reassuring in the wrong direction if it swept both in.
+    expect(reads(output.split('Can be changed on this device')[1]!)).not.toContain(
+      '/Users/me/notes',
+    );
+    expect(output).toContain('a model driving it — can create, edit and delete files there');
   });
 
   /**
@@ -769,5 +869,50 @@ describe('the backup claim in `privacy`', () => {
 
     expect(patchAppDelegate(patched)).toBe(patched);
     expect(() => patchAppDelegate('class AppDelegate {}')).toThrow(/AppDelegate/);
+  });
+});
+
+describe('privacy describes the shell it is running in, not the app’s grant registry', () => {
+  /**
+   * MEASURED ON THE BRANCH BEFORE THE FIX: a model running `bash` got
+   * `privacy` naming `/Users/…/Documents/Tax Returns` twice, unconfirmed, in a
+   * shell where `ls /mnt` exited 2. The app's honesty command was the leak,
+   * and it leaked a path this module goes out of its way to keep out of
+   * `realpath` and out of every error message.
+   */
+  const GRANT = {
+    id: 'm1',
+    name: 'notes',
+    root: '/Users/jane/Documents/Divorce',
+    writable: true,
+    grantedAt: 0,
+  };
+
+  it('says nothing about a folder this shell did not mount', async () => {
+    const command = chatterangCommands(stores({ providers: [], mounts: [GRANT] })).find(
+      (entry: ShellCommand) => entry.name === 'privacy',
+    );
+    // The registry has the grant; this shell resolved nothing.
+    const result = await command!.run([], { confirm: async () => true, actor: 'model', mounts: [] });
+    const output = reads(result.stdout);
+
+    expect(output).not.toContain('Divorce');
+    expect(output).not.toContain('/mnt/notes');
+    expect(output).not.toContain('Can be changed on this device');
+    // And it falls back to the sentence that IS true of such a shell.
+    expect(output).toContain('which for `bash` is this app’s own data');
+  });
+
+  it('names the mount point to a model and the real folder to a person', async () => {
+    const asModel = await privacyOutput({ providers: [], mounts: [GRANT] }, 'model');
+    expect(asModel).toContain('/mnt/notes');
+    expect(asModel).not.toContain('Divorce');
+    expect(asModel).not.toContain('/Users/jane');
+    // Still says the folder can be changed — that fact is about the bytes, not
+    // about where they live, and withholding it would be the other failure.
+    expect(asModel).toContain('Can be changed on this device');
+
+    const asUser = await privacyOutput({ providers: [], mounts: [GRANT] }, 'user');
+    expect(asUser).toContain('/Users/jane/Documents/Divorce');
   });
 });

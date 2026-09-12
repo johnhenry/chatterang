@@ -260,6 +260,50 @@ export const FILESYSTEM_PLUGIN: PluginDefinition = Object.freeze({
 });
 
 /**
+ * `MountHost` — a folder the person chose, and nothing else (#246).
+ *
+ * A SEPARATE PLUGIN FROM `Filesystem`, which looks like duplication and is
+ * not. `FILESYSTEM_PLUGIN` is Capacitor's interface, confined to roots this
+ * app owns, and ten of its fifteen methods exist only to refuse; widening it
+ * to reach a user's own directory would mean `readFile`/`readdir`/`stat`
+ * answering for TWO different confinements depending on the `directory`
+ * argument, in the one file whose whole argument is that there is no safe
+ * default root. It also has no `realpath`, which is the method a mount's
+ * containment has no substitute for.
+ *
+ * So: its own name, its own roots, its own consent. `pick` is the only way a
+ * root comes into existence here, and it opens the operating system's chooser
+ * — the renderer cannot name a directory, because the renderer is a web page
+ * driving a shell a model can drive.
+ *
+ * All ten methods are implemented; none refuses by name. The fall-through that
+ * makes an undeclared method reach the web shim does not apply, because
+ * `@capacitor/filesystem` is a package and this is not — an unlisted method on
+ * `MountHost` has no web implementation to fall through TO, and
+ * `src/plugins/mount-host/web.ts` answers "no mounts on this platform" for
+ * every one of them.
+ */
+export const MOUNT_METHODS = Object.freeze([
+  'pick',
+  'list',
+  'revoke',
+  'realpath',
+  'readFile',
+  'writeFile',
+  'readdir',
+  'stat',
+  'lstat',
+  'mkdir',
+  'rm',
+] as const);
+
+export const MOUNT_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'MountHost',
+  methods: MOUNT_METHODS,
+  events: Object.freeze([] as string[]),
+});
+
+/**
  * The DSH status plugin — the thing that gives milestone A4 a caller.
  *
  * A mount nobody can observe is indistinguishable from no mount, which is the

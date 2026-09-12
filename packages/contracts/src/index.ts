@@ -15,5 +15,6 @@
  */
 
 export type * from './llama-cpp.js';
+export type * from './mount-host.js';
 export type * from './onnx-runtime.js';
 export type * from './listener.js';
