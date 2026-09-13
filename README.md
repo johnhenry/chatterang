@@ -1,8 +1,9 @@
 # Chatterang
 
 An on-device AI super app. Language, vision, speech, and image models run on
-the phone; nothing leaves it unless you explicitly connect a remote provider,
-and when a reply does come from one, the app says so in the thread.
+the phone. What can leave it is listed under [Privacy](#privacy) below — every
+item something you turn on — and when a reply comes from anywhere but this
+device, the app says so in the thread.
 
 Built with Capacitor. The application layer is TypeScript; inference runs
 through native plugins wrapping llama.cpp and ONNX Runtime, and every engine —
@@ -101,16 +102,39 @@ same development shim the browser does, and says so.
 
 ## Privacy
 
-Three things leave the device, and only these:
+What can leave the device, each only when you turn it on:
 
-1. **Model downloads** from Hugging Face, when you ask for one.
+1. **Model search and downloads**, to Hugging Face — both what you type into
+   the search box and the files you fetch.
 2. **Messages to a remote provider**, if you connect one. Each provider states
    plainly what connecting it means, self-hosted endpoints are grouped
    separately from cloud ones, and every remote reply is marked in the thread.
-3. **Benchmark runs you publish**, if you turn that on. It is off by default,
+3. **Tool output, and anything derived from it**, when a tool runs in a chat a
+   remote model is serving — for `bash` that is this app's own data. The app
+   asks first and withholds it if you decline. "Derived" is meant literally: a
+   later tool call's arguments or its name, and a reply the model wrote while
+   the tool was running, all travel under the same grant.
+4. **The arguments of an MCP tool**, to the server that tool comes from, if you
+   connect one. Nothing is asked before they go — enabling the tool for a chat
+   is the whole of the consent today. ([#6](https://github.com/johnhenry/chatterang/issues/6)
+   is changing that to a grant and a receipt.)
+5. **Benchmark runs you publish**, if you turn that on. It is off by default,
    each run is confirmed individually, and the consent sheet shows the literal
    JSON — which contains no install id, device serial, account, or
    conversation content, and truncates the date to the day.
+
+This list is deliberately left open. It used to end by declaring itself
+complete, and that declaration was false when it was written: items 3 and 4
+leave the device today and were missing from it. Completeness is the one claim
+a privacy list cannot keep, because it stops being true the moment anything is
+added rather than when someone remembers to edit the file — which is why the
+in-app `privacy` command refuses to make it about its own list, and why
+`tests/privacy-copy.test.ts` now holds this file to the same rule and fails if
+a route is added without updating what is written here.
+
+**Run `privacy` in Settings › Shell for the version of this list that describes
+your actual configuration** — it names the providers and servers you have
+connected, and it is generated from the code rather than written alongside it.
 
 Conversations, personas, images, and settings are stored in IndexedDB and
 app-private files. Settings offers both "delete all conversations" and "erase
