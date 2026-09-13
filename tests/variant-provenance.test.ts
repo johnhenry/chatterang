@@ -121,6 +121,14 @@ interface Turn {
   readonly text: string;
   readonly provenance: Provenance;
   readonly tool?: ToolInvocation;
+  /**
+   * Stream the text as deltas and then FAIL, instead of finishing (#260).
+   *
+   * What a socket cut mid-reply looks like to the store. The engine now turns
+   * a stream with no terminal chunk into an error event, so this is the shape
+   * the store has to handle without throwing away what the user already read.
+   */
+  readonly failWith?: string;
 }
 
 /** Turns the fake engine hands back, in order. */
@@ -139,6 +147,13 @@ function scriptedEngine(): unknown {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
       if (turn.tool) yield { type: 'tool', tool: turn.tool };
+      if (turn.failWith !== undefined) {
+        // Deltas first, exactly as a real turn does, THEN the failure — so the
+        // row has streamed content at the moment the error arrives.
+        yield { type: 'delta', text: turn.text };
+        yield { type: 'error', message: turn.failWith };
+        return;
+      }
       yield {
         type: 'done',
         text: turn.text,
@@ -691,5 +706,50 @@ describe('the projection below the engine loses nothing (#259)', () => {
     script = [{ text: 'ANSWER', provenance: { ...FULL, warnings: [] } }];
     await useChats.getState().send('hello');
     expect(assistantRow().provenance?.warnings).toBeUndefined();
+  });
+});
+
+const FULL_FOR_FAILURE: Provenance = {
+  backendId: 'b',
+  engine: 'llama-cpp',
+  modelId: QWEN.id,
+  modelName: QWEN.name,
+  reach: REACH_DEVICE,
+};
+
+describe('a failed turn keeps what the user already saw (#260, #185)', () => {
+  it('leaves the streamed text on the row, with the error attached', async () => {
+    /*
+     * `src/state/chat.ts`'s error branch wrote `content: ''`, throwing away
+     * every character that had streamed. That was survivable while a truncated
+     * stream was silently accepted; #260 makes it an ERROR, so without this the
+     * ruling would trade a silent-truncation defect for a lost-text one —
+     * exactly what #185's Done asks not to happen.
+     *
+     * Note the `catch` block one level down ALREADY preserved the row. Only
+     * this branch wiped it, so the two disagreed about the same outcome.
+     */
+    script = [
+      {
+        text: 'half a repl',
+        provenance: FULL_FOR_FAILURE,
+        failWith: 'This reply ended before it was complete.',
+      },
+    ];
+    await useChats.getState().send('hello');
+
+    const row = assistantRow();
+    expect(row.content).toBe('half a repl');
+    expect(row.error).toContain('ended before it was complete');
+    expect(row.streaming).toBe(false);
+  });
+
+  it('a turn that finishes is unaffected — the paired control', async () => {
+    // Without this, the test above passes on a store that never clears
+    // anything, including on turns that genuinely produced nothing.
+    script = [{ text: 'a whole reply', provenance: FULL_FOR_FAILURE }];
+    await useChats.getState().send('hello');
+    expect(assistantRow().content).toBe('a whole reply');
+    expect(assistantRow().error).toBeUndefined();
   });
 });
