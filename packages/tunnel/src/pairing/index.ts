@@ -552,3 +552,6 @@ export function isMulticastDnsName(address: PairingAddress): boolean {
   for (const code of address.value) name += String.fromCharCode(code);
   return name.toLowerCase().endsWith('.local');
 }
+
+/* The single-use window (#129), re-exported so `/pairing` is one entry point. */
+export * from './window.js';

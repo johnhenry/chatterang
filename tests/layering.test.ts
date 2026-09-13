@@ -557,10 +557,35 @@ describe('the tunnel package', () => {
      * this guard is what stops someone paying it and then quietly reaching for
      * `btoa` in the next edit.
      */
+    /*
+     * "Nothing" means nothing FROM OUTSIDE THIS HALF. A `./`-relative import
+     * of a sibling file is the half being more than one file, which is not
+     * what this rule protects against — the danger is a dependency the phone
+     * did not ask for, or `../host`, which is `node:net` in the mobile bundle.
+     *
+     * So: `./x` is allowed, and ANY specifier containing `..` is not, which
+     * bans reaching into another half by relative path as well as reaching out
+     * of the package. Written as an allowlist so widening it is an edit here.
+     */
+    const sameHalf = (specifier: string) => specifier.startsWith('./') && !specifier.includes('..');
     const offenders = half('pairing').flatMap((file) =>
-      specifiersOf(file).map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+      specifiersOf(file)
+        .filter((specifier) => !sameHalf(specifier))
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
     );
     expect(offenders).toEqual([]);
+
+    // The ban has something behind it: a sibling import exists and is allowed,
+    // so this rule is not passing because the half happens to be one file.
+    expect(
+      half('pairing').flatMap(specifiersOf).filter(sameHalf).length,
+      'no sibling import exists, so the allowance above is untested',
+    ).toBeGreaterThan(0);
+
+    // And the thing it must still catch, asserted directly rather than assumed.
+    expect(sameHalf('../host/index.js')).toBe(false);
+    expect(sameHalf('@noble/curves/ed25519.js')).toBe(false);
+    expect(sameHalf('node:crypto')).toBe(false);
 
     const globals = ['btoa', 'atob', 'Buffer', 'TextEncoder', 'TextDecoder', 'crypto'];
     const reached = half('pairing').flatMap((file) => {
