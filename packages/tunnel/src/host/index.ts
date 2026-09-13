@@ -28,9 +28,10 @@
  * #157 and #158. It is not waiting on anybody.
  */
 
-import type { Server } from 'node:net';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
 
-import type { TunnelFrame } from '../wire/index.js';
+import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from '../wire/index.js';
 
 /**
  * The host end of a tunnel.
@@ -48,8 +49,20 @@ export interface TunnelHost {
   send(frame: TunnelFrame): Promise<void>;
   /** Frames from the peer, in arrival order, until the tunnel closes. */
   receive(): AsyncIterable<TunnelFrame>;
-  /** Stop listening and drop the connection. Idempotent. */
-  close(): Promise<void>;
+  /** Stop listening and drop the connection. Says `bye` first. Idempotent. */
+  close(reason?: string): Promise<void>;
+  /** How the tunnel ended, or null while it is open. */
+  ended(): TunnelClose | null;
+  /**
+   * Resolves once the tunnel has ended, however it ended.
+   *
+   * Exists because {@link ended} latches the FIRST classification and a caller
+   * has no other way to know the latch has seen everything it is going to see.
+   * A cut arrives as two events in quick succession — the decode failure, then
+   * the socket going away — and a caller that reads `ended()` between them
+   * gets the right answer for the wrong reason. Awaiting this reads it after.
+   */
+  readonly closed: Promise<void>;
 }
 
 /**
@@ -80,17 +93,201 @@ export interface TunnelHost {
  * QR byte that names which.
  */
 
+/** How a tunnel ended, which is the distinction `bye` exists to make. */
+export type TunnelClose =
+  /** The peer said `bye` first. */
+  | { readonly kind: 'clean'; readonly reason?: string }
+  /** The socket went away without one. A cut, or a peer that crashed. */
+  | { readonly kind: 'abnormal'; readonly code: string; readonly message: string };
+
+export interface TunnelHostOptions {
+  /**
+   * Loopback port. 0 asks the OS for a free one, which is what tests want.
+   *
+   * THERE IS NO HOST OPTION, and that is the boundary rather than an omission.
+   * Binding beyond loopback is what `TunnelBinding` exists to constrain, and
+   * `TunnelBinding` is not written — #135 and #158 settled its shape and
+   * #157/#158 own building it. Rung 0 (#156) is deliberately
+   * `ws://127.0.0.1`: it removes every variable that is not the protocol, so a
+   * stream that tears on loopback is the protocol's fault and nothing else's.
+   *
+   * A `host` parameter here would be the hole shaped exactly like the feature,
+   * added before the union that is supposed to constrain it.
+   */
+  readonly port?: number;
+  /** Frames this host will send on connect, before anything is received. */
+  readonly greeting?: readonly TunnelFrame[];
+}
+
 /**
- * The seam the listener will be built behind.
+ * A loopback listener, for rung 0 (#156).
  *
- * Throws today. See the file comment: the package's deliverable in #155 is the
- * boundary and the guard, not the transport — and the transport is now a
- * decided thing that has not been built, which is a different sentence from
- * the one this used to print.
+ * `ws@8.21.3` per #157's ruling — Node ships a WebSocket CLIENT and no server,
+ * and the hand-rolled handshake that works first try is exactly what makes
+ * hand-rolling tempting and exactly what makes it a few hundred lines of
+ * masking, extended length, fragmentation, ping/pong and close handling that a
+ * phone's implementation will exercise in ways a test by the same author will
+ * not.
+ *
+ * ONE IMPLEMENTATION, TWO CALLERS (#158): Electron and `apps/server` both
+ * start this. Nothing here knows which.
  */
-export function createTunnelHost(): never {
-  throw new Error(
-    'tunnel host is not implemented: the transport is a native socket plugin ' +
-      '(#181, ruled 2026-09-11) and the listener is #157/#158',
-  );
+export async function createTunnelHost(options: TunnelHostOptions = {}): Promise<TunnelHost> {
+  const { WebSocketServer } = await import('ws');
+  const server = createServer();
+  const sockets = new WebSocketServer({ server });
+
+  const inbox: TunnelFrame[] = [];
+  let wake: (() => void) | null = null;
+  let ended: TunnelClose | null = null;
+  let peer: import('ws').WebSocket | null = null;
+
+  let settle!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+
+  const push = (frame: TunnelFrame): void => {
+    inbox.push(frame);
+    wake?.();
+  };
+  /**
+   * Record how the tunnel ended. FIRST CALLER WINS, and that is the contract.
+   *
+   * A tear arrives as a burst: a decode failure and then a socket close, or a
+   * `bye` and then a socket close. The first of those is the one that says
+   * something — the second is the consequence — so `??=` is not defensiveness,
+   * it is the rule that a tunnel which ended for a reason keeps that reason.
+   * `tests/rung0.test.ts` pins it by awaiting `closed` and re-reading.
+   */
+  const finish = (close: TunnelClose): void => {
+    ended ??= close;
+    wake?.();
+    settle();
+  };
+
+  sockets.on('connection', (socket) => {
+    peer = socket;
+    for (const frame of options.greeting ?? []) socket.send(encodeFrame(frame));
+
+    socket.on('message', (data: Buffer) => {
+      let frame: TunnelFrame;
+      try {
+        frame = decodeFrame(new Uint8Array(data));
+      } catch (error) {
+        // A frame the codec refused. Reported with the peer's own vocabulary
+        // rather than thrown, so the caller sees one kind of thing.
+        finish({
+          kind: 'abnormal',
+          code: 'FRAME_INVALID',
+          message: error instanceof Error ? error.message : 'frame refused',
+        });
+        socket.close();
+        return;
+      }
+      if (frame.kind === 'bye') {
+        finish({ kind: 'clean', reason: frame.body?.reason });
+        return;
+      }
+      push(frame);
+    });
+
+    socket.on('close', () => {
+      /*
+       * THE `bye` OBLIGATION, AND WHY IT IS LOAD-BEARING (#260).
+       *
+       * `bye` exists "so the far side can tell it from a dropped link", which
+       * only holds if sending it is required. Without the obligation a clean
+       * end and a cut are the SAME EVENT — not merely an undefined outcome for
+       * #156's faults 3 and 4 but an untestable one, because the assertion has
+       * nothing to distinguish.
+       *
+       * A host that CRASHES cannot send it, so "no bye" means "cut or crashed"
+       * rather than "cut". That is the correct reading: both are the far side
+       * going away without saying so, and both owe the caller the same answer.
+       */
+      /*
+       * UNCONDITIONAL, because the latch above already holds every other
+       * answer. This used to test a `saidBye` flag, which read well and was
+       * DEAD CODE: a `bye` sets `ended` in the branch that receives it, and a
+       * deliberate close sets it before tearing down, so by the time this
+       * fires either the tunnel is already classified or nobody said anything.
+       * Mutation testing found it — flipping that branch changed no test —
+       * and a condition no input can reach is a claim the reader cannot trust.
+       */
+      finish({ kind: 'abnormal', code: 'PEER_GONE', message: 'the peer went away without a bye' });
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(options.port ?? 0, '127.0.0.1', resolve));
+
+  return {
+    server,
+    get close_(): TunnelClose | null {
+      return ended;
+    },
+    async send(frame) {
+      peer?.send(encodeFrame(frame));
+    },
+    async *receive() {
+      for (;;) {
+        while (inbox.length > 0) yield inbox.shift()!;
+        if (ended) return;
+        await new Promise<void>((resolve) => {
+          wake = () => {
+            wake = null;
+            resolve();
+          };
+        });
+      }
+    },
+    ended: () => ended,
+    closed,
+    async close(reason?: string) {
+      // The obligation, from this side: say `bye` before going (#260).
+      if (peer && peer.readyState === peer.OPEN) {
+        peer.send(
+          encodeFrame({ v: TUNNEL_WIRE_VERSION, kind: 'bye', ...(reason ? { body: { reason } } : {}) }),
+        );
+        /*
+         * A TURN OF THE LOOP SO THE FRAME ACTUALLY LEAVES. `send` queues; the
+         * socket is torn down on the next line. Without this the `bye` that
+         * the whole clean-vs-abnormal distinction rests on is written into a
+         * socket that closes before it flushes, and every deliberate close
+         * looks like a cut — the exact confusion #260's obligation removes.
+         */
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      /*
+       * `closeAllConnections()` BEFORE `server.close()`, and this is the bug
+       * that cost the first run of rung 0.
+       *
+       * `http.Server.close()` stops accepting and then WAITS for every open
+       * connection to end on its own. A connected tunnel never ends on its
+       * own, so the callback never fired and `close()` hung forever — which
+       * presented as all nine rung-0 tests timing out at once, i.e. as the
+       * transport not working rather than as teardown not completing.
+       *
+       * The earlier connect probe passed only because it closed the CLIENT
+       * first, leaving the server with nothing to wait for. A harness that
+       * tears down in the other order is the ordinary case, so this is the
+       * order that has to work.
+       */
+      /*
+       * CLASSIFIED BEFORE THE TEARDOWN, not after, and the order is the whole
+       * of it. `terminate()` fires this socket's own `close` handler, which
+       * latches PEER_GONE — so a host that shut itself down deliberately
+       * reported its own shutdown as a cut. Every rung-0 assertion reads the
+       * CLIENT's end, so nothing caught it; `ended() is clean after close()`
+       * now does.
+       */
+      finish({ kind: 'clean', reason });
+
+      sockets.clients.forEach((client) => client.terminate());
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => sockets.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  } as TunnelHost;
 }
