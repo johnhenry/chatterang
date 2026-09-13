@@ -11,12 +11,15 @@ import {
   beginExchange,
   calculateGenerator,
   channelIdentifier,
+  sessionIdentifier,
+  unboundChannelIdentifier,
   computeConfirmation,
   finish,
   generatorString,
   prependLen,
   secretPoint,
 } from '@chatterang/tunnel/pake';
+import { HOST_DESKTOP, HOST_SERVER } from '@chatterang/tunnel/pairing';
 
 /**
  * CPace (#130), against draft-irtf-cfrg-cpace-21's own test vectors.
@@ -173,7 +176,7 @@ describe('the identity abort, which the library does not make for us', () => {
 });
 
 describe('key confirmation, which CPace does not mandate', () => {
-  const ci = channelIdentifier({ initiator: 'phone', responder: 'desktop' });
+  const ci = unboundChannelIdentifier({ initiator: 'phone', responder: 'desktop' });
   const sid = unhex('7e4b4791d6a8ef019b936c79fb7f2c57');
   const scalarA = unhex(VECTORS.exchange['ya']!);
   const scalarB = unhex(VECTORS.exchange['yb']!);
@@ -218,8 +221,8 @@ describe('channel binding — #256, and what it is for', () => {
 
   const exchange = (spkiA: Uint8Array, spkiB: Uint8Array) => {
     const code = '418329';
-    const a = beginExchange({ role: 'initiator', code, ci: channelIdentifier({ initiator: 'phone', responder: 'desktop', spki: spkiA }), sid, scalar: scalarA });
-    const b = beginExchange({ role: 'responder', code, ci: channelIdentifier({ initiator: 'phone', responder: 'desktop', spki: spkiB }), sid, scalar: scalarB });
+    const a = beginExchange({ role: 'initiator', code, ci: channelIdentifier({ initiator: 'phone', responder: 'desktop', hostKind: HOST_DESKTOP, spki: spkiA }), sid, scalar: scalarA });
+    const b = beginExchange({ role: 'responder', code, ci: channelIdentifier({ initiator: 'phone', responder: 'desktop', hostKind: HOST_DESKTOP, spki: spkiB }), sid, scalar: scalarB });
     return { ca: computeConfirmation(a.pending, b.message), cb: computeConfirmation(b.pending, a.message) };
   };
 
@@ -242,16 +245,103 @@ describe('channel binding — #256, and what it is for', () => {
     expect(hex(finish(ca, cb.tag))).toBe(hex(finish(cb, ca.tag)));
   });
 
+  it('a desktop and a headless server are not substitutable', () => {
+    /*
+     * #256 asks whether `hostKind` belongs in CI. It does: a desktop and a
+     * headless server are different trust propositions — #249 argues the
+     * server end at length — and binding the byte means one cannot be
+     * substituted for the other even by someone holding the right certificate.
+     */
+    const code = '418329';
+    const one = (hostKind: number) =>
+      beginExchange({
+        role: 'initiator', code, sid, scalar: scalarA,
+        ci: channelIdentifier({ initiator: 'phone', responder: 'host', hostKind, spki: SPKI_REAL }),
+      });
+    const other = (hostKind: number) =>
+      beginExchange({
+        role: 'responder', code, sid, scalar: scalarB,
+        ci: channelIdentifier({ initiator: 'phone', responder: 'host', hostKind, spki: SPKI_REAL }),
+      });
+
+    const a = one(HOST_DESKTOP);
+    const b = other(HOST_SERVER);
+    const ca = computeConfirmation(a.pending, b.message);
+    const cb = computeConfirmation(b.pending, a.message);
+    expect(() => finish(ca, cb.tag)).toThrow(PakeError);
+
+    // Paired control: the same byte on both sides still agrees.
+    const a2 = one(HOST_DESKTOP);
+    const b2 = other(HOST_DESKTOP);
+    const ca2 = computeConfirmation(a2.pending, b2.message);
+    const cb2 = computeConfirmation(b2.pending, a2.message);
+    expect(hex(finish(ca2, cb2.tag))).toBe(hex(finish(cb2, ca2.tag)));
+  });
+
+  it('refuses an SPKI that is not 32 bytes rather than binding a short one', () => {
+    // A truncated fingerprint would still "work" — both sides would agree —
+    // while binding less than was measured. Length is part of the claim.
+    for (const n of [0, 16, 31, 33, 64]) {
+      expect(() =>
+        channelIdentifier({ initiator: 'a', responder: 'b', hostKind: HOST_DESKTOP, spki: new Uint8Array(n) }),
+      ).toThrow(PakeError);
+    }
+    expect(() =>
+      channelIdentifier({ initiator: 'a', responder: 'b', hostKind: HOST_DESKTOP, spki: new Uint8Array(32) }),
+    ).not.toThrow();
+  });
+
+  it('refuses a hostKind that is not one byte', () => {
+    for (const k of [0, -1, 256, 1.5, Number.NaN]) {
+      expect(() =>
+        channelIdentifier({ initiator: 'a', responder: 'b', hostKind: k, spki: new Uint8Array(32) }),
+      ).toThrow(PakeError);
+    }
+  });
+
   it('an unbound exchange and a bound one are different exchanges', () => {
     // If omitting the SPKI produced the same key as including it, the binding
     // would be decoration. This is what makes #256's wiring load-bearing.
     const bound = exchange(SPKI_REAL, SPKI_REAL);
     const code = '418329';
-    const ci = channelIdentifier({ initiator: 'phone', responder: 'desktop' });
+    const ci = unboundChannelIdentifier({ initiator: 'phone', responder: 'desktop' });
     const a = beginExchange({ role: 'initiator', code, ci, sid, scalar: scalarA });
     const b = beginExchange({ role: 'responder', code, ci, sid, scalar: scalarB });
     const unbound = { ca: computeConfirmation(a.pending, b.message), cb: computeConfirmation(b.pending, a.message) };
     expect(hex(finish(bound.ca, bound.cb.tag))).not.toBe(hex(finish(unbound.ca, unbound.cb.tag)));
+  });
+});
+
+describe('sid comes from both parties — §10.9, and #130 repeats it', () => {
+  it('cannot be built from one side alone', () => {
+    /*
+     * An issuer-chosen `sid` lets one side replay a transcript at the other.
+     * The draft's answer is that each side contributes an ephemeral string,
+     * and taking TWO arguments is how that stops being advice: there is no
+     * call that builds a sid from one party's bytes.
+     */
+    expect(() => sessionIdentifier({ initiatorNonce: new Uint8Array(0), responderNonce: new Uint8Array(16) })).toThrow(PakeError);
+    expect(() => sessionIdentifier({ initiatorNonce: new Uint8Array(16), responderNonce: new Uint8Array(0) })).toThrow(PakeError);
+  });
+
+  it('is order-fixed by role, so both sides compute the same bytes', () => {
+    const a = Uint8Array.of(1, 2, 3);
+    const b = Uint8Array.of(9, 9);
+    expect(hex(sessionIdentifier({ initiatorNonce: a, responderNonce: b }))).toBe(
+      hex(sessionIdentifier({ initiatorNonce: a, responderNonce: b })),
+    );
+    // And swapping the roles is a DIFFERENT sid, which is what makes the
+    // ordering a commitment rather than a formatting detail.
+    expect(hex(sessionIdentifier({ initiatorNonce: a, responderNonce: b }))).not.toBe(
+      hex(sessionIdentifier({ initiatorNonce: b, responderNonce: a })),
+    );
+  });
+
+  it('separates fields, so two contributions cannot be slid past each other', () => {
+    // Without length prefixes, (ab, c) and (a, bc) would be one sid.
+    const one = sessionIdentifier({ initiatorNonce: Uint8Array.of(1, 2), responderNonce: Uint8Array.of(3) });
+    const two = sessionIdentifier({ initiatorNonce: Uint8Array.of(1), responderNonce: Uint8Array.of(2, 3) });
+    expect(hex(one)).not.toBe(hex(two));
   });
 });
 
@@ -280,16 +370,50 @@ describe('the API shape is the security property', () => {
       'generatorString',
       'prependLen',
       'secretPoint',
+      'sessionIdentifier',
+      'unboundChannelIdentifier',
     ]);
     // Of those, the ones that touch secrets return a point or a tag, never a key.
-    const ci = channelIdentifier({ initiator: 'a', responder: 'b' });
+    const ci = unboundChannelIdentifier({ initiator: 'a', responder: 'b' });
     const sid = new Uint8Array(16);
     const a = beginExchange({ role: 'initiator', code: 'x', ci, sid, scalar: unhex(VECTORS.exchange['ya']!) });
     expect(Object.keys(a.pending).sort()).toEqual(['ad', 'message', 'role', 'scalar', 'sid']);
   });
 
+  it('no production module builds an UNBOUND channel identifier', async () => {
+    /*
+     * `unboundChannelIdentifier` exists so the draft's two-field vectors can be
+     * reproduced, and for nothing else. An unbound exchange is precisely the
+     * weakness #256 was filed about, so the name is explicit AND the ban is
+     * asserted — #259 and wsh #35/#39/#40 are all the same shape: a guard
+     * whose violation nothing detects.
+     */
+    const { readFileSync, readdirSync, statSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const walk = (dir: string): string[] =>
+      readdirSync(dir).flatMap((entry) => {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) return entry === 'node_modules' ? [] : walk(full);
+        return full.endsWith('.ts') || full.endsWith('.tsx') ? [full] : [];
+      });
+    const DEFINES_IT = 'packages/tunnel/src/pake/index.ts';
+    const sources = [...walk('src'), ...walk('packages'), ...walk('apps')].filter(
+      (file) => file !== DEFINES_IT,
+    );
+    const offenders = sources.filter((file) =>
+      readFileSync(file, 'utf8').includes('unboundChannelIdentifier'),
+    );
+    expect(offenders).toEqual([]);
+    // The exclusion is the DEFINITION, so prove it is still there — otherwise
+    // renaming the function would make this test pass by finding nothing.
+    expect(readFileSync(DEFINES_IT, 'utf8')).toContain('export function unboundChannelIdentifier');
+    // And the name really is exported, so this is not vacuous.
+    const mod = await import('@chatterang/tunnel/pake');
+    expect(typeof mod.unboundChannelIdentifier).toBe('function');
+  });
+
   it('rejects a scalar that is not 32 bytes rather than padding it', () => {
-    const ci = channelIdentifier({ initiator: 'a', responder: 'b' });
+    const ci = unboundChannelIdentifier({ initiator: 'a', responder: 'b' });
     for (const n of [0, 16, 31, 33]) {
       expect(() =>
         beginExchange({ role: 'initiator', code: 'x', ci, sid: new Uint8Array(16), scalar: new Uint8Array(n) }),
@@ -306,7 +430,7 @@ describe('the API shape is the security property', () => {
 });
 
 describe('the two properties a mutation survived, and what each is worth', () => {
-  const ci = channelIdentifier({ initiator: 'phone', responder: 'desktop' });
+  const ci = unboundChannelIdentifier({ initiator: 'phone', responder: 'desktop' });
   const sid = unhex('7e4b4791d6a8ef019b936c79fb7f2c57');
   const pair = () => {
     const a = beginExchange({ role: 'initiator', code: '418329', ci, sid, scalar: unhex(VECTORS.exchange['ya']!) });

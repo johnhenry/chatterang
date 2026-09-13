@@ -718,7 +718,12 @@ describe('the tunnel package', () => {
     // streams a reply back when the desktop asks it for a turn, so a rule that
     // lived only in the host would be enforced in one direction. It imports a
     // type and `../wire`, which the ban above checks.
+    // `./binding` joins it for #256: it is the ONE channel binding both pairing
+    // routes use, and it is its own half because it is the only place needing
+    // both `pairing/` (which may import nothing) and `pake/` (which may import
+    // noble and nothing else). Putting it in either would break that half's rule.
     expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([
+      './binding',
       './client',
       './codec',
       './host',

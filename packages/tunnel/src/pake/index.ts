@@ -94,7 +94,13 @@ export type PakeErrorReason =
   | 'bad-peer-message'
   /** Key confirmation failed: wrong code, or a peer that is not who we reached. */
   | 'confirmation-failed'
-  | 'bad-scalar-length';
+  | 'bad-scalar-length'
+  /** The SPKI fingerprint was not 32 bytes, so the binding would be wrong. */
+  | 'bad-spki-length'
+  /** `hostKind` was not a single byte — a desktop and a server must differ. */
+  | 'bad-host-kind'
+  /** One side contributed nothing to `sid`, which §10.9 forbids. */
+  | 'one-sided-sid';
 
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 
@@ -194,6 +200,9 @@ export function secretPoint(scalar: Uint8Array, peerEncoded: Uint8Array): Uint8A
   return k.toBytes();
 }
 
+/** A 32-byte SHA-256 SPKI fingerprint — the same 32 bytes #134's payload carries. */
+export const SPKI_BYTES = 32;
+
 /**
  * The channel identifier, and the answer to #256.
  *
@@ -205,20 +214,83 @@ export function secretPoint(scalar: Uint8Array, peerEncoded: Uint8Array): Uint8A
  * confirmation fails. The attacker learns nothing about the code from that
  * failure, which is the property the PAKE contributes and a rate limit cannot.
  *
- * `spki` is optional ONLY so the draft's test vectors — which predate this
- * application and use a bare two-field CI — can be reproduced. Production
- * callers pass it. When they do not, the exchange is unbound, which is #256's
- * whole subject.
+ * ## `spki` IS REQUIRED, AND THAT IS THE CHANGE
+ *
+ * It used to be optional, "so the draft's test vectors can be reproduced".
+ * That is a real need and it was met the wrong way: an optional field that the
+ * entire security property depends on is a field a caller omits by accident,
+ * and the exchange then succeeds — unbound, silently, with both sides agreeing
+ * on a key. #256 exists because the typed route has no binding; a binding that
+ * a caller can forget to pass reproduces that defect inside the fix.
+ *
+ * The vectors are served by {@link unboundChannelIdentifier} instead, which
+ * names what it is. Same reasoning as the `done.message` obligation in #260:
+ * a requirement that is only a comment is not a requirement.
+ *
+ * ## What goes in, and what deliberately does not
+ *
+ * `hostKind` is in, per #256's question about it: a desktop and a headless
+ * server are different trust propositions (#249 argues the server end at
+ * length), and binding it means one cannot be substituted for the other even
+ * if an attacker somehow held the right certificate.
+ *
+ * The HOST AND PORT are deliberately OUT. They look like free extra binding
+ * and they are not: the same legitimate desktop is reachable as a LAN address,
+ * as an mDNS name (#222) and over a relay, so binding them breaks pairing
+ * whenever the route changes while adding nothing — the SPKI already names the
+ * endpoint cryptographically, which an address does not. Written down so it is
+ * not re-proposed as an obvious improvement.
  */
 export function channelIdentifier(parts: {
   readonly initiator: Uint8Array | string;
   readonly responder: Uint8Array | string;
-  readonly spki?: Uint8Array;
+  readonly hostKind: number;
+  readonly spki: Uint8Array;
+}): Uint8Array {
+  if (parts.spki.length !== SPKI_BYTES) throw new PakeError('bad-spki-length');
+  if (!Number.isInteger(parts.hostKind) || parts.hostKind < 1 || parts.hostKind > 255) {
+    throw new PakeError('bad-host-kind');
+  }
+  const as = (v: Uint8Array | string) => (typeof v === 'string' ? text(v) : v);
+  return lvCat(as(parts.initiator), as(parts.responder), Uint8Array.of(parts.hostKind), parts.spki);
+}
+
+/**
+ * The draft's own two-field `CI`, for reproducing its test vectors.
+ *
+ * Named so that reading a call site tells you the exchange is UNBOUND. Nothing
+ * in the app may call this: an unbound exchange is exactly the weakness #256
+ * was filed about, and `tests/tunnel-pake.test.ts` asserts no production
+ * module calls it.
+ */
+export function unboundChannelIdentifier(parts: {
+  readonly initiator: Uint8Array | string;
+  readonly responder: Uint8Array | string;
 }): Uint8Array {
   const as = (v: Uint8Array | string) => (typeof v === 'string' ? text(v) : v);
-  const fields = [as(parts.initiator), as(parts.responder)];
-  if (parts.spki !== undefined) fields.push(parts.spki);
-  return lvCat(...fields);
+  return lvCat(as(parts.initiator), as(parts.responder));
+}
+
+/**
+ * `sid` from BOTH parties, which draft §10.9 requires and #130's ruling repeats.
+ *
+ * An issuer-chosen `sid` lets one side replay a transcript at the other, so
+ * the draft suggests each side contribute an ephemeral random string. Taking
+ * two arguments is how that stops being advice: there is no way to build a
+ * `sid` here from one party's bytes alone, so the requirement is the type
+ * rather than a sentence someone has to have read.
+ *
+ * Order is fixed by ROLE, not by arrival, so both sides compute the same bytes
+ * without negotiating who went first.
+ */
+export function sessionIdentifier(parts: {
+  readonly initiatorNonce: Uint8Array;
+  readonly responderNonce: Uint8Array;
+}): Uint8Array {
+  if (parts.initiatorNonce.length === 0 || parts.responderNonce.length === 0) {
+    throw new PakeError('one-sided-sid');
+  }
+  return lvCat(parts.initiatorNonce, parts.responderNonce);
 }
 
 /** draft-21 §5.4 `transcript_ir` — ordered, for initiator/responder mode. */
