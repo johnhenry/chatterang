@@ -618,3 +618,78 @@ describe('editing a turn that has generations', () => {
     expect(row.variants).toBeUndefined();
   });
 });
+
+describe('the projection below the engine loses nothing (#259)', () => {
+  /**
+   * THE ROOT CAUSE, AND THE RIGHT HOME FOR IT.
+   *
+   * `src/state/chat.ts`'s `done` handler builds `Provenance` field by field.
+   * That is a projection a human maintains, and it silently drops whatever the
+   * snapshot gains — `warnings` was the second field it dropped, and the loss
+   * was invisible because an absent field looks exactly like a field that is
+   * legitimately absent.
+   *
+   * The first version of this guard compared two hand-written samples and was
+   * DECORATION: deleting the copy in the store left it green. Caught by
+   * mutation, which is the only reason it is not still here. So this drives the
+   * real store through the real `done` path and derives what was projected from
+   * what actually came out.
+   */
+  const FULL: Provenance = {
+    backendId: 'backend-x',
+    engine: 'llama-cpp',
+    modelId: QWEN.id,
+    modelName: QWEN.name,
+    reach: REACH_DEVICE,
+    fallbackFrom: 'other-backend',
+    fallbackReason: 'thermal',
+    toolEgress: 'granted',
+    warnings: [
+      {
+        category: 'transport-degraded',
+        severity: 'warning',
+        message: 'This reply arrived incomplete: 15 characters did not reach this device.',
+        source: 'stream',
+      },
+    ],
+  };
+
+  it('carries a warning from the engine all the way onto the stored row', async () => {
+    script = [{ text: 'ANSWER', provenance: FULL }];
+    await useChats.getState().send('hello');
+
+    const stored = assistantRow().provenance;
+    expect(stored?.warnings).toHaveLength(1);
+    expect(stored?.warnings?.[0]?.message).toContain('did not reach this device');
+    expect(stored?.warnings?.[0]?.category).toBe('transport-degraded');
+  });
+
+  it('projects EVERY field the snapshot carried, or transforms it under a known name', async () => {
+    /*
+     * The total check, DERIVED rather than declared against a twin I also
+     * wrote. `snapshotOf` strips `reach` and adds `local`, so every remaining
+     * snapshot key must appear on the stored record, and `local` must have
+     * become `reach`. A field added to the snapshot and not projected fails
+     * here — which is the failure mode that let `warnings` go missing.
+     */
+    script = [{ text: 'ANSWER', provenance: FULL }];
+    await useChats.getState().send('hello');
+
+    const snapshot = snapshotOf(FULL);
+    const stored = assistantRow().provenance as unknown as Record<string, unknown>;
+
+    const missing = Object.keys(snapshot)
+      .filter((key) => key !== 'local')
+      .filter((key) => stored[key] === undefined);
+    expect(missing, 'snapshot fields the store did not project').toEqual([]);
+
+    expect(stored['local']).toBeUndefined();
+    expect(stored['reach']).toBeDefined();
+  });
+
+  it('does not store an empty warnings array', async () => {
+    script = [{ text: 'ANSWER', provenance: { ...FULL, warnings: [] } }];
+    await useChats.getState().send('hello');
+    expect(assistantRow().provenance?.warnings).toBeUndefined();
+  });
+});

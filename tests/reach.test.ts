@@ -286,7 +286,7 @@ const v6 = versions.find((version) => version._cfg?.version === 6)?._cfg?.conten
 const v7 = versions.find((version) => version._cfg?.version === 7)?._cfg?.contentUpgrade;
 
 describe('the versions these migrations claim', () => {
-  it('are 6 and 7, each declared once, in order, with 7 the highest', () => {
+  it('are 6, 7 and 8, each declared once, in order, with 8 the highest', () => {
     /*
      * Two `.version(n)` calls sharing an n is worse than the bug being fixed:
      * Dexie keeps the last and the other migration silently never runs.
@@ -295,13 +295,19 @@ describe('the versions these migrations claim', () => {
      * durable queue) BOTH describe themselves as version 7 in their own
      * bodies, written before either was built. This assertion is what stops
      * the second one to land from erasing the first.
+     *
+     * IT ALREADY WORKED ONCE: #259's v8 landed while this said 7, and the
+     * suite failed rather than the number being collided into. Updating the
+     * bound is the intended cost of adding a version — a guard that had to be
+     * edited is a guard that was read.
      */
     const declared = versions.map((version) => Number(version._cfg?.version));
 
     expect(declared).toContain(6);
     expect(declared).toContain(7);
+    expect(declared).toContain(8);
     expect(new Set(declared).size).toBe(declared.length);
-    expect(Math.max(...declared)).toBe(7);
+    expect(Math.max(...declared)).toBe(8);
     expect([...declared]).toEqual([...declared].sort((a, b) => a - b));
   });
 

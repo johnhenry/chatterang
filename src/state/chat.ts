@@ -621,6 +621,26 @@ async function runGeneration(
               fallbackFrom: event.provenance.fallbackFrom,
               fallbackReason: event.provenance.fallbackReason,
               toolEgress: event.provenance.toolEgress,
+              /*
+               * #259. The engine has produced these since #149 and this
+               * projection had no line for them, so #148's stream checksum,
+               * #149's fallback warning and #142's codec redactions all
+               * computed sentences that stopped here.
+               *
+               * AN EXPLICIT PROPERTY, NOT A CONDITIONAL SPREAD. The spread
+               * form reads better and is type-unsafe: TypeScript does not
+               * apply excess-property checking through a spread, so deleting
+               * `warnings` from `Provenance` left this compiling while the
+               * data still flowed — a type that says the field does not exist
+               * over data that has it. Measured: with the spread, removing the
+               * field produced zero errors. Written this way it is one.
+               *
+               * `undefined` rather than an empty array, so a renderer never
+               * has to tell `[]` from absent.
+               */
+              warnings: event.provenance.warnings?.length
+                ? event.provenance.warnings
+                : undefined,
             },
             stats: event.stats,
           };

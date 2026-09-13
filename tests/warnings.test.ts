@@ -156,3 +156,4 @@ describe('stream integrity', () => {
     ).toBeNull();
   });
 });
+

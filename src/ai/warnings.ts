@@ -24,25 +24,22 @@
  * what a user is ever shown.
  */
 
-import type { IRWarning, WarningCategory } from '@johnhenry/aimatey-types';
+import type { IRWarning } from '@johnhenry/aimatey-types';
 
 import type { FallbackReason } from '@/ai/middleware/resilience';
 import { describeFallback } from '@/ai/middleware/resilience';
+import type { TurnWarning } from '@/domain/chat';
 
-/**
- * What this app stores and shows when a turn did not go cleanly.
- *
- * Deliberately small. A warning is read by a person, so it carries the
- * sentence, the machine-readable category behind it, and where it came from.
+/*
+ * `TurnWarning` MOVED TO `domain/` IN #259, and re-exported here so every
+ * existing import keeps working. The move is the fix, not housekeeping:
+ * `Provenance` has to carry these to persist them, `Provenance` lives in
+ * `domain/`, and `tests/layering.test.ts` forbids `domain/` importing `@/ai`.
+ * While the type lived here there was no legal way for a persisted record to
+ * hold one — the warnings channel could not reach the database because of
+ * where its type was declared.
  */
-export interface TurnWarning {
-  readonly category: WarningCategory;
-  readonly severity: 'info' | 'warning' | 'error';
-  /** Written for the user, not for a log. */
-  readonly message: string;
-  /** Backend or component that produced the condition, when known. */
-  readonly source?: string;
-}
+export type { TurnWarning };
 
 /** Narrow an upstream `IRWarning` to the projection this app persists. */
 export function projectWarning(warning: IRWarning): TurnWarning {

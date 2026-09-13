@@ -7,6 +7,8 @@
  * lets a single thread honestly mix local and remote turns (PRD §3.5).
  */
 
+import type { WarningCategory } from '@johnhenry/aimatey-types';
+
 import type { EngineId, SamplerSettings } from './manifest';
 
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
@@ -183,6 +185,35 @@ export function reachPaired(device: PairedDevice): Reach {
   };
 }
 
+/**
+ * What this app stores and shows when a turn did not go cleanly (#149).
+ *
+ * MOVED HERE FROM `ai/warnings.ts` BY #259, and the move is the fix rather
+ * than tidying. `Provenance` has to carry these to persist them, `Provenance`
+ * lives in `domain/`, and `tests/layering.test.ts` forbids `domain/` importing
+ * `@/ai` — so while this type lived under `ai/` there was no legal way for a
+ * persisted record to hold one. The warnings channel could not reach the
+ * database because of where its type was declared.
+ *
+ * It was always the persisted shape. `ai/warnings.ts` argues it at length:
+ * `IRWarning` is defined upstream in `@johnhenry/aimatey-types`, and
+ * persisting it verbatim would put a shape this repo does not own into the
+ * database where an upstream change becomes a migration. This is the
+ * projection that is ours — so `domain/`, with the other persisted shapes, is
+ * where it belonged all along.
+ *
+ * Deliberately small. A warning is read by a person, so it carries the
+ * sentence, the machine-readable category behind it, and where it came from.
+ */
+export interface TurnWarning {
+  readonly category: WarningCategory;
+  readonly severity: 'info' | 'warning' | 'error';
+  /** Written for the user, not for a log. */
+  readonly message: string;
+  /** Backend or component that produced the condition, when known. */
+  readonly source?: string;
+}
+
 /** Where a message was produced. Drives the local/remote colour split. */
 export interface Provenance {
   /** aimatey backend-adapter id that served the request. */
@@ -207,6 +238,21 @@ export interface Provenance {
    * which it was.
    */
   readonly toolEgress?: 'granted' | 'withheld';
+  /**
+   * Sentences about how this turn went wrong, when it did (#149, #259).
+   *
+   * THE FIELD #259 EXISTS TO ADD. The engine has produced these since #149 and
+   * nothing below it read them: `src/state/chat.ts` builds this record field by
+   * field and there was no field to build. So #148's stream checksum, #149's
+   * fallback warning and #142's codec redactions all computed sentences that
+   * terminated at `ProvenanceSnapshot` — a channel with a writer that runs and
+   * no reader, which is the exact defect #149 was filed to fix, one layer up.
+   *
+   * Optional and omitted rather than empty: a renderer that shows a warnings
+   * chip should not have to distinguish `[]` from absent, and every row written
+   * before v8 has neither.
+   */
+  readonly warnings?: readonly TurnWarning[];
 }
 
 /* ── Reading a reach ────────────────────────────────────────────────── */
