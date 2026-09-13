@@ -958,6 +958,29 @@ export class ChatterangEngine {
       backend: target.backendId,
     }) as AsyncGenerator<IRStreamChunk>;
 
+    /*
+     * #260: a stream that ends without a terminal chunk FAILS the turn.
+     *
+     * It used to be accepted silently — the loop ended, the function returned
+     * `{ text, stats }`, and the engine emitted an ordinary `done`. So a
+     * socket cut between the last content chunk and `done` was
+     * indistinguishable from a reply that finished, which is #185.
+     *
+     * The repo answered this two ways before the ruling:
+     * `packages/cordis-aimatey/src/chunks.ts:298` throws `EMPTY_RESPONSE` for
+     * exactly this case, and this loop did not. The IR settles it — a consumer
+     * that receives a stream that is not the stream that was sent "should fail
+     * the turn rather than render it".
+     *
+     * UNIFORM DISPOSITION, TUNNEL-ONLY DETECTOR, which is deliberate and looks
+     * inconsistent until you say it out loud: failing is the answer everywhere,
+     * while `sequence` contiguity is only checked on streams that crossed a
+     * wire. An async generator cannot drop its own yields, so enforcing
+     * contiguity in-process would be paying for a check on a path where the
+     * fault cannot occur.
+     */
+    let sawTerminal = false;
+
     for await (const chunk of stream) {
       switch (chunk.type) {
         case 'content':
@@ -987,6 +1010,7 @@ export class ChatterangEngine {
           if (mismatch) {
             this.#responseWarnings = mergeWarnings(this.#responseWarnings, [mismatch]);
           }
+          sawTerminal = true;
           break;
         }
 
@@ -996,6 +1020,21 @@ export class ChatterangEngine {
         default:
           break;
       }
+    }
+
+    if (!sawTerminal) {
+      /*
+       * The stream ran out with no `done` and no `error`. Per #260 that is a
+       * failed turn, not a short one — and the message is written for the
+       * person rather than for a log, because the store now keeps whatever
+       * arrived and shows this beside it.
+       */
+      return {
+        text,
+        stats,
+        error: 'This reply ended before it was complete — the connection stopped part-way.',
+        errorCode: 'EMPTY_RESPONSE',
+      };
     }
 
     return { text, stats };

@@ -666,9 +666,22 @@ async function runGeneration(
         }
 
         case 'error': {
+          /*
+           * WHATEVER THE USER ALREADY SAW STAYS VISIBLE, with the failure
+           * attached. This wrote `content: ''`, which threw away every
+           * character that had streamed — and #260's ruling makes a
+           * truncated stream an ERROR, so without this the ruling would trade
+           * a silent-truncation defect for a lost-text one. #185's Done asks
+           * for exactly the opposite.
+           *
+           * The `catch` below already preserved the row; only this branch
+           * wiped it. They agree now.
+           */
+          const partial = splitThinking(raw);
           const failed: Message = {
             ...placeholder,
-            content: '',
+            content: partial.content.trim(),
+            thinking: partial.thinking || undefined,
             streaming: false,
             error: event.message,
           };

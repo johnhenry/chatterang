@@ -1005,3 +1005,85 @@ describe('ChatterangEngine.stream', () => {
     });
   });
 });
+
+/**
+ * A backend whose stream simply stops — no `done`, no `error` (#260).
+ *
+ * What a socket cut between the last content chunk and the terminal chunk
+ * looks like from this side. Before #260's ruling this was accepted silently:
+ * the loop ended, `#runTurn` returned normally, and the engine emitted an
+ * ordinary `done` event — so a truncated reply was indistinguishable from a
+ * finished one, which is #185.
+ */
+function truncatedBackend(text: string): BackendAdapter {
+  return new FunctionBackendAdapter({
+    execute: async (request) => ({
+      message: { role: 'assistant', content: text },
+      finishReason: 'stop',
+      metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
+    }),
+    executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+      yield { type: 'start', sequence: 0, metadata: request.metadata };
+      yield { type: 'content', sequence: 1, delta: text };
+      // and then nothing. No done. No error. The generator just ends.
+    },
+  });
+}
+
+describe('a stream that ends without a terminal chunk fails the turn (#260)', () => {
+  const target = targetFor('llama-cpp', manifest.id, manifest.name, 'truncating');
+
+  /** An engine whose only backend stops mid-stream. */
+  function truncating(text: string): ChatterangEngine {
+    const built = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    built.router.register('truncating', truncatedBackend(text));
+    return built;
+  }
+
+  it('reports an error rather than a finished reply', async () => {
+    /*
+     * The ruling, and the contradiction it closes:
+     * `packages/cordis-aimatey/src/chunks.ts:298` already threw
+     * `EMPTY_RESPONSE` for exactly this, while this loop returned normally.
+     * One repo, one fault, two answers.
+     */
+    const events = await drain(
+      truncating('half a rep').stream({ messages: [{ role: 'user', content: 'hi' }], target }),
+    );
+
+    const error = events.find((event) => event.type === 'error');
+    expect(error, 'a truncated stream produced no error event').toBeDefined();
+    expect((error as { message: string }).message).toContain('ended before it was complete');
+
+    // And NOT a done event, which is what it used to emit.
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+  });
+
+  it('still delivers the text that did arrive', async () => {
+    // #185's Done: whatever the user already saw stays visible with the
+    // failure attached. The deltas are yielded as they arrive, so the failure
+    // must not retract them.
+    const events = await drain(
+      truncating('half a rep').stream({ messages: [{ role: 'user', content: 'hi' }], target }),
+    );
+    const streamed = events
+      .filter((event) => event.type === 'delta')
+      .map((event) => (event as { text: string }).text)
+      .join('');
+    expect(streamed).toBe('half a rep');
+  });
+
+  it('a stream WITH a terminal chunk still succeeds — the paired control', async () => {
+    // Without this, the two above pass on an engine that fails every turn.
+    const control = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    control.router.register('scripted', scriptedBackend(['a complete reply']));
+    const events = await drain(
+      control.stream({
+        messages: [{ role: 'user', content: 'hi' }],
+        target: targetFor('llama-cpp', manifest.id, manifest.name, 'scripted'),
+      }),
+    );
+    expect(events.some((event) => event.type === 'done')).toBe(true);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+  });
+});
