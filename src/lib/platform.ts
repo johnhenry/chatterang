@@ -168,6 +168,27 @@ export interface PlatformCapabilities {
    * is not a folder the person chose.
    */
   readonly folderGrants: boolean;
+  /**
+   * Can a person here pair a device by pointing a camera at a code (#128)?
+   *
+   * TRUE ONLY WHERE A PHONE-SHAPED DEVICE SCANS. Pairing is a phone reading a
+   * code the desktop or server DRAWS, so the rows that draw codes say false
+   * whatever camera hardware they have. The typed route needs no camera, so a
+   * `false` here never means "cannot pair" — it means "offer Type, not Scan".
+   *
+   * `ios` is true because of a measurement, not an assumption: WKWebView hides
+   * `navigator.mediaDevices` entirely unless `NSCameraUsageDescription` is in
+   * the Info.plist, and `scripts/patch-native.mjs` writes that key
+   * (`dev/probe-128/` holds the experiment). Without the patch this row would
+   * be a lie on iOS.
+   *
+   * `electron` is false for a second, sharper reason. The shell installs no
+   * Electron permission handler, and Electron approves every permission request
+   * automatically when none is set (its security tutorial, "Handle session
+   * permission requests"). A camera row of true there would be a camera granted
+   * without the app ever asking. It stays false until that handler exists.
+   */
+  readonly cameraScan: boolean;
 }
 
 /**
@@ -179,6 +200,7 @@ export interface PlatformCapabilities {
  *   fileHandoff  browser-download share-sheet      browser-download  browser-download
  *   purchases    false            true             false             false
  *   folderGrants false            false            true              false
+ *   cameraScan   true             true             false             false
  */
 const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.freeze({
   web: {
@@ -188,6 +210,9 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     fileHandoff: 'browser-download',
     purchases: false,
     folderGrants: false,
+    // A browser on a phone can scan. `getUserMedia` needs a secure origin,
+    // which a served PWA has.
+    cameraScan: true,
   },
   ios: {
     id: 'ios',
@@ -196,6 +221,9 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     fileHandoff: 'share-sheet',
     purchases: true,
     folderGrants: false,
+    // Only because `patch-native.mjs` adds NSCameraUsageDescription — without
+    // it WKWebView exposes no `navigator.mediaDevices` at all (#128).
+    cameraScan: true,
   },
   android: {
     id: 'android',
@@ -204,6 +232,9 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     fileHandoff: 'share-sheet',
     purchases: true,
     folderGrants: false,
+    // `patch-native.mjs` declares CAMERA with the hardware optional, so a
+    // camera-less tablet still installs and falls back to Type.
+    cameraScan: true,
   },
   electron: {
     id: 'electron',
@@ -215,6 +246,10 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal a
     // person dismissed or accepted.
     folderGrants: true,
+    // The desktop DRAWS pairing codes; it does not scan them. And the shell
+    // sets no Electron permission handler, so Electron would approve a camera
+    // request silently — see the field's doc.
+    cameraScan: false,
   },
   /*
    * A9: the bundle served by `apps/server`, running in an ordinary browser
@@ -277,6 +312,9 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
      * there is no consent event, so there is no grant.
      */
     folderGrants: false,
+    // A served deployment draws the code for a phone to scan. The browser
+    // viewing it is not the device that pairs.
+    cameraScan: false,
   },
 });
 
@@ -301,6 +339,8 @@ function unknownPlatform(id: string): PlatformCapabilities {
     // No claims made on an unknown shell's behalf, and this is the one row
     // where "no" is also the safe answer rather than only the honest one.
     folderGrants: false,
+    // No claims on an unknown shell's behalf. The typed route still works.
+    cameraScan: false,
   };
 }
 
