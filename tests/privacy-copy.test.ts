@@ -916,3 +916,135 @@ describe('privacy describes the shell it is running in, not the app’s grant re
     expect(asUser).toContain('/Users/jane/Documents/Divorce');
   });
 });
+
+/* ── README.md's Privacy list, held to the command's own discipline ───── */
+
+/**
+ * THE MOST PUBLIC PRIVACY CLAIM IN THE PROJECT HAD NO TEST AT ALL, AND WAS
+ * FALSE.
+ *
+ * `README.md` said "Three things leave the device, and only these:" and then
+ * listed model downloads, provider messages and benchmark runs. Rendering the
+ * `privacy` command with a single provider enabled and no MCP server produces
+ * FIVE routes: those three plus tool output, plus anything derived from that
+ * output under the same grant. Connecting an MCP server adds a sixth.
+ *
+ * So the sentence was not merely fragile ahead of a tunnel — it was wrong when
+ * it was written, about routes that already shipped. The in-app command had
+ * already learned this lesson twice: it "makes no claim that its list is
+ * complete" and it "claims only storage in its 'stays' list, not the absence
+ * of egress". The README was the one surface still making both claims, and the
+ * one surface nothing checked.
+ */
+describe('README.md’s privacy list', () => {
+  const README = readFileSync(resolve(process.cwd(), 'README.md'), 'utf8');
+  const section = README.slice(README.indexOf('## Privacy'), README.indexOf('## Licence'));
+
+  it('is not empty, so every assertion below is about something', () => {
+    // The section is located by two headings; a rename would silently make
+    // every test in this block vacuous.
+    expect(section.length).toBeGreaterThan(500);
+    expect(section).toContain('## Privacy');
+  });
+
+  it('makes no claim that its list is complete — the rule the command follows', () => {
+    expect(section).not.toMatch(/and only these/i);
+    expect(section).not.toMatch(/nothing else/i);
+    expect(section).not.toMatch(/^\s*\w+ things leave the device/im);
+    // And the summary at the top of the file no longer states an absolute
+    // whose exception is one MECHANISM: a model download leaves with no
+    // provider connected at all, which that sentence denied.
+    const summary = README.slice(0, README.indexOf('Built with Capacitor'));
+    expect(summary).not.toMatch(/nothing leaves it unless/i);
+  });
+
+  it('names every route the `privacy` command names', async () => {
+    /*
+     * The two surfaces are written by different people at different times and
+     * neither generates the other, so this is the only thing standing between
+     * them and drift. Rendered with a provider AND an MCP server, so the
+     * conditional branches of the command are all present.
+     */
+    const output = await privacyOutput({
+      providers: [{ id: 'c1', label: 'OpenAI', enabled: true, defaultModel: 'gpt-4o-mini' }],
+    });
+
+    const ROUTES: readonly { readonly inCommand: RegExp; readonly inReadme: RegExp }[] = [
+      { inCommand: /huggingface\.co/i, inReadme: /Hugging Face/i },
+      { inCommand: /messages you send to/i, inReadme: /Messages to a remote provider/i },
+      { inCommand: /tool output/i, inReadme: /Tool output/i },
+      { inCommand: /anything DERIVED from that output/i, inReadme: /derived from it/i },
+      { inCommand: /a benchmark run/i, inReadme: /Benchmark runs/i },
+    ];
+
+    for (const route of ROUTES) {
+      expect(output, `command should name ${String(route.inCommand)}`).toMatch(route.inCommand);
+      expect(section, `README should name ${String(route.inReadme)}`).toMatch(route.inReadme);
+    }
+  });
+
+  it('names the MCP route, which the command prints only when a server is connected', async () => {
+    // The README cannot be conditional, so it carries the route unconditionally
+    // and says what the consent currently is. The command's own sentence is
+    // pinned above; this is the same fact on the public surface.
+    expect(section).toMatch(/MCP tool/i);
+    expect(section).toMatch(/Nothing is asked before they go/i);
+  });
+
+  it('points at the command as the generated source of truth', () => {
+    // One source of truth, the discipline `privacy` already follows when it
+    // says "What can leave a conversation is the list above."
+    expect(section).toMatch(/`privacy`/);
+    expect(section).toMatch(/generated from the code/i);
+  });
+});
+
+/**
+ * THE FORCING FUNCTION, and the reason the block above is not merely a snapshot.
+ *
+ * Everything above checks routes someone has already thought to list here. It
+ * cannot catch the failure that actually happens: a SIXTH route is added to
+ * the `privacy` command, and README.md is not touched because nothing made
+ * anyone look at it. That is exactly how the list came to be wrong the first
+ * time.
+ *
+ * So the count is pinned. Adding a bullet to the command's leave-list fails
+ * this test, and the failure message is the instruction.
+ */
+describe('adding a way off the device forces the public list to change', () => {
+  async function leaveBullets(overrides: Parameters<typeof stores>[0]): Promise<string[]> {
+    const command = chatterangCommands(stores(overrides)).find(
+      (entry: ShellCommand) => entry.name === 'privacy',
+    );
+    const result = await command!.run([], contextFor(overrides, 'user'));
+    const raw = result.stdout;
+    const start = raw.indexOf('Leaves this device:');
+    const end = raw.indexOf('Two things reach further than they read:');
+    expect(start, 'the leave-list heading moved').toBeGreaterThanOrEqual(0);
+    expect(end, 'the "reach further" heading moved').toBeGreaterThan(start);
+    return raw
+      .slice(start, end)
+      .split('\n')
+      .filter((line) => /^ {2}- /.test(line));
+  }
+
+  it('has exactly five routes with a provider and no MCP server', async () => {
+    const bullets = await leaveBullets({
+      providers: [{ id: 'c1', label: 'OpenAI', enabled: true, defaultModel: 'gpt-4o-mini' }],
+    });
+    expect(
+      bullets.length,
+      'A route was added to or removed from `privacy`. README.md’s Privacy section is the ' +
+        'public version of this list and does not update itself — change it, then change this ' +
+        'number. The list was wrong for exactly this reason once already.',
+    ).toBe(5);
+  });
+
+  it('and the no-provider case still enumerates the same routes', async () => {
+    // The no-provider branch swaps one bullet's wording rather than dropping
+    // it, so the count is stable — which is what makes the number above a
+    // signal about ROUTES rather than about configuration.
+    const bullets = await leaveBullets({ providers: [] });
+    expect(bullets.length).toBe(5);
+  });
+});
