@@ -8,7 +8,12 @@
     "./wire": "./src/wire/index.ts",
     "./codec": "./src/codec/index.ts",
     "./pairing": "./src/pairing/index.ts",
+    "./pake": "./src/pake/index.ts",
     "./client": "./src/client/index.ts",
     "./host": "./src/host/index.ts"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
   }
 }

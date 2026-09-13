@@ -511,7 +511,7 @@ describe('the tunnel package', () => {
   const TUNNEL = resolve(process.cwd(), 'packages/tunnel/src');
   const tunnelFiles = sourceFiles(TUNNEL);
   const relTunnel = (file: string): string => relative(TUNNEL, file).replaceAll('\\', '/');
-  const half = (name: 'wire' | 'codec' | 'pairing' | 'client' | 'host'): string[] =>
+  const half = (name: 'wire' | 'codec' | 'pairing' | 'pake' | 'client' | 'host'): string[] =>
     tunnelFiles.filter((file) => relTunnel(file).startsWith(`${name}/`));
 
   /** Every specifier a file names, with comments stripped first. */
@@ -523,7 +523,7 @@ describe('the tunnel package', () => {
     // nothing — the failure mode of every "no offenders" assertion in this
     // file, and the reason each block here opens with a count.
     expect(tunnelFiles.map(relTunnel).sort()).not.toEqual([]);
-    for (const name of ['wire', 'codec', 'pairing', 'client', 'host'] as const) {
+    for (const name of ['wire', 'codec', 'pairing', 'pake', 'client', 'host'] as const) {
       expect(half(name).length, `packages/tunnel/src/${name} is empty`).toBeGreaterThan(0);
     }
   });
@@ -564,6 +564,39 @@ describe('the tunnel package', () => {
 
     const globals = ['btoa', 'atob', 'Buffer', 'TextEncoder', 'TextDecoder', 'crypto'];
     const reached = half('pairing').flatMap((file) => {
+      const code = codeOf(readFileSync(file, 'utf8'));
+      return globals
+        .filter((name) => new RegExp(`\\b${name}\\b`).test(code))
+        .map((name) => `${relTunnel(file)} -> ${name}`);
+    });
+    expect(reached).toEqual([]);
+  });
+
+  it('the pake half may import noble and nothing else that matters', () => {
+    /*
+     * THE ONE HALF WITH A DEPENDENCY, and the rule is written as an allowlist
+     * rather than a ban so that adding a second one is a deliberate edit here.
+     *
+     * `pairing/` imports nothing and reaches for no global; `pake/` cannot
+     * meet that — CPace needs elliptic-curve arithmetic, and #130's ruling is
+     * explicit that hand-rolling it is not on the table. What it CAN meet is
+     * everything else: no Node builtin, no Electron, no Capacitor, and no
+     * global. Entropy is a parameter precisely so this stays true, which is
+     * also what lets the draft's test vectors fix the scalar.
+     */
+    const allowed = /^@noble\/(curves|hashes)\//;
+    const offenders = half('pake').flatMap((file) =>
+      specifiersOf(file)
+        .filter((specifier) => !allowed.test(specifier))
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+
+    // The same global ban `pairing/` carries. #223 is open about runtimes
+    // nobody has measured, and a PAKE that reaches for `crypto.subtle` would
+    // have thrown away the one advantage it has over a signature scheme.
+    const globals = ['btoa', 'atob', 'Buffer', 'TextDecoder', 'crypto'];
+    const reached = half('pake').flatMap((file) => {
       const code = codeOf(readFileSync(file, 'utf8'));
       return globals
         .filter((name) => new RegExp(`\\b${name}\\b`).test(code))
@@ -613,6 +646,7 @@ describe('the tunnel package', () => {
       ...half('wire'),
       ...half('codec'),
       ...half('pairing'),
+      ...half('pake'),
       ...half('client'),
       ...half('host'),
     ].flatMap((file) =>
@@ -659,6 +693,7 @@ describe('the tunnel package', () => {
       './codec',
       './host',
       './pairing',
+      './pake',
       './wire',
     ]);
   });
