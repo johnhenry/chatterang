@@ -51,6 +51,8 @@
     "@johnhenry/aimatey-utils": "0.4.0",
     "@johnhenry/mcp-query": "^0.0.0",
     "@modelcontextprotocol/client": "^2.0.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
     "dexie": "^4.4.5",
     "just-bash": "^3.4.2",
     "react": "^19.2.8",
