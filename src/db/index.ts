@@ -300,6 +300,24 @@ class ChatterangDatabase extends Dexie {
       .upgrade(async (tx) => {
         await upgradeMessageReachRows(tx.table('messages'), upgradeMessageReachAxes);
       });
+
+    /**
+     * v8 — `Provenance.warnings` (#259).
+     *
+     * NO UPGRADE FUNCTION, and that is the whole migration. The field is
+     * optional and every row written before this version simply does not have
+     * one; there is nothing to convert, because the warnings those turns would
+     * have carried were computed and discarded at the time. Backfilling them
+     * would mean inventing them.
+     *
+     * The store is restated so the version has one, exactly as v4, v5, v6 and
+     * v7 do — no index mentions `provenance`, so the schema is unchanged.
+     *
+     * ON THE VERSION NUMBER, per v7's note: #133 (a paired-device table) and
+     * #195 (a durable queue) both still describe themselves as v7 in their
+     * bodies. This is v8 because it landed. Whoever goes next takes v9.
+     */
+    this.version(8).stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' });
   }
 }
 
