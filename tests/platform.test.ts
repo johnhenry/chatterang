@@ -87,6 +87,7 @@ describe('the capability table', () => {
       // and `src/shell/mount.ts`'s containment is "resolve, then check where
       // it landed". A handle cannot answer the resolve half.
       folderGrants: false,
+      cameraScan: true,
     });
   });
 
@@ -102,6 +103,10 @@ describe('the capability table', () => {
         // Capacitor's Filesystem reaches app-private storage, which is not a
         // folder the person chose.
         folderGrants: false,
+        // #128. On iOS this is true only because patch-native writes
+        // NSCameraUsageDescription; without it `navigator.mediaDevices` is
+        // undefined in WKWebView (dev/probe-128).
+        cameraScan: true,
       });
     });
   }
@@ -127,6 +132,10 @@ describe('the capability table', () => {
       // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal
       // a person accepted.
       folderGrants: true,
+      // The desktop draws codes rather than scanning them — and with no
+      // Electron permission handler installed, a camera request would be
+      // approved silently. False until that handler exists.
+      cameraScan: false,
     });
   });
 
@@ -177,6 +186,7 @@ describe('the capability table', () => {
       fileHandoff: 'browser-download',
       purchases: false,
       folderGrants: false,
+      cameraScan: false,
     });
 
     /*
@@ -214,6 +224,8 @@ describe('the capability table', () => {
     // well as the honest one: an unknown shell's chooser, if it has one, is
     // in front of nobody this app can reason about.
     expect(unknown.folderGrants).toBe(false);
+    // Nor a camera: an unknown shell's permission model is unknown too.
+    expect(unknown.cameraScan).toBe(false);
     // It reports its own id rather than claiming to be one of the four.
     expect(unknown.id).toBe('some-future-shell');
   });
