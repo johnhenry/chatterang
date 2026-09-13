@@ -18,10 +18,21 @@ import { ToolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 /* ── Fixtures ───────────────────────────────────────────────────────── */
 
 function request(overrides: Partial<IRChatRequest> = {}): IRChatRequest {
+  /*
+   * ENABLED IDS FOLLOW THE DECLARED TOOLS, as they do in the engine: `#toIR`
+   * declares `toolRegistry.toIRTools(toolIds)` and carries the same `toolIds`
+   * in metadata. For these fixtures an id and a name are the same string.
+   *
+   * Without this, every test below that declares a tool would pass with the
+   * tool NEVER RUNNING — the dispatcher now fails closed when no ids are
+   * carried, and an error result still counts as an iteration. A test can only
+   * pin a real run if the request says the tool may run.
+   */
+  const toolIds = (overrides.tools ?? []).map((tool) => tool.name);
   return {
     messages: [{ role: 'user', content: 'What is 6 * 7?' }],
     parameters: { model: 'local-model' },
-    metadata: { requestId: 'req_1', timestamp: 0, custom: { local: true } },
+    metadata: { requestId: 'req_1', timestamp: 0, custom: { local: true, toolIds } },
     ...overrides,
   };
 }
@@ -185,7 +196,15 @@ describe('tool middleware', () => {
 
     // One call from `next`, one from the single permitted follow-up.
     expect(backend.execute).toHaveBeenCalledTimes(2);
-    expect((result.metadata.custom?.toolCalls as ExecutedTool[]).length).toBe(2);
+    const calls = result.metadata.custom?.toolCalls as ExecutedTool[];
+    expect(calls.length).toBe(2);
+    // And the tool really RAN on both. An error result also counts as an
+    // iteration, so without this the count above holds for a dispatcher that
+    // refuses every call — which is exactly what failing closed looks like.
+    for (const call of calls) {
+      expect(call.isError).toBe(false);
+      expect(call.output).toBe('4');
+    }
   });
 
   it('strips tool syntax out of the answer the user sees', async () => {
@@ -211,6 +230,9 @@ describe('tool middleware', () => {
 
     expect(result.message.content).not.toContain('tool_call');
     expect(result.message.content).toContain('The answer is 42.');
+    // The stripping must be of a turn whose tool actually ran, or this pins
+    // the text of an error path rather than of the answer.
+    expect((result.metadata.custom?.toolCalls as ExecutedTool[])[0]?.output).toBe('42');
   });
 });
 
@@ -323,5 +345,116 @@ describe('resilience middleware', () => {
     ).rejects.toThrow();
 
     expect(adapter.execute).not.toHaveBeenCalled();
+  });
+});
+
+
+/* ── Enablement is enforced, not merely advertised ───────────────────── */
+
+/**
+ * `Chat.tools` is documented as "Tool ids enabled for this chat". Until these
+ * tests existed it was only the list the model was TOLD about: the dispatcher
+ * resolved any call by name against the global registry, and a probe tool the
+ * chat never enabled executed. These pin the enforcement on the non-streaming
+ * path; `tests/engine.test.ts` pins the streaming one.
+ */
+describe('tool enablement is enforced', () => {
+  const answer = () => ({ execute: vi.fn(async () => response('ok.')) }) as unknown as BackendAdapter;
+
+  /** A request declaring `declared` to the model, with `ids` enabled to run. */
+  function enabled(declared: string[], ids: unknown) {
+    return request({
+      tools: declared.map((name) => ({ name, description: 'x', parameters: { type: 'object' } })),
+      metadata: { requestId: 'req_1', timestamp: 0, custom: { local: true, toolIds: ids } },
+    });
+  }
+
+  function spyTool(id: string, name = id) {
+    const execute = vi.fn(async () => ({ output: `${id} ran` }));
+    const tool: ChatterangTool = {
+      id, name, summary: id, description: id, parameters: { type: 'object' }, execute,
+    };
+    return { tool, execute };
+  }
+
+  async function run(registry: ToolRegistry, req: IRChatRequest, callName: string) {
+    const middleware = createToolMiddleware({ registry });
+    const next = vi.fn(async () => response(`<tool_call>{"name":"${callName}","arguments":{}}</tool_call>`));
+    const result = await middleware(context({ request: req, backend: answer() }), next);
+    return (result.metadata.custom?.toolCalls as ExecutedTool[] | undefined) ?? [];
+  }
+
+  it('does not run a registered tool the chat did not enable', async () => {
+    const allowed = spyTool('allowed');
+    const other = spyTool('other');
+    const calls = await run(new ToolRegistry([allowed.tool, other.tool]), enabled(['allowed'], ['allowed']), 'other');
+    expect(other.execute).not.toHaveBeenCalled();
+    expect(calls[0]?.isError).toBe(true);
+  });
+
+  it('still runs the tool that IS enabled — the paired control', async () => {
+    // Without this, every test in this block passes on a dispatcher that runs
+    // nothing at all.
+    const allowed = spyTool('allowed');
+    await run(new ToolRegistry([allowed.tool]), enabled(['allowed'], ['allowed']), 'allowed');
+    expect(allowed.execute).toHaveBeenCalledOnce();
+  });
+
+  it('runs nothing when the request does not say which tools are enabled', async () => {
+    // Fail closed. A request that declares a tool to the model but carries no
+    // enabled ids is a caller that forgot, and forgetting must not re-open it.
+    const allowed = spyTool('allowed');
+    await run(new ToolRegistry([allowed.tool]), enabled(['allowed'], undefined), 'allowed');
+    expect(allowed.execute).not.toHaveBeenCalled();
+  });
+
+  it('does not trust a malformed enabled-ids value', async () => {
+    for (const malformed of ['allowed', ['allowed', 42], { allowed: true }, null]) {
+      const allowed = spyTool('allowed');
+      await run(new ToolRegistry([allowed.tool]), enabled(['allowed'], malformed), 'allowed');
+      expect(allowed.execute, `ran with toolIds=${JSON.stringify(malformed)}`).not.toHaveBeenCalled();
+    }
+  });
+
+  it('answers a not-enabled tool exactly as it answers a tool that does not exist', async () => {
+    /*
+     * A distinct "not enabled" message would tell the model which tools are
+     * installed that the user chose not to give it — for MCP, which servers
+     * are connected. Modulo the name itself, the two answers are identical.
+     */
+    const allowed = spyTool('allowed');
+    const other = spyTool('other');
+    const registry = new ToolRegistry([allowed.tool, other.tool]);
+    const [installed] = await run(registry, enabled(['allowed'], ['allowed']), 'other');
+    const [absent] = await run(registry, enabled(['allowed'], ['allowed']), 'nonexistent');
+    expect(installed?.output.replace('other', 'NAME')).toBe(absent?.output.replace('nonexistent', 'NAME'));
+  });
+
+  it('accepts a call naming an enabled tool by its ID, as the registry always has', async () => {
+    // `getByName` falls back to the id (`tests/tools.test.ts` pins
+    // `getByName('calculator')`), so a model that called a tool by its id used
+    // to succeed. Enforcement must not quietly remove that — it survived a
+    // mutation until this test existed.
+    const byId = spyTool('the-id', 'the_name');
+    await run(new ToolRegistry([byId.tool]), enabled(['the_name'], ['the-id']), 'the-id');
+    expect(byId.execute).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a call naming a NON-enabled tool by its id — the id is not a side door', async () => {
+    const allowed = spyTool('allowed');
+    const other = spyTool('other-id', 'other_name');
+    await run(new ToolRegistry([allowed.tool, other.tool]), enabled(['allowed'], ['allowed']), 'other-id');
+    expect(other.execute).not.toHaveBeenCalled();
+  });
+
+  it('resolves a shared name to the ENABLED tool, not whichever registered first', async () => {
+    // Why enforcement goes through ids and not a name allowlist: `getByName`
+    // returns the first registration, so a name allowlist would run the
+    // non-enabled twin whenever it happened to register earlier.
+    const first = spyTool('first', 'lookup');
+    const second = spyTool('second', 'lookup');
+    await run(new ToolRegistry([first.tool, second.tool]), enabled(['lookup'], ['second']), 'lookup');
+    expect(second.execute).toHaveBeenCalledOnce();
+    expect(first.execute).not.toHaveBeenCalled();
   });
 });
