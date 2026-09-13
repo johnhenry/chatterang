@@ -46,6 +46,7 @@ import type { DshStatus, FleetEntry, HostHandle } from '@chatterang/desktop/brid
 import type { SessionRegistry } from './sessions.js';
 import { createFilesystemPlugin } from '@chatterang/desktop/fs/filesystem';
 
+import { advertisedAddressesForThisMachine, describeAdvertised } from './addresses.js';
 import { asTlsMaterial, parseArgv, resolveBinding } from './binding.js';
 import type { ServerBinding } from './binding.js';
 import { startServer } from './index.js';
@@ -284,6 +285,24 @@ async function main(): Promise<void> {
   // Both arms now, because both arms have a token. `created` is still the
   // gate: the secret is printed on the run that made it and never again.
   for (const line of describe(binding, running.origin, created ? binding.token.value : null)) {
+    log(line);
+  }
+
+  /*
+   * WHAT PAIRING WILL ADVERTISE (#252), printed at boot.
+   *
+   * `describe` above deliberately refuses to turn a wildcard bind into a
+   * browsable URL — only the operator knows which of this machine's names they
+   * reach it by. Pairing cannot make that refusal: the phone needs somewhere
+   * to dial and there is no operator in the loop at that moment. So this
+   * guesses, offers SEVERAL, and prints them — which is the half that keeps a
+   * guess honest, because an operator who never sees the list cannot know it
+   * is wrong.
+   */
+  for (const line of describeAdvertised(
+    advertisedAddressesForThisMachine(options.advertise),
+    options.advertise !== undefined && options.advertise.trim() !== '',
+  )) {
     log(line);
   }
 
