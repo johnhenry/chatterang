@@ -23,7 +23,7 @@ import type {
   ToolUseContent,
 } from '@johnhenry/aimatey-types';
 
-import type { ToolRegistry } from '@/ai/tools/registry';
+import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
 export interface ExecutedTool {
   readonly id: string;
@@ -148,10 +148,60 @@ export function findToolCalls(message: IRMessage): ToolUseContent[] {
 }
 
 /** Run a batch of tool calls, returning both IR results and UI records. */
+/**
+ * The tool ids the engine enabled for this turn, carried in request metadata.
+ *
+ * The IR request only names tools (`request.tools` is what the MODEL is told),
+ * and a name is not a grant: two registered tools can share one. So the engine
+ * puts the chat's enabled ids in `metadata.custom.toolIds`, and anything that
+ * is not a clean string array reads as NO tools. Failing closed is the point —
+ * a request that forgot to say which tools are enabled runs none of them.
+ */
+export function enabledToolIds(request: IRChatRequest): readonly string[] {
+  const raw = request.metadata.custom?.['toolIds'];
+  return Array.isArray(raw) && raw.every((id) => typeof id === 'string') ? (raw as string[]) : [];
+}
+
+/**
+ * The tool a call names, looked up ONLY among the tools this chat enabled.
+ *
+ * THIS IS THE ENFORCEMENT, and until it existed there was none. The dispatcher
+ * called `registry.getByName(call.name)` on the GLOBAL registry, so a chat with
+ * only `calculator` enabled would run any registered tool the model named —
+ * including an MCP tool connected for a different purpose. `Chat.tools` is
+ * documented as "Tool ids enabled for this chat"; it was a list of what the
+ * model was TOLD about, not a limit on what could run. Reproduced before this
+ * was written: a probe tool the chat never enabled executed once.
+ *
+ * Resolved through the enabled IDS rather than filtered by name, because a name
+ * allowlist still lets a non-enabled tool through when it shares a name with an
+ * enabled one — `getByName` returns whichever registered first.
+ */
+function enabledTool(
+  registry: ToolRegistry,
+  enabledIds: readonly string[],
+  name: string,
+): ChatterangTool | undefined {
+  for (const id of enabledIds) {
+    const tool = registry.get(id);
+    if (tool !== undefined && (tool.name === name || tool.id === name)) return tool;
+  }
+  return undefined;
+}
+
 export async function runToolCalls(
   registry: ToolRegistry,
   calls: readonly ToolUseContent[],
-  options: { signal?: AbortSignal; onToolExecuted?: (tool: ExecutedTool) => void } = {},
+  /*
+   * `enabledIds` is REQUIRED, not optional, and that is deliberate. An optional
+   * safety parameter is one a future caller omits, and the omission would
+   * silently restore the hole this closes.
+   */
+  options: {
+    enabledIds: readonly string[];
+    signal?: AbortSignal;
+    onToolExecuted?: (tool: ExecutedTool) => void;
+  },
 ): Promise<{ results: MessageContent[]; executed: ExecutedTool[] }> {
   const results: MessageContent[] = [];
   const executed: ExecutedTool[] = [];
@@ -159,7 +209,10 @@ export async function runToolCalls(
   for (const call of calls) {
     if (options.signal?.aborted) break;
 
-    const tool = registry.getByName(call.name);
+    // A tool this chat did not enable gets the SAME answer as a tool that does
+    // not exist. A distinct "not enabled" message would tell the model which
+    // tools are installed that the user chose not to give it.
+    const tool = enabledTool(registry, options.enabledIds, call.name);
     const started = performance.now();
 
     let output: string;
@@ -243,6 +296,7 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
       if (calls.length === 0) break;
 
       const batch = await runToolCalls(options.registry, calls, {
+        enabledIds: enabledToolIds(context.request),
         signal: context.signal,
         onToolExecuted: options.onToolExecuted,
       });

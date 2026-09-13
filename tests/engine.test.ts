@@ -321,6 +321,100 @@ describe('ChatterangEngine.stream', () => {
     expect(events.filter((event) => event.type === 'tool')).toHaveLength(0);
   });
 
+
+  it('does not run a registered tool the chat did not enable', async () => {
+    /*
+     * THE HOLE THIS FILE MISSED. A chat with only `calculator` enabled, and a
+     * model that names a DIFFERENT registered tool — the shape an MCP tool
+     * connected for another purpose takes. The dispatcher used to resolve the
+     * name against the GLOBAL registry, so the tool ran: this test was written
+     * first, failed with the probe called once, and only then was the fix made.
+     * The test above covers a chat with NO tools; nothing covered a chat with
+     * some, which is the case every real chat is in.
+     */
+    const execute = vi.fn(async () => ({ output: 'secrets' }));
+    toolRegistry.register({
+      id: 'probe-not-enabled',
+      name: 'read_secrets',
+      summary: 'probe',
+      description: 'probe',
+      parameters: { type: 'object', properties: {} },
+      execute,
+    });
+    try {
+      engine.router.register(
+        'scripted',
+        scriptedBackend(['<tool_call>{"name":"read_secrets","arguments":{}}</tool_call>', 'done.']),
+      );
+      await drain(
+        engine.stream({
+          messages: [{ role: 'user', content: 'x' }],
+          target: localTarget,
+          toolIds: ['calculator'],
+        }),
+      );
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      toolRegistry.unregister('probe-not-enabled');
+    }
+  });
+
+
+  /*
+   * THE NON-STREAMING DOOR. `complete` serves tools, titling and benchmarks,
+   * and it reaches tools through the MIDDLEWARE rather than through the loop
+   * above — which returns early on every streamed request. So every test above
+   * is silent about it. The ids travel in `metadata.custom.toolIds` through the
+   * real bridge; if they did not arrive, the middleware fails closed and the
+   * positive case below would not run its tool. That is what makes it a test of
+   * the path and not of a fixture.
+   */
+  function spyTool(id: string, name = id) {
+    const execute = vi.fn(async () => ({ output: `${id} ran` }));
+    toolRegistry.register({
+      id, name, summary: id, description: id, parameters: { type: 'object', properties: {} }, execute,
+    });
+    return execute;
+  }
+
+  it('complete(): runs a tool the chat DID enable — the ids arrive through the bridge', async () => {
+    const execute = spyTool('probe-enabled', 'probe_enabled');
+    try {
+      engine.router.register(
+        'scripted',
+        scriptedBackend(['<tool_call>{"name":"probe_enabled","arguments":{}}</tool_call>', 'done.']),
+      );
+      await engine.complete({
+        messages: [{ role: 'user', content: 'x' }],
+        target: localTarget,
+        toolIds: ['probe-enabled'],
+      });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      toolRegistry.unregister('probe-enabled');
+    }
+  });
+
+  it('complete(): does not run a registered tool the chat did not enable', async () => {
+    const enabledTool = spyTool('probe-enabled', 'probe_enabled');
+    const other = spyTool('probe-other', 'probe_other');
+    try {
+      engine.router.register(
+        'scripted',
+        scriptedBackend(['<tool_call>{"name":"probe_other","arguments":{}}</tool_call>', 'done.']),
+      );
+      await engine.complete({
+        messages: [{ role: 'user', content: 'x' }],
+        target: localTarget,
+        toolIds: ['probe-enabled'],
+      });
+      expect(other).not.toHaveBeenCalled();
+      expect(enabledTool).not.toHaveBeenCalled();
+    } finally {
+      toolRegistry.unregister('probe-enabled');
+      toolRegistry.unregister('probe-other');
+    }
+  });
   it('bounds the tool loop rather than looping forever', async () => {
     const alwaysCallsTool =
       '<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>';
@@ -584,7 +678,6 @@ describe('ChatterangEngine.stream', () => {
   });
 
   it('reports a tool the registry does not have, without failing the turn', async () => {
-    const spy = vi.spyOn(toolRegistry, 'getByName');
     engine.router.register(
       'scripted',
       scriptedBackend([
@@ -607,7 +700,6 @@ describe('ChatterangEngine.stream', () => {
     expect(tool?.tool.isError).toBe(true);
     expect(tool?.tool.output).toContain('teleport');
     expect(doneEvent(events).text).toBe('I cannot do that.');
-    spy.mockRestore();
   });
 
   /* ── A missing runtime is not a reason to answer from the cloud ────── */

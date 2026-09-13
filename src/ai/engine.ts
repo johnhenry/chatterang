@@ -906,7 +906,10 @@ export class ChatterangEngine {
       // next, and it rides out in a block type a `tool_result` rule misses.
       const composedAfterOutput = tools.length > 0;
 
-      const batch = await runToolCalls(toolRegistry, calls, { signal: request.signal });
+      const batch = await runToolCalls(toolRegistry, calls, {
+        enabledIds: request.toolIds ?? [],
+        signal: request.signal,
+      });
       tools.push(...batch.executed);
       for (const tool of batch.executed) yield { type: 'tool', tool };
 
@@ -1169,6 +1172,10 @@ export class ChatterangEngine {
           backend: request.target.backendId,
           local: runsOnThisDevice(request.target),
           engine: request.target.engine,
+          // Which tools may actually RUN, as ids. `tools` above is only what
+          // the model is told, and a name is not a grant; the tool middleware
+          // reads this and runs nothing when it is absent.
+          toolIds: request.toolIds ? [...request.toolIds] : [],
         },
       },
       stream,

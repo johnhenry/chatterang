@@ -8,7 +8,8 @@ import { createMcpTool } from '@/ai/mcp/tools';
 import { renderPrompt } from '@/ai/prompt';
 import { getProvider } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
-import { toolRegistry } from '@/ai/tools/registry';
+import { runToolCalls } from '@/ai/middleware/tools';
+import { ToolRegistry, toolRegistry } from '@/ai/tools/registry';
 import {
   BACKUP_RULES_XML,
   CAMERA_USAGE_DESCRIPTION,
@@ -366,6 +367,47 @@ describe('the privacy command', () => {
 
     expect(confirm).not.toHaveBeenCalled();
     expect(call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
+  });
+
+  it('says an MCP tool has to be enabled per chat — and one that is not cannot run', async () => {
+    /*
+     * FOUR SURFACES MADE THIS PROMISE WHILE IT WAS FALSE. Settings says every
+     * MCP tool "has to be enabled per chat", the MCP panel says tools are
+     * turned "on per chat", the persona editor says "you turn those on
+     * yourself, per chat", and `privacy` calls enabling "the whole of the
+     * consent". The dispatcher resolved calls against the GLOBAL registry, so a
+     * chat that never enabled an MCP tool would run it the moment the model
+     * named it. The sentences were right about the design and wrong about the
+     * code, and nothing measured the code.
+     */
+    const SETTINGS = SETTINGS_SCREEN;
+    const PANEL = shipped('features/settings/McpPanel.tsx');
+    expect(SETTINGS).toContain('every one has to be enabled per chat');
+    expect(PANEL).toContain('on per chat, and anything that can change data asks first');
+
+    // The measurement: a real MCP tool, registered, NOT enabled for the chat.
+    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+    const mcp = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: true,
+        destructive: false,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      { serverUrl: 'https://notes.example/mcp', confirm: vi.fn(async () => true), call },
+    );
+    const registry = new ToolRegistry([mcp]);
+    const use = [{ type: 'tool_use' as const, id: 'c1', name: mcp.name, input: { text: SECRET } }];
+
+    await runToolCalls(registry, use, { enabledIds: [] });
+    expect(call, 'an MCP tool the chat did not enable reached its server').not.toHaveBeenCalled();
+
+    // The paired control: the same call, with the tool enabled, does reach it.
+    // Without this the assertion above holds for a dispatcher that runs nothing.
+    await runToolCalls(registry, use, { enabledIds: [mcp.id] });
+    expect(call).toHaveBeenCalledOnce();
   });
 
   it('says a destructive call asks about the server’s data, not about what leaves', async () => {
