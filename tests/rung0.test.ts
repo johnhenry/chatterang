@@ -4,8 +4,10 @@ import type { AddressInfo } from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { streamIntegrityWarning, streamedTextOf } from '@/ai/engine';
 import { createTunnelClient } from '@chatterang/tunnel/client';
 import { createTunnelHost } from '@chatterang/tunnel/host';
+import { isMessage } from '@chatterang/tunnel/stream';
 import { TUNNEL_WIRE_VERSION, encodeFrame, type TunnelFrame } from '@chatterang/tunnel/wire';
 
 /**
@@ -43,12 +45,32 @@ const chunk = (sequence: number, delta: string): TunnelFrame => ({
   body: { type: 'content', sequence, delta },
 });
 
-const done = (sequence: number, message: string): TunnelFrame => ({
+/**
+ * A terminal chunk. `message` is an `IRMessage`, NOT a string — and that is a
+ * correction, not a detail. `StreamDoneChunk.message` is typed `IRMessage`,
+ * `streamedTextOf` reads `.content`, and this fixture originally sent a bare
+ * string: it compared strings itself and passed, while the detector the app
+ * actually ships would have reached `.map` on `undefined` and thrown. The
+ * frame body is `unknown` by design, so nothing caught it until `#260`'s
+ * obligation made the shape a rule rather than a convention.
+ */
+const done = (sequence: number, text: string): TunnelFrame => ({
   v: TUNNEL_WIRE_VERSION,
   kind: 'chunk',
   turn: 't1',
-  body: { type: 'done', sequence, finishReason: 'stop', message },
+  body: {
+    type: 'done',
+    sequence,
+    finishReason: 'stop',
+    message: { role: 'assistant', content: text },
+  },
 });
+
+/** The far side's own assembly, as the app reads it. */
+const assembledOf = (frame: TunnelFrame | undefined): string | undefined => {
+  const message = bodyOf(frame!)?.['message'];
+  return isMessage(message) ? streamedTextOf(message) : undefined;
+};
 
 /** A host and a client, connected, both registered for teardown. */
 async function pair(greeting?: readonly TunnelFrame[]) {
@@ -109,63 +131,128 @@ describe('the clean path', () => {
     await host.close();
 
     const received = await drain(client.receive());
-    const assembled = bodyOf(received.at(-1)!)?.['message'];
-    expect(assembled).toBe(textOf(received.slice(0, -1)));
+    expect(assembledOf(received.at(-1))).toBe(textOf(received.slice(0, -1)));
+    // Read through the app's own reader, so the fixture cannot drift from the
+    // shape `streamIntegrityWarning` actually consumes.
+    expect(streamIntegrityWarning(textOf(received.slice(0, -1)), { role: 'assistant', content: 'the quick brown fox' })).toBeNull();
   });
 });
 
 describe('fault 1 — a dropped frame', () => {
-  it('arrives short, and the done chunk is what says so', async () => {
+  it('fails the stream at the gap, rather than rendering what arrived', async () => {
     /*
      * INJECTED BY THE HARNESS, not by the wire. A WebSocket delivers whole
      * messages in order over TCP, so a frame cannot go missing by accident —
-     * which is exactly why this test is written by omitting one at the source.
-     * What it exercises is the DETECTOR, not the transport: without
-     * `done.message` there is nothing that could notice.
+     * which is why this is written by omitting one at the source.
+     *
+     * THE OUTCOME CHANGED WITH #260's RULING. The IR says a consumer that sees
+     * a gap "should fail the turn rather than render it", and the tunnel now
+     * does: the stream ends at the gap, not at the end. Rendering the rest and
+     * warning afterwards would show the user something and then take it back.
      */
     const lossy = STREAM.filter((frame) => bodyOf(frame)?.['sequence'] !== 2);
     const { host, client } = await pair(lossy);
+
+    const received = await drain(client.receive());
+    expect(textOf(received)).toBe('the quick ');
+    const close = client.ended();
+    expect(close).toMatchObject({ kind: 'abnormal', code: 'SEQUENCE_BROKEN' });
+    // The sentence too, not just the code: #148's argument is that the user
+    // reads a torn reply as the MODEL failing, so the wording is the fix.
+    expect(close?.kind === 'abnormal' ? close.message : '').toContain('incomplete');
+    await host.close();
+  });
+
+  it('a RENUMBERED drop is contiguous, and only done.message catches it', async () => {
+    /*
+     * THE CASE THAT JUSTIFIES THE `done.message` OBLIGATION (#260).
+     *
+     * Contiguity catches a gap. It is blind to a relay that drops a frame and
+     * renumbers what follows — the sequence is perfect, and the only thing
+     * left that disagrees is the far side's own assembly. #260 called
+     * `done.message` "the only detector faults 1 and 2 have"; with contiguity
+     * enforced it is narrower than that and more important: it is the only
+     * detector for the loss that contiguity cannot see.
+     */
+    const renumbered: TunnelFrame[] = [
+      chunk(0, 'the '),
+      chunk(1, 'quick '),
+      chunk(2, 'fox'), // 'brown ' dropped, and the gap papered over
+      done(3, 'the quick brown fox'),
+    ];
+    const { host, client } = await pair(renumbered);
     await host.close();
 
     const received = await drain(client.receive());
+    // The transport is satisfied: no gap, and it closed cleanly.
+    expect(client.ended()).toEqual({ kind: 'clean' });
+
     const deltas = textOf(received.slice(0, -1));
-    const assembled = bodyOf(received.at(-1)!)?.['message'];
-
     expect(deltas).toBe('the quick fox');
-    expect(assembled).toBe('the quick brown fox');
-    expect(deltas).not.toBe(assembled);
-  });
+    expect(assembledOf(received.at(-1))).toBe('the quick brown fox');
 
-  it('leaves a gap in the sequence, which is the other detector', async () => {
-    // The IR calls contiguity "the only loss-detection primitive the IR has"
-    // once a stream crosses a wire. Both detectors see this fault; only one
-    // of them sees a dropped `metadata` chunk, which changes no text.
-    const lossy = STREAM.filter((frame) => bodyOf(frame)?.['sequence'] !== 2);
-    const { host, client } = await pair(lossy);
-    await host.close();
-
-    const seen = seqOf(await drain(client.receive()));
-    expect(seen).toEqual([0, 1, 3, 4]);
-    expect(seen).not.toEqual([0, 1, 2, 3, 4]);
+    // And this is the app's own detector, run over what actually crossed the
+    // wire — not a fixture built to look like it.
+    const warning = streamIntegrityWarning(deltas, { role: 'assistant', content: 'the quick brown fox' });
+    expect(warning).not.toBeNull();
+    expect(warning?.category).toBe('transport-degraded');
+    expect(warning?.message).toContain('6 characters did not reach this device');
   });
 });
 
 describe('fault 2 — two frames reordered', () => {
-  it('arrives scrambled, and the assembled text disagrees', async () => {
+  it('fails the stream, because the sequence is what notices', async () => {
+    /*
+     * A length check could not see this: same frames, same count, different
+     * order. `sequence` is the whole reason the IR carries a counter that is
+     * "decoration" in one process.
+     */
     const swapped = [STREAM[0]!, STREAM[2]!, STREAM[1]!, STREAM[3]!, STREAM[4]!];
     const { host, client } = await pair(swapped);
-    await host.close();
 
     const received = await drain(client.receive());
-    const deltas = textOf(received.slice(0, -1));
-    expect(deltas).toBe('the brown quick fox');
-    expect(bodyOf(received.at(-1)!)?.['message']).toBe('the quick brown fox');
+    expect(seqOf(received)).toEqual([0]);
+    expect(client.ended()).toMatchObject({ kind: 'abnormal', code: 'SEQUENCE_BROKEN' });
+    await host.close();
+  });
 
-    // Same length, different order — which is why a length check alone would
-    // miss this and the sequence numbers would not.
-    const seen = seqOf(received);
-    expect(seen).toEqual([0, 2, 1, 3, 4]);
-    expect([...seen].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4]);
+  it('the same frames in order are clean — the paired control', async () => {
+    const { host, client } = await pair(STREAM);
+    await host.close();
+    const received = await drain(client.receive());
+    expect(seqOf(received)).toEqual([0, 1, 2, 3, 4]);
+    expect(client.ended()).toEqual({ kind: 'clean' });
+  });
+});
+
+describe('the done.message obligation, from the sending side (#260)', () => {
+  it('the host refuses to send a terminal chunk without it', async () => {
+    /*
+     * #260 predicted the failure mode exactly: the field is a second full copy
+     * of the reply, so "the first reviewer optimising bandwidth deletes it
+     * unless the requirement is written down". A comment is not a requirement.
+     */
+    const { host } = await pair();
+    await expect(
+      host.send({
+        v: TUNNEL_WIRE_VERSION,
+        kind: 'chunk',
+        turn: 't1',
+        body: { type: 'done', sequence: 0, finishReason: 'stop' },
+      }),
+    ).rejects.toThrow(/must carry `message`/);
+  });
+
+  it('and refuses a bare string, which is the shape that used to pass', async () => {
+    const { host } = await pair();
+    await expect(
+      host.send({
+        v: TUNNEL_WIRE_VERSION,
+        kind: 'chunk',
+        turn: 't1',
+        body: { type: 'done', sequence: 0, finishReason: 'stop', message: 'the quick brown fox' },
+      }),
+    ).rejects.toThrow(/IRMessage/);
   });
 });
 

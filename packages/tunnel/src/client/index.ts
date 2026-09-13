@@ -36,6 +36,7 @@
  * day someone pours it into the wrong half.
  */
 
+import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
 import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from '../wire/index.js';
 
 /**
@@ -117,6 +118,7 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
   const closed = new Promise<void>((resolve) => {
     settle = resolve;
   });
+  const guard = createSequenceGuard();
 
   /** First caller wins. See the host's, which carries the argument. */
   const finish = (close: TunnelClose): void => {
@@ -145,6 +147,20 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
       finish({ kind: 'clean', reason: frame.body?.reason });
       return;
     }
+    /*
+     * CONTIGUITY, ENFORCED (#260). The IR calls `sequence` "the only
+     * loss-detection primitive the IR has" once a stream crosses a wire and
+     * says a consumer that sees a gap "should fail the turn rather than render
+     * it". Failing here rather than at the end is the point: the frames after
+     * a gap are not the stream that was sent, so rendering them and warning
+     * afterwards shows the user something and then takes it back.
+     */
+    const fault = guard.check(frame);
+    if (fault) {
+      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(fault) });
+      socket.close();
+      return;
+    }
     inbox.push(frame);
     wake?.();
   });
@@ -167,6 +183,9 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
 
   return {
     async send(frame) {
+      // The obligation is symmetric: a client streams a reply back when the
+      // desktop asks the phone for a turn. See `assertSendable`.
+      assertSendable(frame);
       socket.send(encodeFrame(frame));
     },
     async *receive() {

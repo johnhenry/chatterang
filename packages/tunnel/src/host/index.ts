@@ -31,6 +31,7 @@
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 
+import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
 import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from '../wire/index.js';
 
 /**
@@ -141,6 +142,7 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
   let wake: (() => void) | null = null;
   let ended: TunnelClose | null = null;
   let peer: import('ws').WebSocket | null = null;
+  const guard = createSequenceGuard();
 
   let settle!: () => void;
   const closed = new Promise<void>((resolve) => {
@@ -168,7 +170,10 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
 
   sockets.on('connection', (socket) => {
     peer = socket;
-    for (const frame of options.greeting ?? []) socket.send(encodeFrame(frame));
+    for (const frame of options.greeting ?? []) {
+      assertSendable(frame);
+      socket.send(encodeFrame(frame));
+    }
 
     socket.on('message', (data: Buffer) => {
       let frame: TunnelFrame;
@@ -187,6 +192,13 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
       }
       if (frame.kind === 'bye') {
         finish({ kind: 'clean', reason: frame.body?.reason });
+        return;
+      }
+      // Contiguity, enforced. See the client's, which carries the argument.
+      const fault = guard.check(frame);
+      if (fault) {
+        finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(fault) });
+        socket.close();
         return;
       }
       push(frame);
@@ -227,6 +239,7 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
       return ended;
     },
     async send(frame) {
+      assertSendable(frame);
       peer?.send(encodeFrame(frame));
     },
     async *receive() {
