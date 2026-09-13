@@ -11,9 +11,14 @@ import { clearForDestination, markTainted } from '@/ai/taint';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   BACKUP_RULES_XML,
+  CAMERA_USAGE_DESCRIPTION,
   DATA_EXTRACTION_RULES_XML,
+  patchAndroidCamera,
   patchAndroidManifest,
   patchAppDelegate,
+  patchInfoPlist,
+  IOS_INFO_PLIST,
+  NATIVE_PATCHES,
 } from '../scripts/patch-native.mjs';
 import { isLocalEngine } from '@/domain/manifest';
 import type { IRMessage } from '@johnhenry/aimatey-types';
@@ -1046,5 +1051,153 @@ describe('adding a way off the device forces the public list to change', () => {
     // signal about ROUTES rather than about configuration.
     const bullets = await leaveBullets({ providers: [] });
     expect(bullets.length).toBe(5);
+  });
+});
+
+
+/* ── The camera permission, and the sentence that justifies it (#128) ─── */
+
+/**
+ * WHY THIS IS IN THE PRIVACY SUITE AND NOT A BUILD TEST.
+ *
+ * The camera string is not configuration. It is displayed in an OS dialog at
+ * the moment a privacy-first app asks for a camera, it is what an App Review
+ * reviewer reads against the store listing, and once shipped it is changeable
+ * only through another review. It belongs beside the other sentences this file
+ * refuses to let drift.
+ *
+ * The measurement that made this path possible is in `dev/probe-128/`: without
+ * `NSCameraUsageDescription`, `navigator.mediaDevices` is UNDEFINED in
+ * WKWebView — not permission-blocked, absent — at `capacitor://localhost` and
+ * at an `http://localhost` origin alike. #128 inferred the custom URL scheme
+ * was the cause. It is not. So this key is not a label on a capability the app
+ * already has; it is the capability.
+ */
+describe('the camera usage string', () => {
+  it('is the sentence the owner ruled, exactly', () => {
+    expect(CAMERA_USAGE_DESCRIPTION).toBe(
+      'Chatterang uses the camera to scan a pairing code shown on your computer. ' +
+        'Nothing the camera sees is stored or sent anywhere.',
+    );
+  });
+
+  it('deliberately does not say "only", and that omission is the ruling', () => {
+    /*
+     * #128 drafted "uses the camera ONLY to scan a pairing code". That is the
+     * strongest sentence available and a permanent constraint: any later
+     * feature reaching the same capture surface would make a shipped privacy
+     * promise false and cost a new string plus a re-review.
+     *
+     * Pinned as an ABSENCE because this is the kind of word a later reader
+     * adds as an improvement, not noticing it is spending something.
+     */
+    expect(CAMERA_USAGE_DESCRIPTION).not.toMatch(/\bonly\b/i);
+  });
+
+  it('names pairing specifically rather than giving a vague purpose', () => {
+    // Vague purpose strings are a documented App Review rejection reason, and
+    // read as evasive in an app whose pitch is candour.
+    expect(CAMERA_USAGE_DESCRIPTION).toMatch(/pairing code/i);
+    expect(CAMERA_USAGE_DESCRIPTION).toMatch(/your computer/i);
+  });
+
+  it('makes a promise about the frames that the app must then keep', () => {
+    // The second sentence is the one #128 says "has to be true": frames never
+    // touch the blob store and never reach a model. This pins the CLAIM; the
+    // conduct is pinned where the scanner lands.
+    expect(CAMERA_USAGE_DESCRIPTION).toMatch(/stored or sent anywhere/i);
+  });
+});
+
+describe('the camera permission, applied by the sync step', () => {
+  const STOCK_PLIST = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '\t<key>CFBundleDisplayName</key>',
+    '\t<string>Chatterang</string>',
+    '</dict>',
+    '</plist>',
+  ].join('\n');
+
+  it('adds the usage string to Info.plist, and only once', () => {
+    const patched = patchInfoPlist(STOCK_PLIST);
+    expect(patched).toContain('<key>NSCameraUsageDescription</key>');
+    expect(patched).toContain(CAMERA_USAGE_DESCRIPTION);
+    // A second sync must not produce two keys, which is a malformed plist.
+    expect(patchInfoPlist(patched)).toBe(patched);
+    expect(patched.match(/NSCameraUsageDescription/g)).toHaveLength(1);
+  });
+
+  it('leaves the plist well-formed XML', () => {
+    // A duplicated or unbalanced key is a build failure on someone else's
+    // machine, days later. Parsed here instead.
+    const patched = patchInfoPlist(STOCK_PLIST);
+    const doc = new DOMParser().parseFromString(patched, 'application/xml');
+    expect(doc.querySelector('parsererror')).toBeNull();
+    expect(doc.querySelector('plist > dict')).not.toBeNull();
+  });
+
+  it('refuses to be a silent no-op if Capacitor changes the template', () => {
+    // The failure mode that matters: the transform quietly does nothing, the
+    // key never lands, and `getUserMedia` is undefined on every iOS build with
+    // a green suite.
+    expect(() => patchInfoPlist('<plist version="1.0"></plist>')).toThrow(/<dict>/);
+  });
+
+  it('declares CAMERA on Android, and only once', () => {
+    const stock = '<?xml version="1.0"?>\n<manifest xmlns:android="x">\n  <application />\n</manifest>';
+    const patched = patchAndroidCamera(stock);
+    expect(patched).toContain('android.permission.CAMERA');
+    expect(patchAndroidCamera(patched)).toBe(patched);
+    expect(patched.match(/android\.permission\.CAMERA/g)).toHaveLength(1);
+  });
+
+  it('declares the camera hardware OPTIONAL, so camera-less devices still install', () => {
+    /*
+     * NOT BOILERPLATE. Declaring CAMERA without a `<uses-feature
+     * required="false">` makes Play treat a camera as a device requirement and
+     * hide the app from hardware that has none. That would be wrong on the
+     * facts: pairing has a TYPED route that needs no camera, which the owner
+     * ruled takes a host field beside the six digits. A camera-less tablet is
+     * a device this app works on.
+     */
+    const patched = patchAndroidCamera('<manifest xmlns:android="x"><application /></manifest>');
+    expect(patched).toContain('android:name="android.hardware.camera"');
+    expect(patched).toContain('android:required="false"');
+  });
+
+  it('refuses to be a silent no-op on Android too', () => {
+    expect(() => patchAndroidCamera('<application />')).toThrow(/<manifest>/);
+  });
+
+  it('is actually WIRED into the sync step, not merely exported', () => {
+    /*
+     * The gap every test above leaves open. They prove the transforms work;
+     * none of them proves one RUNS. A camera key that is never applied is an
+     * iOS build where `navigator.mediaDevices` is undefined, with a green
+     * suite — which is exactly the state the app is in today, and exactly what
+     * #128 spent its whole life inferring the wrong cause of.
+     */
+    const files = NATIVE_PATCHES.map((patch) => patch.file);
+    expect(files).toContain(IOS_INFO_PLIST);
+
+    // And the wired transform is the real one, not a stub with the same name.
+    const entry = NATIVE_PATCHES.find((patch) => patch.file === IOS_INFO_PLIST);
+    expect(entry?.platform).toBe('ios');
+    const applied = entry!.transform('<plist version="1.0"><dict></dict></plist>');
+    expect(applied).toContain(CAMERA_USAGE_DESCRIPTION);
+  });
+
+  it('composes with the backup patch without either undoing the other', () => {
+    // `main()` runs them over the same file. Two transforms sharing one file
+    // is exactly where an idempotency bug hides.
+    const stock =
+      '<?xml version="1.0"?>\n<manifest xmlns:android="x">\n  <application android:allowBackup="true" />\n</manifest>';
+    const once = patchAndroidCamera(patchAndroidManifest(stock));
+    expect(once).toContain('android:allowBackup="false"');
+    expect(once).toContain('android.permission.CAMERA');
+    expect(patchAndroidCamera(patchAndroidManifest(once))).toBe(once);
   });
 });
