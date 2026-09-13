@@ -555,3 +555,6 @@ export function isMulticastDnsName(address: PairingAddress): boolean {
 
 /* The single-use window (#129), re-exported so `/pairing` is one entry point. */
 export * from './window.js';
+
+/* The typed route's grammar (#130), re-exported for the same reason. */
+export * from './typed.js';
