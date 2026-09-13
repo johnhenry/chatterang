@@ -4,8 +4,26 @@
     {
       "name": "chatterang",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "port": 5273
+    },
+    {
+      "name": "probe-128",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "--yes",
+        "http-server",
+        "dev/probe-128",
+        "-p",
+        "8128",
+        "-c-1",
+        "-a",
+        "0.0.0.0"
+      ],
+      "port": 8128
     }
   ]
 }

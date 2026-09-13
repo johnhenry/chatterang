@@ -1,0 +1,75 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#128 capture-API probe</title>
+<style>
+  body{font:15px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111}
+  h1{font-size:17px;margin:0 0 4px}
+  p.origin{margin:0 0 16px;color:#666;font-size:13px;word-break:break-all}
+  table{border-collapse:collapse;width:100%;font-size:14px}
+  td{padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top}
+  td:first-child{color:#555;white-space:nowrap}
+  .y{color:#0a7d28;font-weight:600}.n{color:#b00020;font-weight:600}
+  pre{background:#f6f6f6;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;margin-top:16px}
+</style>
+<h1>#128 — capture API probe</h1>
+<p class="origin" id="origin"></p>
+<table id="out"></table>
+<pre id="json"></pre>
+<script>
+/*
+ * THE EXPERIMENT #128 NAMES. It reads the same two APIs the #176 probe read
+ * under `capacitor://localhost`, but from whatever origin serves this file —
+ * so pointing mobile Safari at http://localhost (secure by the localhost rule,
+ * and a WebKit-native origin) answers the question #128 could only infer:
+ * is the custom URL scheme why `mediaDevices` is absent on iOS?
+ */
+const results = {
+  href: location.href,
+  origin: location.origin,
+  protocol: location.protocol,
+  isSecureContext,
+  userAgent: navigator.userAgent,
+  mediaDevices: 'mediaDevices' in navigator,
+  getUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+  legacyGetUserMedia: !!(navigator.getUserMedia || navigator.webkitGetUserMedia),
+  BarcodeDetector: typeof BarcodeDetector !== 'undefined',
+  devices: null,
+  barcodeFormats: null,
+  error: null,
+};
+
+const table = document.getElementById('out');
+document.getElementById('origin').textContent = location.href;
+const row = (k, v) => {
+  const tr = table.insertRow();
+  tr.insertCell().textContent = k;
+  const cell = tr.insertCell();
+  cell.textContent = typeof v === 'boolean' ? (v ? 'PRESENT' : 'ABSENT') : String(v);
+  if (typeof v === 'boolean') cell.className = v ? 'y' : 'n';
+};
+
+(async () => {
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      results.devices = list.map((d) => ({ kind: d.kind, labelled: d.label !== '' }));
+    }
+  } catch (e) { results.error = String(e); }
+  try {
+    if (typeof BarcodeDetector !== 'undefined') {
+      results.barcodeFormats = await BarcodeDetector.getSupportedFormats();
+    }
+  } catch (e) { results.error = (results.error || '') + ' ' + String(e); }
+
+  row('isSecureContext', results.isSecureContext);
+  row('navigator.mediaDevices', results.mediaDevices);
+  row('getUserMedia', results.getUserMedia);
+  row('legacy getUserMedia', results.legacyGetUserMedia);
+  row('BarcodeDetector', results.BarcodeDetector);
+  row('devices', results.devices ? results.devices.length + ' (' + results.devices.filter(d=>d.labelled).length + ' labelled)' : 'n/a');
+  row('barcode formats', results.barcodeFormats ? results.barcodeFormats.join(', ') : 'n/a');
+  document.getElementById('json').textContent = JSON.stringify(results, null, 2);
+  window.__probe = results;
+})();
+</script>

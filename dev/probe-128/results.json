@@ -1,0 +1,73 @@
+{
+  "issue": 128,
+  "question": "Why is navigator.mediaDevices absent on iOS, and is the custom URL scheme the cause?",
+  "runtime": { "ios": "26.5", "device": "iPhone 17 Pro simulator", "engine": "WKWebView / mobile Safari 26.5" },
+  "method": "One app, two WKWebViews, same process and same Info.plist: one at http://localhost:8128, one at chatterang://localhost served by a WKURLSchemeHandler (which is what capacitor:// is). Only the scheme varies. Then the same pair re-run with NSCameraUsageDescription added, and again with it removed.",
+  "runs": [
+    {
+      "host": "mobile Safari",
+      "origin": "http://localhost:8128",
+      "NSCameraUsageDescription": "n/a (Safari, not the app)",
+      "isSecureContext": true,
+      "mediaDevices": true,
+      "getUserMedia": true,
+      "BarcodeDetector": false,
+      "devices": "1 (audioinput only; simulator has no camera)"
+    },
+    {
+      "host": "WKWebView",
+      "origin": "http://localhost:8128",
+      "NSCameraUsageDescription": false,
+      "isSecureContext": true,
+      "mediaDevices": false,
+      "getUserMedia": false,
+      "BarcodeDetector": false
+    },
+    {
+      "host": "WKWebView",
+      "origin": "chatterang://localhost",
+      "NSCameraUsageDescription": false,
+      "isSecureContext": true,
+      "mediaDevices": false,
+      "getUserMedia": false,
+      "BarcodeDetector": false
+    },
+    {
+      "host": "WKWebView",
+      "origin": "http://localhost:8128",
+      "NSCameraUsageDescription": true,
+      "isSecureContext": true,
+      "mediaDevices": true,
+      "getUserMedia": true,
+      "BarcodeDetector": false
+    },
+    {
+      "host": "WKWebView",
+      "origin": "chatterang://localhost",
+      "NSCameraUsageDescription": true,
+      "isSecureContext": true,
+      "mediaDevices": true,
+      "getUserMedia": true,
+      "BarcodeDetector": false
+    },
+    {
+      "host": "WKWebView",
+      "origin": "both",
+      "NSCameraUsageDescription": "removed again (paired control)",
+      "mediaDevices": false,
+      "getUserMedia": false,
+      "BarcodeDetector": false,
+      "note": "Flips back, so the effect is the plist key and not install order or caching."
+    }
+  ],
+  "findings": {
+    "schemeIsNotTheCause": "An http origin in the same WKWebView is equally blind without the usage string. #128's stated best explanation is falsified.",
+    "usageStringIsTheGate": "NSCameraUsageDescription toggles navigator.mediaDevices on and off at BOTH origins, on the same binary.",
+    "decoderStillMissing": "BarcodeDetector is absent in WKWebView at both origins AND in mobile Safari. iOS needs a bundled decoder under every option."
+  },
+  "caveats": [
+    "The simulator has no camera: this measures API SURFACE, not capture or decode. enumerateDevices returned audioinput only.",
+    "iOS 26.5 only. Older iOS runtimes not measured (see #223).",
+    "Measured in a bare WKWebView, not Capacitor's. The custom-scheme arm matches capacitor:// in the respect that matters, but confirming in a real chatterang build with the plist string added is the remaining step."
+  ]
+}
