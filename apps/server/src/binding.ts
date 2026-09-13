@@ -331,6 +331,14 @@ export function parseArgv(argv: readonly string[]): BindingRequest & {
   readonly root?: string;
   readonly bundle?: string;
   readonly hosts?: string;
+  /**
+   * What pairing advertises, overriding what this machine can see (#252).
+   *
+   * Separate from `--host`, which is a BIND address, and the distinction is
+   * the whole reason this flag exists: `0.0.0.0` is a legitimate thing to bind
+   * and never a thing to dial. See `addresses.ts`.
+   */
+  readonly advertise?: string;
 } {
   const out: {
     host?: string;
@@ -340,6 +348,7 @@ export function parseArgv(argv: readonly string[]): BindingRequest & {
     root?: string;
     bundle?: string;
     hosts?: string;
+    advertise?: string;
   } = {};
   for (let at = 0; at < argv.length; at += 1) {
     const flag = argv[at];
@@ -354,6 +363,9 @@ export function parseArgv(argv: readonly string[]): BindingRequest & {
     switch (flag) {
       case '--host':
         out.host = need();
+        break;
+      case '--advertise':
+        out.advertise = need();
         break;
       case '--port':
         out.port = Number(need());
