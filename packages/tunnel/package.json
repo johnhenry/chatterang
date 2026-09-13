@@ -7,6 +7,7 @@
   "exports": {
     "./wire": "./src/wire/index.ts",
     "./codec": "./src/codec/index.ts",
+    "./stream": "./src/stream/index.ts",
     "./pairing": "./src/pairing/index.ts",
     "./pake": "./src/pake/index.ts",
     "./client": "./src/client/index.ts",
@@ -14,6 +15,7 @@
   },
   "dependencies": {
     "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0"
+    "@noble/hashes": "2.4.0",
+    "ws": "8.21.3"
   }
 }

@@ -713,12 +713,18 @@ describe('the tunnel package', () => {
     // `./pairing` joins the importable side (#134): the phone is the half that
     // SCANS a pairing code, so the parser has to be in its bundle. It imports
     // nothing and reaches for no global, which the rule above checks.
+    // `./stream` joins the importable side (#260): it is the contiguity guard
+    // and the `done.message` obligation, and BOTH halves apply it — the phone
+    // streams a reply back when the desktop asks it for a turn, so a rule that
+    // lived only in the host would be enforced in one direction. It imports a
+    // type and `../wire`, which the ban above checks.
     expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([
       './client',
       './codec',
       './host',
       './pairing',
       './pake',
+      './stream',
       './wire',
     ]);
   });

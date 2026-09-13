@@ -36,7 +36,8 @@
  * day someone pours it into the wrong half.
  */
 
-import type { TunnelFrame } from '../wire/index.js';
+import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
+import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from '../wire/index.js';
 
 /**
  * The client end of a tunnel.
@@ -52,8 +53,12 @@ export interface TunnelClient {
   send(frame: TunnelFrame): Promise<void>;
   /** Frames from the peer, in arrival order, until the tunnel closes. */
   receive(): AsyncIterable<TunnelFrame>;
-  /** Close this end. Idempotent. */
-  close(): Promise<void>;
+  /** Close this end. Says `bye` first, per #260. Idempotent. */
+  close(reason?: string): Promise<void>;
+  /** How the tunnel ended, or null while it is open. */
+  ended(): TunnelClose | null;
+  /** Resolves once the tunnel has ended. See the host's, which this mirrors. */
+  readonly closed: Promise<void>;
 }
 
 /**
@@ -79,19 +84,133 @@ export function randomChallenge(byteLength = 32): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(byteLength));
 }
 
+/** How a tunnel ended. Mirrors the host's, deliberately — one vocabulary. */
+export type TunnelClose =
+  | { readonly kind: 'clean'; readonly reason?: string }
+  | { readonly kind: 'abnormal'; readonly code: string; readonly message: string };
+
+export interface TunnelClientOptions {
+  /** `ws://127.0.0.1:<port>` for rung 0. */
+  readonly url: string;
+}
+
 /**
- * The seam the transport will be built behind.
+ * Connect to a tunnel host.
  *
- * It throws, and that is the honest state of this milestone: the package
- * exists, the boundary is guarded, and the thing that goes inside is not built.
- * It is no longer BLOCKED — #181 ruled — so the message names the ticket that
- * would build it rather than the one that would decide it. A stub that returned
- * a fake client would read as working code and would be worse than a throw with
- * a ticket number in it.
+ * USES THE GLOBAL `WebSocket`, which is not laziness — it is the whole reason
+ * this half can exist. Node 24 ships a WebSocket CLIENT (undici) and every
+ * target this half runs in has one: the iOS and Android webviews, the desktop
+ * renderer, and Node. #157's ruling is about the SERVER, which Node does not
+ * ship and which lives in the other half behind a ban.
+ *
+ * So the asymmetry in this package — a dependency on one side and a global on
+ * the other — is the asymmetry in the platform, not a preference.
  */
-export function createTunnelClient(): never {
-  throw new Error(
-    'tunnel client is not implemented: the transport is a native socket plugin ' +
-      '(#181, ruled 2026-09-11) and the client that speaks it is #156',
-  );
+export async function createTunnelClient(options: TunnelClientOptions): Promise<TunnelClient> {
+  const socket = new WebSocket(options.url);
+  socket.binaryType = 'arraybuffer';
+
+  const inbox: TunnelFrame[] = [];
+  let wake: (() => void) | null = null;
+  let ended: TunnelClose | null = null;
+
+  let settle!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const guard = createSequenceGuard();
+
+  /** First caller wins. See the host's, which carries the argument. */
+  const finish = (close: TunnelClose): void => {
+    ended ??= close;
+    wake?.();
+    settle();
+  };
+
+  socket.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as ArrayBuffer | string;
+    let frame: TunnelFrame;
+    try {
+      frame = decodeFrame(
+        typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data),
+      );
+    } catch (error) {
+      finish({
+        kind: 'abnormal',
+        code: 'FRAME_INVALID',
+        message: error instanceof Error ? error.message : 'frame refused',
+      });
+      socket.close();
+      return;
+    }
+    if (frame.kind === 'bye') {
+      finish({ kind: 'clean', reason: frame.body?.reason });
+      return;
+    }
+    /*
+     * CONTIGUITY, ENFORCED (#260). The IR calls `sequence` "the only
+     * loss-detection primitive the IR has" once a stream crosses a wire and
+     * says a consumer that sees a gap "should fail the turn rather than render
+     * it". Failing here rather than at the end is the point: the frames after
+     * a gap are not the stream that was sent, so rendering them and warning
+     * afterwards shows the user something and then takes it back.
+     */
+    const fault = guard.check(frame);
+    if (fault) {
+      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(fault) });
+      socket.close();
+      return;
+    }
+    inbox.push(frame);
+    wake?.();
+  });
+
+  socket.addEventListener('close', () => {
+    /*
+     * See the host's identical branch. `bye` is obliged on a deliberate close
+     * (#260), so a socket that goes away without one is reported as abnormal
+     * rather than as the end of a stream — which is the distinction #185 says
+     * does not currently exist and which #156's faults 3 and 4 assert.
+     */
+    // Unconditional; the latch holds every other answer. See the host's.
+    finish({ kind: 'abnormal', code: 'PEER_GONE', message: 'the peer went away without a bye' });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    socket.addEventListener('open', () => resolve(), { once: true });
+    socket.addEventListener('error', () => reject(new Error(`tunnel client: cannot reach ${options.url}`)), { once: true });
+  });
+
+  return {
+    async send(frame) {
+      // The obligation is symmetric: a client streams a reply back when the
+      // desktop asks the phone for a turn. See `assertSendable`.
+      assertSendable(frame);
+      socket.send(encodeFrame(frame));
+    },
+    async *receive() {
+      for (;;) {
+        while (inbox.length > 0) yield inbox.shift()!;
+        if (ended) return;
+        await new Promise<void>((resolve) => {
+          wake = () => {
+            wake = null;
+            resolve();
+          };
+        });
+      }
+    },
+    ended: () => ended,
+    closed,
+    async close(reason?: string) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(
+          encodeFrame({ v: TUNNEL_WIRE_VERSION, kind: 'bye', ...(reason ? { body: { reason } } : {}) }),
+        );
+      }
+      // Before `socket.close()`, for the reason the host's does. See there.
+      finish({ kind: 'clean', reason });
+      socket.close();
+    },
+  };
 }
