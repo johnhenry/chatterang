@@ -1052,6 +1052,23 @@ describe('adding a way off the device forces the public list to change', () => {
     const bullets = await leaveBullets({ providers: [] });
     expect(bullets.length).toBe(5);
   });
+
+  it('README.md’s Privacy section has exactly five numbered items', () => {
+    /*
+     * THE OTHER HALF OF THE FORCING FUNCTION, and it was missing. The tests
+     * above count the COMMAND's bullets and never read the README, so a route
+     * added to the public list alone — or dropped from it — failed nothing.
+     * Two counts pinned to the same number is what makes the pair move together.
+     */
+    const README = readFileSync(resolve(process.cwd(), 'README.md'), 'utf8');
+    const section = README.slice(README.indexOf('## Privacy'), README.indexOf('## Licence'));
+    const items = section.split('\n').filter((line) => /^\d+\. /.test(line));
+    expect(
+      items.length,
+      'README.md’s Privacy list changed length. The `privacy` command is the generated version ' +
+        'of this list — change both, then change both numbers.',
+    ).toBe(5);
+  });
 });
 
 

@@ -1,7 +1,7 @@
 /**
  * THE HOST HALF: the listener, which `src/` may never import.
  *
- * A listener binds a socket. `node:net` is right there in the import list
+ * A listener binds a socket. `node:http` is right there in the import list
  * below, and that import is not an accident of implementation — it is the
  * definition of this half. That is exactly why `@chatterang/tunnel/host` is in
  * `DESKTOP_LAYER_BAN` in `tests/layering.test.ts` alongside
@@ -38,7 +38,7 @@ import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from 
  * The host end of a tunnel.
  *
  * Typed against Node's own `Server` deliberately. It would be easy to write
- * this half against a structural `{ close(): void }` and keep `node:net` out of
+ * this half against a structural `{ close(): void }` and keep `node:http` out of
  * the file — and that would be a boundary that looks kept while the code below
  * it binds a socket anyway. Naming the Node type here makes the half honest
  * about what it is, and makes the guard's ban a rule with something behind it.

@@ -3,11 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "The tunnel between two Chatterangs, split at the entry point: ./wire, ./codec, ./pairing and ./client are importable from src/, ./host never is. There is deliberately no \".\" export \u2014 a single entry point that re-exported both halves would put node:net in the mobile bundle.",
+  "description": "The tunnel between two Chatterangs, split at the entry point: ./wire, ./codec, ./pairing, ./pake, ./stream, ./binding and ./client are importable from src/, ./host never is. There is deliberately no \".\" export — a single entry point that re-exported both halves would put node:http in the mobile bundle.",
   "exports": {
     "./wire": "./src/wire/index.ts",
     "./codec": "./src/codec/index.ts",
-"./stream": "./src/stream/index.ts",
+    "./stream": "./src/stream/index.ts",
     "./binding": "./src/binding/index.ts",
     "./pairing": "./src/pairing/index.ts",
     "./pake": "./src/pake/index.ts",

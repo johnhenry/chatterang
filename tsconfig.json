@@ -44,6 +44,10 @@
       // `tests/layering.test.ts` asserts all three of these facts.
       "@chatterang/tunnel/wire": ["packages/tunnel/src/wire/index.ts"],
       "@chatterang/tunnel/codec": ["packages/tunnel/src/codec/index.ts"],
+      "@chatterang/tunnel/pairing": ["packages/tunnel/src/pairing/index.ts"],
+      "@chatterang/tunnel/pake": ["packages/tunnel/src/pake/index.ts"],
+      "@chatterang/tunnel/stream": ["packages/tunnel/src/stream/index.ts"],
+      "@chatterang/tunnel/binding": ["packages/tunnel/src/binding/index.ts"],
       "@chatterang/tunnel/client": ["packages/tunnel/src/client/index.ts"],
       "@chatterang/tunnel/host": ["packages/tunnel/src/host/index.ts"],
       "@chatterang/desktop/*": ["apps/desktop/src/*"],
