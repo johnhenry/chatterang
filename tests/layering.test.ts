@@ -43,7 +43,7 @@ const SRC = resolve(process.cwd(), 'src');
  * guards on purpose: the package.json key is asserted absent in the tunnel
  * block below, and if someone adds a `.` that re-exports both halves — the
  * obvious convenience, and the thing that silently deletes this boundary — the
- * bare import still fails here rather than shipping `node:net` to a phone.
+ * bare import still fails here rather than shipping `node:http` to a phone.
  *
  * Relative paths get the same treatment, at both plausible layouts
  * (`packages/tunnel/host` and today's `packages/tunnel/src/host`), because
@@ -487,14 +487,14 @@ describe('contracts package', () => {
  *
  *   src/wire/    imports nothing at all.               `src/` MAY import it.
  *   src/client/  web globals only (no `node:`).        `src/` MAY import it.
- *   src/host/    `node:net`, and a socket to bind.     `src/` MAY NOT.
+ *   src/host/    `node:http`, and a socket to bind.     `src/` MAY NOT.
  *
  * WHY THE PACKAGE-NAME BAN ABOVE IS NOT ENOUGH BY ITSELF, and why this block
  * exists rather than one more name in `DESKTOP_LAYER_BAN`. The dangerous edge
  * is not `src/` naming the host entry — that is banned and revert-checked. It
  * is `packages/tunnel/src/client/` importing `../host/index.js`, INSIDE the
  * package, where the specifier `src/` writes is still `@chatterang/tunnel
- * /client` and every guard above waves it through while `node:net` rides into
+ * /client` and every guard above waves it through while `node:http` rides into
  * the mobile bundle behind it. A ban that only watches the front door is a ban
  * on the front door.
  *
@@ -511,7 +511,9 @@ describe('the tunnel package', () => {
   const TUNNEL = resolve(process.cwd(), 'packages/tunnel/src');
   const tunnelFiles = sourceFiles(TUNNEL);
   const relTunnel = (file: string): string => relative(TUNNEL, file).replaceAll('\\', '/');
-  const half = (name: 'wire' | 'codec' | 'pairing' | 'pake' | 'client' | 'host'): string[] =>
+  const half = (
+    name: 'wire' | 'codec' | 'pairing' | 'pake' | 'stream' | 'binding' | 'client' | 'host',
+  ): string[] =>
     tunnelFiles.filter((file) => relTunnel(file).startsWith(`${name}/`));
 
   /** Every specifier a file names, with comments stripped first. */
@@ -523,7 +525,7 @@ describe('the tunnel package', () => {
     // nothing — the failure mode of every "no offenders" assertion in this
     // file, and the reason each block here opens with a count.
     expect(tunnelFiles.map(relTunnel).sort()).not.toEqual([]);
-    for (const name of ['wire', 'codec', 'pairing', 'pake', 'client', 'host'] as const) {
+    for (const name of ['wire', 'codec', 'pairing', 'pake', 'stream', 'binding', 'client', 'host'] as const) {
       expect(half(name).length, `packages/tunnel/src/${name} is empty`).toBeGreaterThan(0);
     }
   });
@@ -561,7 +563,7 @@ describe('the tunnel package', () => {
      * "Nothing" means nothing FROM OUTSIDE THIS HALF. A `./`-relative import
      * of a sibling file is the half being more than one file, which is not
      * what this rule protects against — the danger is a dependency the phone
-     * did not ask for, or `../host`, which is `node:net` in the mobile bundle.
+     * did not ask for, or `../host`, which is `node:http` in the mobile bundle.
      *
      * So: `./x` is allowed, and ANY specifier containing `..` is not, which
      * bans reaching into another half by relative path as well as reaching out
@@ -644,24 +646,85 @@ describe('the tunnel package', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('the client half never reaches into the host half', () => {
+  it('no importable half reaches into the host half', () => {
     // THE EDGE A PACKAGE-NAME BAN CANNOT SEE. `src/` importing
     // `@chatterang/tunnel/client` is allowed and always will be; if that file
-    // imports `../host/index.js`, `node:net` is in the phone bundle and every
+    // imports `../host/index.js`, `node:http` is in the phone bundle and every
     // other guard in this file still passes.
+    //
+    // EVERY IMPORTABLE HALF, not only `client`. This rule used to cover `client`
+    // alone, while `binding/` and `stream/` — both importable from `src/` —
+    // were checked by nothing at all: neither appeared in any rule in this
+    // block, so a `../host` import in either would have passed the whole file.
     //
     // Both spellings, because the relative path is the one someone actually
     // types from inside the package and the package name is the one a
     // refactor leaves behind.
-    const offenders = half('client').flatMap((file) =>
+    const reachesHost = (specifier: string): boolean =>
+      DESKTOP_LAYER_BAN.test(specifier) || /(^|\/)\.\.\/host(\/|$)/.test(`/${specifier}`);
+    const importable = ['client', 'binding', 'stream', 'pairing', 'pake'] as const;
+    const offenders = importable.flatMap((name) =>
+      half(name).flatMap((file) =>
+        specifiersOf(file)
+          .filter(reachesHost)
+          .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+      ),
+    );
+    expect(offenders).toEqual([]);
+
+    // The check can fail: both spellings are caught, and a sibling half is not.
+    expect(reachesHost('../host/index.js')).toBe(true);
+    expect(reachesHost('@chatterang/tunnel/host')).toBe(true);
+    expect(reachesHost('../pake/index.js')).toBe(false);
+  });
+
+  it('the binding half imports only the two halves it joins', () => {
+    /*
+     * `binding/` exists as its own half for one reason: it is the only place
+     * that needs both `pairing/` (which may import nothing) and `pake/` (which
+     * may import noble and nothing else). So it may import exactly those two,
+     * plus its own siblings — not noble directly, not `../host`, not a builtin.
+     */
+    const ALLOWED = new Set(['../pake/index.js', '../pairing/index.js']);
+    const allowed = (specifier: string): boolean =>
+      ALLOWED.has(specifier) || (specifier.startsWith('./') && !specifier.includes('..'));
+    const offenders = half('binding').flatMap((file) =>
       specifiersOf(file)
-        .filter(
-          (specifier) =>
-            DESKTOP_LAYER_BAN.test(specifier) || /(^|\/)\.\.\/host(\/|$)/.test(`/${specifier}`),
-        )
+        .filter((specifier) => !allowed(specifier))
         .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
     );
     expect(offenders).toEqual([]);
+
+    // Positive control: both allowances are actually used, so neither passes
+    // because the file happens not to import it.
+    const used = half('binding').flatMap(specifiersOf);
+    expect(used).toContain('../pake/index.js');
+    expect(used).toContain('../pairing/index.js');
+    expect(allowed('../host/index.js')).toBe(false);
+    expect(allowed('@noble/curves/ed25519.js')).toBe(false);
+    expect(allowed('node:crypto')).toBe(false);
+  });
+
+  it('the stream half imports the wire and the IR types, and the types only as types', () => {
+    // `stream/` is loaded by both ends, so it gets `wire/`'s manners plus the
+    // one thing it needs to name: the IR message shape. That is a TYPE, and a
+    // value import from the IR package would put runtime code in a half that
+    // was written to carry none.
+    const ALLOWED = new Set(['../wire/index.js', '@johnhenry/aimatey-types']);
+    const offenders = half('stream').flatMap((file) =>
+      specifiersOf(file)
+        .filter((specifier) => !ALLOWED.has(specifier))
+        .map((specifier) => `${relTunnel(file)} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+
+    const valueImportsOfTypes = half('stream').flatMap((file) =>
+      [...codeOf(readFileSync(file, 'utf8')).matchAll(/import\s+(?!type\b)[^;]*?from\s+['"]@johnhenry\/aimatey-types['"]/g)]
+        .map(() => relTunnel(file)),
+    );
+    expect(valueImportsOfTypes, 'a VALUE import from @johnhenry/aimatey-types').toEqual([]);
+
+    expect(half('stream').flatMap(specifiersOf)).toContain('../wire/index.js');
   });
 
   it('neither shared half imports the app', () => {
@@ -672,6 +735,8 @@ describe('the tunnel package', () => {
       ...half('codec'),
       ...half('pairing'),
       ...half('pake'),
+      ...half('stream'),
+      ...half('binding'),
       ...half('client'),
       ...half('host'),
     ].flatMap((file) =>
@@ -690,7 +755,7 @@ describe('the tunnel package', () => {
     // ban's justification arrives after the code it was supposed to constrain.
     //
     // So the ban is required to have something behind it, asserted in the
-    // positive direction. `import type { Server } from 'node:net'` in
+    // positive direction. `import type { Server } from 'node:http'` in
     // `host/index.ts` is deliberate for exactly this reason, and the comment
     // there says so.
     const named = half('host').flatMap((file) => specifiersOf(file).filter(isNodeBuiltin));
@@ -700,7 +765,7 @@ describe('the tunnel package', () => {
   it('declares no "." export, so a bare @chatterang/tunnel resolves to nothing', () => {
     // The one plausible way this boundary disappears without anyone deciding to
     // delete it: someone adds `".": "./src/index.ts"` re-exporting both halves
-    // because a bare import is tidier, and `src/` gets `node:net` through a
+    // because a bare import is tidier, and `src/` gets `node:http` through a
     // specifier no ban mentions. `DESKTOP_LAYER_BAN` bans the bare specifier as
     // well for the same reason — two independent guards, because this one is a
     // convenience someone will genuinely want.
@@ -751,7 +816,7 @@ describe('the tunnel package', () => {
       // which a raw text search reads as the violation itself, and which is the
       // exact trap this file's contracts block documents at `SPECIFIER`.
       const code = codeOf(source);
-      for (const entry of ['wire', 'codec', 'client', 'host']) {
+      for (const entry of ['wire', 'codec', 'pairing', 'pake', 'stream', 'binding', 'client', 'host']) {
         expect(code, `${name} does not map @chatterang/tunnel/${entry}`).toContain(
           `@chatterang/tunnel/${entry}`,
         );

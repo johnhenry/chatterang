@@ -52,6 +52,18 @@ export default defineConfig({
       '@chatterang/tunnel/codec': fileURLToPath(
         new URL('./packages/tunnel/src/codec/index.ts', import.meta.url),
       ),
+      '@chatterang/tunnel/pairing': fileURLToPath(
+        new URL('./packages/tunnel/src/pairing/index.ts', import.meta.url),
+      ),
+      '@chatterang/tunnel/pake': fileURLToPath(
+        new URL('./packages/tunnel/src/pake/index.ts', import.meta.url),
+      ),
+      '@chatterang/tunnel/stream': fileURLToPath(
+        new URL('./packages/tunnel/src/stream/index.ts', import.meta.url),
+      ),
+      '@chatterang/tunnel/binding': fileURLToPath(
+        new URL('./packages/tunnel/src/binding/index.ts', import.meta.url),
+      ),
       '@chatterang/tunnel/client': fileURLToPath(
         new URL('./packages/tunnel/src/client/index.ts', import.meta.url),
       ),
