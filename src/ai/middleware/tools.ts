@@ -318,9 +318,11 @@ export async function runToolCalls(
 
   for (const [index, call] of calls.entries()) {
     const refusal = refused.get(index);
-    // Nothing runs once the turn is stopped. A call Stop held back is still
-    // written down below, so the thread can say it did not go.
-    if (options.signal?.aborted && refusal?.why !== 'stopped') continue;
+    // Nothing runs once the turn is stopped. A refused call is still written
+    // down below, whatever refused it: a refusal sends nothing, and a call the
+    // person declined before Stop came is as much not sent as one Stop held
+    // back (owner ruling OD7).
+    if (options.signal?.aborted && !refusal) continue;
 
     const tool = tools[index];
     const started = performance.now();

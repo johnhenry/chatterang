@@ -148,8 +148,10 @@ export interface McpCallFields {
  * - `server-changed`: nobody refused it. The server record it was prepared for
  *   was removed, switched off, renamed or pointed elsewhere while it waited, or
  *   no client was left to send it ({@link McpNotSent}).
- * - `stopped`: the reply was stopped while the call waited on a person — the
- *   send sheet or the data-change confirm. Nothing leaves after Stop, so an
+ * - `stopped`: the reply was stopped before anyone allowed the call — while it
+ *   waited on a person, at the send sheet or the data-change confirm, or before
+ *   its own send sheet was raised, because Stop came at an earlier sheet in the
+ *   batch or before the batch was dispatched. Nothing leaves after Stop, so an
  *   answer that came later did not count.
  *
  * Each reads differently in the thread and the export, because each is a

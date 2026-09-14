@@ -883,6 +883,130 @@ describe('MCP arguments do not leave the device without a grant', () => {
     );
   });
 
+  it('still records a call the person declined when Stop comes later in the batch', async () => {
+    // Every sheet in a batch is answered before any call runs, so a "Don’t
+    // send" is already a refusal when Stop lands — at the next server's sheet,
+    // or during a granted call queued before the declined one.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const declinedThenStopped = async (stopAt: 'sheet' | 'call') => {
+      const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+      const archive = mcpProbe({
+        serverName: 'archive',
+        serverId: 'mcp_archive',
+        serverUrl: 'https://archive.example/mcp',
+      });
+      toolRegistry.register(archive.tool);
+      const controller = new AbortController();
+      // At the sheet: notes is declined, and Stop comes while archive's is open.
+      // During the call: notes is granted and Stop comes while it runs; archive
+      // was declined before it started.
+      const request = vi.fn(async (asked: DestinationRequest): Promise<DestinationDecision> => {
+        if (stopAt === 'call') return 'deny';
+        if (asked.destination.serverId !== 'mcp_archive') return 'deny';
+        controller.abort();
+        return 'calls';
+      });
+      probe.call.mockImplementation(async () => {
+        controller.abort();
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+
+      const events = await settled(
+        drainEvents(
+          engine.stream({
+            messages: [{ role: 'user', content: 'file my note' }],
+            target: local(),
+            toolIds: [probe.tool.id, archive.tool.id],
+            mcpEgress: {
+              isGranted: (destination) => stopAt === 'call' && destination.serverId === PROBE_SERVER.serverId,
+              request,
+            },
+            signal: controller.signal,
+          }),
+        ),
+      );
+      toolRegistry.unregister(archive.tool.id);
+      const records = events.flatMap((event) =>
+        event.type === 'tool' ? [[event.tool.name, event.tool.receipt] as const] : [],
+      );
+      return { probe, archive, request, records };
+    };
+
+    const atSheet = await declinedThenStopped('sheet');
+    expect(atSheet.request).toHaveBeenCalledTimes(2);
+    expect(atSheet.probe.call).not.toHaveBeenCalled();
+    expect(atSheet.archive.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(atSheet.records.map(([name, receipt]) => [name, receipt?.outcome === 'withheld' && receipt.why])).toEqual([
+      ['notes.note', 'not-allowed'],
+      ['archive.note', 'stopped'],
+    ]);
+
+    const duringCall = await declinedThenStopped('call');
+    expect(duringCall.request).toHaveBeenCalledOnce();
+    expect(duringCall.probe.call).toHaveBeenCalledOnce();
+    expect(duringCall.archive.call).not.toHaveBeenCalled();
+    expect(duringCall.records.map(([name]) => name)).toEqual(['notes.note', 'archive.note']);
+    expect(duringCall.records[1]![1]).toMatchObject({
+      outcome: 'withheld',
+      why: 'not-allowed',
+      host: 'archive.example',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+  });
+
+  it('holds back the whole batch at Stop: a server not yet asked about is recorded as stopped, and a granted call does not run', async () => {
+    // What this build does when Stop lands at one server's sheet, pinned so
+    // that changing it is a decision rather than a tidy-up. A call to another
+    // server that was not yet asked about is recorded as stopped. A call to a
+    // server the conversation already allowed does not run and has no record,
+    // because it waited on nobody; whether it should be recorded too is with
+    // the owner (#92).
+    const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { engine, probe } = setUp([MCP_CALL + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://archive.example/mcp',
+    });
+    const mirror = mcpProbe({
+      serverName: 'mirror',
+      serverId: 'mcp_mirror',
+      serverUrl: 'https://mirror.example/mcp',
+    });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    const controller = new AbortController();
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => {
+      controller.abort();
+      return 'calls';
+    });
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id],
+          mcpEgress: { isGranted: (destination) => destination.serverId === 'mcp_mirror', request },
+          signal: controller.signal,
+        }),
+      ),
+    );
+
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual([PROBE_SERVER.serverId]);
+    expect(probe.call).not.toHaveBeenCalled();
+    expect(archive.call).not.toHaveBeenCalled();
+    expect(mirror.call, 'a granted call does not run after Stop').not.toHaveBeenCalled();
+    const records = events.flatMap((event) =>
+      event.type === 'tool' ? [[event.tool.name, event.tool.receipt] as const] : [],
+    );
+    expect(records.map(([name, receipt]) => [name, receipt?.outcome === 'withheld' && receipt.why])).toEqual([
+      ['notes.note', 'stopped'],
+      ['archive.note', 'stopped'],
+    ]);
+  });
+
   it('sends nothing after Stop while a destructive call’s own confirm is open, even when it is answered yes after', async () => {
     // The ruling names the send sheet; its stated effect is that nothing leaves
     // after Stop, so the other sheet a call waits on is held to it too.
