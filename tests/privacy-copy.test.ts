@@ -2427,7 +2427,11 @@ describe('a listening socket forces the privacy copy to change', () => {
     // The TLS identity (#179): a key, its pin, a certificate, and the
     // owner-only file the key is kept in. `node:crypto` and `node:fs`, and on
     // macOS a `/bin/ls -lde` child process to read ACLs; no socket.
+    // On Windows the store also runs `whoami` and PowerShell's Get-Acl, which
+    // read an account and a security descriptor and open nothing (#179).
+    TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS: 'binds nothing',
     TunnelIdentityError: 'binds nothing',
+    currentTunnelCertificate: 'binds nothing',
     generateTunnelKey: 'binds nothing',
     issueTunnelCertificate: 'binds nothing',
     loadOrCreateTunnelKey: 'binds nothing',

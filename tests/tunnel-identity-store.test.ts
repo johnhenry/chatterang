@@ -45,6 +45,7 @@ import {
   type KeyFileStat,
   type KeyFileSystem,
   type TunnelIdentityErrorReason,
+  type WindowsToolRunner,
 } from '@chatterang/tunnel/host';
 
 /**
@@ -756,7 +757,8 @@ describe('where owner-only cannot be checked, nothing is stored', () => {
     },
   });
 
-  it.each(['win32', 'freebsd', 'openbsd', 'sunos', 'aix', 'android', 'cygwin'])(
+  // Windows is stored on now (#179), and has its own describe below.
+  it.each(['freebsd', 'openbsd', 'sunos', 'aix', 'android', 'cygwin'])(
     'refuses %s, whose permissions this store has not been taught to read, before touching the disk',
     async (platform) => {
       const error = await refused(
@@ -975,5 +977,545 @@ describe('the desktop adapter is typed against Electron, not linked to it', () =
     expect(source).not.toMatch(/(?:from|import|require)\s*\(?\s*['"]electron['"]/);
     // The matcher is not blind.
     expect("import { safeStorage } from 'electron';").toMatch(/(?:from|import|require)\s*\(?\s*['"]electron['"]/);
+  });
+});
+
+/*
+ * #179, SECOND RULING: on Linux, a key saved unencrypted before a keyring
+ * existed is refused once encryption is available; a new sealed key is made
+ * only when a person deletes the old one, and paired devices pair again. Pinned
+ * here through the Linux branch of the desktop adapter, from both ways a Linux
+ * session writes a plain key: no encryption at all, and encryption with no
+ * secret store behind it.
+ */
+describe('on Linux, a plain key from before the keyring is refused once the keyring is there (#179)', () => {
+  it.each([
+    ['safeStorage could not encrypt', (storage: FakeSafeStorage) => {
+      storage.available = false;
+    }],
+    ['safeStorage had only its basic_text backend', (storage: FakeSafeStorage) => {
+      storage.backend = 'basic_text';
+    }],
+  ] as const)('when %s: refused, kept byte for byte, never re-sealed, and replaced only once deleted', async (_label, noKeyring) => {
+    const storage = fakeSafeStorage();
+    noKeyring(storage);
+    const before = await desktop({ userData: base, safeStorage: storage, platform: 'linux' });
+    expect(before).toMatchObject({ created: true, protection: 'plain' });
+    const bytes = readFileSync(before.path);
+
+    // The keyring unlocks.
+    storage.available = true;
+    storage.backend = 'gnome_libsecret';
+    const error = await refused(desktop({ userData: base, safeStorage: storage, platform: 'linux' }), 'protection-downgrade');
+    expect(error.message).toContain(before.path);
+    expectNoKeyMaterial(error.message, [tunnelKeyPkcs8Pem(before.key)]);
+    expect(readFileSync(before.path).equals(bytes)).toBe(true);
+    expect(readdirSync(dirname(before.path))).toEqual(['key']);
+    expect(storage.calls).toMatchObject({ encrypt: 0, decrypt: 0 });
+    // Refused again on the next start: nothing was changed to make it pass.
+    await refused(desktop({ userData: base, safeStorage: storage, platform: 'linux' }), 'protection-downgrade');
+
+    // A person deletes it. The next start makes a sealed key — a new pin, which is the re-pair.
+    rmSync(before.path);
+    const after = await desktop({ userData: base, safeStorage: storage, platform: 'linux' });
+    expect(after).toMatchObject({ created: true, protection: 'sealed' });
+    expect(after.key.pin.spkiSha256).not.toBe(before.key.pin.spkiSha256);
+  });
+});
+
+/*
+ * WINDOWS (#179's second ruling), driven from a machine that is not Windows.
+ *
+ * The store runs against the real temporary directory with `platform: 'win32'`,
+ * so everything it does to files is real. What only Windows can print — the SID
+ * `whoami` reports and the SDDL Get-Acl returns — comes from a runner answering
+ * with fixtures in the shapes those tools print, which records what it was asked
+ * to run. NONE OF THIS RAN ON WINDOWS. The descriptors follow the SDDL in
+ * PowerShell's Get-Acl reference and the entries a directory under C:\Users
+ * inherits; a Windows run is what would confirm them.
+ */
+describe('on Windows, the key is sealed with DPAPI and the descriptor of everything on its path is read', () => {
+  const SYSTEM_ROOT = 'C:\\Windows';
+  const WHOAMI = 'C:\\Windows\\System32\\whoami.exe';
+  const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+  const PATH_VARIABLE = 'CHATTERANG_TUNNEL_ACL_PATH';
+  const USER = 'S-1-5-21-1004336348-1177238915-682003330-1001';
+  const OTHER = 'S-1-5-21-1004336348-1177238915-682003330-1002';
+  const GROUP = 'S-1-5-21-1004336348-1177238915-682003330-513';
+  /** `whoami /user /fo csv /nh` as Windows prints it: quoted CSV, CRLF. */
+  const account = (sid: string): string => `"desktop-7f3k2q\\john","${sid}"\r\n`;
+  /** A directory under a profile: SYSTEM, Administrators and the user, inherited by everything made inside. */
+  const profileDirectory = (extra = '', owner = USER): string =>
+    `O:${owner}G:${GROUP}D:AI${extra}(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;${USER})`;
+  /** A file made inside one. */
+  const profileFile = (extra = '', owner = USER): string =>
+    `O:${owner}G:${GROUP}D:AI${extra}(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;${USER})`;
+
+  interface ToolRun {
+    readonly file: string;
+    readonly args: readonly string[];
+    readonly env: Readonly<Record<string, string>>;
+  }
+
+  /**
+   * A Windows whose `whoami` prints `whoami()` and whose Get-Acl answers
+   * `answer(path)` — or, where that is undefined, the profile descriptor for
+   * what the path is on disk. A returned Error is a tool that failed.
+   */
+  function windowsTools(
+    answer: (path: string) => string | Error | undefined = () => undefined,
+    runs: ToolRun[] = [],
+    whoami: () => string | Error = () => account(USER),
+  ): WindowsToolRunner {
+    return async (file, args, env) => {
+      runs.push({ file, args: [...args], env: { ...env } });
+      let reply: string | Error;
+      if (file === WHOAMI) {
+        reply = whoami();
+      } else if (file === POWERSHELL) {
+        const path = env[PATH_VARIABLE]!;
+        reply = answer(path) ?? (lstatSync(path).isDirectory() ? profileDirectory() : profileFile());
+        if (typeof reply === 'string') reply = `${reply}\r\n`;
+      } else {
+        reply = Object.assign(new Error(`not a tool this Windows has: ${file}`), { code: 'ENOENT' });
+      }
+      if (reply instanceof Error) throw reply;
+      return reply;
+    };
+  }
+
+  /** The desktop adapter on Windows: after ready, with a sealer, no uid, and these tools. */
+  const onWindows = (
+    options: {
+      readonly tools?: WindowsToolRunner;
+      readonly storage?: FakeSafeStorage;
+      readonly fs?: KeyFileSystem;
+      readonly userData?: string;
+    } = {},
+  ) =>
+    desktop({
+      userData: options.userData ?? base,
+      safeStorage: options.storage ?? fakeSafeStorage(),
+      platform: 'win32',
+      uid: -1,
+      systemRoot: SYSTEM_ROOT,
+      runWindowsTool: options.tools ?? windowsTools(),
+      fs: options.fs,
+    });
+
+  const untouchable = new Proxy({} as KeyFileSystem, {
+    get: (_target, property) => () => {
+      throw new Error(`the store touched fs.${String(property)}`);
+    },
+  });
+
+  describe('what it runs, and in what order', () => {
+    it('creates the key sealed: the account, then the data directory, the key directory and the new file before its secret', async () => {
+      const runs: ToolRun[] = [];
+      const events: string[] = [];
+      const tools = windowsTools(undefined, runs);
+      const recording: WindowsToolRunner = async (file, args, env) => {
+        events.push(file === WHOAMI ? 'whoami' : `get-acl ${env[PATH_VARIABLE]}`);
+        return tools(file, args, env);
+      };
+      const writes: KeyFileSystem = {
+        ...realFs,
+        open: async (path, flags, mode) => {
+          const handle = await fsPromises.open(path, flags, mode);
+          return {
+            stat: () => handle.stat(),
+            readFile: () => handle.readFile(),
+            writeFile: async (data) => {
+              events.push(`write ${path}`);
+              await handle.writeFile(data);
+            },
+            sync: () => handle.sync(),
+            close: () => handle.close(),
+          };
+        },
+      };
+      const storage = fakeSafeStorage();
+      const created = await onWindows({ tools: recording, storage, fs: writes });
+      expect(created).toMatchObject({ created: true, protection: 'sealed', path: keyPath(base) });
+      expect(storage.calls.encrypt).toBe(1);
+      const directory = join(base, 'tunnel-identity');
+      const temporary = events.find((event) => /^write .*key\.[0-9a-f]{16}\.tmp$/.test(event))!.slice('write '.length);
+      expect(events).toEqual(['whoami', `get-acl ${base}`, `get-acl ${directory}`, `get-acl ${temporary}`, `write ${temporary}`]);
+      const raw = readFileSync(created.path, 'utf8');
+      expect(JSON.parse(raw)).toMatchObject({ protection: 'sealed', spkiSha256: created.key.pin.spkiSha256 });
+      expect(raw).not.toContain('PRIVATE KEY');
+      expect(readdirSync(directory)).toEqual(['key']);
+
+      // Absolute tools under %SystemRoot%, fixed arguments, and the path only ever in the environment.
+      expect(runs[0]).toEqual({ file: WHOAMI, args: ['/user', '/fo', 'csv', '/nh'], env: {} });
+      expect(runs[1]).toEqual({
+        file: POWERSHELL,
+        args: [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$ErrorActionPreference = 'Stop'; (Get-Acl -LiteralPath $env:${PATH_VARIABLE}).Sddl`,
+        ],
+        env: { [PATH_VARIABLE]: base },
+      });
+      for (const run of runs.slice(1)) {
+        expect(run.file).toBe(POWERSHELL);
+        expect(run.args).toEqual(runs[1]!.args);
+      }
+
+      events.length = 0;
+      const loaded = await onWindows({ tools: recording, storage });
+      expect(loaded).toMatchObject({ created: false, protection: 'sealed' });
+      expect(loaded.key.pin.spkiSha256).toBe(created.key.pin.spkiSha256);
+      expect(events).toEqual(['whoami', `get-acl ${base}`, `get-acl ${directory}`, `get-acl ${created.path}`]);
+    });
+
+    it('checks owners against the account whoami reports, not one it assumes', async () => {
+      const error = await refused(onWindows({ tools: windowsTools(undefined, [], () => account(OTHER)) }), 'data-directory-unsafe');
+      expect(error.message).toContain(`owned by ${USER}`);
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('reads no mode and no uid, which describe nothing on Windows', async () => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      chmodSync(path, 0o644);
+      chmodSync(dirname(path), 0o755);
+      chmodSync(base, 0o777);
+      expect((await onWindows({ storage })).created).toBe(false);
+    });
+
+    it('does not open the key directory to sync it, which Node cannot do on Windows', async () => {
+      const noDirectories: KeyFileSystem = {
+        ...realFs,
+        open: (path, flags, mode) => {
+          if (lstatSync(path, { throwIfNoEntry: false })?.isDirectory()) {
+            return Promise.reject(Object.assign(new Error(`EISDIR: ${path}`), { code: 'EISDIR' }));
+          }
+          return fsPromises.open(path, flags, mode);
+        },
+      };
+      expect((await onWindows({ fs: noDirectories })).created).toBe(true);
+    });
+  });
+
+  describe('sealed or nothing', () => {
+    it('stores nothing, and runs nothing, when safeStorage cannot seal', async () => {
+      const storage = fakeSafeStorage();
+      storage.available = false;
+      const runs: ToolRun[] = [];
+      const error = await refused(onWindows({ storage, tools: windowsTools(undefined, runs) }), 'encryption-unavailable');
+      expect(error.message).toContain('DPAPI');
+      expect(runs).toEqual([]);
+      expect(readdirSync(base)).toEqual([]);
+      expect(storage.calls.encrypt).toBe(0);
+    });
+
+    it('refuses the headless server, which has nothing to seal with, before the disk', async () => {
+      await refused(loadOrCreateServerTunnelKey({ root: base, platform: 'win32', fs: untouchable }), 'encryption-unavailable');
+    });
+
+    it('refuses a plain key planted over the sealed one', async () => {
+      const storage = fakeSafeStorage();
+      const created = await onWindows({ storage });
+      const planted = generateTunnelKey();
+      rewrite(created.path, (e) => ({ ...e, protection: 'plain', spkiSha256: planted.pin.spkiSha256, key: tunnelKeyPkcs8Pem(planted) }));
+      const tampered = readFileSync(created.path);
+      const error = await refused(onWindows({ storage }), 'protection-downgrade');
+      expectNoKeyMaterial(error.message, [tunnelKeyPkcs8Pem(planted), tunnelKeyPkcs8Pem(created.key)]);
+      expect(readFileSync(created.path).equals(tampered)).toBe(true);
+    });
+  });
+
+  describe('the key file and its directory: this account, SYSTEM and Administrators only', () => {
+    it.each([
+      ['Users allowed to read and execute, inherited', '(A;ID;0x1200a9;;;BU)', 'BU'],
+      ['Everyone allowed to read', '(A;;FR;;;WD)', 'WD'],
+      ['Authenticated Users allowed to modify', '(A;ID;0x1301bf;;;AU)', 'AU'],
+      ['another account allowed full control', `(A;;FA;;;${OTHER})`, OTHER],
+      ['another account allowed only to read the descriptor', `(A;;RC;;;${OTHER})`, OTHER],
+      ['Everyone in an entry only what is inside would use', '(A;OICIIO;GA;;;WD)', 'WD'],
+    ])('refuses a key file whose descriptor has %s, and leaves the file as it is', async (_label, entry, sid) => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const bytes = readFileSync(path);
+      const error = await refused(
+        onWindows({ storage, tools: windowsTools((p) => (p === path ? profileFile(entry) : undefined)) }),
+        'key-file-unsafe',
+      );
+      expect(error.message).toContain(`allows ${sid}`);
+      expect(error.message).toContain('not tightened');
+      expect(readFileSync(path).equals(bytes)).toBe(true);
+    });
+
+    it.each([
+      ['this account', USER],
+      ['SYSTEM', 'SY'],
+      ['Administrators', 'BA'],
+      ['SYSTEM, by SID', 'S-1-5-18'],
+      ['Administrators, by SID', 'S-1-5-32-544'],
+    ])('accepts a key file owned by %s', async (_label, owner) => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const loaded = await onWindows({ storage, tools: windowsTools((p) => (p === path ? profileFile('', owner) : undefined)) });
+      expect(loaded.created).toBe(false);
+    });
+
+    it('accepts SYSTEM and Administrators by SID in allow entries, and a protected DACL', async () => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const explicit = `O:${USER}G:${GROUP}D:PAI(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)(A;;FA;;;${USER})`;
+      expect((await onWindows({ storage, tools: windowsTools((p) => (p === path ? explicit : undefined)) })).created).toBe(false);
+    });
+
+    it('refuses a key file owned by another account, which could change its DACL', async () => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const error = await refused(
+        onWindows({ storage, tools: windowsTools((p) => (p === path ? profileFile('', OTHER) : undefined)) }),
+        'key-file-unsafe',
+      );
+      expect(error.message).toContain(`owned by ${OTHER}`);
+    });
+
+    it('refuses a key file with no DACL at all, which grants every account everything', async () => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const error = await refused(
+        onWindows({ storage, tools: windowsTools((p) => (p === path ? `O:${USER}G:${GROUP}D:NO_ACCESS_CONTROL` : undefined)) }),
+        'key-file-unsafe',
+      );
+      expect(error.message).toContain('no access control list');
+    });
+
+    it('accepts a deny entry for anyone, which grants nothing', async () => {
+      const storage = fakeSafeStorage();
+      const { path } = await onWindows({ storage });
+      const denied = await onWindows({ storage, tools: windowsTools((p) => (p === path ? profileFile('(D;;FA;;;BU)(D;;WD;;;WD)') : undefined)) });
+      expect(denied.created).toBe(false);
+    });
+
+    it('refuses the new file when it inherited another principal, before the secret is written into it', async () => {
+      const writes: string[] = [];
+      const recording: KeyFileSystem = {
+        ...realFs,
+        open: async (path, flags, mode) => {
+          const handle = await fsPromises.open(path, flags, mode);
+          return {
+            stat: () => handle.stat(),
+            readFile: () => handle.readFile(),
+            writeFile: async (data) => {
+              writes.push(data);
+              await handle.writeFile(data);
+            },
+            sync: () => handle.sync(),
+            close: () => handle.close(),
+          };
+        },
+      };
+      const error = await refused(
+        onWindows({ fs: recording, tools: windowsTools((p) => (p.endsWith('.tmp') ? profileFile('(A;ID;FR;;;BU)') : undefined)) }),
+        'key-file-unsafe',
+      );
+      expect(error.message).toContain('allows BU');
+      expect(writes).toEqual([]);
+      expect(readdirSync(join(base, 'tunnel-identity'))).toEqual([]);
+    });
+
+    it('refuses a key directory that allows another principal, once made and before any key is in it', async () => {
+      const directory = join(base, 'tunnel-identity');
+      const error = await refused(
+        onWindows({ tools: windowsTools((p) => (p === directory ? profileDirectory('(A;OICIID;0x1200a9;;;BU)') : undefined)) }),
+        'key-directory-unsafe',
+      );
+      expect(error.message).toContain('allows BU');
+      expect(readdirSync(directory)).toEqual([]);
+    });
+
+    it('refuses a key directory owned by another account', async () => {
+      const directory = join(base, 'tunnel-identity');
+      const error = await refused(
+        onWindows({ tools: windowsTools((p) => (p === directory ? profileDirectory('', OTHER) : undefined)) }),
+        'key-directory-unsafe',
+      );
+      expect(error.message).toContain(`owned by ${OTHER}`);
+    });
+
+    it('refuses a key file that is a link, checked before the open, since Windows has no O_NOFOLLOW', async () => {
+      const storage = fakeSafeStorage();
+      const good = await onWindows({ storage, userData: mkdtempSync(join(base, 'good-')) });
+      const userData = mkdtempSync(join(base, 'user-data-'));
+      mkdirSync(join(userData, 'tunnel-identity'), { mode: 0o700 });
+      symlinkSync(good.path, keyPath(userData));
+      const error = await refused(onWindows({ storage, userData }), 'key-file-unsafe');
+      expect(error.message).toContain('not a regular file');
+      expect(lstatSync(keyPath(userData)).isSymbolicLink()).toBe(true);
+    });
+
+    it('refuses a key directory that is a link', async () => {
+      const storage = fakeSafeStorage();
+      const good = await onWindows({ storage, userData: mkdtempSync(join(base, 'good-')) });
+      const userData = mkdtempSync(join(base, 'user-data-'));
+      symlinkSync(dirname(good.path), join(userData, 'tunnel-identity'));
+      await refused(onWindows({ storage, userData }), 'key-directory-unsafe');
+    });
+  });
+
+  describe('the data directory: others may read it, never write it, and nothing it hands down', () => {
+    it.each(['(A;OICI;0x1200a9;;;BU)', '(A;CI;FR;;;WD)', '(A;OI;FR;;;AU)', '(A;OICIIO;GA;;;CO)', `(A;OICINP;FR;;;${OTHER})`])(
+      'refuses an entry for another principal that what is made inside would inherit, %s, before anything is made',
+      async (entry) => {
+        const error = await refused(
+          onWindows({ tools: windowsTools((p) => (p === base ? profileDirectory(entry) : undefined)) }),
+          'data-directory-unsafe',
+        );
+        expect(error.message).toContain('inherit');
+        expect(readdirSync(base)).toEqual([]);
+      },
+    );
+
+    it.each(['0x2', '0x4', '0x10', '0x40', '0x100', '0x10000', '0x40000', '0x80000', 'GW', 'GA', 'FA', 'FW', 'WD', 'DC', 'LC', '0x1301bf'])(
+      'refuses an entry that lets another principal do more than read it: %s',
+      async (rights) => {
+        const error = await refused(
+          onWindows({ tools: windowsTools((p) => (p === base ? profileDirectory(`(A;;${rights};;;AU)`) : undefined)) }),
+          'data-directory-unsafe',
+        );
+        expect(error.message).toContain('more than reading');
+        expect(readdirSync(base)).toEqual([]);
+      },
+    );
+
+    it.each(['0x1200a9', 'GRGX', 'FR', 'FX', 'RC', 'CCSWWPLO', '0x100000'])(
+      'lets an entry that only lets another principal read it stand, as mode 0755 does: %s',
+      async (rights) => {
+        const reading = await onWindows({ tools: windowsTools((p) => (p === base ? profileDirectory(`(A;;${rights};;;BU)`) : undefined)) });
+        expect(reading.created).toBe(true);
+      },
+    );
+
+    it('refuses a data directory owned by another account, before anything is made', async () => {
+      const error = await refused(
+        onWindows({ tools: windowsTools((p) => (p === base ? profileDirectory('', OTHER) : undefined)) }),
+        'data-directory-unsafe',
+      );
+      expect(error.message).toContain(`owned by ${OTHER}`);
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('refuses a data directory that is a link, which Get-Acl is never asked about', async () => {
+      const target = mkdtempSync(join(base, 'root-'));
+      const link = join(base, 'root-link');
+      symlinkSync(target, link);
+      const runs: ToolRun[] = [];
+      await refused(onWindows({ userData: link, tools: windowsTools(undefined, runs) }), 'data-directory-unsafe');
+      expect(runs.map((run) => run.file)).toEqual([WHOAMI]);
+      expect(readdirSync(target)).toEqual([]);
+    });
+  });
+
+  describe('a descriptor or account it cannot read, or a tool that cannot run, is refused', () => {
+    it.each([
+      ['nothing at all', ''],
+      ['an error where the descriptor should be', "Get-Acl : Cannot find path 'C:\\x' because it does not exist."],
+      ['no owner', `G:${GROUP}D:AI(A;OICI;FA;;;SY)`],
+      ['no DACL', `O:${USER}G:${GROUP}`],
+      ['two descriptors', `${profileDirectory()}\r\n${profileDirectory()}`],
+      ['an object ACE', `O:${USER}D:(OA;;FA;bf967aba-0de6-11d0-a285-00aa003049e2;;WD)(A;;FA;;;${USER})`],
+      ['a conditional ACE', `O:${USER}D:(XA;;FA;;;WD;(Member_of {SID(BA)}))(A;;FA;;;${USER})`],
+      ['an audit entry in the DACL', `O:${USER}D:(AU;SA;FA;;;WD)(A;;FA;;;${USER})`],
+      ['a flag this parser has no meaning for', `O:${USER}D:(A;ZZ;FA;;;${USER})`],
+      ['half a flag', `O:${USER}D:(A;O;FA;;;${USER})`],
+      ['a right this parser has no meaning for', `O:${USER}D:(A;;QQ;;;${USER})`],
+      ['a mask wider than 32 bits', `O:${USER}D:(A;;0x100000000;;;${USER})`],
+      ['an entry with five fields', `O:${USER}D:(A;;FA;;${USER})`],
+      ['an object type on an allow entry', `O:${USER}D:(A;;FA;bf967aba-0de6-11d0-a285-00aa003049e2;;${USER})`],
+      ['a principal that is a name, not a SID', `O:${USER}D:(A;;FA;;;john)`],
+    ])('refuses a descriptor with %s, and makes nothing', async (_label, sddl) => {
+      const error = await refused(
+        onWindows({ tools: windowsTools((p) => (p === base ? sddl : undefined)) }),
+        'data-directory-unsafe',
+      );
+      expect(error.message).toContain('not in a form this store reads');
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('refuses when Get-Acl fails, without echoing what it printed, and makes nothing', async () => {
+      const error = await refused(
+        onWindows({ tools: windowsTools(() => Object.assign(new Error('Get-Acl : secret detail'), { code: 1 })) }),
+        'data-directory-unsafe',
+      );
+      expect(error.message).toContain('could not be read (1)');
+      expect(error.message).not.toContain('secret detail');
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('refuses when Get-Acl fails on the new file, and writes no key', async () => {
+      const failing = windowsTools((p) => (p.endsWith('.tmp') ? Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) : undefined));
+      const error = await refused(onWindows({ tools: failing }), 'key-file-unsafe');
+      expect(error.message).toContain('could not be read (ETIMEDOUT)');
+      expect(readdirSync(join(base, 'tunnel-identity'))).toEqual([]);
+    });
+
+    it.each([
+      ['cannot be run', () => Object.assign(new Error('whoami: secret detail'), { code: 'ENOENT' })],
+      ['prints its table rather than CSV', () => 'USER INFORMATION\r\n----------------\r\n'],
+      ['prints no SID', () => '"desktop-7f3k2q\\john","john"\r\n'],
+      ['prints two accounts', () => `${account(USER)}${account(OTHER)}`],
+    ])('refuses when whoami %s, and reads no descriptor', async (_label, whoami) => {
+      const runs: ToolRun[] = [];
+      const error = await refused(onWindows({ tools: windowsTools(undefined, runs, whoami) }), 'unsupported-platform');
+      expect(error.message).not.toContain('secret detail');
+      expect(runs.map((run) => run.file)).toEqual([WHOAMI]);
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it.each([
+      ['an empty', ''],
+      ['a relative', 'Windows'],
+      ['a UNC', '\\\\server\\share\\Windows'],
+      ['a bare drive as', 'C:'],
+      ['a quoted', 'C:\\Windows" & calc & "'],
+    ])('refuses %s %%SystemRoot%%, and runs nothing', async (_label, systemRoot) => {
+      const runs: ToolRun[] = [];
+      const error = await refused(
+        desktop({ userData: base, safeStorage: fakeSafeStorage(), platform: 'win32', uid: -1, systemRoot, runWindowsTool: windowsTools(undefined, runs) }),
+        'unsupported-platform',
+      );
+      expect(error.message).toContain('SystemRoot');
+      expect(runs).toEqual([]);
+      expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('finds the tools under %SystemRoot% from the environment when it is not given', async () => {
+      const runs: ToolRun[] = [];
+      try {
+        vi.stubEnv('SystemRoot', 'D:\\Win');
+        await refused(
+          desktop({ userData: base, safeStorage: fakeSafeStorage(), platform: 'win32', uid: -1, runWindowsTool: windowsTools(undefined, runs) }),
+          'unsupported-platform',
+        );
+        expect(runs.map((run) => run.file)).toEqual(['D:\\Win\\System32\\whoami.exe']);
+        vi.stubEnv('SystemRoot', undefined);
+        runs.length = 0;
+        await refused(
+          desktop({ userData: base, safeStorage: fakeSafeStorage(), platform: 'win32', uid: -1, runWindowsTool: windowsTools(undefined, runs) }),
+          'unsupported-platform',
+        );
+        expect(runs).toEqual([]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.runIf(process.platform !== 'win32')('fails closed with the real runner on a machine that has no Windows tools', async () => {
+      const error = await refused(
+        desktop({ userData: base, safeStorage: fakeSafeStorage(), platform: 'win32', uid: -1, systemRoot: SYSTEM_ROOT }),
+        'unsupported-platform',
+      );
+      expect(error.message).toContain('could not be read');
+      expect(readdirSync(base)).toEqual([]);
+    });
   });
 });

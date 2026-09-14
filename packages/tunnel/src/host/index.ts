@@ -79,7 +79,9 @@ export type { CredentialStore, DeviceCredentials, MintedCredential } from './cre
  * one entry `src/` may not.
  */
 export {
+  TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS,
   TunnelIdentityError,
+  currentTunnelCertificate,
   generateTunnelKey,
   issueTunnelCertificate,
   sameTunnelPin,
@@ -88,8 +90,10 @@ export {
   tunnelPinOf,
 } from './identity.js';
 export type {
+  CurrentTunnelCertificate,
   TunnelCertificate,
   TunnelCertificateOptions,
+  TunnelCertificateStanding,
   TunnelIdentityErrorReason,
   TunnelKey,
   TunnelPin,
@@ -105,6 +109,7 @@ export type {
   KeySealer,
   StoredTunnelKey,
   TunnelKeyStoreOptions,
+  WindowsToolRunner,
 } from './identity-store.js';
 
 /*

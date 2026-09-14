@@ -33,6 +33,18 @@
  * which is what a Linux session without its keyring looks like, and a fresh key
  * there would be a silent re-pair of every device.
  *
+ * ON WINDOWS, SEALED OR NOTHING (#179's second ruling). `safeStorage` there is
+ * DPAPI, which Electron documents as available once `ready` has been emitted
+ * and as protecting what it encrypts from other users of the machine — not from
+ * other apps running as the same user. The sealer is the same one macOS gets,
+ * with no backend to ask. What differs is in the store: it keeps a Windows key
+ * only sealed, so if `isEncryptionAvailable()` is false after `ready` nothing is
+ * written and the call is refused (`encryption-unavailable`), and the file's
+ * owner and DACL are read with Get-Acl in place of a mode. DPAPI is documented
+ * as decrypting only for the logon credential that encrypted, so a sealed key
+ * that reaches another account or another machine does not unseal, and is
+ * refused rather than replaced, like any other.
+ *
  * The synchronous methods are the ones Electron 44's own declarations carry
  * without a deprecation; Electron's newer docs move to async variants, and
  * following them is a change to this one adapter.
@@ -44,7 +56,7 @@
 import * as fsPromises from 'node:fs/promises';
 
 import { TunnelIdentityError, loadOrCreateTunnelKey } from '@chatterang/tunnel/host';
-import type { KeyFileSystem, KeySealer, StoredTunnelKey } from '@chatterang/tunnel/host';
+import type { KeyFileSystem, KeySealer, StoredTunnelKey, WindowsToolRunner } from '@chatterang/tunnel/host';
 
 /** The methods of Electron's `safeStorage` this uses, and nothing else. */
 export interface SafeStorageLike {
@@ -70,8 +82,12 @@ export interface DesktopTunnelKeyOptions {
   readonly fs?: KeyFileSystem;
   /** `process.platform` unless a test says otherwise. */
   readonly platform?: string;
-  /** `process.getuid()` unless a test says otherwise. */
+  /** `process.getuid()` unless a test says otherwise. Not read on Windows. */
   readonly uid?: number;
+  /** Windows only: runs `whoami` and PowerShell's Get-Acl. `execFile` unless a test says otherwise. */
+  readonly runWindowsTool?: WindowsToolRunner;
+  /** Windows only: `process.env.SystemRoot` unless a test says otherwise. */
+  readonly systemRoot?: string;
 }
 
 /**
@@ -105,5 +121,7 @@ export async function loadOrCreateDesktopTunnelKey(options: DesktopTunnelKeyOpti
     sealer: sealerFor(options.safeStorage, platform),
     platform,
     uid: options.uid ?? process.getuid?.() ?? -1,
+    runWindowsTool: options.runWindowsTool,
+    systemRoot: options.systemRoot,
   });
 }
