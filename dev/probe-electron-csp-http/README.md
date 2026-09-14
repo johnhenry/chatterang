@@ -152,14 +152,33 @@ Both panics printed:
 
     panic: bad origin: origins must contain '*' or include http://,https://,chrome-extension://,safari-extension://,moz-extension://,ms-browser-extension://
 
+A second, independent run (same isolation, ports 12401-12407, `GET /api/version`
+only, no preflight) repeated the unset row and both panics, then tried where the
+`*` goes:
+
+| `OLLAMA_ORIGINS` | `chatterang-desktop://app` | `chatterang-desktop://app-evil` | `evilchatterang-desktop://app` | `capacitor://localhost` | `capacitor://localhost.evil` | `xcapacitor://localhost` |
+|---|---|---|---|---|---|---|
+| unset | 403 | 403 | 403 | 403 | 403 | 403 |
+| `chatterang-desktop://app*` | 200 | **200** | 403 | 403 | 403 | 403 |
+| `*chatterang-desktop://app` | 200 | 403 | **200** | 403 | 403 | 403 |
+| `*capacitor://localhost` | 403 | 403 | 403 | 200 | 403 | **200** |
+| `*chatterang-desktop://app,*capacitor://localhost` | 200 | 403 | **200** | 200 | 403 | **200** |
+
+Every value in that table started, and `https://localhost` and
+`http://localhost:5273` got 200 under each.
+
 What the rows show:
 
 - **An exact origin on a scheme outside that list is refused at startup.**
   `chatterang-desktop://` (desktop) and `capacitor://` (iOS) are both outside
   it. Only a value containing `*` starts. The FAQ's own example is in that form
   (`chrome-extension://*,moz-extension://*,safari-web-extension://*`).
-- **`*` matches as a prefix.** `chatterang-desktop://app*` admits
-  `chatterang-desktop://app-evil` too.
+- **Where the `*` sits decides what else gets in.** A trailing `*` matches a
+  prefix: `chatterang-desktop://app*` admits `chatterang-desktop://app-evil`
+  too. A leading `*` matches a suffix: `*chatterang-desktop://app` refuses
+  `app-evil` but admits `evilchatterang-desktop://app`, any origin ending in
+  the app's own. The FAQ documents neither position, only the `scheme://*`
+  example.
 - **The web origins need no setting.** With it unset, `https://localhost` and
   `http://localhost:5273` got 200. The startup log's `server config` line lists
   the defaults: `http://` and `https://` for `localhost`, `127.0.0.1` and
