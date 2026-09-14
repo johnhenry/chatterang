@@ -24,7 +24,10 @@ export interface ToolResult {
   /** Optional payload the UI renders instead of raw text. */
   readonly display?: { readonly kind: 'html' | 'json' | 'text'; readonly value: string };
   readonly isError?: boolean;
-  /** Set by a tool that handed its arguments to an MCP server. See `McpCallReceipt`. */
+  /**
+   * Set by an MCP tool for what became of its call, including a call it did not
+   * send. Whether anything left is `mayHaveLeft`'s answer. See `McpCallReceipt`.
+   */
   readonly receipt?: McpCallReceipt;
 }
 

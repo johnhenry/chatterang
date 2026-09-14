@@ -739,9 +739,16 @@ describe('MCP arguments do not leave the device without a grant', () => {
 
   it('sends nothing when the person says no', async () => {
     const { probe, run } = setUp();
-    const request = ask('deny');
+    let answeredAt = 0;
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => {
+      // A sheet takes as long as the person does.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      answeredAt = Date.now();
+      return 'deny';
+    });
 
     const events = await run({ isGranted: () => false, request });
+    const finishedAt = Date.now();
 
     expect(request).toHaveBeenCalledOnce();
     expect(probe.call).not.toHaveBeenCalled();
@@ -750,6 +757,11 @@ describe('MCP arguments do not leave the device without a grant', () => {
       'The user did not allow sending this call’s arguments to notes.example.',
     );
     expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({ outcome: 'withheld', why: 'not-allowed' });
+    // The export prints this time as when the call was held back, so it is
+    // taken once the answer is in, not before the sheet opened.
+    const at = tool?.type === 'tool' ? tool.tool.receipt?.at : undefined;
+    expect(at).toBeGreaterThanOrEqual(answeredAt);
+    expect(at).toBeLessThanOrEqual(finishedAt);
   });
 
   it('sends nothing, and records it as not sent, when the person declines a destructive call its server was allowed', async () => {
@@ -856,6 +868,7 @@ describe('MCP arguments do not leave the device without a grant', () => {
   it('sends nothing when the answer and Stop land in the same tick', async () => {
     const { engine, probe } = setUp();
     const controller = new AbortController();
+    let stoppedAt = 0;
 
     const events = await settled(
       drainEvents(
@@ -866,6 +879,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
           mcpEgress: {
             isGranted: () => false,
             request: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              stoppedAt = Date.now();
               controller.abort();
               return 'calls';
             },
@@ -874,6 +889,7 @@ describe('MCP arguments do not leave the device without a grant', () => {
         }),
       ),
     );
+    const finishedAt = Date.now();
 
     expect(probe.call).not.toHaveBeenCalled();
     const tool = events.find((event) => event.type === 'tool');
@@ -881,6 +897,10 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(tool?.type === 'tool' && tool.tool.output).toBe(
       'This call’s arguments were not sent to notes.example: the reply was stopped.',
     );
+    // Stamped when Stop held it back, which the export prints.
+    const at = tool?.type === 'tool' ? tool.tool.receipt?.at : undefined;
+    expect(at).toBeGreaterThanOrEqual(stoppedAt);
+    expect(at).toBeLessThanOrEqual(finishedAt);
   });
 
   it('still records a call the person declined when Stop comes later in the batch', async () => {

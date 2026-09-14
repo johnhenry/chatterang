@@ -40,7 +40,11 @@ export interface ExecutedTool {
   readonly isError: boolean;
   readonly durationMs: number;
   readonly display?: { readonly kind: 'html' | 'json' | 'text'; readonly value: string };
-  /** Copied from the tool's result: this call's arguments went to an MCP server. */
+  /**
+   * What became of an MCP call: copied from the tool's result, or written here
+   * for a call the dispatcher held back. It is present for a call that did not
+   * leave as well; whether anything left is `mayHaveLeft`'s answer.
+   */
   readonly receipt?: McpCallReceipt;
 }
 
