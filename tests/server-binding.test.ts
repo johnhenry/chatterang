@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_PORT,
   LOOPBACK_HOST,
+  SERVER_FLAGS,
   asAuthToken,
   asTlsMaterial,
   cookieIsSecure,
@@ -229,6 +230,78 @@ describe('the command line', () => {
   it('refuses a flag with no value rather than swallowing the next one', () => {
     expect(() => parseArgv(['--root'])).toThrow(/needs a value/);
     expect(() => parseArgv(['--root', '--port'])).toThrow(/needs a value/);
+  });
+
+  it('every flag in the table round-trips and is named in the refusal', () => {
+    // THE DRIFT THIS PINS. The refusal was a hand-written sentence beside a
+    // switch, and `--advertise` (#252) joined the switch without joining the
+    // sentence, so an operator who mistyped it was handed a list without it.
+    const refusal = (() => {
+      try {
+        parseArgv(['--no-auth']);
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error('--no-auth was accepted');
+    })();
+
+    for (const [flag, spec] of Object.entries(SERVER_FLAGS)) {
+      const argv = (() => {
+        switch (spec.arity) {
+          case 'value':
+            return [flag, '9000'];
+          default: {
+            // A new arity fails to compile here until this test drives it.
+            const unhandled: never = spec.arity;
+            throw new Error(`no way to drive arity ${String(unhandled)}`);
+          }
+        }
+      })();
+      // Exactly one field written, holding the value: a row whose `set` does
+      // nothing, or writes two fields, is not a flag this server takes.
+      expect(Object.values(parseArgv(argv)).map(String), flag).toEqual(['9000']);
+    }
+
+    // The names in the refusal ARE the table's keys — neither a flag the
+    // parser accepts and the sentence omits, nor one it names and refuses.
+    const named = refusal.replace('unknown option --no-auth', '').match(/--[a-z][a-z-]*/g) ?? [];
+    expect([...named].sort()).toEqual(Object.keys(SERVER_FLAGS).sort());
+    expect(named).toContain('--advertise');
+    expect(refusal).toContain('There is no flag that turns authentication off');
+  });
+
+  it('reads every flag into its own field', () => {
+    // `main.ts` reads these by field name; a row writing the neighbouring
+    // field (a key path into `tlsCertPath`) would start with half a certificate.
+    expect(
+      parseArgv([
+        '--root', '/srv/chatterang',
+        '--bundle', '/srv/dist',
+        '--hosts', '/srv/host.mjs',
+        '--port', '8443',
+        '--host', '0.0.0.0',
+        '--advertise', 'studio.local',
+        '--tls-key', '/etc/key.pem',
+        '--tls-cert', '/etc/cert.pem',
+      ]),
+    ).toEqual({
+      root: '/srv/chatterang',
+      bundle: '/srv/dist',
+      hosts: '/srv/host.mjs',
+      port: 8443,
+      host: '0.0.0.0',
+      advertise: 'studio.local',
+      tlsKeyPath: '/etc/key.pem',
+      tlsCertPath: '/etc/cert.pem',
+    });
+  });
+
+  it('refuses a name the table inherits rather than owns', () => {
+    // A plain index would find `Object.prototype` behind these and hand the
+    // parser something that is not a row. They are unknown options.
+    for (const token of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      expect(() => parseArgv([token]), token).toThrow(/unknown option/);
+    }
   });
 });
 

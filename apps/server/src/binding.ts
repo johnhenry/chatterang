@@ -320,14 +320,8 @@ function authenticated(
   };
 }
 
-/**
- * Read the flags this server understands, and refuse the ones it does not.
- *
- * An unknown flag is an error rather than a shrug: `--no-auth`, `--insecure`
- * and `--allow-remote` are exactly the flags someone will try, and silently
- * ignoring one would leave them believing it did something.
- */
-export function parseArgv(argv: readonly string[]): BindingRequest & {
+/** What the command line asked for: a binding request, and where things live. */
+export interface ServerArgv extends BindingRequest {
   readonly root?: string;
   readonly bundle?: string;
   readonly hosts?: string;
@@ -339,59 +333,86 @@ export function parseArgv(argv: readonly string[]): BindingRequest & {
    * and never a thing to dial. See `addresses.ts`.
    */
   readonly advertise?: string;
-} {
-  const out: {
-    host?: string;
-    port?: number;
-    tlsKeyPath?: string;
-    tlsCertPath?: string;
-    root?: string;
-    bundle?: string;
-    hosts?: string;
-    advertise?: string;
-  } = {};
+}
+
+type ParsedArgv = { -readonly [K in keyof ServerArgv]: ServerArgv[K] };
+
+/** One row of {@link SERVER_FLAGS}. */
+export interface ServerFlag {
+  /**
+   * What the flag consumes after itself. Every flag takes a value today, so
+   * this has one member. A flag that takes none widens it, and the `never`
+   * checks in `parseArgv` and in its test turn that widening into a build
+   * failure until both handle the new arity — rather than a parser that
+   * quietly swallows the next token as the flag's value.
+   */
+  readonly arity: 'value';
+  readonly set: (out: ParsedArgv, value: string) => void;
+}
+
+/**
+ * Every flag this server takes, and what each one sets.
+ *
+ * ONE TABLE, BECAUSE TWO LISTS DRIFTED. The parser was a `switch` and the
+ * refusal was a sentence naming its cases. When `--advertise` joined the
+ * switch (#252) the sentence did not move, so an operator who typed
+ * `--advertize` was told this server takes seven flags, none of them the one
+ * they meant. The refusal now reads its list from these keys: a flag cannot be
+ * accepted without being named, or named without being accepted.
+ *
+ * Only OWN keys are flags. `parseArgv` looks a token up with `Object.hasOwn`,
+ * so `constructor` or `__proto__` meets the refusal rather than finding
+ * `Object.prototype` behind a plain index.
+ */
+export const SERVER_FLAGS: Readonly<Record<string, ServerFlag>> = Object.freeze({
+  '--root': { arity: 'value', set: (out, value) => (out.root = value) },
+  '--bundle': { arity: 'value', set: (out, value) => (out.bundle = value) },
+  '--hosts': { arity: 'value', set: (out, value) => (out.hosts = value) },
+  '--port': { arity: 'value', set: (out, value) => (out.port = Number(value)) },
+  '--host': { arity: 'value', set: (out, value) => (out.host = value) },
+  '--advertise': { arity: 'value', set: (out, value) => (out.advertise = value) },
+  '--tls-key': { arity: 'value', set: (out, value) => (out.tlsKeyPath = value) },
+  '--tls-cert': { arity: 'value', set: (out, value) => (out.tlsCertPath = value) },
+});
+
+/**
+ * Read the flags this server understands, and refuse the ones it does not.
+ *
+ * An unknown flag is an error rather than a shrug: `--no-auth`, `--insecure`
+ * and `--allow-remote` are exactly the flags someone will try, and silently
+ * ignoring one would leave them believing it did something.
+ */
+export function parseArgv(argv: readonly string[]): ServerArgv {
+  const out: ParsedArgv = {};
   for (let at = 0; at < argv.length; at += 1) {
-    const flag = argv[at];
-    const value = argv[at + 1];
-    const need = (): string => {
-      if (value === undefined || value.startsWith('--')) {
-        throw new Error(`chatterang server: ${String(flag)} needs a value.`);
+    const flag = String(argv[at]);
+    const spec = Object.hasOwn(SERVER_FLAGS, flag) ? SERVER_FLAGS[flag] : undefined;
+    if (spec === undefined) {
+      const names = Object.keys(SERVER_FLAGS);
+      throw new Error(
+        `chatterang server: unknown option ${flag}. This server takes ` +
+          `${names.slice(0, -1).join(', ')} and ${String(names.at(-1))}. There is no flag ` +
+          'that turns authentication off; the binding that would need one cannot be ' +
+          'constructed.',
+      );
+    }
+    switch (spec.arity) {
+      case 'value': {
+        const value = argv[at + 1];
+        if (value === undefined || value.startsWith('--')) {
+          throw new Error(`chatterang server: ${flag} needs a value.`);
+        }
+        at += 1;
+        spec.set(out, value);
+        break;
       }
-      at += 1;
-      return value;
-    };
-    switch (flag) {
-      case '--host':
-        out.host = need();
-        break;
-      case '--advertise':
-        out.advertise = need();
-        break;
-      case '--port':
-        out.port = Number(need());
-        break;
-      case '--tls-key':
-        out.tlsKeyPath = need();
-        break;
-      case '--tls-cert':
-        out.tlsCertPath = need();
-        break;
-      case '--root':
-        out.root = need();
-        break;
-      case '--bundle':
-        out.bundle = need();
-        break;
-      case '--hosts':
-        out.hosts = need();
-        break;
-      default:
-        throw new Error(
-          `chatterang server: unknown option ${String(flag)}. This server takes --root, ` +
-            '--bundle, --hosts, --port, --host, --tls-key and --tls-cert. There is no flag ' +
-            'that turns authentication off; the binding that would need one cannot be ' +
-            'constructed.',
-        );
+      default: {
+        // `src/lib/platform.ts:unreachable`, inlined because this module
+        // imports nothing: a compile error when the union widens, and a
+        // refusal rather than a guess if a value arrives anyway.
+        const unhandled: never = spec.arity;
+        throw new Error(`chatterang server: unhandled arity ${String(unhandled)} for ${flag}.`);
+      }
     }
   }
   return out;

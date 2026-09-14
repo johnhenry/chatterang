@@ -88,6 +88,7 @@ import { assertServerSurface } from './surface.js';
 export {
   LOOPBACK_HOST,
   DEFAULT_PORT,
+  SERVER_FLAGS,
   asAuthToken,
   asTlsMaterial,
   listenHost,
