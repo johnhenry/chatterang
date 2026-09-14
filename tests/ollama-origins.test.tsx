@@ -10,19 +10,25 @@
  * The expected values here are not derived from the code. Each one was measured
  * against a throwaway `ollama serve` 0.34.0, one process per value, on its own
  * loopback port with an empty models directory
- * (`dev/probe-electron-csp-http/README.md`):
- *
- *   unset                          chatterang-desktop://app 403, capacitor://localhost 403,
- *                                  https://localhost 200, http://localhost:5273 200,
- *                                  http://192.168.1.10:5273 403, null 403
- *   chatterang-desktop://app       Ollama panics before listening
- *   *chatterang-desktop://app      ://app 200, ://app-evil 403, xchatterang-desktop://app 200
- *   *capacitor://localhost         capacitor://localhost 200, ://localhost.evil 403
- *   http://192.168.1.10:5273       that origin 200; :5274, :52730, https://, .100 all 403
+ * (`dev/probe-electron-csp-http/README.md`), tabled below in line comments
+ * because the values contain the characters that would close this one.
  *
  * The note is rendered into a real DOM, with `window.location` stubbed per test,
  * because the panel reads the origin when it renders.
  */
+//
+//   unset                          chatterang-desktop://app 403, capacitor://localhost 403,
+//                                  https://localhost 200, http://localhost:5273 200,
+//                                  http://192.168.1.10:5273 403, null 403
+//   chatterang-desktop://app       Ollama panics before listening (so does httpx://host)
+//   *chatterang-desktop://app      ://app 200, ://app-evil 403, but xchatterang-desktop://app
+//                                  and evil.chatterang-desktop://app 200
+//   chatterang-desktop:*//app      ://app 200; xchatterang-desktop://app, evil.…, ://app-evil,
+//                                  ://evil, ://app:1, ://x.app, chatterang-desktop-x://app 403
+//   capacitor:*//localhost         capacitor://localhost 200; xcapacitor://localhost,
+//                                  ://localhost.evil, ://evil, ://localhost:1 403
+//   http://192.168.1.10:5273       that origin 200; :5274, :52730, https://, .100 all 403
+//   httpx:*//host                  starts; httpx://host 200, xhttpx://host 403
 
 import { createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -62,14 +68,16 @@ const { ProvidersPanel } = await import('@/features/settings/ProvidersPanel');
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 /**
- * How Ollama 0.34.0 matched an entry in every row measured: exact, or a leading
- * `*` as a suffix match, or a trailing `*` as a prefix match. Used only to state
- * the look-alike rows the measurement found; the values themselves are pinned.
+ * How Ollama 0.34.0 matched an entry in every row measured: exact, or around its
+ * one `*`, the text before it as a prefix and the text after it as a suffix. A
+ * leading `*` is a suffix match and a trailing one a prefix match. Used only to
+ * state the look-alike rows the measurement found; the values themselves are
+ * pinned.
  */
 function measuredAdmits(entry: string, origin: string): boolean {
-  if (entry.startsWith('*')) return origin.endsWith(entry.slice(1));
-  if (entry.endsWith('*')) return origin.startsWith(entry.slice(0, -1));
-  return entry === origin;
+  const star = entry.indexOf('*');
+  if (star === -1) return entry === origin;
+  return origin.startsWith(entry.slice(0, star)) && origin.endsWith(entry.slice(star + 1));
 }
 
 /** Ollama's startup check: an entry with no `*` must name one of these schemes. */
@@ -99,6 +107,7 @@ describe('ollamaOriginsSetting', () => {
       'app://-',
       'tauri://localhost',
       'vscode-webview://abc',
+      'vscode-file://vscode-app',
     ]) {
       expect(ollamaOriginsSetting(origin), origin).toEqual({ kind: 'none-needed' });
     }
@@ -124,14 +133,26 @@ describe('ollamaOriginsSetting', () => {
     });
   });
 
-  it('gives any other scheme a leading-star value, never the bare origin', () => {
+  it('gives any other scheme the star after its colon, never the bare origin', () => {
     expect(ollamaOriginsSetting('chatterang-desktop://app')).toEqual({
       kind: 'add',
-      value: '*chatterang-desktop://app',
+      value: 'chatterang-desktop:*//app',
     });
     expect(ollamaOriginsSetting('capacitor://localhost')).toEqual({
       kind: 'add',
-      value: '*capacitor://localhost',
+      value: 'capacitor:*//localhost',
+    });
+    // Measured to start and admit that origin alone, port included.
+    expect(ollamaOriginsSetting('x-custom+scheme.v2://host:8080')).toEqual({
+      kind: 'add',
+      value: 'x-custom+scheme.v2:*//host:8080',
+    });
+    // An exact value on an extension scheme also starts; the middle form admits
+    // the same one origin (measured: xchrome-extension://abcdef and
+    // chrome-extension://abcdefg 403), so one rule covers it.
+    expect(ollamaOriginsSetting('chrome-extension://abcdef')).toEqual({
+      kind: 'add',
+      value: 'chrome-extension:*//abcdef',
     });
   });
 
@@ -175,6 +196,11 @@ describe('ollamaOriginsSetting', () => {
       'ionic://localhost',
       'chrome-extension://abcdef',
       'x-custom+scheme.v2://host:8080',
+      // Schemes that begin with the letters "http" but are not http(s): a bare
+      // `httpx://host` measured a panic.
+      'httpx://host',
+      'https+x://host',
+      'http-foo://x',
       'http://192.168.1.10:5273',
       'https://chat.example.com',
       'http://[::1]:5273',
@@ -184,25 +210,49 @@ describe('ollamaOriginsSetting', () => {
       expect(setting.kind, origin).toBe('add');
       if (setting.kind !== 'add') continue;
       expect(ollamaStartsWith(setting.value), setting.value).toBe(true);
-      if (!/^https?:\/\//.test(origin)) {
+      // One entry, never split or padded by what OLLAMA_ORIGINS is parsed with.
+      expect(setting.value, origin).not.toMatch(/[,\s]/);
+      if (/^https?:\/\//.test(origin)) {
+        expect(setting.value, origin).toBe(origin);
+      } else {
         expect(setting.value, origin).toContain('*');
-        expect(setting.value, origin).toBe(`*${origin}`);
+        expect(setting.value, origin).toBe(origin.replace('://', ':*//'));
       }
     }
   });
 
-  it('prints the measured value, which admits the app and refuses its prefix look-alike', () => {
+  it('prints the measured value, which admits this app and refuses every measured look-alike', () => {
     const desktop = ollamaOriginsSetting('chatterang-desktop://app');
     const ios = ollamaOriginsSetting('capacitor://localhost');
     if (desktop.kind !== 'add' || ios.kind !== 'add') throw new Error('expected values');
     expect(measuredAdmits(desktop.value, 'chatterang-desktop://app')).toBe(true);
-    expect(measuredAdmits(desktop.value, 'chatterang-desktop://app-evil')).toBe(false);
-    expect(measuredAdmits(desktop.value, 'chatterang-desktop://evil')).toBe(false);
+    for (const lookAlike of [
+      'xchatterang-desktop://app',
+      'evil.chatterang-desktop://app',
+      'chatterang-desktop://app-evil',
+      'chatterang-desktop://evil',
+      'chatterang-desktop://app:1',
+      'chatterang-desktop://x.app',
+      'chatterang-desktop-x://app',
+      'capacitor://localhost',
+    ]) {
+      expect(measuredAdmits(desktop.value, lookAlike), lookAlike).toBe(false);
+    }
     expect(measuredAdmits(ios.value, 'capacitor://localhost')).toBe(true);
-    expect(measuredAdmits(ios.value, 'capacitor://localhost.evil')).toBe(false);
-    // The residual the suffix form keeps, measured 200: an origin that merely
-    // ends with this app's. Stated so it is not mistaken for exact.
-    expect(measuredAdmits(desktop.value, 'xchatterang-desktop://app')).toBe(true);
+    for (const lookAlike of [
+      'xcapacitor://localhost',
+      'capacitor://localhost.evil',
+      'capacitor://evil',
+      'capacitor://localhost:1',
+      'chatterang-desktop://app',
+    ]) {
+      expect(measuredAdmits(ios.value, lookAlike), lookAlike).toBe(false);
+    }
+    // Why not a leading star: `*chatterang-desktop://app` measured 200 for both
+    // of these, and the value printed refuses them.
+    for (const lookAlike of ['xchatterang-desktop://app', 'evil.chatterang-desktop://app']) {
+      expect(measuredAdmits('*chatterang-desktop://app', lookAlike), lookAlike).toBe(true);
+    }
   });
 });
 
@@ -246,16 +296,16 @@ describe('the Ollama note in the Providers panel', () => {
   it('shows the value for the origin the page is at when it renders', () => {
     const desktop = renderPanelAt('chatterang-desktop://app');
     const ollamaOnDesktop = providerItem(desktop.body, 'Ollama');
-    expect(codes(ollamaOnDesktop)).toEqual(['OLLAMA_ORIGINS', '*chatterang-desktop://app']);
+    expect(codes(ollamaOnDesktop)).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
     expect(ollamaOnDesktop.textContent).toContain(
-      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add *chatterang-desktop://app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
     );
     desktop.unmount();
 
     // Same module, same import, another origin: the value follows it.
     const ios = renderPanelAt('capacitor://localhost');
     const ollamaOnIos = providerItem(ios.body, 'Ollama');
-    expect(codes(ollamaOnIos)).toEqual(['OLLAMA_ORIGINS', '*capacitor://localhost']);
+    expect(codes(ollamaOnIos)).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
     expect(ollamaOnIos.textContent).not.toContain('chatterang-desktop');
     ios.unmount();
 
@@ -322,7 +372,7 @@ describe('the Ollama note in the Providers panel', () => {
     // The "What this means" card; the address field's hint has its own <code>.
     const meaning = sheet?.querySelector('.card--remote');
     expect(meaning?.textContent).toContain('What this means');
-    expect(codes(meaning!)).toEqual(['OLLAMA_ORIGINS', '*capacitor://localhost']);
+    expect(codes(meaning!)).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
     page.unmount();
   });
 });

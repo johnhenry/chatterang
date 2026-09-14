@@ -1354,10 +1354,10 @@ describe('the provider panel hints', () => {
         .join('') ?? null;
 
     expect(words('chatterang-desktop://app')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add *chatterang-desktop://app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
     );
     expect(words('capacitor://localhost')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add *capacitor://localhost to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
     );
     // Android and the web dev server: measured 200 with nothing set.
     expect(words('https://localhost')).toBeNull();

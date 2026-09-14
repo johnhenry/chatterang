@@ -267,11 +267,24 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
  *   the note asks for nothing.
  * - A value starting `http://` or `https://` starts, and an exact one admits
  *   that origin alone, so an http(s) origin is its own value.
- * - An exact value on any other scheme (`chatterang-desktop://app`,
- *   `capacitor://localhost`) makes Ollama panic before it listens. A value
- *   with `*` starts, and the `*` must lead: `*chatterang-desktop://app` matches
- *   origins ending in the app's own, so `chatterang-desktop://app-evil` is
- *   refused. A trailing `*` matches a prefix and admits that origin.
+ * - An exact value makes Ollama panic before it listens unless it starts with
+ *   one of the schemes its startup check lists: `http://`, `https://` and four
+ *   browser-extension schemes. `chatterang-desktop://app`,
+ *   `capacitor://localhost` and `httpx://host` all panic. A value with one `*`
+ *   starts, and where the `*` sits decides what else it admits:
+ *   - a leading `*` (`*chatterang-desktop://app`) matches a suffix, so it also
+ *     admits `xchatterang-desktop://app` and `evil.chatterang-desktop://app`;
+ *   - a trailing `*` matches a prefix, so it also admits
+ *     `chatterang-desktop://app-evil`;
+ *   - a `*` right after the scheme's colon (`chatterang-desktop:`, then `*`, then
+ *     `//app`, written as one word) needs the origin to start with
+ *     `chatterang-desktop:` and end with `//app`. A host
+ *     cannot contain `/`, so that fixes the scheme, the host and the port, and of
+ *     the origins a browser sends only this app's own matches. The look-alikes
+ *     above were all refused.
+ *   So every origin outside http(s) gets the middle form. For the extension
+ *   schemes an exact value would also start, but it admits no other origin a
+ *   browser sends either, so one rule covers them.
  * - Anything that is not exactly a serialized origin (opaque `null`, a path, a
  *   comma, a `*`, a non-canonical form) gets no value. A comma would split into
  *   two entries, and a `*` would widen the match, so printing a guess could
@@ -333,7 +346,9 @@ export function ollamaOriginsSetting(origin: string): OllamaOriginsSetting {
   }
   const scheme = shape[1];
   if (scheme === 'http' || scheme === 'https') return { kind: 'add', value: origin };
-  return { kind: 'add', value: `*${origin}` };
+  // `scheme:`, then the `*`, then `//host[:port]`: see the rule above. The
+  // canonical check made `${url.protocol}//${url.host}` the origin itself.
+  return { kind: 'add', value: `${url.protocol}*//${url.host}` };
 }
 
 export function getProvider(id: string): ProviderDescriptor | undefined {
