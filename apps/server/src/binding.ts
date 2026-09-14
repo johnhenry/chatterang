@@ -16,8 +16,9 @@
  * literal `127.0.0.1` for it, and there is no field an operator could set to
  * change that. The authenticated arm cannot be written down without an
  * {@link AuthToken} and {@link TlsMaterial}, and neither of those can be
- * written down at all — both are branded with a symbol this module does not
- * export, so the only way to obtain one is to call the function that produces
+ * written down at all — both are branded with a symbol no module exports
+ * (`TlsMaterial`'s now lives in `packages/tunnel/src/host/tls.ts`, shared with
+ * the tunnel's binding), so the only way to obtain one is to call the function that produces
  * it from real bytes on a real disk. `{ kind: 'authenticated', host: '0.0.0.0',
  * port: 8080, token: 'hunter2', tls: {} }` is not a value TypeScript will
  * accept, and `tests/server-binding.test.ts` pins that with `@ts-expect-error`
@@ -89,18 +90,22 @@
  * something, rather than requiring nothing.
  */
 
-/**
- * The loopback address, as a literal that appears exactly once.
- *
- * `localhost` would be wrong: it resolves through the host's name service and
- * can answer `::1`, a LAN address, or whatever a hosts file says. The point of
- * this arm is an address no other machine can route to, so it is the address
- * rather than a name for it.
+/*
+ * THE LOOPBACK LITERAL AND THE TLS BRAND LIVE IN THE TUNNEL NOW (#135, #158),
+ * and are re-exported here unchanged. The tunnel's own binding needs the SAME
+ * `TlsMaterial` — a `unique symbol` brand copied into a second file is a second,
+ * incompatible type — and `packages/tunnel` cannot import an app. So the two
+ * shared pieces moved sideways into `packages/tunnel/src/host/tls.ts`, a file
+ * that imports nothing, and the operator token and the cookie helpers stayed
+ * here, where #135 says they belong.
  */
-export const LOOPBACK_HOST = '127.0.0.1';
+import { LOOPBACK_HOST } from '@chatterang/tunnel/host';
+import type { TlsMaterial } from '@chatterang/tunnel/host';
+
+export { LOOPBACK_HOST, asTlsMaterial } from '@chatterang/tunnel/host';
+export type { TlsMaterial } from '@chatterang/tunnel/host';
 
 declare const TOKEN_BRAND: unique symbol;
-declare const TLS_BRAND: unique symbol;
 
 /**
  * A pre-shared operator token.
@@ -119,13 +124,6 @@ export interface AuthToken {
   readonly value: string;
 }
 
-/** A key and certificate, read from disk and non-empty. */
-export interface TlsMaterial {
-  readonly [TLS_BRAND]: true;
-  readonly key: string;
-  readonly cert: string;
-}
-
 /**
  * Wrap a secret as an {@link AuthToken}.
  *
@@ -142,24 +140,6 @@ export function asAuthToken(value: string): AuthToken {
     );
   }
   return { value } as AuthToken;
-}
-
-/**
- * Wrap key/cert bytes as {@link TlsMaterial}.
- *
- * Both must be non-empty. An empty file is the shape a half-finished
- * certificate setup takes, and a server that started with one would be
- * advertising https while failing every handshake — which an operator reads as
- * "the network is broken", not as "there is no certificate".
- */
-export function asTlsMaterial(key: string, cert: string): TlsMaterial {
-  if (key.trim() === '' || cert.trim() === '') {
-    throw new Error(
-      'chatterang server: the TLS key and certificate must both be non-empty. ' +
-        'Binding beyond loopback requires real material, not a placeholder.',
-    );
-  }
-  return { key, cert } as TlsMaterial;
 }
 
 /**
@@ -420,7 +400,8 @@ export function parseArgv(argv: readonly string[]): ServerArgv {
       }
       default: {
         // `src/lib/platform.ts:unreachable`, inlined because this module
-        // imports nothing: a compile error when the union widens, and a
+        // imports nothing from the app — only the loopback literal and the TLS
+        // brand it shares with the tunnel: a compile error when the union widens, and a
         // refusal rather than a guess if a value arrives anyway.
         const unhandled: never = spec.arity;
         throw new Error(`chatterang server: unhandled arity ${String(unhandled)} for ${flag}.`);

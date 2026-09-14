@@ -39,6 +39,8 @@
 import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
 import {
   TUNNEL_CAP_CLOSE_CODE,
+  TUNNEL_CREDENTIAL_HEADER,
+  TUNNEL_PAIRING_ONLY_CLOSE_CODE,
   TUNNEL_WIRE_VERSION,
   decodeFrame,
   encodeFrame,
@@ -98,6 +100,57 @@ export type TunnelClose =
 export interface TunnelClientOptions {
   /** `ws://127.0.0.1:<port>` for rung 0. */
   readonly url: string;
+  /**
+   * The device credential the host minted, sent in `TUNNEL_CREDENTIAL_HEADER`
+   * and never in `url` (#136). Omitted, the connection presents nothing and a
+   * host admits it only while it is showing a pairing code, and only to pair.
+   *
+   * WHERE THIS WORKS, said plainly: the standard `WebSocket` constructor has
+   * no way to set a request header. Node's (undici) takes a non-standard
+   * `{ headers }` init — measured: the header arrives — and that is what rung
+   * 0 runs on. A webview's `WebSocket` reads the same init as a subprotocol
+   * name and throws, so on a phone this fails loudly rather than connecting
+   * without the credential. The phone's real transport is #181's native socket
+   * plugin, which sets the header itself.
+   *
+   * REFUSED OVER PLAINTEXT OFF LOOPBACK: with a credential, `url` must be
+   * `wss:`, or `ws:` to exactly `127.0.0.1`. A bearer credential over plaintext
+   * on a LAN is a bearer credential on the wire, which is the argument
+   * `apps/server/src/binding.ts` makes for its own token.
+   */
+  readonly credential?: string;
+}
+
+/** Can this URL carry a credential? `wss:` anywhere, or plaintext loopback. */
+function carriesCredentialSafely(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === 'wss:' || (parsed.protocol === 'ws:' && parsed.hostname === '127.0.0.1');
+}
+
+/**
+ * The socket, with the credential in a header when there is one.
+ *
+ * The cast is the non-standard init described on
+ * {@link TunnelClientOptions.credential}, and it is confined to this function.
+ */
+function openSocket(options: TunnelClientOptions): WebSocket {
+  if (options.credential === undefined) return new WebSocket(options.url);
+  if (!carriesCredentialSafely(options.url)) {
+    throw new Error(
+      'tunnel client: a device credential goes only over wss://, or ws:// to 127.0.0.1. ' +
+        'Over plaintext on a network it is readable by anyone on the path.',
+    );
+  }
+  const WithHeaders = WebSocket as unknown as new (
+    url: string,
+    init: { readonly headers: Readonly<Record<string, string>> },
+  ) => WebSocket;
+  return new WithHeaders(options.url, { headers: { [TUNNEL_CREDENTIAL_HEADER]: options.credential } });
 }
 
 /**
@@ -113,7 +166,7 @@ export interface TunnelClientOptions {
  * the other — is the asymmetry in the platform, not a preference.
  */
 export async function createTunnelClient(options: TunnelClientOptions): Promise<TunnelClient> {
-  const socket = new WebSocket(options.url);
+  const socket = openSocket(options);
   socket.binaryType = 'arraybuffer';
 
   const inbox: TunnelFrame[] = [];
@@ -184,6 +237,19 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
         kind: 'abnormal',
         code: 'TUNNEL_FULL',
         message: 'the other device is already holding as many connections as it allows',
+      });
+      return;
+    }
+    /*
+     * The same argument for the pairing refusal (#136): a connection that was
+     * let in only to pair, and tried something else or outlived the code on
+     * screen. Not a cut, and not something to retry without pairing.
+     */
+    if (event.code === TUNNEL_PAIRING_ONLY_CLOSE_CODE) {
+      finish({
+        kind: 'abnormal',
+        code: 'PAIRING_ONLY',
+        message: 'the other device accepted this connection only to pair',
       });
       return;
     }

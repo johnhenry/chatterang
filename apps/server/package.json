@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@chatterang/contracts": "*",
-    "@chatterang/desktop": "*"
+    "@chatterang/desktop": "*",
+    "@chatterang/tunnel": "*"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"
