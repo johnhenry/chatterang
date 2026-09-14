@@ -37,6 +37,11 @@ class FakeUtilityProcess extends EventEmitter {
   kills = 0;
   #phase: Phase = 'alive';
 
+  /** Where in its life the process is, as a post arriving now would find it. */
+  get phase(): Phase {
+    return this.#phase;
+  }
+
   postMessage(message: unknown): void {
     // Never throws, in any phase. Measured: every post returned undefined.
     this.posted.push({ message, phase: this.#phase });
@@ -241,6 +246,57 @@ describe('a post that does not go settles as HANDLE_LOST, and never hangs', () =
     });
     expect(await outcome(early)).toMatchObject({ rejected: { code: HANDLE_LOST } });
     expect(child.postsToAnExitedProcess).toEqual([]);
+  });
+
+  it('a notify listener that releases its renderer inside the close posts nothing into the process', async () => {
+    // `#onClose` latches `#closed` first but drops `#handle` last, in `#retire`,
+    // after it has delivered each turn's synthesised `llamaEnd` through
+    // `notify`. A listener that answers that end by releasing its renderer
+    // therefore posts a `cancel` through a handle that is still live, from
+    // inside the exit dispatch. Nothing in main.ts does this today; this is the
+    // one callback away the adapter's latch exists for.
+    // If `#onClose` is ever changed to drop `#handle` before it notifies, the
+    // first expectation below stops holding, and so does the comment in
+    // utility-host.ts that describes this window.
+    // FAULT INJECTED: deleting the adapter's `if (exited) { throw … }` guard let
+    // the cancel reach the process with phase "inside the exit dispatch".
+    const child = new FakeUtilityProcess();
+    const attempts: Post[] = [];
+    const supervisor: Supervisor = new Supervisor({
+      spawn: () => {
+        const handle = utilityHostHandle(child);
+        return {
+          ...handle,
+          link: {
+            ...handle.link,
+            postMessage: (message) => {
+              attempts.push({ message, phase: child.phase });
+              handle.link.postMessage(message);
+            },
+          },
+        };
+      },
+      notify: (_plugin, eventName, _data, ownerId) => {
+        if (eventName === 'llamaEnd' && ownerId !== undefined) {
+          supervisor.releaseRenderer(ownerId, 'the window closed when its turn ended');
+        }
+      },
+      timers: heldClock(),
+    });
+    const llama = supervisor.plugin(LLAMA_PLUGIN.name) as unknown as LlamaFacade;
+    const turn = llama.generate(1, { handle: 'h', prompt: 'p', requestId: 'r1' });
+    expect(child.posted.map((post) => post.phase)).toEqual(['alive']);
+
+    expect(() => child.exit(0)).not.toThrow();
+
+    const insideTheDispatch = attempts
+      .filter((attempt) => attempt.phase === 'inside the exit dispatch')
+      .map((attempt) => (attempt.message as { method?: string }).method);
+    expect(insideTheDispatch).toEqual(['cancel']);
+    expect(child.postsToAnExitedProcess).toEqual([]);
+    // Released before `#onClose` reached its own rejections, so it settles as
+    // the release said, not as HANDLE_LOST. What matters is that it settles.
+    expect(await outcome(turn)).toMatchObject({ rejected: { code: 'RENDERER_GONE' } });
   });
 
   it('a call to a host whose exit the supervisor never heard settles instead of hanging', async () => {

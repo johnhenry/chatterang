@@ -24,16 +24,25 @@
  *     or `setImmediate` after `kill()` and after a SIGKILL, and from a timer
  *     after `kill()`, 10 of 10 each.
  *
- * The `'exit'` listeners are exactly where `Supervisor#onClose` runs. Today
- * nothing on that path posts, because `#onClose` latches `#closed` and drops
- * `#handle` before anything could. That rests on ordering, and a native crash
- * is not a failure mode an ordering mistake should be able to buy. So the
- * process is marked exited in the FIRST `'exit'` listener, registered here
- * before any caller can register one. Every post after that throws instead of
- * reaching Electron. `Supervisor#post` already treats a throwing link as a lost
- * host: it runs `#onClose`, which rejects every pending call with
- * `HANDLE_LOST`. A post that would have crashed main, or been dropped into a
- * dead process and left its call waiting, becomes a settled `HANDLE_LOST`.
+ * The `'exit'` listeners are exactly where `Supervisor#onClose` runs, and
+ * `#onClose` does NOT stop posts by itself. It latches `#closed` first, so a
+ * new `#call` is refused. But `#handle` stays live until `#retire`, at the very
+ * end, after `#onClose` has delivered each turn's synthesised end through
+ * `notify`, synchronously. `releaseRenderer` and `#tick`'s cancel post through
+ * `#post`, which checks `#handle` and not `#closed`. So a `notify` listener
+ * that called `releaseRenderer` would post from inside the dispatch. Today
+ * nothing posts there only because `main.ts`'s `notify` sends to a renderer
+ * and calls nothing back, and a native crash is not a failure mode one
+ * callback should be able to buy. `tests/desktop-utility-host.test.ts` drives
+ * that callback against the real `Supervisor` and shows the post it makes.
+ *
+ * So the process is marked exited in the FIRST `'exit'` listener, registered
+ * here, before any caller can register one. Every post after that throws
+ * instead of reaching Electron. `Supervisor#post` already treats a throwing
+ * link as a lost host: it runs `#onClose`, which rejects every pending call
+ * with `HANDLE_LOST`. A post that would have crashed main, or been dropped
+ * into a dead process and left its call waiting, becomes a settled
+ * `HANDLE_LOST`.
  */
 
 import type { HostHandle } from './bridge/protocol.js';

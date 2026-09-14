@@ -124,11 +124,17 @@ specific. Three reports, from two runs, have the same address and shape.
   crash it in any run. That dispatch is exactly where `Supervisor#onClose`
   runs, because `main.ts` hands the supervisor the child's `'exit'` as its
   `onClose`.
-- **The shipped code does not post there today, by ordering, not by design.**
-  `#onClose` latches `#closed` and drops `#handle` before anything it calls
-  could post, and `main.ts` registered no other `'exit'` listener that posts.
-  So this is a native crash one listener or one reordering away, not one
-  observed in the app.
+- **The shipped code does not post there today, by accident, not by design.**
+  `#onClose` latches `#closed` first, so a new call is refused. But it drops
+  `#handle` last, in `#retire`, after it has delivered each turn's synthesised
+  end through `notify`, synchronously. `releaseRenderer` and `#tick`'s cancel
+  post through `#post`, which checks `#handle` and not `#closed`. So a
+  `notify` listener that called `releaseRenderer` would post from inside the
+  dispatch. None does only because `main.ts`'s `notify` sends to a renderer and
+  calls nothing back, and `main.ts` registered no other `'exit'` listener that
+  posts. So this is a native crash one callback or one listener away, not one
+  observed in the app. `tests/desktop-utility-host.test.ts` drives that
+  callback against the real `Supervisor` and shows the post it makes.
 - **So the post moved into `apps/desktop/src/utility-host.ts`.** Its first
   `'exit'` listener, registered in the same turn as the fork, marks the child
   exited. Every post after that throws instead of reaching Electron.
