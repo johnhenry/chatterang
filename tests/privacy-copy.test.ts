@@ -38,6 +38,7 @@ import {
   parseTypedEndpoint,
 } from '@chatterang/tunnel/pairing';
 import { isLocalEngine } from '@/domain/manifest';
+import { validateServerUrl } from '@/domain/mcp';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
 import { capabilities } from '@/lib/platform';
 import {
@@ -567,6 +568,20 @@ describe('the privacy command', () => {
       await privacyOutput({ mcp: [{ name: 'notes', host: 'notes.example', enabled: true }] }),
     ).toContain('Every grant to a server is dropped when it is removed or switched off.');
     expect(await privacyOutput({})).not.toContain('Every grant to a server');
+  });
+
+  it('says which server addresses it takes, localhost http included', () => {
+    // The URL hint said "https only." `validateServerUrl` has always taken plain
+    // http on localhost and 127.0.0.1, and the packaged desktop's CSP used to
+    // refuse those fetches anyway. #284 put `http:` in connect-src, so such a
+    // server now connects there too. The hint names the exception, and the
+    // validator is measured beside it so neither moves alone.
+    const PANEL = shipped('features/settings/McpPanel.tsx');
+    expect(PANEL).not.toContain('https only.');
+    expect(PANEL).toContain('Streamable HTTP endpoint. https, or localhost for development.');
+    expect(validateServerUrl('http://localhost:3000/mcp').ok).toBe(true);
+    expect(validateServerUrl('http://127.0.0.1:3000/mcp').ok).toBe(true);
+    expect(validateServerUrl('http://api.example.com/mcp').ok).toBe(false);
   });
 
   it('says a destructive call is asked about twice, what leaves first', async () => {

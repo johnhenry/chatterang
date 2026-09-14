@@ -134,6 +134,13 @@ const FONT_FILE_ORIGIN = 'https://fonts.gstatic.com';
  * This moves what the page is PERMITTED to reach, not what the app sends: a
  * provider request still goes only to a connection the user added, at the
  * address that connection holds.
+ *
+ * IT REACHES MCP TOO. The MCP transport also fetches from the renderer, and
+ * `validateServerUrl` (`src/domain/mcp.ts`) has always taken plain http on
+ * `localhost` and `127.0.0.1`. The old policy refused those servers in a
+ * packaged build; `http:` lets them connect, so the McpPanel hint that said
+ * "https only." now names the localhost exception. Whether MCP should keep that
+ * exception was not part of this ruling.
  */
 export const CSP_PRODUCTION = [
   "default-src 'self'",
