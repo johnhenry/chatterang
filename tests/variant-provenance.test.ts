@@ -27,6 +27,7 @@
 
 import { createElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { stage } from './support/stage';
 
 import type { InstalledModel } from '@/db';
 import type { Message, Provenance, ToolInvocation } from '@/domain/chat';
@@ -848,16 +849,27 @@ async function until(condition: () => boolean): Promise<void> {
 }
 
 /** Resolves once `holds()` is true: at once if it already is, otherwise on the store change that makes it so. */
-function whenStore(store: { subscribe: (listener: () => void) => () => void }, holds: () => boolean): Promise<void> {
+function whenStore(
+  what: string,
+  store: { subscribe: (listener: () => void) => () => void },
+  holds: () => boolean,
+): Promise<void> {
   if (holds()) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const unsubscribe = store.subscribe(() => {
-      if (!holds()) return;
-      unsubscribe();
-      resolve();
-    });
-  });
+  return stage(
+    what,
+    new Promise<void>((resolve) => {
+      const unsubscribe = store.subscribe(() => {
+        if (!holds()) return;
+        unsubscribe();
+        resolve();
+      });
+    }),
+  );
 }
+
+/** The store has finished with a held-open turn's tool event, including every write it makes for it. */
+const toolHandled = (handled: { hang: Promise<void> }): Promise<void> =>
+  stage('the store to finish with the tool event', handled.hang);
 
 /** A turn that stays open after its tool event until `release` is called. */
 function heldOpen(): { hang: Promise<void>; release: () => void } {
@@ -932,7 +944,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     const sending = useChats.getState().send('hello');
     try {
       // The store has finished with the tool event; the turn is still held open.
-      await handled.hang;
+      await toolHandled(handled);
       expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
       const inFlight = storedRows().find((row) => row.streaming === true);
       expect(inFlight?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
@@ -968,7 +980,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
       expect(useChats.getState().messages, 'the running row is off screen').toEqual([]);
 
       beforeTool.release();
-      await handled.hang;
+      await toolHandled(handled);
 
       expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
       const inFlight = storedRows().find((row) => row.streaming === true);
@@ -1012,7 +1024,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, onToolHandled: handled.release, hang: turn.hang }];
     const sending = useChats.getState().send('hello');
     try {
-      await handled.hang;
+      await toolHandled(handled);
       const live = storedRows().find((row) => row.streaming === true)!;
       expect(live, 'the running row was written mid-turn').toBeDefined();
       const stale: Message = { ...live, id: 'msg_stale', createdAt: live.createdAt + 1 };
@@ -1187,7 +1199,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
       // Not a window of ticks: the store has finished with the tool event, so
       // any write it makes for that event has been made, and the turn is still
       // held open.
-      await handled.hang;
+      await toolHandled(handled);
       expect(
         useChats.getState().messages.some((row) => row.role === 'assistant' && (row.toolCalls?.length ?? 0) > 0),
         'the tool event reached the row',
@@ -1313,7 +1325,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: SENT, onToolHandled: handled.release, hang: turn.hang }];
     const regenerating = useChats.getState().regenerate('msg_old');
     try {
-      await handled.hang;
+      await toolHandled(handled);
       const inFlight = storedRows().find((row) => row.streaming === true);
       expect(inFlight?.variants?.map((variant) => variant.content)).toEqual(['OLD ANSWER']);
       expect(tables.messages.delete).toHaveBeenCalledWith('msg_old');
@@ -1338,7 +1350,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     const regenerating = useChats.getState().regenerate('msg_old');
     try {
       // The store has finished with the tool event, as above.
-      await handled.hang;
+      await toolHandled(handled);
       expect(assistantRow().toolCalls?.length ?? 0, 'the tool event reached the row').toBeGreaterThan(0);
       expect(tables.messages.delete).not.toHaveBeenCalledWith('msg_old');
     } finally {
@@ -1467,12 +1479,16 @@ describe('the MCP send sheet, through the store’s own policy', () => {
     });
     return {
       /** Every grant started so far has settled, and any started while waiting. */
-      async settled(): Promise<void> {
-        for (let seen = -1; seen !== started.length; ) {
-          seen = started.length;
-          await Promise.all(started);
-        }
-      },
+      settled: (): Promise<void> =>
+        stage(
+          'every MCP grant started here to settle',
+          (async () => {
+            for (let seen = -1; seen !== started.length; ) {
+              seen = started.length;
+              await Promise.all(started);
+            }
+          })(),
+        ),
       restore: () => useChats.setState({ grantMcpEgress: original }),
     };
   }
@@ -1507,13 +1523,13 @@ describe('the MCP send sheet, through the store’s own policy', () => {
     mcpAnswers = [];
     script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
     const sending = useChats.getState().send('file it');
-    await whenStore(useApp, () => useApp.getState().approvals.length > 0);
+    await whenStore('the send sheet to be raised', useApp, () => useApp.getState().approvals.length > 0);
     expect(useApp.getState().approvals).toHaveLength(1);
     expect(useApp.getState().approvals[0]?.title).toBe(mcpSendSheet(ASK).title);
 
     useChats.getState().stop();
 
-    await whenStore(useApp, () => useApp.getState().approvals.length === 0);
+    await whenStore('Stop to take the sheet down', useApp, () => useApp.getState().approvals.length === 0);
     await sending;
     // Stop's no is the policy's answer; the dispatcher reads it off the signal.
     expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
@@ -1586,7 +1602,7 @@ describe('the MCP send sheet, through the store’s own policy', () => {
         granted.push(policy.isGranted(ASK.destination));
 
         write.release();
-        await whenStore(useChats, () => grants().length > 0);
+        await whenStore('the store to hold the grant', useChats, () => grants().length > 0);
         expect(grants()).toHaveLength(1);
         // What `useMcp.toggle('mcp_notes', false)` and `remove` call.
         await revokeMcpGrantsFor('mcp_notes');
@@ -1662,7 +1678,12 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       started: () => started,
       /** Resolves once `count` writes have started: at once, if they have. */
       startedAt: (count: number): Promise<void> =>
-        started >= count ? Promise.resolve() : new Promise<void>((arrived) => arrivals.push({ count, arrived })),
+        started >= count
+          ? Promise.resolve()
+          : stage(
+              `${count} chat write(s) to start`,
+              new Promise<void>((arrived) => arrivals.push({ count, arrived })),
+            ),
       release: () => release(),
       restore: () => {
         release();

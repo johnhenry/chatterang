@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { stage } from './support/stage';
 
 /**
  * The persisted half of the tool-output rule.
@@ -354,7 +355,8 @@ const OPENAI = {
  *
  * A test names the chat whose put it means. `held` resolves when that put has
  * started, rather than polling a count of puts: a count can be met by another
- * chat's put, and a poll has a budget a loaded runner can spend.
+ * chat's put, and a poll has a budget a loaded runner can spend. A put that
+ * never starts fails as `stage` reports it, naming the chat.
  */
 function holdingChatWrites() {
   const stored = new Map<string, Chat>();
@@ -381,7 +383,7 @@ function holdingChatWrites() {
     held: (chatId: string): Promise<void> =>
       holds.some((put) => put.chatId === chatId)
         ? Promise.resolve()
-        : new Promise<void>((arrived) => arrivals.push({ chatId, arrived })),
+        : stage(`a put of ${chatId} to be held`, new Promise<void>((arrived) => arrivals.push({ chatId, arrived }))),
     /** Let the oldest held put of `chatId` finish. Throws if none is held. */
     release: (chatId: string): void => {
       const at = holds.findIndex((put) => put.chatId === chatId);
@@ -409,15 +411,18 @@ const storedConnections = (stored: Map<string, Chat>, id: string): string[] =>
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** Resolves once `holds()` is true: at once if it already is, otherwise on the store change that makes it so. */
-function whenChats(holds: () => boolean): Promise<void> {
+function whenChats(what: string, holds: () => boolean): Promise<void> {
   if (holds()) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const unsubscribe = useChats.subscribe(() => {
-      if (!holds()) return;
-      unsubscribe();
-      resolve();
-    });
-  });
+  return stage(
+    what,
+    new Promise<void>((resolve) => {
+      const unsubscribe = useChats.subscribe(() => {
+        if (!holds()) return;
+        unsubscribe();
+        resolve();
+      });
+    }),
+  );
 }
 
 /**
@@ -438,12 +443,16 @@ function recordingGrantWrites() {
   });
   return {
     /** Every grant started so far has settled, and any started while waiting. */
-    async settled(): Promise<void> {
-      for (let seen = -1; seen !== started.length; ) {
-        seen = started.length;
-        await Promise.all(started);
-      }
-    },
+    settled: (): Promise<void> =>
+      stage(
+        'every provider grant started here to settle',
+        (async () => {
+          for (let seen = -1; seen !== started.length; ) {
+            seen = started.length;
+            await Promise.all(started);
+          }
+        })(),
+      ),
     restore: () => useChats.setState({ grantEgress: original }),
   };
 }
@@ -1112,7 +1121,7 @@ describe('the store’s provider policy, while a grant is being withdrawn', () =
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
       await db.held('c1');
       db.release('c1');
-      await whenChats(() => connectionsOf('c1').length > 0);
+      await whenChats('the store to hold the new grant for c1', () => connectionsOf('c1').length > 0);
       expect(connectionsOf('c1')).toEqual(['conn_openai']);
       // Its own check runs while c2's revocation is still held.
       await macrotask();
