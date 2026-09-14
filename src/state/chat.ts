@@ -83,6 +83,25 @@ const HISTORY_TURNS = 64;
  */
 let livePlaceholderId: string | null = null;
 
+/**
+ * How many times each MCP server's grants have been withdrawn, by server id (#6).
+ *
+ * Two things act on a conversation answer before its grant is stored: the
+ * policy that took the answer (`mcpEgressPolicy`), and the write itself, which
+ * can land after a revocation that read the chats first and so found nothing
+ * to drop. Both compare this count instead of trusting the order things finish
+ * in. Without it, switching a server off and back on during a long turn left
+ * the answer in force — the live check in `state/mcp.ts` passes again for the
+ * same record at the same address — and the privacy command's "Every grant to
+ * a server is dropped when it is removed or switched off" was false.
+ *
+ * Counted per server, not per conversation: a revocation scoped to one chat
+ * also makes other chats' in-flight answers to that server ask again, which
+ * fails closed.
+ */
+const mcpRevocations = new Map<string, number>();
+const mcpRevocationsOf = (serverId: string): number => mcpRevocations.get(serverId) ?? 0;
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -315,6 +334,7 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async grantMcpEgress(chatId, { serverId, url }) {
+    const revocations = mcpRevocationsOf(serverId);
     const chat = get().chats.find((entry) => entry.id === chatId);
     if (!chat) return;
     if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return;
@@ -328,9 +348,15 @@ export const useChats = create<ChatState>((set, get) => ({
       { kind: 'mcp', serverId, url, grantedAt: Date.now() },
     ];
     await get().updateChat(chatId, { egressGrants });
+    // A revocation that started while this was being written read the chat
+    // before the grant was in it, and dropped nothing. See `mcpRevocations`.
+    if (mcpRevocationsOf(serverId) !== revocations) await get().revokeMcpEgress(serverId, chatId);
   },
 
   async revokeMcpEgress(serverId, chatId) {
+    // Counted before anything is read or awaited, so an answer or a write
+    // already under way sees it however the rest of this interleaves.
+    mcpRevocations.set(serverId, mcpRevocationsOf(serverId) + 1);
     const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
     const affected = get().chats.filter(
       (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
@@ -1077,19 +1103,21 @@ export function mcpSendSheet({ destination, calls }: DestinationRequest): McpSen
  * conversation answer given during this turn until its write lands: the grant
  * is persisted with `void`, and a model that calls the same server again at
  * once must not be asked what the person has just answered for the whole
- * conversation. It cannot outlive a revocation that matters: removing a server
- * or switching it off makes its calls refuse at the live check in
- * `state/mcp.ts`, and a changed address is a different key.
+ * conversation. A changed address is a different key. An answer is held with
+ * the server's revocation count when it was given, and honoured only while that
+ * count stands: switching a server off and on again brings back the same record
+ * at the same address, so the live check in `state/mcp.ts` cannot be what ends
+ * it. See `mcpRevocations`.
  */
 function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
-  const answered = new Set<string>();
+  const answered = new Map<string, number>();
   const keyOf = (destination: ToolDestination): string => `${destination.serverId} ${destination.url}`;
 
   return {
     isGranted: (destination) =>
-      answered.has(keyOf(destination)) ||
+      answered.get(keyOf(destination)) === mcpRevocationsOf(destination.serverId) ||
       holdsGrant(grantsFor(), {
         kind: 'mcp',
         serverId: destination.serverId,
@@ -1097,7 +1125,7 @@ function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
       }),
 
     onGranted: (destination) => {
-      answered.add(keyOf(destination));
+      answered.set(keyOf(destination), mcpRevocationsOf(destination.serverId));
       void useChats
         .getState()
         .grantMcpEgress(chatId, { serverId: destination.serverId, url: destination.url });

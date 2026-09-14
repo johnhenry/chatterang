@@ -552,7 +552,9 @@ describe('MCP arguments do not leave the device without a grant', () => {
     vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => answer);
 
   afterEach(() => {
-    for (const id of ['mcp:notes.note', 'mcp:archive.note', 'mcp:x.y', 'x.y']) toolRegistry.unregister(id);
+    for (const id of ['mcp:notes.note', 'mcp:archive.note', 'mcp:mirror.note', 'mcp:x.y', 'x.y']) {
+      toolRegistry.unregister(id);
+    }
   });
 
   function setUp(turns: string[] = [MCP_CALL, 'Done.']) {
@@ -687,6 +689,43 @@ describe('MCP arguments do not leave the device without a grant', () => {
     ]);
     expect(probe.call).toHaveBeenCalledOnce();
     expect(archive.call).toHaveBeenCalledOnce();
+  });
+
+  it('does not let a grant for one server answer another server on the same host, or at the same address', async () => {
+    // The test above cannot tell a key on the address from a key on the host
+    // the sheet shows: its two addresses are on different hosts. These two
+    // share one. A gateway serving several servers under one host is ordinary,
+    // and a group keyed on anything coarser than the record's id and address
+    // is checked against its FIRST call's destination — so the grant held for
+    // the probe would carry the others' arguments unasked.
+    const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { probe, run } = setUp([MCP_CALL + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://notes.example/archive/mcp',
+    });
+    const mirror = mcpProbe({ serverName: 'mirror', serverId: 'mcp_mirror' });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    expect(archive.tool.destination?.host).toBe(probe.tool.destination?.host);
+    expect(mirror.tool.destination?.url).toBe(probe.tool.destination?.url);
+    const request = ask('deny');
+
+    await run(
+      { ...GRANTED_PROBE, request },
+      { toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id] },
+    );
+
+    // The control: the server the grant names is sent to, unasked.
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual([
+      'mcp_archive',
+      'mcp_mirror',
+    ]);
+    expect(archive.call).not.toHaveBeenCalled();
+    expect(mirror.call).not.toHaveBeenCalled();
   });
 
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {

@@ -242,6 +242,69 @@ describe('an MCP grant', () => {
     expect(grantsOf('c1')).toEqual([grantOf(MOVED)]);
   });
 
+  it('leaves the conversation’s other grants where they are, whether it is new or replaces a stale address', async () => {
+    // Seeded FIRST. The tests above grant a server into a conversation holding
+    // nothing else, so a filter that dropped every other grant along with the
+    // stale one would pass them — and would quietly undo a provider answer the
+    // person gave, bringing its sheet back every turn.
+    const OTHER = { serverId: 'mcp_other', url: 'https://other.example/mcp' };
+    const MOVED = { serverId: 'mcp_notes', url: 'https://moved.example/mcp' };
+    const provider = { connectionId: 'conn_openai', grantedAt: expect.any(Number) };
+    await useChats.getState().grantEgress('c1', 'conn_openai');
+    await useChats.getState().grantMcpEgress('c1', OTHER);
+
+    await useChats.getState().grantMcpEgress('c1', NOTES);
+    expect(grantsOf('c1')).toEqual([provider, grantOf(OTHER), grantOf(NOTES)]);
+
+    await useChats.getState().grantMcpEgress('c1', MOVED);
+    expect(grantsOf('c1')).toEqual([provider, grantOf(OTHER), grantOf(MOVED)]);
+  });
+
+  it('does not survive a revocation that ran while it was being written', async () => {
+    // A conversation answer is written with `void` (`mcpEgressPolicy`), and a
+    // revocation reads the chats before it writes. One that starts while the
+    // grant's write is in flight finds no grant to drop, and — without the
+    // check this measures — the grant lands after it and outlives the server
+    // being switched off. c2 holds a grant already, so the revocation is still
+    // under way (its write held open) when c1's lands.
+    await useChats.getState().grantMcpEgress('c2', NOTES);
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    chatsTable.put.mockImplementationOnce(async () => {}).mockImplementationOnce(() => held);
+
+    const granting = useChats.getState().grantMcpEgress('c1', NOTES);
+    const revoking = useChats.getState().revokeMcpEgress('mcp_notes');
+    await granting;
+    release();
+    await revoking;
+
+    expect(grantsOf('c1')).toEqual([]);
+    expect(grantsOf('c2')).toEqual([]);
+
+    // The control: a grant asked for after the revocation is kept.
+    await useChats.getState().grantMcpEgress('c1', NOTES);
+    expect(grantsOf('c1')).toEqual([grantOf(NOTES)]);
+  });
+
+  it('survives a revocation of another server that ran while it was being written', async () => {
+    // The check above is per server. One that counted every server's
+    // revocations together would quietly undo this answer too.
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    chatsTable.put.mockImplementationOnce(() => held);
+
+    const granting = useChats.getState().grantMcpEgress('c1', NOTES);
+    await useChats.getState().revokeMcpEgress('mcp_other');
+    release();
+    await granting;
+
+    expect(grantsOf('c1')).toEqual([grantOf(NOTES)]);
+  });
+
   it('is left alone when a connection with the same id goes, and leaves that connection’s grant alone', async () => {
     await useChats.getState().grantMcpEgress('c1', { serverId: 'shared', url: NOTES.url });
     await useChats.getState().grantEgress('c1', 'shared');

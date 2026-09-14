@@ -555,8 +555,13 @@ describe('the privacy command', () => {
     // Measured in `tests/egress-grants.test.ts`, through the real `useMcp` and
     // chat store: removing or switching off a server drops exactly the grants
     // that named it, switching it back on restores none, and no provider grant
-    // goes with them. Printed inside the MCP paragraph, which appears only when
-    // a server is connected — see "says nothing about MCP servers" above.
+    // goes with them, even when the grant's write lands after the revocation.
+    // And in `tests/variant-provenance.test.ts`, through the store's own
+    // policy: a conversation answer the running turn still remembers stops
+    // counting the moment the server's grants are withdrawn, although the
+    // server comes back at the same address. Printed inside the MCP paragraph,
+    // which appears only when a server is connected — see "says nothing about
+    // MCP servers" above.
     expect(
       await privacyOutput({ mcp: [{ name: 'notes', host: 'notes.example', enabled: true }] }),
     ).toContain('Every grant to a server is dropped when it is removed or switched off.');
