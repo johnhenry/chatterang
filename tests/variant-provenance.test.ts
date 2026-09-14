@@ -31,6 +31,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { InstalledModel } from '@/db';
 import type { Message, Provenance, ToolInvocation } from '@/domain/chat';
 import type { McpCallReceipt } from '@/domain/mcp';
+import type { ToolEgressPolicy } from '@/ai/engine';
 
 /* ── The database, stubbed at the table boundary ────────────────────── */
 
@@ -130,6 +131,11 @@ interface Turn {
    * the store has to handle without throwing away what the user already read.
    */
   readonly failWith?: string;
+  /**
+   * Raise the tool-output sheet first, with no tools, as the real engine does
+   * on a turn whose HISTORY carries tool-derived text.
+   */
+  readonly asksEgress?: boolean;
   /** Hold the turn open BEFORE its tool event until this settles. */
   readonly beforeTool?: Promise<void>;
   /** Called once the store has finished handling the tool event. */
@@ -152,9 +158,17 @@ let script: Turn[] = [];
  */
 function scriptedEngine(): unknown {
   return {
-    async *stream() {
+    async *stream(request: { readonly egress?: ToolEgressPolicy }) {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
+      if (turn.asksEgress) {
+        await request.egress?.request?.({
+          backendId: 'conn_openai',
+          modelName: 'gpt-4o-mini',
+          tools: [],
+          characters: 42,
+        });
+      }
       if (turn.beforeTool) await turn.beforeTool;
       if (turn.tool) {
         yield { type: 'tool', tool: turn.tool };
@@ -1116,5 +1130,65 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
       await regenerating;
     }
     expect(tables.messages.delete).toHaveBeenCalledWith('msg_old');
+  });
+});
+
+/* ── The tool-output sheet, a turn later ─────────────────────────────── */
+
+describe('the tool-output sheet over an earlier reply', () => {
+  const EARLIER: Message = {
+    id: 'msg_a',
+    chatId: 'c1',
+    role: 'assistant',
+    content: 'Your notes say you owe Sam.',
+    createdAt: 2,
+    toolCalls: [SENT],
+    provenance: REMOTE,
+  };
+
+  it('names the server that reply drew on, through the store’s own policy', async () => {
+    // The engine asks with this turn's tools, which on a later turn are none,
+    // so whatever the sheet says about the history the store has to supply.
+    const shown: (string | undefined)[] = [];
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      requestApproval: async (_action: string, prompt?: { readonly body?: string }) => {
+        shown.push(prompt?.body);
+        return false;
+      },
+    });
+    try {
+      useChats.setState({ messages: [USER, EARLIER] });
+      script = [{ text: 'Sure.', provenance: ON_DEVICE, asksEgress: true }];
+      await useChats.getState().send('and then?');
+    } finally {
+      useApp.setState({ requestApproval: original });
+    }
+
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toContain('what notes.search returned from notes.example');
+    expect(shown[0]).not.toContain('own data');
+  });
+
+  it('names only earlier replies still in the prompt', async () => {
+    // Longer than the smallest prompt budget `contextBudget` allows (256
+    // tokens), so a small window really has to drop it.
+    const chat = useChats.getState().chats[0]!;
+    const long: Message = { ...EARLIER, content: 'Your notes say you owe Sam. '.repeat(200) };
+    const rows: Message[] = [USER, long, { ...USER, id: 'msg_u2', content: 'and then?', createdAt: 3 }];
+
+    const whole = await buildMessages(chat, rows, 0, QWEN.id);
+    expect(whole.derivedReplies.map((reply) => reply.toolCalls[0]?.receipt?.host)).toEqual([
+      'notes.example',
+    ]);
+
+    // A window too small for it: the reply is dropped from the prompt, so it is
+    // not going, and the sheet has no business naming where it came from.
+    useModels.setState({ installed: { [QWEN.id]: installedRecord({ ...QWEN, contextLength: 64 }) } });
+    const trimmed = await buildMessages(chat, rows, 0, QWEN.id);
+    expect(trimmed.messages.some((message) => message.role === 'assistant'), 'the reply was dropped').toBe(
+      false,
+    );
+    expect(trimmed.derivedReplies).toEqual([]);
   });
 });

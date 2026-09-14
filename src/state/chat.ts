@@ -42,6 +42,8 @@ import {
   type ToolEgressPolicy,
 } from '@/ai/engine';
 import { markTainted } from '@/ai/taint';
+import type { ExecutedTool } from '@/ai/middleware/tools';
+import type { McpCallReceipt } from '@/domain/mcp';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -585,7 +587,7 @@ async function runGeneration(
       target,
       sampler: resolveSampler(chat, target.modelId),
       toolIds: chat.tools,
-      egress: egressPolicy(chat.id),
+      egress: egressPolicy(chat.id, built.derivedReplies),
       signal: controller.signal,
     });
 
@@ -813,13 +815,128 @@ async function runGeneration(
 /* ── Tool-output egress ──────────────────────────────────────────────── */
 
 /**
+ * The tool-output sheet's body: where the output going with this request came
+ * from, then what sending it means.
+ *
+ * It used to say every tool "read from this app’s own data", which was true
+ * while every tool ran here. An MCP tool's output comes back from someone
+ * else's server and is marked tainted like any other (src/ai/engine.ts), so a
+ * remote model raises this sheet over it — and the sheet said it was ours.
+ *
+ * TWO SOURCES, because the sheet is raised on two kinds of turn. `tools` are
+ * the calls made in this turn, which the engine hands over. `earlier` are the
+ * replies from previous turns that were written from tool output: the history
+ * carries them marked tainted (`buildMessages`), so every later turn raises
+ * this sheet before any tool has run, with `tools` empty. Attributing `tools`
+ * alone fell back to "A tool read from this app’s own data" over a reply
+ * written from what a server returned — on every turn after the call.
+ *
+ * This turn's calls are attributed by the receipt's OUTCOME, not by whether
+ * there is one. A call that failed was handed to the server, and what came
+ * back into the thread is this app's framing around an error message that the
+ * server may itself have written (mcp-query passes a JSON-RPC error's text
+ * through). So the sheet says the call did not complete on that host: neither
+ * that the server returned it, nor that it is this app's own.
+ *
+ * An EARLIER call with no receipt is not called this app's own either. A row
+ * stored before receipts existed looks exactly like a local tool's, so only a
+ * receipt can name an origin, and without one the sheet names none.
+ *
+ * Exported so the attribution is measured against real tool records rather
+ * than a copy of the string.
+ */
+export function toolOutputSheetBody(
+  tools: readonly ExecutedTool[],
+  earlier: readonly DerivedReply[],
+  modelName: string,
+  characters: number,
+): string {
+  const sentences: string[] = [];
+
+  // Grouped by origin, so several local tools still read as one clause and
+  // each server gets its own.
+  const byOrigin = new Map<string, string[]>();
+  for (const tool of tools) {
+    const [name, origin] = originOf(tool);
+    const names = byOrigin.get(origin) ?? [];
+    if (!names.includes(name)) names.push(name);
+    byOrigin.set(origin, names);
+  }
+  if (byOrigin.size > 0) {
+    sentences.push([...byOrigin].map(([origin, names]) => `${names.join(', ')} ${origin}`).join('; '));
+  }
+
+  if (earlier.length > 0) {
+    const bySource = new Map<string, { receipt: McpCallReceipt; names: string[] }>();
+    for (const call of earlier.flatMap((reply) => reply.toolCalls)) {
+      const receipt = call.receipt;
+      if (receipt === undefined) continue;
+      const key = `${receipt.outcome} ${receipt.host}`;
+      const source = bySource.get(key) ?? { receipt, names: [] };
+      if (!source.names.includes(receipt.toolName)) source.names.push(receipt.toolName);
+      bySource.set(key, source);
+    }
+    const sources = [...bySource.values()].map(({ receipt, names }) =>
+      earlierSourceOf(receipt, names.join(', ')),
+    );
+    sentences.push(
+      'Earlier replies in this conversation drew on tool output' +
+        (sources.length > 0 ? `, including ${sources.join('; ')}` : ''),
+    );
+  }
+
+  // The engine asks only over tainted content, and both kinds are above, so
+  // this is a floor that claims no origin rather than a sentence anyone should
+  // normally read.
+  if (sentences.length === 0) sentences.push('This request carries tool output');
+
+  return (
+    `${sentences.join('. ')}. ` +
+    `To answer, ${modelName} has to see it. ` +
+    `${characters.toLocaleString()} characters — this is not a message you typed.`
+  );
+}
+
+/** A tool's name as the sheet prints it, and the clause saying where its output came from. */
+function originOf(tool: ExecutedTool): [name: string, origin: string] {
+  const receipt = tool.receipt;
+  if (receipt === undefined) return [tool.name, 'read from this app’s own data'];
+  switch (receipt.outcome) {
+    case 'sent':
+      return [receipt.toolName, `returned this from ${receipt.host}`];
+    case 'failed':
+      return [receipt.toolName, `did not complete on ${receipt.host}`];
+    default: {
+      // A new outcome has to say where its output came from before this compiles.
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
+}
+
+/** An earlier call's server as the sheet names it, which only its receipt can. */
+function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
+  switch (receipt.outcome) {
+    case 'sent':
+      return `what ${names} returned from ${receipt.host}`;
+    case 'failed':
+      return `${names}, which did not complete on ${receipt.host}`;
+    default: {
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
+}
+
+/**
  * The consent side of the engine's rule, in the app's own voice.
  *
  * Read live from the store rather than captured when the turn started: a grant
  * made in the sheet has to be visible to the check that raised it, and the
- * chat record may have moved on by then.
+ * chat record may have moved on by then. `earlier` is the exception, fixed for
+ * the turn, because it describes the history this turn's prompt was built from.
  */
-function egressPolicy(chatId: string): ToolEgressPolicy {
+function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgressPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
 
@@ -834,7 +951,6 @@ function egressPolicy(chatId: string): ToolEgressPolicy {
       const app = useApp.getState();
       const label =
         app.connections.find((connection) => connection.id === backendId)?.label ?? backendId;
-      const names = [...new Set(tools.map((tool) => tool.name))];
 
       // Named, counted, and attributed. "The request contains a tool message"
       // is not a thing anybody can decide about; "`bash` read 3 files from this
@@ -842,10 +958,7 @@ function egressPolicy(chatId: string): ToolEgressPolicy {
       let extended = false;
       const allowed = await app.requestApproval(`send tool output to ${label}`, {
         title: `Send tool output to ${label}?`,
-        body:
-          `${names.join(', ') || 'A tool'} read from this app’s own data. ` +
-          `To answer, ${modelName} has to see it. ` +
-          `${characters.toLocaleString()} characters — this is not a message you typed.`,
+        body: toolOutputSheetBody(tools, earlier, modelName, characters),
         detail: tools.slice(0, 4).map((tool) => `${tool.name} · ${tool.output.length} chars`),
         confirmLabel: 'Send this turn',
         extendedLabel: 'Send for this conversation',
@@ -951,6 +1064,22 @@ function resolveSampler(chat: Chat, modelId: string): SamplerSettings {
 export interface BuiltPrompt {
   readonly messages: IRMessage[];
   readonly fit: FitResult;
+  /**
+   * The earlier replies this prompt carries marked tool-derived, in order. The
+   * engine raises the tool-output sheet over them on every later turn, and it
+   * knows only the tools that ran in THIS one — so what the sheet can say about
+   * the rest comes from here. A reply the fit dropped is not going, and is not
+   * listed.
+   */
+  readonly derivedReplies: readonly DerivedReply[];
+}
+
+/**
+ * One earlier reply written while tools ran, and the calls its generation
+ * made. Empty for a generation whose tool use was never recorded.
+ */
+export interface DerivedReply {
+  readonly toolCalls: readonly ToolInvocation[];
 }
 
 /**
@@ -983,6 +1112,9 @@ export async function buildMessages(
     .slice(-HISTORY_TURNS);
 
   const result: IRMessage[] = [];
+  // Each tainted reply's calls, by the object pushed for it, so the replies that
+  // survive the fit below can be told from the ones it dropped.
+  const derivedFrom = new Map<IRMessage, readonly ToolInvocation[]>();
 
   const systemParts: string[] = [];
   const modelPrompt = chat.modelId ? models.installed[chat.modelId]?.systemPrompt : '';
@@ -1031,7 +1163,12 @@ export async function buildMessages(
     const derived =
       message.role === 'assistant' &&
       ((message.toolCalls?.length ?? 0) > 0 || displaysUnrecorded(message));
-    const carry = (built: IRMessage): IRMessage => (derived ? markTainted(built) : built);
+    const carry = (built: IRMessage): IRMessage => {
+      if (!derived) return built;
+      const marked = markTainted(built);
+      derivedFrom.set(marked, message.toolCalls ?? []);
+      return marked;
+    };
 
     const images = (message.attachments ?? []).filter(
       (attachment): attachment is Extract<Attachment, { kind: 'image' }> =>
@@ -1078,6 +1215,12 @@ export async function buildMessages(
     });
   }
 
+  const repliesIn = (sent: readonly IRMessage[]): DerivedReply[] =>
+    sent.flatMap((built) => {
+      const toolCalls = derivedFrom.get(built);
+      return toolCalls ? [{ toolCalls }] : [];
+    });
+
   const manifest = models.installed[modelId]?.manifest;
   if (!manifest) {
     return {
@@ -1088,12 +1231,13 @@ export async function buildMessages(
         dropped: 0,
         overflowed: false,
       },
+      derivedReplies: repliesIn(result),
     };
   }
 
   const sampler = resolveSampler(chat, modelId);
   const fit = fitToContext(result, contextBudget(manifest.contextLength, sampler.maxTokens));
-  return { messages: fit.messages, fit };
+  return { messages: fit.messages, fit, derivedReplies: repliesIn(fit.messages) };
 }
 
 /**
