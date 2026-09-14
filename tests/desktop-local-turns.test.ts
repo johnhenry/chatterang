@@ -10,6 +10,7 @@ import {
   LOCAL_TURNS_PLUGIN,
   PluginHost,
   SENDER_SCOPED,
+  TURN_END_METHOD,
   TURN_WAITING_EVENT,
   UNIT_IDLE_TIMEOUT_MS,
   WorkBroker,
@@ -125,8 +126,10 @@ interface FakeHost {
   send(message: HostMessage): void;
 }
 
-function rig(options: { hostedUnitOf?: HostedUnitOf } = {}) {
+function rig(options: { hostedUnitOf?: HostedUnitOf; policy?: { readonly generateIdleTimeoutMs?: number } } = {}) {
   const clock = manualClock();
+  /** Host calls already answered, so a turn's later decode is answered by its own call. */
+  const answered = new Set<number>();
   const hosts: FakeHost[] = [];
   const warnings: string[] = [];
   const delivered: { senderId: number; payload: EventPayload }[] = [];
@@ -170,7 +173,7 @@ function rig(options: { hostedUnitOf?: HostedUnitOf } = {}) {
       };
     },
     notify: withTurnProgress(broker, notify, options.hostedUnitOf),
-    entries: [{ engine: LLAMA_ENGINE, host: 'llama' }],
+    entries: [{ engine: LLAMA_ENGINE, host: 'llama', ...(options.policy === undefined ? {} : { policy: options.policy }) }],
     warn: (_host, message) => warnings.push(message),
     timers: clock,
   });
@@ -207,19 +210,44 @@ function rig(options: { hostedUnitOf?: HostedUnitOf } = {}) {
         .filter((entry) => entry.senderId === senderId && entry.payload.eventName === eventName)
         .map((entry) => entry.payload.data as T);
     },
-    generate(senderId: number, requestId: string): Promise<unknown> {
-      const turn = pluginHost.invoke(senderId, LLAMA_PLUGIN.name, 'generate', [
-        { handle: 'h', prompt: 'p', requestId } satisfies GenerateOptions,
-      ]);
+    /**
+     * A page's `generate`. `wholeTurn` is what the renderer's streamed turn sends:
+     * one decode of a turn that keeps the slot until the page ends it.
+     */
+    generate(senderId: number, requestId: string, options: { wholeTurn?: boolean } = {}): Promise<unknown> {
+      const request: GenerateOptions & { wholeTurn?: true } = {
+        handle: 'h',
+        prompt: 'p',
+        requestId,
+        ...(options.wholeTurn === true ? { wholeTurn: true as const } : {}),
+      };
+      const turn = pluginHost.invoke(senderId, LLAMA_PLUGIN.name, 'generate', [request]);
       void turn.catch(() => undefined);
       return turn;
     },
     cancel(senderId: number, requestId: string): Promise<unknown> {
       return pluginHost.invoke(senderId, LLAMA_PLUGIN.name, 'cancel', [{ requestId }]);
     },
-    /** requestIds the llama host was asked to generate, in order. */
+    /** A page's turn is over, however it ended. */
+    endTurn(senderId: number, requestId: string): Promise<unknown> {
+      return pluginHost.invoke(senderId, LLAMA_PLUGIN.name, 'endTurn', [{ requestId }]);
+    },
+    /** requestIds the llama host was asked to generate, in order, once per decode. */
     generated(): string[] {
       return calls('generate').map((call) => (call.args[0] as GenerateOptions).requestId);
+    },
+    /** What the llama host was sent for each `generate`, in order. */
+    generateArgs(): unknown[] {
+      return calls('generate').map((call) => call.args[0]);
+    },
+    /** The host refuses a turn's oldest unanswered decode. */
+    failDecode(requestId: string, message: string): void {
+      const call = calls('generate').find(
+        (entry) => (entry.args[0] as GenerateOptions).requestId === requestId && !answered.has(entry.id),
+      );
+      if (call === undefined) throw new Error(`no unanswered generate for ${requestId}`);
+      answered.add(call.id);
+      host().send({ k: 'ret', id: call.id, ok: false, error: { message } });
     },
     cancelled(): string[] {
       return calls('cancel').map((call) => (call.args[0] as { requestId: string }).requestId);
@@ -248,8 +276,11 @@ function rig(options: { hostedUnitOf?: HostedUnitOf } = {}) {
     },
     /** The host ends a generation the way LlamaCppNode does: its event, then its return. */
     finish(requestId: string, stopReason: GenerationEndEvent['stopReason'] = 'stop'): void {
-      const call = calls('generate').find((entry) => (entry.args[0] as GenerateOptions).requestId === requestId);
+      const call = calls('generate').find(
+        (entry) => (entry.args[0] as GenerateOptions).requestId === requestId && !answered.has(entry.id),
+      );
       if (call === undefined) throw new Error(`the host was never asked to generate ${requestId}`);
+      answered.add(call.id);
       const end = endOf(requestId, stopReason);
       host().send({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: end });
       host().send({ k: 'ret', id: call.id, ok: true, data: end });
@@ -498,9 +529,12 @@ describe('the wrapper changes generate, cancel and benchmark, and nothing else',
     expect(r.broker.waitingCount).toBe(0);
   });
 
-  it('LOCAL_TURNS_PLUGIN is llama.cpp plus the waiting event, and the host cannot emit that event', async () => {
+  it('LOCAL_TURNS_PLUGIN is llama.cpp plus the waiting event and the turn’s end, and the host cannot emit that event', async () => {
     expect(LOCAL_TURNS_PLUGIN.name).toBe(LLAMA_PLUGIN.name);
-    expect(LOCAL_TURNS_PLUGIN.methods).toBe(LLAMA_METHODS);
+    // The renderer's reach grows by the one method main answers itself, and
+    // the host protocol by nothing.
+    expect(LOCAL_TURNS_PLUGIN.methods).toEqual([...LLAMA_METHODS, TURN_END_METHOD]);
+    expect(LLAMA_PLUGIN.methods).not.toContain(TURN_END_METHOD);
     expect(LOCAL_TURNS_PLUGIN.events).toEqual([...LLAMA_EVENTS, TURN_WAITING_EVENT]);
     expect(LLAMA_PLUGIN.events).not.toContain(TURN_WAITING_EVENT);
 
@@ -715,5 +749,315 @@ describe('the waiting notifier forgets a window that went away', () => {
     await expect(waiting).rejects.toMatchObject({ code: 'OWNER_LOST' });
     r.notices(1, { kind: 'started', unitId: 'local-1' });
     expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local-1', position: 1 }]);
+  });
+});
+
+/* ══ A desktop turn holds the slot for the whole turn ═══════════════════ */
+
+/**
+ * OWNER RULING ON #7: a desktop turn keeps the one slot from its first decode
+ * until the turn settles, its tool calls included, and a phone turn waits for
+ * the whole desktop turn. #169's "one turn at a time" is one turn, not one
+ * decode.
+ *
+ * The page's streamed turn sends every decode with `wholeTurn: true` and says
+ * when the turn is over with `endTurn`. A turn's later decodes run under the
+ * unit its first decode was admitted as. Rejected by the ruling, and so pinned
+ * against here: a phone unit starting between two decodes, and a hold that
+ * gives the slot up after a long tool call.
+ */
+describe('a desktop turn holds the one slot from its first decode until the page ends the turn', () => {
+  const PHONE = { kind: 'device', id: 'phone' } as const;
+  const WINDOW_1 = { kind: 'window', id: 1 } as const;
+
+  /** One decode of a whole turn, answered by the host. */
+  async function decoded(r: ReturnType<typeof rig>, senderId: number, requestId: string): Promise<void> {
+    const decode = r.generate(senderId, requestId, { wholeTurn: true });
+    await settle();
+    r.token(requestId, 0);
+    r.finish(requestId);
+    await decode;
+    await settle();
+  }
+
+  it('a phone unit queued between two decodes waits, however long the tool runs, and the next decode neither waits nor is told it waits', async () => {
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'turn');
+
+    // Between two decodes: the page is running a tool call.
+    const phone = r.phoneTurn('phone-1');
+    expect(r.broker.positionOf(PHONE, 'phone-1'), 'the phone waits behind the desktop turn').toBe(1);
+    // Three times the broker's idle deadline of tool call, with no progress:
+    // the ruling rejected a hold that yields after a long tool call.
+    for (let round = 0; round < 3; round += 1) await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+    expect(phone.starts, 'a phone unit ran between two decodes of one desktop turn').toBe(0);
+    expect(r.broker.isRunning(WINDOW_1, 'turn')).toBe(true);
+
+    const second = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'the second decode reaches the host at once').toEqual(['turn', 'turn']);
+    expect(r.events(1, TURN_WAITING_EVENT), 'waiting told for the desktop turn').toEqual([]);
+    expect(r.broker.waitingCount, 'only the phone waits').toBe(1);
+    r.token('turn', 0);
+    r.finish('turn');
+    await second;
+    await settle();
+    expect(phone.starts, 'the phone started when a decode ended, not when the turn did').toBe(0);
+
+    await r.endTurn(1, 'turn');
+    await settle();
+    expect(phone.starts).toBe(1);
+    expect(r.events<GenerationEndEvent>(1, 'llamaEnd'), 'one llamaEnd per decode').toHaveLength(2);
+
+    // Given back once: a second end changes nothing for the phone now holding
+    // the slot, and the window's next turn waits for it.
+    await r.endTurn(1, 'turn');
+    expect(r.broker.isRunning(PHONE, 'phone-1')).toBe(true);
+    const next = r.generate(1, 'next', { wholeTurn: true });
+    await settle();
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'next', position: 1 }]);
+    phone.resolve('done');
+    await settle();
+    expect(r.generated()).toEqual(['turn', 'turn', 'next']);
+    r.finish('next');
+    await next;
+    await r.endTurn(1, 'next');
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
+    // The host is sent the page's options without the flag: holding the slot
+    // is main's business, not the inference host's.
+    expect(r.generateArgs()[0]).toEqual({ handle: 'h', prompt: 'p', requestId: 'turn' });
+  });
+
+  it('a benchmark asked for between two decodes of a desktop turn is refused SLOT_BUSY, from any window', async () => {
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'turn');
+    const fromItsWindow = r.benchmark(1);
+    const fromAnother = r.benchmark(2);
+    await settle();
+    expect(r.benchmarkArgs(), 'a benchmark reached the host between two decodes of a desktop turn').toEqual([]);
+    await expect(fromItsWindow).rejects.toMatchObject({ code: 'SLOT_BUSY' });
+    await expect(fromAnother).rejects.toMatchObject({ code: 'SLOT_BUSY' });
+
+    await r.endTurn(1, 'turn');
+    await settle();
+    const bench = r.benchmark(2);
+    await settle();
+    expect(r.benchmarkArgs()).toHaveLength(1);
+    r.finishBenchmark({ generateTokensPerSecond: 1 });
+    await expect(bench).resolves.toEqual({ generateTokensPerSecond: 1 });
+  });
+
+  it('ended while a decode runs: the decode is cancelled in the host, and the slot is given back once the host has stopped', async () => {
+    const r = rig();
+    r.subscribe(1);
+    const decode = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    const phone = r.phoneTurn('phone-1');
+
+    await r.endTurn(1, 'turn');
+    await settle();
+    expect(r.cancelled()).toEqual(['turn']);
+    expect(phone.starts, 'the slot was given back while the host still decoded').toBe(0);
+    expect(r.broker.slotCount).toBe(1);
+
+    r.finish('turn', 'cancelled');
+    expect(await decode).toMatchObject({ requestId: 'turn', stopReason: 'cancelled' });
+    await settle();
+    expect(phone.starts).toBe(1);
+    expect(r.events(1, 'llamaEnd')).toHaveLength(1);
+  });
+
+  it('a decode that fails keeps the turn’s slot: the page decides whether the turn goes on, and its next decode runs under it', async () => {
+    const r = rig();
+    r.subscribe(1);
+    const first = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    const phone = r.phoneTurn('phone-1');
+    r.failDecode('turn', 'the model could not answer');
+    await expect(first).rejects.toThrow('the model could not answer');
+    await settle();
+    expect(phone.starts).toBe(0);
+
+    const second = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    expect(r.generated()).toEqual(['turn', 'turn']);
+    r.finish('turn');
+    await second;
+    await r.endTurn(1, 'turn');
+    await settle();
+    expect(phone.starts).toBe(1);
+  });
+
+  it('ended by the broker between decodes (a suspend): the slot is free at once, and a later decode of that turn is refused and never reaches the host', async () => {
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'turn');
+
+    r.broker.suspend();
+    await settle();
+    expect(r.broker.slotCount, 'a turn with nothing decoding kept the slot after its end').toBe(0);
+    r.broker.resume();
+
+    const later = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'a decode of a turn the broker had ended reached the host').toEqual(['turn']);
+    await expect(later).rejects.toMatchObject({ code: 'HOST_SUSPENDED' });
+    // The refused decode never started: no llamaEnd for it.
+    expect(r.events(1, 'llamaEnd')).toHaveLength(1);
+    expect(r.broker.waitingCount).toBe(0);
+    await r.endTurn(1, 'turn');
+
+    // And the window's next turn starts at once.
+    const next = r.generate(1, 'next', { wholeTurn: true });
+    await settle();
+    expect(r.generated()).toEqual(['turn', 'next']);
+    r.finish('next');
+    await next;
+    await r.endTurn(1, 'next');
+  });
+
+  it('its window goes away: between decodes the slot is free at once, and during one it is free once the fleet has stopped the decode', async () => {
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'between');
+    const phone = r.phoneTurn('phone-1');
+    r.localTurns.releaseRenderer(1, 'The window was closed.');
+    await settle();
+    expect(phone.starts).toBe(1);
+    phone.resolve('done');
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
+
+    r.subscribe(2);
+    const during = r.generate(2, 'during', { wholeTurn: true });
+    await settle();
+    const phone2 = r.phoneTurn('phone-2');
+    r.localTurns.releaseRenderer(2, 'The window was closed.');
+    await expect(during).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    await settle();
+    expect(phone2.starts).toBe(1);
+    expect(r.fleet.supervisorFor(LLAMA_PLUGIN.name).inflightCount).toBe(0);
+    expect(r.events(2, 'llamaEnd')).toEqual([]);
+  });
+
+  it('cancelled while its first decode still waits: it never holds the slot, gets one cancelled llamaEnd, and its end afterwards is nothing', async () => {
+    const r = rig();
+    r.subscribe(1);
+    const phone = r.phoneTurn('phone-1');
+    const waiting = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+
+    await r.cancel(1, 'turn');
+    expect(await waiting).toMatchObject({ requestId: 'turn', stopReason: 'cancelled' });
+    await r.endTurn(1, 'turn');
+    expect(r.broker.isRunning(PHONE, 'phone-1')).toBe(true);
+    phone.resolve('done');
+    await settle();
+    expect(r.generated()).toEqual([]);
+    expect(r.broker.slotCount).toBe(0);
+    expect(r.events<GenerationEndEvent>(1, 'llamaEnd')).toEqual([
+      expect.objectContaining({ requestId: 'turn', stopReason: 'cancelled' }),
+    ]);
+  });
+
+  it('ended while its first decode still waits: that decode never starts, and gets one cancelled llamaEnd', async () => {
+    const r = rig();
+    r.subscribe(1);
+    const phone = r.phoneTurn('phone-1');
+    const waiting = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    expect(r.broker.positionOf(WINDOW_1, 'turn')).toBe(1);
+
+    await r.endTurn(1, 'turn');
+    expect(await waiting).toMatchObject({ requestId: 'turn', stopReason: 'cancelled' });
+    expect(r.broker.positionOf(WINDOW_1, 'turn'), 'a turn its page had ended still waits for the slot').toBeUndefined();
+    phone.resolve('done');
+    await settle();
+    expect(r.generated()).toEqual([]);
+    expect(r.broker.slotCount).toBe(0);
+    expect(r.events<GenerationEndEvent>(1, 'llamaEnd')).toEqual([
+      expect.objectContaining({ requestId: 'turn', stopReason: 'cancelled' }),
+    ]);
+  });
+
+  it('only its own window ends the turn, and one decode at a time runs under it', async () => {
+    const r = rig();
+    r.subscribe(1);
+    r.subscribe(2);
+    const first = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    await expect(r.generate(1, 'turn', { wholeTurn: true })).rejects.toMatchObject({ code: 'DUPLICATE_UNIT' });
+    expect(r.generated()).toEqual(['turn']);
+    r.finish('turn');
+    await first;
+    await settle();
+
+    const phone = r.phoneTurn('phone-1');
+    await r.endTurn(2, 'turn');
+    await settle();
+    expect(phone.starts, 'another window ended this window’s turn').toBe(0);
+    expect(r.broker.isRunning(WINDOW_1, 'turn')).toBe(true);
+    await r.endTurn(1, 'turn');
+    await settle();
+    expect(phone.starts).toBe(1);
+  });
+
+  it('the broker’s backstop still covers a later decode: one that makes no progress for UNIT_IDLE_TIMEOUT_MS is ended DEADLINE', async () => {
+    // The Supervisor's own idle deadline is moved out of the way, so this is
+    // the broker's alone.
+    const r = rig({ policy: { generateIdleTimeoutMs: 10 * UNIT_IDLE_TIMEOUT_MS } });
+    r.subscribe(1);
+    await decoded(r, 1, 'turn');
+    await r.clock.advance(2 * UNIT_IDLE_TIMEOUT_MS);
+
+    const second = r.generate(1, 'turn', { wholeTurn: true });
+    await settle();
+    expect(r.generated()).toEqual(['turn', 'turn']);
+    await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+    expect(r.cancelled(), 'the broker never ended a later decode that made no progress').toEqual(['turn']);
+    r.finish('turn', 'cancelled');
+    await expect(second).rejects.toMatchObject({ code: 'DEADLINE' });
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
+  });
+
+  it('a worker window’s tool loop runs under its phone unit as before: its flag and its end change nothing about that unit', async () => {
+    const WORKER = 7;
+    const hosted = { owner: PHONE, unitId: 'phone-turn' };
+    const r = rig({ hostedUnitOf: (senderId) => (senderId === WORKER ? hosted : undefined) });
+    r.subscribe(WORKER);
+    r.subscribe(1);
+    const job = work();
+    expect(r.broker.admit({ owner: hosted.owner, unitId: hosted.unitId, executor: 'worker', start: job.start })).toMatchObject({
+      admitted: true,
+      position: 0,
+    });
+
+    await decoded(r, WORKER, 'worker-turn');
+    // Between the worker's decodes, a user's turn waits behind the phone's.
+    const local = r.generate(1, 'local', { wholeTurn: true });
+    await settle();
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local', position: 1 }]);
+
+    await decoded(r, WORKER, 'worker-turn');
+    expect(r.generated()).toEqual(['worker-turn', 'worker-turn']);
+    // The worker's engine ends its turn. The phone's unit is its work's to end.
+    await r.endTurn(WORKER, 'worker-turn');
+    await settle();
+    expect(r.broker.isRunning(hosted.owner, hosted.unitId)).toBe(true);
+    expect(r.generated()).toEqual(['worker-turn', 'worker-turn']);
+    expect(r.generateArgs()[0]).toEqual({ handle: 'h', prompt: 'p', requestId: 'worker-turn' });
+
+    job.resolve('the phone’s answer');
+    await settle();
+    expect(r.generated()).toEqual(['worker-turn', 'worker-turn', 'local']);
+    r.finish('local');
+    await local;
+    await r.endTurn(1, 'local');
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
   });
 });

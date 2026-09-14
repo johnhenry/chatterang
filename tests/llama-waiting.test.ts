@@ -17,6 +17,10 @@ interface Fake {
   readonly plugin: Record<string, unknown>;
   readonly subscribed: string[];
   readonly removed: string[];
+  /** What each `generate` was sent, in order. */
+  readonly requests: unknown[];
+  /** The requestIds `endTurn` was called with, in order. */
+  readonly ended: string[];
   generateCalled(): boolean;
   /** Whether the adapter has asked for its `llamaWaiting` subscription. */
   subscribingToWaiting(): boolean;
@@ -24,14 +28,36 @@ interface Fake {
   finish(): void;
 }
 
-function fakeLlama(options: { refuseWaiting?: boolean; holdWaiting?: Promise<void> } = {}): Fake {
+function fakeLlama(
+  options: {
+    refuseWaiting?: boolean;
+    holdWaiting?: Promise<void>;
+    /** How the platform answers `endTurn`. Default: it takes it. */
+    endTurn?: 'refuses' | 'throws' | 'absent';
+  } = {},
+): Fake {
   const listeners = new Map<string, (event: unknown) => void>();
   const subscribed: string[] = [];
   const removed: string[] = [];
+  const requests: unknown[] = [];
+  const ended: string[] = [];
   let called = false;
   let subscribing = false;
   let finish: () => void = () => undefined;
+  const endTurn = (end: { requestId: string }): Promise<void> => {
+    if (options.endTurn === 'throws') throw new Error('"LlamaCpp.endTurn()" is not implemented on android');
+    if (options.endTurn === 'refuses') {
+      // What PluginHost answers on a platform that registered the plain llama
+      // definition, such as the headless server.
+      return Promise.reject(
+        Object.assign(new Error('desktop bridge: "LlamaCpp" has no method "endTurn".'), { code: 'UNKNOWN_METHOD' }),
+      );
+    }
+    ended.push(end.requestId);
+    return Promise.resolve();
+  };
   const plugin = {
+    ...(options.endTurn === 'absent' ? {} : { endTurn }),
     load: async () => ({
       handle: 'h1',
       backend: 'cpu',
@@ -63,6 +89,7 @@ function fakeLlama(options: { refuseWaiting?: boolean; holdWaiting?: Promise<voi
     },
     generate: (request: { requestId: string }) => {
       called = true;
+      requests.push(request);
       return new Promise((done) => {
         finish = () =>
           done({
@@ -83,6 +110,8 @@ function fakeLlama(options: { refuseWaiting?: boolean; holdWaiting?: Promise<voi
     plugin,
     subscribed,
     removed,
+    requests,
+    ended,
     generateCalled: () => called,
     subscribingToWaiting: () => subscribing,
     emit: (eventName, data) => listeners.get(eventName)?.(data),
@@ -237,6 +266,69 @@ describe('a streamed desktop generation hears that it is waiting (#7)', () => {
     await done;
 
     expect(seen).toEqual([{ requestId: 'turn-1', position: 2 }]);
+  });
+
+  it('a streamed decode asks to keep the slot for its whole turn, and ending that turn tells the platform once', async () => {
+    // Owner ruling on #7: a desktop turn holds the shared slot from its first
+    // decode until the turn settles, tool calls included. The engine ends the
+    // turn; this is what that end reaches.
+    const fake = fakeLlama();
+    vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
+    const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
+    const adapter = new LlamaCppBackendAdapter({ resolver });
+
+    const done = drain(adapter.executeStream(request));
+    await vi.waitFor(() => expect(fake.generateCalled()).toBe(true));
+    fake.finish();
+    await done;
+    expect(fake.requests).toEqual([expect.objectContaining({ requestId: 'turn-1', wholeTurn: true })]);
+    // A decode ending is not the turn ending: a tool call may follow it.
+    expect(fake.ended).toEqual([]);
+
+    await adapter.endTurn('turn-1');
+    await adapter.endTurn('turn-1');
+    expect(fake.ended).toEqual(['turn-1']);
+    // A turn this adapter never decoded for holds nothing to end.
+    await adapter.endTurn('someone-else');
+    expect(fake.ended).toEqual(['turn-1']);
+  });
+
+  it.each([
+    ['refuses', 'refuses'],
+    ['throws on', 'throws'],
+    ['has no method for', 'absent'],
+  ] as const)(
+    'a platform that %s the turn’s end still ends the turn',
+    async (_label, how) => {
+      // The headless server registers the plain llama definition and refuses
+      // the method; a native plugin that does not implement it may throw, or
+      // not have it at all. None of them has a slot to give back.
+      const fake = fakeLlama({ endTurn: how });
+      vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
+      const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
+      const adapter = new LlamaCppBackendAdapter({ resolver });
+
+      const done = drain(adapter.executeStream(request));
+      await vi.waitFor(() => expect(fake.generateCalled()).toBe(true));
+      fake.finish();
+      expect(await done).toContain('done');
+      await expect(adapter.endTurn('turn-1')).resolves.toBeUndefined();
+    },
+  );
+
+  it('the non-streamed path is one decode and not a turn: it asks for no hold, and has nothing to end', async () => {
+    const fake = fakeLlama();
+    vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
+    const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
+    const adapter = new LlamaCppBackendAdapter({ resolver });
+
+    const result = adapter.execute(request);
+    await vi.waitFor(() => expect(fake.generateCalled()).toBe(true));
+    fake.finish();
+    await result;
+    expect(fake.requests[0]).not.toHaveProperty('wholeTurn');
+    await adapter.endTurn('turn-1');
+    expect(fake.ended).toEqual([]);
   });
 
   it('the app store turns a position into the rail’s state, and 0 into not waiting', () => {

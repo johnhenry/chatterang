@@ -80,6 +80,8 @@ export {
   TURN_WAITING_EVENT,
   admitLocalTurns,
   localTurnNotices,
+  TURN_END_METHOD,
+  WHOLE_TURN_OPTION,
   withTurnProgress,
 } from './local-turns.js';
 export type { HostedUnit, HostedUnitOf, LocalTurnNotices, LocalTurns, LocalTurnsOptions } from './local-turns.js';

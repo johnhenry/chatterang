@@ -15,6 +15,10 @@
  *     It reaches the fleet's facade only when the unit takes the slot. While
  *     it waits, the window receives `llamaWaiting { requestId, position }`, and
  *     `position: 0` once it starts.
+ *   - A `generate` that carries `wholeTurn: true` is one decode of a turn that
+ *     keeps the slot until the page ends it (see below). Its first decode is
+ *     admitted as above; its later decodes run under the same unit.
+ *   - `endTurn` is the page saying that turn is over, however it ended.
  *   - `cancel` of a turn that is still WAITING ends it in the broker. It gets a
  *     `llamaEnd` with `stopReason: 'cancelled'` and its `generate` resolves the
  *     way a cancelled generation does. A running turn's cancel goes to the
@@ -27,14 +31,38 @@
  *   - Every other method is the facade's own and takes no slot: none of them
  *     decodes.
  *
- * A WINDOW'S UNIT IS ONE DECODE; A PHONE'S UNIT IS ONE TURN. The broker's slot
- * is taken per `generate` here, because that is the only boundary main can
- * see: a renderer's turn is a loop in `src/ai/engine.ts` (a tool call runs
- * between two generates, and a local approval sheet waits between them
- * holding nothing). So a phone's turn can take the slot between two decodes of
- * a local tool turn. The GPU never runs two decodes, which is what the slot
- * exists for; whether #169's "one turn at a time" also means a local tool loop
- * keeps the slot across its tool calls is the owner's to rule.
+ * A DESKTOP TURN HOLDS THE SLOT FOR THE WHOLE TURN (owner ruling on #7). A
+ * renderer's turn is a loop in `src/ai/engine.ts`: decode, tool call, decode,
+ * with local approval sheets between. The ruling is that it keeps the slot from
+ * its first decode until the turn settles (finished, failed, stopped, or
+ * refused), tool calls included, and that a phone turn waits for the whole of
+ * it: #169's "one turn at a time" is one turn, not one decode. Rejected:
+ * admitting per decode, and a hold that gives the slot up after a long tool
+ * call. Main sees only generates, so the page says which decodes are one turn:
+ *
+ *   - every decode of its streamed turn carries `wholeTurn: true` and the
+ *     turn's one `requestId`. The flag is main's: it is taken off before the
+ *     options reach the facade;
+ *   - the first is admitted, waits and is told it waits like any generate. The
+ *     unit's work is the whole turn, so the slot stays held when that decode
+ *     returns, and the broker's idle deadline stops between decodes
+ *     (`WorkBroker.betweenSteps`): a tool call reports no progress;
+ *   - a later decode runs under that unit at once: no admission, no place in
+ *     line, nothing said about waiting. One decode at a time;
+ *   - `endTurn` ends the turn. A decode still running is cancelled in the host,
+ *     and the slot is given back once it has returned. A first decode still
+ *     waiting never starts;
+ *   - if the broker ends the unit first (a suspend, a quit, its backstop
+ *     deadline, the window going away), a decode running is cancelled in the
+ *     host and its `generate` rejects with the broker's reason, and a later
+ *     decode of that turn is refused with it and never reaches the host.
+ *
+ * A decode that FAILS does not end the turn: the page decides whether the turn
+ * goes on (the engine may answer the error, or run on elsewhere), and it ends
+ * it either way. What bounds a turn that never ends is its window: every turn
+ * a window holds is released with it, a reload included (`did-start-navigation`
+ * tears it down in `main.ts`). A generate without the flag is one decode, as
+ * before: the non-streamed path sends none.
  *
  * A WORKER'S GENERATIONS RUN UNDER THE UNIT IT RUNS. Ruling 1 puts a phone's
  * turn in a hidden worker window (S5), whose engine calls `LlamaCpp.generate`
@@ -43,29 +71,34 @@
  * `hostedUnitOf` names, for a window that is a worker, the unit it runs: its
  * `generate` goes straight to the host while that unit is running, one at a
  * time, and is refused otherwise; and its tokens are progress for that unit.
- * Main passes no `hostedUnitOf` until S5 creates a worker, so today every
- * window is a user's.
+ * Its `wholeTurn` flag and its `endTurn` change nothing: the phone's unit is
+ * the worker's work to end. Main passes no `hostedUnitOf` until S5 creates a
+ * worker, so today every window is a user's.
  *
- * EXACTLY ONE `llamaEnd`, STILL:
+ * EXACTLY ONE `llamaEnd` PER DECODE, STILL:
  *
- *   - A turn that STARTED gets its terminal from the Supervisor, whichever way
- *     it ends. If the broker ends it (a suspend, a quit, the broker's backstop
- *     deadline), the wrapper cancels it in the host through the facade, and the
- *     host's end is the one delivered. The `generate` promise, which is the
- *     page's authority (`supervisor.ts`), rejects with the broker's reason.
+ *   - A decode that STARTED gets its terminal from the Supervisor, whichever
+ *     way it ends. If the broker ends it (a suspend, a quit, the broker's
+ *     backstop deadline), the wrapper cancels it in the host through the
+ *     facade, and the host's end is the one delivered. The `generate` promise,
+ *     which is the page's authority (`supervisor.ts`), rejects with the
+ *     broker's reason.
  *   - A turn that NEVER STARTED gets one synthesised `llamaEnd` from here,
  *     unless its window is gone. That matches `Supervisor.releaseRenderer`: no
  *     page, nothing delivered.
  *   - A turn the broker REFUSES gets no `llamaEnd`, the same as a generate the
  *     Supervisor refuses before starting it (a duplicate requestId, a closed
- *     host). So does a worker's generate refused for not running its unit.
+ *     host). So does a worker's generate refused for not running its unit, and
+ *     a later decode refused because its turn is over.
  *
- * WHY `llamaWaiting` IS NOT IN `LLAMA_EVENTS`. The llama host is served with
- * `LLAMA_PLUGIN`, and the Supervisor drops any event that definition does not
- * declare. So the host cannot emit a waiting state it does not own. Only main,
- * registering `LOCAL_TURNS_PLUGIN`, lets a window subscribe to it. A platform
- * that registers the plain definition, such as the headless server, refuses
- * the subscription, and the renderer treats that as "never waits here".
+ * WHY `llamaWaiting` IS NOT IN `LLAMA_EVENTS`, AND `endTurn` NOT IN
+ * `LLAMA_METHODS`. The llama host is served with `LLAMA_PLUGIN`, and the
+ * Supervisor drops any event that definition does not declare. So the host
+ * cannot emit a waiting state it does not own, and the host protocol has no
+ * turn to end. Only main, registering `LOCAL_TURNS_PLUGIN`, lets a window
+ * subscribe to the one and call the other. A platform that registers the plain
+ * definition, such as the headless server, refuses both, and the renderer
+ * treats that as "never waits here" and "nothing held here".
  *
  * PLATFORM-FREE, like the rest of the bridge. `main.ts` cannot be imported by a
  * test, so the wiring lives here, where `tests/desktop-local-turns.test.ts`
@@ -79,10 +112,16 @@ import type { PluginDefinition } from './protocol.js';
 import { LLAMA_EVENTS, LLAMA_METHODS, LLAMA_PLUGIN, SENDER_SCOPED } from './protocol.js';
 import type { NotifyListeners, StreamSpec } from './supervisor.js';
 import { LLAMA_ENGINE } from './supervisor.js';
-import type { AdmitRefusal, BrokerNotice, Owner, UnitEnd, WorkBroker } from './work-broker.js';
+import type { AdmitRefusal, BrokerNotice, Owner, UnitEnd, UnitTerminal, WorkBroker } from './work-broker.js';
 
 /** The event that tells a window its generation is waiting, and where it is. */
 export const TURN_WAITING_EVENT = 'llamaWaiting';
+
+/** The method a page ends a whole turn with. */
+export const TURN_END_METHOD = 'endTurn';
+
+/** The `generate` option that marks one decode of a turn that holds the slot until `endTurn`. */
+export const WHOLE_TURN_OPTION = 'wholeTurn';
 
 /** The executor name the desktop's generations run on, for `WorkBroker.workerLost`. */
 export const LOCAL_EXECUTOR = 'llama';
@@ -92,12 +131,13 @@ const BENCHMARK = 'benchmark';
 
 /**
  * What main registers for `LlamaCpp`: the llama definition plus the waiting
- * event. The methods are the same array, not a copy, so the renderer's reach
- * cannot grow here by accident.
+ * event and the turn's end. Both are main's own; the host protocol
+ * (`LLAMA_PLUGIN`) has neither, so a host can neither emit the one nor be sent
+ * the other.
  */
 export const LOCAL_TURNS_PLUGIN: PluginDefinition = Object.freeze({
   name: LLAMA_PLUGIN.name,
-  methods: LLAMA_METHODS,
+  methods: Object.freeze([...LLAMA_METHODS, TURN_END_METHOD]),
   events: Object.freeze([...LLAMA_EVENTS, TURN_WAITING_EVENT]),
 });
 
@@ -140,8 +180,8 @@ export interface LocalTurns {
   readonly plugin: PluginImplementation;
   /**
    * A window went away. Its units leave the broker first, so a waiting turn
-   * can never start for a page that is gone, and then the fleet releases what
-   * it was running.
+   * can never start for a page that is gone and a turn it held gives the slot
+   * back, and then the fleet releases what it was running.
    */
   releaseRenderer(senderId: number, reason: string): void;
 }
@@ -177,6 +217,9 @@ const BENCHMARK_ENDED: Readonly<Record<Exclude<UnitEnd, 'COMPLETED' | 'FAILED'>,
   DESKTOP_QUITTING: 'The benchmark stopped because the app is quitting.',
 };
 
+/** A turn the broker has already ended, or one its page already ended. */
+const TURN_OVER = 'desktop bridge: this turn is over, so it may not generate again.';
+
 function codedError(message: string, code: string): Error {
   const error = new Error(message);
   Object.assign(error, { code });
@@ -208,6 +251,36 @@ function cancelledEnd(requestId: string): GenerationEndEvent {
 function requestIdOf(options: unknown): string | undefined {
   const requestId = (options as { requestId?: unknown } | null | undefined)?.requestId;
   return typeof requestId === 'string' && requestId.length > 0 ? requestId : undefined;
+}
+
+/** Whether a page's `generate` is one decode of a whole turn. */
+function isWholeTurn(options: unknown): boolean {
+  return (options as Record<string, unknown> | null | undefined)?.[WHOLE_TURN_OPTION] === true;
+}
+
+/** The page's options as the host takes them: without the flag, which is main's. */
+function forHost(options: unknown): unknown {
+  if (typeof options !== 'object' || options === null || !(WHOLE_TURN_OPTION in options)) return options;
+  const { [WHOLE_TURN_OPTION]: _flag, ...rest } = options as Record<string, unknown>;
+  return rest;
+}
+
+/** A turn whose decodes share one broker unit, from its first decode until it ends. */
+interface WholeTurn {
+  readonly senderId: number;
+  readonly requestId: string;
+  /** The unit took the slot. */
+  started: boolean;
+  /** The decode running under the unit, if one is. */
+  decoding: Promise<unknown> | null;
+  /** The turn is over: its page ended it, or the broker decided the unit's end. */
+  ending: boolean;
+  /** The broker decided the unit's end (its signal aborted). */
+  aborted: boolean;
+  /** The unit's terminal, once decided. */
+  readonly settled: Promise<UnitTerminal>;
+  /** Report the unit's work done. Called once the turn is over and nothing decodes. */
+  finish(): void;
 }
 
 /**
@@ -261,6 +334,24 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     }
   };
 
+  /** A unit that never started: what its page is told, as for any generate that never reached the host. */
+  const neverStarted = (senderId: number, requestId: string, terminal: UnitTerminal): GenerationEndEvent => {
+    /* c8 ignore next 3 */
+    if (terminal.end === 'COMPLETED' || terminal.end === 'FAILED') {
+      throw codedError(TURN_OVER, 'NOT_RUNNING');
+    }
+    if (terminal.end === 'CANCELLED') {
+      const end = cancelledEnd(requestId);
+      endOnce(senderId, end);
+      return end;
+    }
+    const message = ENDED[terminal.end];
+    if (terminal.end !== 'OWNER_LOST') {
+      endOnce(senderId, stream.synthesise(requestId, message) as GenerationEndEvent);
+    }
+    throw codedError(message, terminal.end);
+  };
+
   /** Hosted units with a generate in flight: one decode at a time under one slot. */
   const hostedBusy = new Set<string>();
 
@@ -284,13 +375,130 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     }
   };
 
+  /** Whole turns by window and requestId, from their first decode until their page ends them. */
+  const wholeTurns = new Map<string, WholeTurn>();
+  const turnKey = (senderId: number, requestId: string): string => `${String(senderId)} ${requestId}`;
+
+  /** One decode under a whole turn's unit. */
+  const decodeUnder = async (turn: WholeTurn, request: unknown): Promise<unknown> => {
+    const owner: Owner = { kind: 'window', id: turn.senderId };
+    const decoding = call(stream.start, turn.senderId, request as GenerateOptions);
+    turn.decoding = decoding;
+    let value: unknown;
+    let failure: { error: unknown } | null = null;
+    try {
+      value = await decoding;
+    } catch (error) {
+      failure = { error };
+    }
+    turn.decoding = null;
+    const endedByBroker = turn.aborted;
+    // The turn is over and nothing decodes: the slot can be given back. If
+    // not, the page is between two decodes, running a tool call or waiting on
+    // a sheet, and the unit keeps the slot with its idle deadline stopped.
+    if (turn.ending) turn.finish();
+    else broker.betweenSteps(owner, turn.requestId);
+    if (endedByBroker) {
+      const { end } = await turn.settled;
+      /* c8 ignore next */
+      if (end === 'COMPLETED' || end === 'FAILED') throw codedError(TURN_OVER, 'NOT_RUNNING');
+      throw codedError(ENDED[end], end);
+    }
+    if (failure !== null) throw failure.error;
+    return value;
+  };
+
+  /** A decode of a whole turn: its first admits the turn's unit, and every later one runs under it. */
+  const generateInTurn = async (senderId: number, requestId: string, request: unknown): Promise<unknown> => {
+    const owner: Owner = { kind: 'window', id: senderId };
+    const key = turnKey(senderId, requestId);
+    const held = wholeTurns.get(key);
+
+    if (held !== undefined) {
+      // One decode at a time, and none while the first still waits.
+      if (held.decoding !== null || (!held.started && broker.positionOf(owner, requestId) !== undefined)) {
+        throw codedError(REFUSED.DUPLICATE_UNIT, 'DUPLICATE_UNIT');
+      }
+      if (!broker.isRunning(owner, requestId)) {
+        // The broker ended this turn between its decodes. The turn is over:
+        // this decode never starts, and is refused with the reason.
+        const { end } = await held.settled;
+        /* c8 ignore next */
+        if (end === 'COMPLETED' || end === 'FAILED') throw codedError(TURN_OVER, 'NOT_RUNNING');
+        throw codedError(ENDED[end], end);
+      }
+      // The next step of the turn starts: its idle deadline counts again.
+      broker.progress(owner, requestId);
+      return decodeUnder(held, request);
+    }
+
+    let finishWork: () => void = () => undefined;
+    const work = new Promise<void>((done) => {
+      finishWork = done;
+    });
+    let reportSettled: (terminal: UnitTerminal) => void = () => undefined;
+    const turn: WholeTurn = {
+      senderId,
+      requestId,
+      started: false,
+      decoding: null,
+      ending: false,
+      aborted: false,
+      settled: new Promise<UnitTerminal>((done) => {
+        reportSettled = done;
+      }),
+      finish: () => finishWork(),
+    };
+    let first: Promise<unknown> = Promise.resolve();
+    let reportStarted: () => void = () => undefined;
+    const began = new Promise<void>((done) => {
+      reportStarted = done;
+    });
+    const admission = broker.admit({
+      owner,
+      unitId: requestId,
+      executor: LOCAL_EXECUTOR,
+      start: (signal) => {
+        turn.started = true;
+        reportStarted();
+        // The broker decided this turn's end some other way. A decode running
+        // is stopped in the host, so the host's own terminal is the one the
+        // page receives and the slot is given back only once it has stopped.
+        signal.addEventListener(
+          'abort',
+          () => {
+            turn.ending = true;
+            turn.aborted = true;
+            if (turn.decoding !== null) void call(stream.cancel, senderId, { requestId }).catch(() => undefined);
+            else turn.finish();
+          },
+          { once: true },
+        );
+        first = decodeUnder(turn, request);
+        void first.catch(() => undefined);
+        // The whole turn is the unit's work: it returns when the turn is over.
+        return work;
+      },
+    });
+    if (!admission.admitted) throw codedError(REFUSED[admission.refusal], admission.refusal);
+    void admission.settled.then(reportSettled);
+    wholeTurns.set(key, turn);
+
+    // Waiting: until the unit takes the slot, or ends without having taken it.
+    if (!turn.started) await Promise.race([began, admission.settled]);
+    return turn.started ? first : neverStarted(senderId, requestId, await admission.settled);
+  };
+
   const generate = async (senderId: number, request: unknown): Promise<unknown> => {
     const requestId = requestIdOf(request);
     if (requestId === undefined) {
       throw new Error(`desktop bridge: ${LLAMA_PLUGIN.name}.${stream.start} requires a requestId.`);
     }
+    const wholeTurn = isWholeTurn(request);
+    const options = forHost(request);
     const hosted = hostedUnitOf?.(senderId);
-    if (hosted !== undefined) return generateHosted(senderId, request, hosted);
+    if (hosted !== undefined) return generateHosted(senderId, options, hosted);
+    if (wholeTurn) return generateInTurn(senderId, requestId, options);
 
     const owner: Owner = { kind: 'window', id: senderId };
     const admission = broker.admit({
@@ -308,7 +516,7 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
           },
           { once: true },
         );
-        return call(stream.start, senderId, request as GenerateOptions);
+        return call(stream.start, senderId, options as GenerateOptions);
       },
     });
     if (!admission.admitted) throw codedError(REFUSED[admission.refusal], admission.refusal);
@@ -316,16 +524,8 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     const terminal = await admission.settled;
     if (terminal.end === 'COMPLETED') return terminal.value;
     if (terminal.end === 'FAILED') throw terminal.error;
-    if (!terminal.started && terminal.end === 'CANCELLED') {
-      const end = cancelledEnd(requestId);
-      endOnce(senderId, end);
-      return end;
-    }
-    const message = ENDED[terminal.end];
-    if (!terminal.started && terminal.end !== 'OWNER_LOST') {
-      endOnce(senderId, stream.synthesise(requestId, message) as GenerationEndEvent);
-    }
-    throw codedError(message, terminal.end);
+    if (!terminal.started) return neverStarted(senderId, requestId, terminal);
+    throw codedError(ENDED[terminal.end], terminal.end);
   };
 
   const cancel = async (senderId: number, request: unknown): Promise<unknown> => {
@@ -336,6 +536,34 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
       return undefined;
     }
     return call(stream.cancel, senderId, request);
+  };
+
+  /**
+   * The page's turn is over, however it ended. Nothing held for this window
+   * under this requestId (a turn never decoded here, one already ended, another
+   * window's, a worker's) is nothing to end.
+   */
+  const endTurn = async (senderId: number, request: unknown): Promise<unknown> => {
+    const requestId = requestIdOf(request);
+    if (requestId === undefined) {
+      throw new Error(`desktop bridge: ${LLAMA_PLUGIN.name}.${TURN_END_METHOD} requires a requestId.`);
+    }
+    // A worker's generates run under its phone unit and open no whole turn, so
+    // its page's end finds nothing here: the phone's unit is its work's to end.
+    const key = turnKey(senderId, requestId);
+    const turn = wholeTurns.get(key);
+    if (turn === undefined) return undefined;
+    wholeTurns.delete(key);
+    if (!turn.started) {
+      // Still waiting for the slot, or ended before it took it: it never starts.
+      broker.cancel({ kind: 'window', id: senderId }, requestId);
+      return undefined;
+    }
+    if (turn.ending) return undefined;
+    turn.ending = true;
+    if (turn.decoding !== null) void call(stream.cancel, senderId, { requestId }).catch(() => undefined);
+    else turn.finish();
+    return undefined;
   };
 
   let benchmarks = 0;
@@ -366,14 +594,17 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     else if (name === BENCHMARK) implementation[name] = benchmark;
     else implementation[name] = (...args: unknown[]) => call(name, ...args);
   }
-  // The benchmark is scoped HERE, for the slot's owner, and not below: the
-  // facade's scoping is checked above to be exactly start and cancel.
-  implementation[SENDER_SCOPED] = [stream.start, stream.cancel, BENCHMARK];
+  implementation[TURN_END_METHOD] = endTurn;
+  // The benchmark and the turn's end are scoped HERE, for the slot's owner, and
+  // not below: the facade's scoping is checked above to be exactly start and
+  // cancel, and the facade has no turn to end.
+  implementation[SENDER_SCOPED] = [stream.start, stream.cancel, BENCHMARK, TURN_END_METHOD];
 
   return {
     plugin: implementation as unknown as PluginImplementation,
     releaseRenderer(senderId, reason) {
       broker.releaseWindow(senderId);
+      for (const [key, turn] of wholeTurns) if (turn.senderId === senderId) wholeTurns.delete(key);
       notices.release(senderId);
       fleet.releaseRenderer(senderId, reason);
     },

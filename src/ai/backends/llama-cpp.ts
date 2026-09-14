@@ -23,6 +23,7 @@ import { LlamaCpp } from '@/plugins/llama-cpp';
 import type {
   ComputeBackendId,
   GenerateImage,
+  GenerateOptions,
   GenerateResult,
   TokenEvent,
   TurnWaitingEvent,
@@ -69,6 +70,21 @@ interface WaitingEvents {
   ): Promise<{ remove(): Promise<void> }>;
 }
 
+/**
+ * The one method the contract does not declare, for the same reason.
+ *
+ * On the desktop a streamed turn holds the slot it shares with a paired
+ * phone's turns from its first decode until the turn is over, its tool calls
+ * included (#7, owner ruling). Every decode of the turn says so with
+ * `wholeTurn: true`, and `endTurn` says the turn is over. Only the desktop's
+ * main process has either (`LOCAL_TURNS_PLUGIN`): the headless server refuses
+ * the method, a native plugin has no such method, and every platform ignores
+ * the option.
+ */
+interface WholeTurns {
+  endTurn(options: { requestId: string }): Promise<void>;
+}
+
 interface LoadedHandle {
   handle: string;
   modelId: string;
@@ -106,6 +122,8 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
   #config: LlamaCppBackendConfig;
   #loaded: LoadedHandle | null = null;
   #loading: Promise<LoadedHandle> | null = null;
+  /** Turns a streamed decode was sent for with `wholeTurn`, and not yet ended. See `endTurn`. */
+  #wholeTurns = new Set<string>();
 
   constructor(config: LlamaCppBackendConfig) {
     this.#config = config;
@@ -264,6 +282,21 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     this.#loaded = null;
   }
 
+  /**
+   * The turn `requestId` names is over, however it ended (#7). Called by the
+   * engine once per turn; sends something only for a turn this adapter
+   * streamed a decode for, and only once.
+   *
+   * A platform that refuses it, or has no such method, holds no slot, so that
+   * is not a failure. Never throws.
+   */
+  async endTurn(requestId: string): Promise<void> {
+    if (!this.#wholeTurns.delete(requestId)) return;
+    await Promise.resolve()
+      .then(() => (LlamaCpp as unknown as WholeTurns).endTurn({ requestId }))
+      .catch(() => undefined);
+  }
+
   /** Currently resident model id, for the instrument rail. */
   get residentModelId(): string | null {
     return this.#loaded?.modelId ?? null;
@@ -378,13 +411,20 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
       return;
     }
 
-    const generation = LlamaCpp.generate({
+    // #7: one decode of a turn that, on the desktop, keeps the slot until the
+    // engine ends the turn (`endTurn`), so a paired phone's turn cannot run
+    // between this decode and the next one after a tool call. Noted before the
+    // call, so a turn ended while this decode is still being asked for is ended.
+    const options: GenerateOptions & { wholeTurn: true } = {
       handle: loaded.handle,
       prompt,
       images,
       sampler: this.#sampler(request, loaded.modelId),
       requestId,
-    })
+      wholeTurn: true,
+    };
+    this.#wholeTurns.add(requestId);
+    const generation = LlamaCpp.generate(options)
       .then((result) => {
         finished = result;
       })

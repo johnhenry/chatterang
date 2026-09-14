@@ -12,7 +12,14 @@ import {
   localTurnNotices,
   withTurnProgress,
 } from '@chatterang/desktop/bridge';
-import type { HostCall, HostMessage, NotifyListeners, Owner, SupervisorTimers } from '@chatterang/desktop/bridge';
+import type {
+  HostCall,
+  HostMessage,
+  NotifyListeners,
+  Owner,
+  SupervisorTimers,
+  UnitEnd,
+} from '@chatterang/desktop/bridge';
 
 /**
  * STOP AND THE SHARED SLOT, FROM THE COMPOSER TO THE HOST (#7, #305).
@@ -115,6 +122,7 @@ const { catalogEntry } = await import('@/data/catalog');
 const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { ChatterangEngine } = await import('@/ai/engine');
 const { probeResolver } = await import('./support/egress-probe');
+const { toolRegistry } = await import('@/ai/tools/registry');
 
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
@@ -123,6 +131,8 @@ const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
 /** The desktop window this page is, as main keys it. */
 const WINDOW = 1;
 const OWNER: Owner = { kind: 'window', id: WINDOW };
+/** The paired phone whose units are admitted straight to the broker. */
+const PHONE: Owner = { kind: 'device', id: 'phone' };
 
 /* ── Waiting ─────────────────────────────────────────────────────────── */
 
@@ -153,17 +163,17 @@ function manualClock(): SupervisorTimers {
   return { now: () => 0, every: () => () => undefined, after: () => () => undefined };
 }
 
-function endOf(requestId: string): GenerationEndEvent {
+function endOf(requestId: string, stopReason: GenerationEndEvent['stopReason'] = 'stop'): GenerationEndEvent {
   return {
     requestId,
-    text: 'the answer',
+    text: stopReason === 'stop' ? 'the answer' : '',
     promptTokens: 1,
     cachedTokens: 0,
     completionTokens: 1,
     ttftMs: 1,
     totalMs: 1,
     tokensPerSecond: 1,
-    stopReason: 'stop',
+    stopReason,
   };
 }
 
@@ -187,9 +197,17 @@ function desktop() {
   const notify: NotifyListeners = (pluginName, eventName, data, ownerId) =>
     pluginHost.notifyListeners(pluginName, eventName, data, ownerId);
 
-  // The construction order of main.ts.
+  // The construction order of main.ts. The broker's notifier is main's, seen
+  // on the way through so a test can count the ends the broker decided.
   const notices = localTurnNotices(notify);
-  const broker = new WorkBroker({ notifyWindow: notices, timers: manualClock() });
+  const windowTerminals: { unitId: string; end: UnitEnd }[] = [];
+  const broker = new WorkBroker({
+    notifyWindow: (windowId, notice) => {
+      if (notice.kind === 'terminal') windowTerminals.push({ unitId: notice.terminal.unitId, end: notice.terminal.end });
+      return notices(windowId, notice);
+    },
+    timers: manualClock(),
+  });
   const fleet = new HostFleet({
     spawn: () => ({
       link: {
@@ -214,41 +232,87 @@ function desktop() {
   const localTurns = admitLocalTurns({ broker, facade: fleet.plugin(LLAMA_PLUGIN.name), fleet, notices, notify });
   pluginHost.register(LOCAL_TURNS_PLUGIN, localTurns.plugin);
 
-  const generateCalls = (): HostCall[] =>
-    posted.filter((message): message is HostCall => message.k === 'call' && message.method === 'generate');
+  const hostCalls = (method: string): HostCall[] =>
+    posted.filter((message): message is HostCall => message.k === 'call' && message.method === method);
+  const generateCalls = (): HostCall[] => hostCalls('generate');
+  /** Host calls already answered, so each decode of a turn is answered by its own call. */
+  const answered = new Set<number>();
+  const unanswered = (requestId: string): HostCall | undefined =>
+    generateCalls().find(
+      (entry) => (entry.args[0] as GenerateOptions).requestId === requestId && !answered.has(entry.id),
+    );
 
   const state = {
     broker,
-    /** requestIds this page asked main to generate, in order. */
+    localTurns,
+    /** requestIds this page asked main to generate, in order, once per decode. */
     asked: [] as string[],
+    /** What the page sent with each generate, in order. */
+    pageOptions: [] as unknown[],
+    /** requestIds this page ended its turn for, in order. */
+    ended: [] as string[],
+    /** Set once the window is gone: nothing the page calls reaches main. */
+    gone: false,
     /** Set to hold the page's `llamaWaiting` subscription open. */
     holdWaiting: null as Promise<void> | null,
     subscribingToWaiting: false,
-    /** requestIds the llama host itself was asked to generate, in order. */
+    /** requestIds the llama host itself was asked to generate, in order, once per decode. */
     generated: (): string[] => generateCalls().map((call) => (call.args[0] as GenerateOptions).requestId),
-    finished: new Set<string>(),
-    /** The host ends a generation the way LlamaCppNode does: its event, then its return. */
-    finish(requestId: string): void {
-      const call = generateCalls().find((entry) => (entry.args[0] as GenerateOptions).requestId === requestId);
-      if (call === undefined || state.finished.has(requestId)) return;
-      state.finished.add(requestId);
-      hostSend({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endOf(requestId) });
-      hostSend({ k: 'ret', id: call.id, ok: true, data: endOf(requestId) });
+    /** requestIds the llama host was asked to cancel, in order. */
+    cancelledOnHost: (): string[] => hostCalls('cancel').map((call) => (call.args[0] as { requestId: string }).requestId),
+    /** How many benchmarks reached the llama host. */
+    benchmarksOnHost: (): number => hostCalls('benchmark').length,
+    /** Every end the broker decided for one of this window's units, in order. */
+    terminals: (unitId: string): UnitEnd[] =>
+      windowTerminals.filter((terminal) => terminal.unitId === unitId).map((terminal) => terminal.end),
+    /** A benchmark from this window, as the Benchmarks screen asks for one. */
+    benchmark: (): Promise<unknown> => pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'benchmark', [{ handle: 'h1' }]),
+    /** An end for this window's turn that main receives, whoever sent it. */
+    lateEnd: (requestId: string): Promise<unknown> =>
+      pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'endTurn', [{ requestId }]),
+    /**
+     * The host ends a turn's oldest unanswered decode the way LlamaCppNode does:
+     * what it said, its event, then its return.
+     */
+    finish(requestId: string, text?: string, stopReason: GenerationEndEvent['stopReason'] = 'stop'): void {
+      const call = unanswered(requestId);
+      if (call === undefined) return;
+      answered.add(call.id);
+      if (text !== undefined) {
+        hostSend({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaToken', data: { requestId, token: text, index: 0 } });
+      }
+      hostSend({ k: 'ev', plugin: LLAMA_PLUGIN.name, name: 'llamaEnd', data: endOf(requestId, stopReason) });
+      hostSend({ k: 'ret', id: call.id, ok: true, data: endOf(requestId, stopReason) });
+    },
+    /** The host refuses a turn's oldest unanswered decode. */
+    fail(requestId: string, message: string): void {
+      const call = unanswered(requestId);
+      if (call === undefined) return;
+      answered.add(call.id);
+      hostSend({ k: 'ret', id: call.id, ok: false, error: { message } });
     },
     /** A paired phone's unit holding or waiting for the slot, admitted straight to the broker. */
-    phoneTurn(unitId: string): { resolve: () => void } {
+    phoneTurn(unitId: string): { resolve: () => void; readonly starts: number } {
       let resolve: () => void = () => undefined;
+      let starts = 0;
       const admission = broker.admit({
-        owner: { kind: 'device', id: 'phone' },
+        owner: PHONE,
         unitId,
         executor: 'worker',
-        start: () =>
-          new Promise<unknown>((done) => {
+        start: () => {
+          starts += 1;
+          return new Promise<unknown>((done) => {
             resolve = () => done('the phone’s answer');
-          }),
+          });
+        },
       });
       if (!admission.admitted) throw new Error(`phone unit refused: ${admission.refusal}`);
-      return { resolve: () => resolve() };
+      return {
+        resolve: () => resolve(),
+        get starts() {
+          return starts;
+        },
+      };
     },
   };
 
@@ -265,10 +329,20 @@ function desktop() {
     }),
     unload: async () => undefined,
     generate: (options: GenerateOptions) => {
+      if (state.gone) return Promise.reject(new Error('The window is gone.'));
       state.asked.push(options.requestId);
+      state.pageOptions.push(structuredClone(options));
       return pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'generate', [options]);
     },
-    cancel: (options: { requestId: string }) => pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'cancel', [options]),
+    cancel: (options: { requestId: string }) =>
+      state.gone
+        ? Promise.reject(new Error('The window is gone.'))
+        : pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'cancel', [options]),
+    endTurn: (options: { requestId: string }) => {
+      if (state.gone) return Promise.reject(new Error('The window is gone.'));
+      state.ended.push(options.requestId);
+      return pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'endTurn', [options]);
+    },
     addListener: async (eventName: string, listener: (event: unknown) => void) => {
       if (eventName === 'llamaWaiting' && state.holdWaiting !== null) {
         state.subscribingToWaiting = true;
@@ -291,7 +365,7 @@ function desktop() {
 
 /* ── The page ─────────────────────────────────────────────────────────── */
 
-function chat(id: string): Chat {
+function chat(id: string, tools: readonly string[] = []): Chat {
   return {
     id,
     title: id,
@@ -299,7 +373,7 @@ function chat(id: string): Chat {
     personaId: null,
     modelId: QWEN.id,
     sampler: null,
-    tools: [],
+    tools: [...tools],
     showThinking: false,
     createdAt: 1,
     updatedAt: 1,
@@ -310,17 +384,22 @@ function chat(id: string): Chat {
 
 /** Chats in the store and the table, each with one exchange on disk; the first is open. */
 function given(...ids: string[]): void {
+  givenWithTools([], ...ids);
+}
+
+/** As `given`, with these tools enabled in every chat. */
+function givenWithTools(tools: readonly string[], ...ids: string[]): void {
   const threadOf = (id: string): Message[] => [
     { id: `${id}_user`, chatId: id, role: 'user', content: 'hello', createdAt: 1 },
     { id: `${id}_reply`, chatId: id, role: 'assistant', content: 'Hi.', createdAt: 2 },
   ];
   for (const id of ids) {
-    fake.chats.set(id, structuredClone(chat(id)));
+    fake.chats.set(id, structuredClone(chat(id, tools)));
     for (const row of threadOf(id)) fake.messages.set(row.id, structuredClone(row));
   }
   useChats.setState({
     loaded: true,
-    chats: ids.map(chat),
+    chats: ids.map((id) => chat(id, tools)),
     activeChatId: ids[0] ?? null,
     messages: ids[0] === undefined ? [] : threadOf(ids[0]),
     generating: false,
@@ -504,6 +583,315 @@ describe('Stop and the shared slot (#7, #305)', () => {
       expect(main.broker.slotCount).toBe(0);
     } finally {
       await drainAll([phone], [sending]);
+    }
+  });
+});
+
+/* ── The whole turn holds the slot (#7, owner ruling) ────────────────── */
+
+/** A local tool that runs until the test lets it return, or the turn is stopped. */
+function slowTool(id: string) {
+  let release: () => void = () => undefined;
+  let calls = 0;
+  const tool = {
+    id,
+    name: id,
+    description: 'Runs until the test lets it return, or the turn is stopped.',
+    summary: 'probe',
+    parameters: { type: 'object' as const, properties: {} },
+    execute: async (_input: Record<string, unknown>, context: { readonly signal?: AbortSignal }) => {
+      calls += 1;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+        context.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return { output: 'what the tool found' };
+    },
+  };
+  return {
+    tool,
+    /** What the model says to call it. */
+    call: `<tool_call>{"name":"${id}","arguments":{}}</tool_call>`,
+    get calls(): number {
+      return calls;
+    },
+    release: (): void => release(),
+  };
+}
+
+type SlowTool = ReturnType<typeof slowTool>;
+
+/**
+ * A desktop turn in `chatId` that has decoded once, asked for `tool`, and is
+ * running it: between two decodes of one turn.
+ */
+async function inItsToolCall(chatId: string, tool: SlowTool): Promise<{ sending: Promise<void>; turn: string }> {
+  givenWithTools([tool.tool.id], chatId);
+  const sending = useChats.getState().send('look it up');
+  await until(() => main.generated().length === 1);
+  const turn = main.asked[0]!;
+  main.finish(turn, tool.call);
+  await until(() => tool.calls === 1);
+  return { sending, turn };
+}
+
+/** Undone after each test. */
+let cleanups: (() => void)[] = [];
+
+describe('a desktop turn holds the one slot for the whole turn, its tool calls included (#7)', () => {
+  /*
+   * OWNER RULING ON #7: a desktop turn keeps the WorkBroker's one slot from its
+   * first decode until the turn settles (finished, failed, stopped, or
+   * refused), tool calls included, and a phone turn waits for the whole desktop
+   * turn. #169's "one turn at a time" is one turn, not one decode.
+   */
+  let tool: SlowTool;
+  let sending: Promise<void>;
+  let phones: { resolve: () => void }[];
+
+  beforeEach(() => {
+    tool = slowTool('look_up');
+    toolRegistry.register(tool.tool);
+    sending = Promise.resolve();
+    phones = [];
+    cleanups = [];
+  });
+
+  async function cleanUp(): Promise<void> {
+    for (const cleanup of cleanups) cleanup();
+    tool.release();
+    await drainAll(phones, [sending]);
+    toolRegistry.unregister(tool.tool.id);
+  }
+
+  it('a phone turn queued while the desktop turn runs its tool waits for the whole turn, and the turn’s next decode neither waits nor is told it waits', async () => {
+    try {
+      const started = await inItsToolCall('whole_turn', tool);
+      sending = started.sending;
+      const { turn } = started;
+      const phone = main.phoneTurn('phone-q');
+      phones.push(phone);
+      expect(main.broker.positionOf(PHONE, 'phone-q'), 'the phone waits behind the desktop turn').toBe(1);
+
+      tool.release();
+      await until(() => main.generated().length === 2 || phone.starts > 0);
+      expect(phone.starts, 'a phone turn ran between two decodes of one desktop turn').toBe(0);
+      expect(main.generated(), 'the turn’s second decode reached the host at once').toEqual([turn, turn]);
+      expect(main.broker.waitingCount).toBe(1);
+      main.finish(turn, 'the answer');
+      await sending;
+      await settle();
+
+      expect(heard.filter((entry) => entry.requestId === turn), 'waiting heard for the desktop turn').toEqual([]);
+      expect(main.pageOptions.map((options) => (options as { wholeTurn?: unknown }).wholeTurn)).toEqual([true, true]);
+      expect(main.ended, 'turns the page ended').toEqual([turn]);
+      expect(main.terminals(turn)).toEqual(['COMPLETED']);
+      expect(phone.starts, 'the phone started once the desktop turn was over').toBe(1);
+      expect(main.broker.slotCount).toBe(1);
+      expect(useChats.getState().messages.at(-1)).toMatchObject({ role: 'assistant', content: 'the answer' });
+      expect(useChats.getState().generating).toBe(false);
+    } finally {
+      await cleanUp();
+    }
+  });
+
+  const SETTLES: readonly {
+    readonly name: string;
+    /** Decodes the host is asked for in all. */
+    readonly decodes: number;
+    readonly settle: (turn: string) => Promise<void>;
+  }[] = [
+    {
+      name: 'finishes',
+      decodes: 2,
+      settle: async (turn) => {
+        tool.release();
+        await until(() => main.generated().length === 2);
+        main.finish(turn, 'the answer');
+      },
+    },
+    {
+      name: 'fails in the decode after its tool call',
+      decodes: 2,
+      settle: async (turn) => {
+        tool.release();
+        await until(() => main.generated().length === 2);
+        main.fail(turn, 'The model stopped answering.');
+      },
+    },
+    {
+      name: 'fails while its tool call is being recorded',
+      decodes: 1,
+      settle: async () => {
+        // The page's own handling of the tool's record throws, after the tool
+        // has run and before the next decode: the turn fails in its tool phase.
+        let thrown = false;
+        cleanups.push(
+          useChats.subscribe((state) => {
+            if (thrown || !state.messages.some((message) => (message.toolCalls?.length ?? 0) > 0)) return;
+            thrown = true;
+            throw new Error('The thread could not be updated.');
+          }),
+        );
+        tool.release();
+      },
+    },
+    {
+      name: 'is stopped during its tool call',
+      decodes: 1,
+      settle: async () => {
+        stop();
+      },
+    },
+    {
+      name: 'is stopped during its second decode',
+      decodes: 2,
+      settle: async (turn) => {
+        tool.release();
+        await until(() => main.generated().length === 2);
+        stop();
+        await until(() => main.cancelledOnHost().includes(turn));
+        main.finish(turn, undefined, 'cancelled');
+      },
+    },
+  ];
+
+  it.each(SETTLES.map((path) => [path.name, path] as const))(
+    'a desktop turn that %s gives the slot back once, and not before it has settled',
+    async (_name, { decodes, settle: settleTurn }) => {
+      try {
+        const started = await inItsToolCall('settles', tool);
+        sending = started.sending;
+        const { turn } = started;
+        const phone = main.phoneTurn('phone-q');
+        phones.push(phone);
+        expect(main.broker.positionOf(PHONE, 'phone-q'), 'the phone waits behind the desktop turn').toBe(1);
+
+        await settleTurn(turn);
+        await sending;
+        await settle();
+
+        expect(useChats.getState().generating, 'a turn still running in the store').toBe(false);
+        expect(main.generated(), 'decodes the host was asked for').toHaveLength(decodes);
+        expect(main.ended, 'turns the page ended').toEqual([turn]);
+        expect(main.terminals(turn), 'ends the broker decided for the desktop turn').toHaveLength(1);
+        expect(main.broker.positionOf(OWNER, turn)).toBeUndefined();
+        expect(phone.starts, 'the phone started once the desktop turn was over').toBe(1);
+
+        // Given back once: a late end for the turn leaves the phone holding the
+        // slot, with nothing waiting.
+        await main.lateEnd(turn);
+        expect(main.broker.isRunning(PHONE, 'phone-q')).toBe(true);
+        expect(main.broker.slotCount).toBe(1);
+        expect(main.broker.waitingCount).toBe(0);
+      } finally {
+        await cleanUp();
+      }
+    },
+  );
+
+  it('a desktop turn stopped while its first decode still waits never takes the slot, and its end gives nothing back', async () => {
+    try {
+      given('stopped_waiting');
+      const phone = main.phoneTurn('phone-first');
+      phones.push(phone);
+      sending = useChats.getState().send('a question');
+      await until(() => main.broker.waitingCount === 1);
+      const turn = main.asked[0]!;
+
+      stop();
+      await sending;
+      await settle();
+      expect(main.terminals(turn)).toEqual(['CANCELLED']);
+      expect(main.ended, 'turns the page ended').toEqual([turn]);
+      expect(main.broker.isRunning(PHONE, 'phone-first')).toBe(true);
+      expect(main.broker.slotCount).toBe(1);
+
+      phone.resolve();
+      await settle();
+      expect(main.broker.slotCount).toBe(0);
+      expect(main.generated()).toEqual([]);
+    } finally {
+      await cleanUp();
+    }
+  });
+
+  it('a desktop turn whose window goes away during its tool call gives the slot back at once, and never decodes again', async () => {
+    try {
+      const started = await inItsToolCall('window_gone', tool);
+      sending = started.sending;
+      const { turn } = started;
+      const phone = main.phoneTurn('phone-q');
+      phones.push(phone);
+      expect(main.broker.positionOf(PHONE, 'phone-q'), 'the phone waits behind the desktop turn').toBe(1);
+
+      main.gone = true;
+      main.localTurns.releaseRenderer(WINDOW, 'The window was closed.');
+      await settle();
+      expect(phone.starts, 'the phone waited for a window that is gone').toBe(1);
+      expect(main.broker.positionOf(OWNER, turn)).toBeUndefined();
+
+      tool.release();
+      await sending;
+      expect(main.generated()).toHaveLength(1);
+      expect(main.broker.isRunning(PHONE, 'phone-q')).toBe(true);
+      expect(main.broker.slotCount).toBe(1);
+      expect(main.broker.waitingCount).toBe(0);
+    } finally {
+      await cleanUp();
+    }
+  });
+
+  it('a second turn the store refuses while the desktop turn runs its tool neither takes the slot, nor queues for it, nor ends the turn holding it', async () => {
+    try {
+      const started = await inItsToolCall('refused_second', tool);
+      sending = started.sending;
+      const { turn } = started;
+      const phone = main.phoneTurn('phone-q');
+      phones.push(phone);
+      expect(main.broker.positionOf(PHONE, 'phone-q'), 'the phone waits behind the desktop turn').toBe(1);
+
+      await useChats.getState().send('a second question');
+      await useChats.getState().editMessage('refused_second_user', 'hello again');
+      expect(main.asked, 'generations asked of main').toHaveLength(1);
+      expect(main.ended, 'turns the page ended').toEqual([]);
+      expect(main.broker.waitingCount, 'units waiting').toBe(1);
+      expect(main.broker.isRunning(OWNER, turn)).toBe(true);
+      expect(main.broker.positionOf(PHONE, 'phone-q')).toBe(1);
+
+      tool.release();
+      await until(() => main.generated().length === 2);
+      expect(phone.starts).toBe(0);
+      main.finish(turn, 'the answer');
+      await sending;
+      await settle();
+      expect(phone.starts).toBe(1);
+    } finally {
+      await cleanUp();
+    }
+  });
+
+  it('a benchmark asked for while the desktop turn runs its tool is refused as busy, and runs once the turn is over', async () => {
+    try {
+      const started = await inItsToolCall('bench_between', tool);
+      sending = started.sending;
+      const { turn } = started;
+
+      const refused = main.benchmark();
+      void refused.catch(() => undefined);
+      await settle();
+      expect(main.benchmarksOnHost(), 'a benchmark reached the host between two decodes of a desktop turn').toBe(0);
+      await expect(refused).rejects.toMatchObject({ code: 'SLOT_BUSY' });
+
+      tool.release();
+      await until(() => main.generated().length === 2);
+      main.finish(turn, 'the answer');
+      await sending;
+      await settle();
+      await expect(main.benchmark()).resolves.toBeNull();
+      expect(main.benchmarksOnHost()).toBe(1);
+    } finally {
+      await cleanUp();
     }
   });
 });

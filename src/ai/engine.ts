@@ -665,6 +665,25 @@ export class ChatterangEngine {
    */
   async *stream(request: GenerationRequest): AsyncGenerator<GenerationEvent> {
     const requestId = newId('req');
+    /*
+     * THE TURN'S END, HOWEVER IT ENDS (#7, owner ruling). On the desktop a turn
+     * that decoded locally holds the slot it shares with a paired phone's turns
+     * from its first decode until it is over, its tool calls included, and a
+     * phone's turn waits for all of it. Every decode of this turn carries this
+     * one requestId; this is where the turn is over: finished, failed, stopped,
+     * or ended by a consumer that stopped reading, which runs this `finally`
+     * too. A turn that never decoded locally holds nothing, and the adapter
+     * sends nothing for it.
+     */
+    try {
+      yield* this.#turn(request, requestId);
+    } finally {
+      await this.llama.endTurn(requestId);
+    }
+  }
+
+  /** The turn itself: `stream`, without its end. */
+  async *#turn(request: GenerationRequest, requestId: string): AsyncGenerator<GenerationEvent> {
     this.#pendingTools = [];
     this.#lastFallback = null;
     this.#responseWarnings = [];
