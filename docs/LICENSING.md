@@ -39,6 +39,8 @@ No source was copied from any AGPL-licensed project.
 | `dexie` | Apache-2.0 | IndexedDB |
 | `react-markdown`, `remark-gfm`, `rehype-highlight` | MIT | Reply rendering |
 | `vite`, `vitest`, `typescript` | MIT / Apache-2.0 | Build and test |
+| `@peculiar/x509` | MIT | The tunnel's self-signed certificate (#179); desktop and server only |
+| `reflect-metadata` | Apache-2.0 | The polyfill `@peculiar/x509` requires; loaded with it |
 
 Verified against each package's published `LICENSE` file. The aimatey packages
 are pinned to exact versions rather than ranges, per the PRD's treatment of
@@ -52,6 +54,26 @@ than `'node:crypto'`. In a webview that resolves to nothing and the module is
 externalised. Chatterang therefore imports middleware from subpaths
 (`@johnhenry/aimatey-middleware/retry`, `/logging`) rather than the barrel.
 Worth fixing upstream, since the app owns that package.
+
+### The tunnel's certificate library, and what it brings with it
+
+#179 rules that the desktop's tunnel certificate is made by a maintained X.509
+library, pinned. `@peculiar/x509@2.1.0` and `reflect-metadata@0.2.2` are
+dependencies of `packages/tunnel` and imported only by its `host` half, which
+`src/` may not import; the root manifest does not declare them, so the
+`src/ imports only what this app declares` guard refuses them in the app bundle.
+
+The table above is direct dependencies. These two bring, transitively: the
+`@peculiar/asn1-*` schemas, `@peculiar/utils`, `pvtsutils`, `pvutils` and
+`tsyringe` (all MIT), `asn1js` (**BSD-3-Clause**) and `tslib` (**0BSD**). Both
+are permissive and compatible with Apache-2.0, and the lockfile already carried
+BSD-3-Clause and 0BSD packages before this one.
+
+Not chosen, with the reason: `node-forge` is BSD-3-Clause OR GPL-2.0 and makes
+RSA certificates only; `jsrsasign` is marked unmaintained on npm; `pkijs` is
+BSD-3-Clause as a direct dependency; `@fidm/x509` parses and does not create,
+and was last published in 2022; `selfsigned` wraps `@peculiar/x509` 1.x and
+adds `pkijs`, for nothing the tunnel needs.
 
 ## Native engine licences
 

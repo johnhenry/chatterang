@@ -2424,6 +2424,16 @@ describe('a listening socket forces the privacy copy to change', () => {
   const HOST_EXPORTS: Readonly<Record<string, 'listens' | 'binds nothing'>> = {
     createTunnelHost: 'listens',
     createTunnelListener: 'listens',
+    // The TLS identity (#179): a key, its pin, a certificate, and the
+    // owner-only file the key is kept in. `node:crypto` and `node:fs`, no socket.
+    TunnelIdentityError: 'binds nothing',
+    generateTunnelKey: 'binds nothing',
+    issueTunnelCertificate: 'binds nothing',
+    loadOrCreateTunnelKey: 'binds nothing',
+    sameTunnelPin: 'binds nothing',
+    tunnelKeyFromPkcs8Pem: 'binds nothing',
+    tunnelKeyPkcs8Pem: 'binds nothing',
+    tunnelPinOf: 'binds nothing',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [

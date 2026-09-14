@@ -17,6 +17,8 @@
   "dependencies": {
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
+    "@peculiar/x509": "2.1.0",
+    "reflect-metadata": "0.2.2",
     "ws": "8.21.3"
   }
 }

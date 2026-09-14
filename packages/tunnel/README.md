@@ -75,6 +75,28 @@ either handshaking onto a tunnel that is already over. The check is at the
 upgrade because `server.close()` alone lets a connection that is already inside
 a request finish upgrading.
 
+## The TLS identity (#179, #180)
+
+`src/host/identity.ts` makes the key a paired client pins and the certificates
+that carry it; `src/host/identity-store.ts` keeps the key on disk for both apps.
+Neither binds anything, and neither is called by an app yet.
+
+- **The pin is the key, not the certificate.** `TunnelPin` is the SHA-256 of the
+  DER SubjectPublicKeyInfo, as 32 bytes (`NegotiatedPeer.spki`) and as padded
+  base64 (`NegotiatedPeerCertificate.spkiSha256`). Re-issuing a certificate
+  reuses the stored key, so the pin does not change.
+- **EC P-256.** Ed25519 fails the TLS handshake under Electron 44's BoringSSL.
+- **Names are a parameter, none by default** (#180, #295).
+- **`validDays` has no default**: certificate lifetime is part of the open
+  lifetime question.
+- **Key rotation is not implemented.** A new key is a new pin, so it is a loud
+  re-pair of every device; nothing here makes a key except when none exists.
+- **Owner-only or refused.** `<data>/tunnel-identity/key` is 0600 in a 0700
+  directory, sealed with `safeStorage` on the desktop where it can encrypt. A
+  wider mode, a symlink, another owner, a malformed or tampered file, or a sealed
+  file with nothing to unseal it is refused — never tightened and never replaced.
+  Windows is refused until its ACL story is decided.
+
 ## What is deliberately not here
 
 - **A production transport.** #181 chose a native socket plugin on both
