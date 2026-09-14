@@ -48,6 +48,7 @@ import { declaredValue, rootProperties, substitute, thresholds, toPx } from './s
 import {
   createBudget,
   pollUntil,
+  probeFailureMessage,
   StageTimeout,
   type StageTimeoutDetails,
   withDeadline,
@@ -127,6 +128,8 @@ interface ProbeResult {
   readonly seeded: number;
   readonly widths: Record<string, WidthRecord>;
   readonly sweep: Record<'declared' | 'fallback', Record<string, number | null>>;
+  /** `innerWidth` read in the same evaluation as each sweep measure. */
+  readonly sweepViewport: Record<'declared' | 'fallback', Record<string, number>>;
   readonly consoleErrors: readonly string[];
   readonly fonts: {
     readonly prose: string;
@@ -332,20 +335,22 @@ afterAll(async () => {
 /**
  * The probe's answer, or a failure that says what stopped it.
  *
- * A probe that ran out of time is not a layout finding, and its message must
- * not read like one. Every engine test below then fails with the stage, the
- * milliseconds it waited and what its last look saw, prefixed as a harness
- * timeout; a layout defect fails as an assertion with a measured value in it.
+ * Every engine test below fails with the same line when the probe did not
+ * finish, and that line is decided by WHAT stopped it (`probeFailureMessage`):
+ *
+ *   - a renderer that did not answer is a harness timeout, and says so;
+ *   - a condition that stayed false while the renderer answered — the list
+ *     rendered fifty rows and never two hundred — is a real failure, and must
+ *     NOT be excused as a slow runner;
+ *   - anything else, a script that threw included, is "the layout probe
+ *     failed", as it always was.
+ *
+ * A layout defect in a probe that did finish fails as an assertion with a
+ * measured value in it.
  */
 function measured(): ProbeResult {
   if (probe === undefined) throw new Error('the layout probe produced no measurements');
-  if (probe.failure !== undefined) {
-    throw new Error(
-      'the layout probe ran out of time, so nothing in this file was measured ' +
-        `(a harness timeout, not a layout finding): ${probe.error?.split('\n')[0]}`,
-    );
-  }
-  if (probe.error !== undefined) throw new Error(`the layout probe failed: ${probe.error}`);
+  if (probe.error !== undefined) throw new Error(probeFailureMessage(probe));
   return probe;
 }
 
@@ -390,6 +395,29 @@ describe('the layout probe itself', () => {
     },
   );
 
+  it.skipIf(ELECTRON === undefined)(
+    'read every width at that width, so a stale reading fails by name',
+    () => {
+      /*
+       * `setWidth` waits for `innerWidth` to be the width asked for before
+       * anything is measured. With that wait removed, `setContentSize` returns
+       * before the renderer has the resize and the file failed two runs in
+       * three — as "the reading measure narrowed at 919px" and "expected 1224
+       * to be 1440": true numbers, read at the previous width. This says so.
+       */
+      for (const [width, record] of Object.entries(measured().widths)) {
+        expect(record.geometry.viewport.width, `the geometry "at ${width}px"`).toBe(Number(width));
+      }
+      for (const face of ['declared', 'fallback'] as const) {
+        const viewports = measured().sweepViewport[face];
+        expect(Object.keys(viewports)).toEqual(Object.keys(measured().sweep[face]));
+        for (const [width, seen] of Object.entries(viewports)) {
+          expect(seen, `the ${face} reading measure "at ${width}px"`).toBe(Number(width));
+        }
+      }
+    },
+  );
+
   it('names the stage and the milliseconds waited when an evaluation never answers', async () => {
     /*
      * CI run 34872871078 failed the whole file on "timed out evaluating the
@@ -408,33 +436,115 @@ describe('the layout probe itself', () => {
     );
     expect(timeout.stage).toBe('evaluating the engine to settle at 390px');
     expect(timeout.waitedMs).toBeGreaterThanOrEqual(20);
-    expect(timeout.toJSON()).toMatchObject({ budgetMs: 25, lastObserved: null });
+    expect(timeout.toJSON()).toMatchObject({
+      kind: 'unanswered',
+      budgetMs: 25,
+      lastObserved: null,
+    });
   });
 
   it('says what the last look saw, so a false condition and a silent renderer read differently', async () => {
-    await expect(
-      pollUntil<number>({
-        stage: 'waiting for the engine to settle at 390px',
-        budgetMs: 60,
-        intervalMs: 5,
-        check: async () => ({ done: false, observed: 'innerWidth was 1440, not yet 390' }),
-      }),
-    ).rejects.toThrow(
+    const unmet: unknown = await pollUntil<number>({
+      stage: 'waiting for the engine to settle at 390px',
+      budgetMs: 60,
+      intervalMs: 5,
+      check: async () => ({ done: false, observed: 'innerWidth was 1440, not yet 390' }),
+    }).catch((error: unknown) => error);
+    expect(unmet).toBeInstanceOf(StageTimeout);
+    expect((unmet as StageTimeout).message).toMatch(
       /^timed out waiting for the engine to settle at 390px after \d+ms \(budget 60ms\); last observed: innerWidth was 1440, not yet 390$/,
     );
+    // The renderer answered every look: the page never got there.
+    expect((unmet as StageTimeout).kind).toBe('unmet');
 
-    await expect(
-      pollUntil<boolean>({
-        stage: 'waiting for the app shell to mount',
-        budgetMs: 60,
-        attemptMs: 15,
-        intervalMs: 5,
-        check: (attemptMs) =>
-          withDeadline(silence(), { stage: 'evaluating the app shell', budgetMs: attemptMs }),
-      }),
-    ).rejects.toThrow(
+    const unanswered: unknown = await pollUntil<boolean>({
+      stage: 'waiting for the app shell to mount',
+      budgetMs: 60,
+      attemptMs: 15,
+      intervalMs: 5,
+      check: (attemptMs) =>
+        withDeadline(silence(), { stage: 'evaluating the app shell', budgetMs: attemptMs }),
+    }).catch((error: unknown) => error);
+    expect(unanswered).toBeInstanceOf(StageTimeout);
+    expect((unanswered as StageTimeout).message).toMatch(
       /^timed out waiting for the app shell to mount after \d+ms \(budget 60ms\); last observed: a look did not answer within \d+ms$/,
     );
+    // No look answered: the runner, not the page.
+    expect((unanswered as StageTimeout).kind).toBe('unanswered');
+  });
+
+  it('fails a stage at once when a look throws, rather than retrying a script bug for the whole budget', async () => {
+    // A thrown script error is deterministic. Retried, it cost a full minute
+    // and was then reported as a timeout.
+    let looks = 0;
+    const started = Date.now();
+    const caught: unknown = await pollUntil<number>({
+      stage: 'waiting for the engine to settle at 390px',
+      budgetMs: 5_000,
+      attemptMs: 1_000,
+      intervalMs: 1,
+      check: async () => {
+        looks += 1;
+        throw new Error('a settle script bug');
+      },
+    }).catch((error: unknown) => error);
+    expect(looks).toBe(1);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(StageTimeout);
+    expect((caught as Error).message).toMatch(
+      /^waiting for the engine to settle at 390px failed after \d+ms: a look threw: a settle script bug$/,
+    );
+  });
+
+  it('fails the engine tests with a line that tells a silent renderer from a page that never got there', () => {
+    /*
+     * The mutation that made this necessary: ChatScreen rendering fifty rows
+     * instead of two hundred. The seeded-rows wait answered "false" for its
+     * whole budget, and every engine test called that "a harness timeout, not
+     * a layout finding" — a real regression, excused as a slow runner.
+     */
+    const base = {
+      stage: 'waiting for the seeded rows and thread to render',
+      waitedMs: 60_001,
+      budgetMs: 60_000,
+    };
+    const asTheProbeWritesIt = (timeout: StageTimeout) => ({
+      error: String(timeout.stack),
+      failure: timeout.toJSON(),
+    });
+
+    const neverGotThere = probeFailureMessage(
+      asTheProbeWritesIt(
+        new StageTimeout({ ...base, lastObserved: 'the condition was still false', kind: 'unmet' }),
+      ),
+    );
+    expect(neverGotThere).toMatch(
+      /^the layout probe stopped at a step that never came true while the renderer kept answering \(a real failure in the page or the probe, not a slow runner\): \w+: timed out waiting for the seeded rows and thread to render after 60001ms \(budget 60000ms\); last observed: the condition was still false$/,
+    );
+    expect(neverGotThere).not.toContain('harness timeout');
+
+    const silentRenderer = probeFailureMessage(
+      asTheProbeWritesIt(
+        new StageTimeout({
+          ...base,
+          lastObserved: 'a look did not answer within 9909ms',
+          kind: 'unanswered',
+        }),
+      ),
+    );
+    expect(silentRenderer).toMatch(
+      /^the layout probe ran out of time on a renderer that did not answer, so nothing in this file was measured \(a harness timeout, not a layout finding\): \w+: timed out waiting for the seeded rows and thread to render after 60001ms \(budget 60000ms\); last observed: a look did not answer within 9909ms$/,
+    );
+
+    const threw = probeFailureMessage({
+      error:
+        'Error: waiting for the engine to settle at 390px failed after 3ms: a look threw: a settle script bug\n    at run',
+    });
+    expect(threw).toMatch(
+      /^the layout probe failed: Error: waiting for the engine to settle at 390px failed after 3ms: a look threw: a settle script bug/,
+    );
+    expect(threw).not.toContain('harness timeout');
   });
 
   it('lets a slow look cost time rather than the stage', async () => {

@@ -4,7 +4,14 @@
  * THIS is what the typecheck reads: keep it in step with the module.
  */
 
+/**
+ * `unanswered`: the renderer did not answer (a harness timeout).
+ * `unmet`: the renderer answered and the condition stayed false (a real failure).
+ */
+export type StageTimeoutKind = 'unanswered' | 'unmet';
+
 export interface StageTimeoutDetails {
+  readonly kind: StageTimeoutKind;
   readonly stage: string;
   readonly waitedMs: number;
   readonly budgetMs: number;
@@ -18,10 +25,12 @@ export interface StageTimeoutInit {
   readonly budgetMs: number;
   readonly lastObserved?: string | null;
   readonly note?: string | null;
+  readonly kind?: StageTimeoutKind;
 }
 
 export declare class StageTimeout extends Error implements StageTimeoutDetails {
   constructor(init: StageTimeoutInit);
+  readonly kind: StageTimeoutKind;
   readonly stage: string;
   readonly waitedMs: number;
   readonly budgetMs: number;
@@ -31,6 +40,11 @@ export declare class StageTimeout extends Error implements StageTimeoutDetails {
 }
 
 export declare function describeTimeout(init: StageTimeoutInit): string;
+
+export declare function probeFailureMessage(result: {
+  readonly error?: string;
+  readonly failure?: StageTimeoutDetails | null;
+}): string;
 
 export interface Budget {
   readonly totalMs: number;

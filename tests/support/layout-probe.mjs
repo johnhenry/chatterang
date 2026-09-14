@@ -102,8 +102,16 @@ const LOAD_MS = 60_000;
 const WAIT_MS = 60_000;
 /** A width applied and laid out; see `setWidth`. */
 const SETTLE_MS = 60_000;
-/** One measurement script. Nothing makes it slow but a starved renderer. */
-const EVALUATE_MS = 30_000;
+/**
+ * One evaluation: a measurement, a click, the seed. Nothing makes it slow but
+ * a starved renderer, so it gets the same budget a settle does — and is NOT
+ * retried. `executeJavaScript` cannot be cancelled: an evaluation that has
+ * run out is still queued in the renderer, and a second copy would only queue
+ * behind it. One long deadline is the same tolerance without the duplicate,
+ * so a 35s stall inside the sheet list costs what a 35s stall inside a resize
+ * costs — time — where a 30s deadline here used to fail the file on it.
+ */
+const EVALUATE_MS = 60_000;
 /** One look inside a wait. A look that runs out is retried, not fatal. */
 const LOOK_MS = 10_000;
 
@@ -224,7 +232,9 @@ async function evaluate(contents, expression, what, timeoutMs = EVALUATE_MS) {
 /**
  * Resolve once the page satisfies `predicate` (a JS expression), or throw a
  * `StageTimeout` naming `what`, the wait, and whether the last look found the
- * predicate false, found it throwing, or got no answer from the renderer.
+ * predicate false (`unmet`: the page never got there) or got no answer from
+ * the renderer (`unanswered`: a harness timeout). A predicate that throws
+ * fails the wait at once, naming it.
  */
 async function waitFor(contents, predicate, what, timeoutMs = WAIT_MS) {
   trace(`waiting for ${what}`);
@@ -562,7 +572,7 @@ const geometry = `
 `;
 
 /** Filled as the probe goes, so a failure still reports what it did measure. */
-const out = { seeded: 0, widths: {}, sweep: {}, consoleErrors: [] };
+const out = { seeded: 0, widths: {}, sweep: {}, sweepViewport: {}, consoleErrors: [] };
 
 /**
  * Open the sheet the way a user does — the rail's button — and measure it.
@@ -718,15 +728,22 @@ async function run() {
         );
       }
       const measures = {};
+      const viewports = {};
       for (const width of SWEEP) {
         await setWidth(window, width);
-        measures[width] = await evaluate(
+        // `innerWidth` read in the SAME evaluation as the measure, so a
+        // reading taken at the previous width — the thing `setWidth` waits
+        // out — fails by name in the test instead of as a narrowing measure.
+        const reading = await evaluate(
           contents,
-          READING_MEASURE,
+          `({ width: innerWidth, measure: ${READING_MEASURE} })`,
           `the reading measure at ${width}px (${face})`,
         );
+        measures[width] = reading.measure;
+        viewports[width] = reading.width;
       }
       out.sweep[face] = measures;
+      out.sweepViewport[face] = viewports;
     }
     await evaluate(
       contents,
@@ -749,9 +766,10 @@ app.whenReady().then(async () => {
     // Partial measurements are still written. A probe that reported nothing on
     // the way to failing would make every failure a mystery.
     out.error = String(error && error.stack ? error.stack : error);
-    // A wait that ran out is recorded AS one — its stage, how long it waited,
-    // its budget and what it last saw — so the test can say "the harness ran
-    // out of time here" instead of letting it read like a layout finding.
+    // A wait that ran out is recorded AS one — its kind, stage, how long it
+    // waited, its budget and what it last saw — so the test can tell "the
+    // renderer did not answer" (a harness timeout) from "the page never got
+    // there" (a real failure), and read neither as a layout finding.
     if (error instanceof StageTimeout) out.failure = error.toJSON();
     failed = true;
   }
