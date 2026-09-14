@@ -202,18 +202,31 @@ app's origin, and shown only where Ollama needs one.
 - an origin Ollama already allows by default gets no value, and the note asks
   for nothing;
 - an `http://` or `https://` origin outside the defaults is its own value, exactly;
-- any other scheme gets `*` followed by the origin (the suffix form);
+- any other scheme gets the origin with `*` inserted right after the scheme's
+  colon (`chatterang-desktop:*//app`, the middle form; the fourth run below
+  shows why);
 - anything that is not exactly a canonical serialized origin (`null`, a path, a
   comma, a `*`, a default port) gets no value, and the note says the app cannot
   tell.
 
-A third run measured each value the function prints. It used the same isolation
+On desktop the note reads:
+
+> Ollama refuses this app until its `OLLAMA_ORIGINS` setting allows it. Add
+> `chatterang-desktop:*//app` to that setting. If it already has a value, put a
+> comma between them, with no spaces. Restart Ollama for the change to take
+> effect.
+
+### Third run: the values the first version printed
+
+The function's first version gave desktop and iOS a leading `*`
+(`*chatterang-desktop://app`); review replaced it with the middle form. A third
+run measured each value that first version printed. It used the same isolation
 as the runs above, plus its own empty `HOME`, on ports 12501-12507. Each case
 was checked with `GET /api/version` and the preflight for `POST /api/chat`, and
 the two agreed in every cell (200 with 204, 403 with 403). The user's own
 `ollama serve` was the only Ollama process before and after.
 
-| page origin | platform | function prints | unset | under the printed value |
+| page origin | platform | first version printed | unset | under the printed value |
 |---|---|---|---|---|
 | `chatterang-desktop://app` | desktop | `*chatterang-desktop://app` | 403 | 200 |
 | `capacitor://localhost` | iOS | `*capacitor://localhost` | 403 | 200 |
@@ -237,19 +250,16 @@ What else each printed value lets in:
   `http://localhost:5273`, `http://127.0.0.1`, `https://0.0.0.0:8443`, `app://-`,
   `tauri://localhost`, `vscode-webview://abc` and the string `file://`. Each
   `server config` line listed the value ahead of the unchanged defaults. That is
-  why the note says to add the value, with a comma, to anything already set.
-  The two-entry row shows a comma-joined value keeps both.
+  why the note says to add the value to anything already set. The two-entry row
+  shows a comma-joined value, with no space, keeps both.
 - `chatterang-desktop://app`, set exactly, was run once more: it panicked with
   the same message and exited 2 without listening.
 - `http://localhost.evil.example` and `https://evil.example` were 403 under
   every value.
-- **The residual of the suffix form.** `*chatterang-desktop://app` also admits
-  any origin that merely ends with the app's own, such as
-  `xchatterang-desktop://app`. That needs another app on the machine to register
-  a look-alike scheme and send requests from it. The prefix form
-  (`chatterang-desktop://app*`) admits `chatterang-desktop://app-evil` on this
-  app's own scheme, and an exact value does not start, so the suffix form is
-  the narrowest one that starts.
+- `*chatterang-desktop://app` also admits any origin that merely ends with the
+  app's own, such as `xchatterang-desktop://app`. This run took the leading
+  form for the narrowest value that starts, because only the leading and
+  trailing positions had been tried. The fourth run shows it is not.
 - A browser page at a `file:` URL sends `Origin: null`, whatever its
   `location.origin` says, so the function gives no value for `file://` even
   though that string matched a default.
@@ -258,3 +268,87 @@ What else each printed value lets in:
   copied from that version's `server config` line, and its literals are in the
   bundled binary. Ollama's FAQ, read through Context7, names only `127.0.0.1`
   and `0.0.0.0`. A different Ollama version could have different defaults.
+
+### Fourth run: the middle form, and how the value is added
+
+Review found two things. The leading form was not the narrowest value that
+starts. And "with a comma between it and anything already there" let a user
+break the setting. A fourth run used the same isolation: a throwaway
+`ollama serve` 0.34.0 per value, each with its own empty `HOME` and
+`OLLAMA_MODELS`, on loopback ports 12701-12717. Each cell was checked with
+`GET /api/version` and the preflight for `POST /api/chat`, and the two agreed in
+every cell (200 with 204, 403 with 403). The user's own `ollama serve` was the
+only Ollama process before and after.
+
+| `OLLAMA_ORIGINS` | server | 200, besides the defaults | 403 |
+|---|---|---|---|
+| unset | starts | nothing (`vscode-file://vscode-app` is a default and got 200) | `chatterang-desktop://app`, `capacitor://localhost`, `http://192.168.1.10:5273`, `chrome-extension://abcdef`, `httpx://host` |
+| `chatterang-desktop:*//app` | starts | `chatterang-desktop://app`, and the string `chatterang-desktop:x//app`, which no browser sends as an origin | `xchatterang-desktop://app`, `evil.chatterang-desktop://app`, `chatterang-desktop://app-evil`, `chatterang-desktop://evil`, `chatterang-desktop://app:1`, `chatterang-desktop://x.app`, `chatterang-desktop-x://app`, `capacitor://localhost` |
+| `capacitor:*//localhost` | starts | `capacitor://localhost` | `xcapacitor://localhost`, `capacitor://localhost.evil`, `capacitor://evil`, `capacitor://localhost:1`, `capacitor://x.localhost`, `chatterang-desktop://app` |
+| `*chatterang-desktop://app` (the first version's) | starts | `chatterang-desktop://app`, **`xchatterang-desktop://app`**, **`evil.chatterang-desktop://app`** | `chatterang-desktop://app-evil`, `chatterang-desktop://evil` |
+| `http://192.168.1.10:5273` | starts | that origin | `http://192.168.1.10:5274` |
+| `chrome-extension://abcdef` | starts | that origin | `xchrome-extension://abcdef`, `chrome-extension://abcdefg` |
+| `chrome-extension:*//abcdef` | starts | that origin | the same two |
+| `x-custom+scheme.v2:*//host:8080` | starts | that origin | `x-custom+scheme.v2://host:8081`, `xx-custom+scheme.v2://host:8080` |
+| `httpx://host` | **panics before listening**, exit 2 | | |
+| `httpx:*//host` | starts | `httpx://host` | `xhttpx://host` |
+
+Under every value that started, the defaults still answered 200:
+`http://127.0.0.1`, `https://localhost`, `http://localhost:5273`, `app://-`,
+`tauri://localhost` and `vscode-file://vscode-app`.
+
+How the value joins a setting that already has one:
+
+| `OLLAMA_ORIGINS` | server | result |
+|---|---|---|
+| `http://example.test,chatterang-desktop:*//app` | starts | both origins 200 |
+| `chatterang-desktop:*//app,http://192.168.1.10:5273` | starts | both origins 200 |
+| `http://example.test, chatterang-desktop:*//app` (space after the comma) | starts | `http://example.test` 200, **`chatterang-desktop://app` 403** |
+| `http://example.test, *chatterang-desktop://app` (space after the comma) | starts | `http://example.test` 200, **`chatterang-desktop://app` 403** |
+| `*capacitor://localhost, http://192.168.1.10:5273` (space before `http://`) | **panics before listening**, exit 2 | |
+| `,chatterang-desktop:*//app` (nothing before the comma) | **panics before listening**, exit 2 | |
+| `chatterang-desktop:*//app,` (nothing after the comma) | **panics before listening**, exit 2 | |
+
+Ollama splits the setting on commas and keeps the spaces. The `server config`
+line printed the entry after `, ` with its leading space, and an entry that
+starts with a space never matches a browser's origin. An entry starting
+` http://` no longer starts with `http://`, and an empty entry has no `*`, so
+both fail the startup check and Ollama panics with the message above.
+
+What the rows show:
+
+- **The middle form is the narrowest value that starts.** The origin has to
+  start with `chatterang-desktop:` and end with `//app`. A host cannot contain
+  `/`, so of the origins a browser sends only `chatterang-desktop://app`
+  matches, and every look-alike measured was refused. The leading form admitted
+  `xchatterang-desktop://app` and `evil.chatterang-desktop://app`, the trailing
+  form admits `chatterang-desktop://app-evil`, and an exact value does not
+  start. So the note shows `chatterang-desktop:*//app` on desktop and
+  `capacitor:*//localhost` on iOS.
+- **Extension schemes.** An exact `chrome-extension://abcdef` starts, as the
+  panic message's scheme list says, and so does the middle form. Each admitted
+  only that origin, so the function uses the middle form for every scheme
+  outside http(s). No shipped build runs at an extension origin.
+- **How the value is added.** A space after the comma silently leaves the new
+  entry unmatched. A space before `http://`, or a comma with nothing on one
+  side, stops Ollama from starting. So the note says to put a comma between the
+  values only if the setting already has one, and to use no spaces.
+
+Residuals:
+
+- **Desktop.** The value admits exactly `chatterang-desktop://app`. Ollama
+  cannot tell this app from another program that registers the same
+  `chatterang-desktop` scheme and sends that same origin. CORS never constrains
+  a client that is not a browser in the first place.
+- **iOS.** `capacitor.config.ts` sets no `server.iosScheme` or
+  `server.hostname`. Capacitor's documentation, read through Context7, says an
+  iOS app is served from `capacitor://localhost` by default. So every Capacitor
+  iOS app that keeps those defaults sends the same origin as this one.
+  `capacitor:*//localhost`, like any value that admits this app there, admits
+  all of them wherever they can reach the server. Only a distinct `iosScheme` or
+  `hostname` would change that, and that is out of scope here.
+- **Shells.** The value contains `*`. Typed unquoted as a command argument in
+  zsh, macOS's default shell, it stops the command with "no matches found".
+  Measured: `zsh -c 'print -r -- chatterang-desktop:*//app'` and the same with
+  `*chatterang-desktop://app` both printed that and exited 1. The note does not
+  mention quoting.
