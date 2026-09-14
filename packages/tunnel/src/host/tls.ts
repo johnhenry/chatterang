@@ -13,8 +13,16 @@
  * paired phone authenticates with a device credential (`./credential.ts`), and
  * the operator token is one person reaching their own machine, not a phone.
  *
- * THIS FILE IMPORTS NOTHING, which is what lets the server re-export it without
- * its binding growing a dependency on anything the tunnel's listener needs.
+ * THIS FILE IMPORTS NOTHING, AND THAT IS HALF OF WHAT KEEPS THE LISTENER OUT OF
+ * THE SERVER'S BUNDLE. The server reaches it through `@chatterang/tunnel/host`
+ * — the package's exports are pinned by `tests/layering.test.ts` and name no
+ * `./host/tls` — so TypeScript and esbuild both load `host/index.ts` to get
+ * here. The other half is `"sideEffects": false` in this package's manifest:
+ * without it esbuild keeps every module that entry imports for its top-level
+ * statements, and the server bundle carried the wire codec and
+ * `credential.ts`'s module-load `randomBytes` for two exports it never used.
+ * Measured with `node apps/server/scripts/build.mjs`: with the flag, the
+ * tunnel's only code in `apps/server/build/server.mjs` is this file.
  */
 
 /**

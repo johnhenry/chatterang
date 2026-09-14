@@ -98,6 +98,14 @@
  * shared pieces moved sideways into `packages/tunnel/src/host/tls.ts`, a file
  * that imports nothing, and the operator token and the cookie helpers stayed
  * here, where #135 says they belong.
+ *
+ * THE IMPORT IS THE HOST ENTRY, NOT `tls.ts`. The tunnel package exports no
+ * `./host/tls` subpath (its export list is pinned in `tests/layering.test.ts`),
+ * so typechecking this file loads the listener's module too. The BUNDLE does
+ * not carry it: `packages/tunnel/package.json` declares `"sideEffects": false`,
+ * so esbuild keeps only the code these names use — `tls.ts` — and none of the
+ * listener, the codec or the credential registry. `tls.ts`'s header records
+ * the measurement.
  */
 import { LOOPBACK_HOST } from '@chatterang/tunnel/host';
 import type { TlsMaterial } from '@chatterang/tunnel/host';
@@ -400,9 +408,10 @@ export function parseArgv(argv: readonly string[]): ServerArgv {
       }
       default: {
         // `src/lib/platform.ts:unreachable`, inlined because this module
-        // imports nothing from the app — only the loopback literal and the TLS
-        // brand it shares with the tunnel: a compile error when the union widens, and a
-        // refusal rather than a guess if a value arrives anyway.
+        // imports nothing from the app. Its one import is
+        // `@chatterang/tunnel/host`, for the loopback literal and the TLS brand
+        // it shares with the tunnel. A compile error when the union widens, and
+        // a refusal rather than a guess if a value arrives anyway.
         const unhandled: never = spec.arity;
         throw new Error(`chatterang server: unhandled arity ${String(unhandled)} for ${flag}.`);
       }
