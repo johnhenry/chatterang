@@ -1141,18 +1141,36 @@ describe('adding a way off the device forces the public list to change', () => {
  * WHAT IT READS: `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` and
  * `.cjs` under every `apps/<app>/src` and `packages/<package>/src`, comments
  * stripped, for a `.listen(` call, `new WebSocketServer`, an `'upgrade'`
- * handler, a call to `createTunnelHost` or `createTunnelListener`, and any
- * import of `net`, `dgram` or `ws`.
+ * handler, any import of `net`, `dgram` or `ws`, and a CALL to a function that
+ * listens: `createTunnelHost`, `createTunnelListener` and the server's
+ * `startServer`.
+ *
+ * WHY A CALL COUNTS, and not only the `.listen(` inside it: a socket written
+ * once is opened wherever its factory is called. `startServer` holds the
+ * bridge's `.listen(`, so Electron main importing `@chatterang/server` and
+ * calling it would open a second bridge while this still read one `.listen(`
+ * in `index.ts`. Its one caller today, `main.ts`, is in the inventory for that
+ * reason, and a test below holds the `.listen(` inside `startServer`, so moving
+ * it into a function with another name cannot retire the name quietly.
  *
  * WHAT IT SKIPS ON PURPOSE: `packages/tunnel/src/host`, the sanctioned
- * implementation. It reaches a user only by being called, and the call from an
- * app is what this counts.
+ * implementation. It reaches a user only by being called, so every runtime
+ * export it has is named below as one that listens or one that binds nothing.
+ * A new export fails until it is placed on one side — otherwise an attach mode
+ * for #158 exported under a new name, and called from `apps/server`, would
+ * open a socket nothing here counts.
  *
  * WHAT IT CANNOT SEE, so a green run is not read as more than it is:
  *
  *   - a listener in another process: a spawned binary handed a `--port`, or
  *     whatever `fork`/`utilityProcess` starts from a file outside these
  *     directories;
+ *   - a dependency that opens a socket by itself when constructed or called —
+ *     an mDNS responder for #222, say — unless it is reached through `net`,
+ *     `dgram` or `ws` in these directories;
+ *   - the callers of a NEW wrapper around one of the counted calls. The
+ *     wrapper's own call is counted where it is written, so the checklist fires
+ *     then; who calls the wrapper afterwards is not;
  *   - any other file type — Swift, Kotlin, Java, C/C++, a native Capacitor
  *     plugin, a shell script;
  *   - any other directory: `src/` (the webview bundle, which cannot bind, and
@@ -1166,6 +1184,22 @@ describe('a listening socket forces the privacy copy to change', () => {
   const SCANNED = /\.(?:[cm]?[jt]s|[jt]sx)$/;
   const SANCTIONED = 'packages/tunnel/src/host/';
 
+  /**
+   * Functions that open a socket when called, counted at every call site.
+   * `createTunnelListener` is the name #158's listener/tunnel split is planned
+   * to export; it is matched already, so that change only has to add it to
+   * HOST_EXPORTS below.
+   */
+  const LISTENING_FACTORIES = ['createTunnelHost', 'createTunnelListener', 'startServer'] as const;
+
+  /**
+   * Every runtime export of the skipped host, and whether calling it can listen.
+   * Types are not listed: a type opens nothing and cannot be called.
+   */
+  const HOST_EXPORTS: Readonly<Record<string, 'listens' | 'binds nothing'>> = {
+    createTunnelHost: 'listens',
+  };
+
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [
     ['.listen(', /\.\s*listen\s*\(/g],
     ['new WebSocketServer', /\bnew\s+(?:[\w$]+\s*\.\s*)*WebSocketServer\b/g],
@@ -1173,10 +1207,39 @@ describe('a listening socket forces the privacy copy to change', () => {
       "an 'upgrade' handler",
       /\.\s*(?:on|once|addListener|prependListener|prependOnceListener)\s*\(\s*['"`]upgrade['"`]/g,
     ],
-    ['createTunnelHost(', /\bcreateTunnelHost\s*\(/g],
-    ['createTunnelListener(', /\bcreateTunnelListener\s*\(/g],
+    // A declaration is not a call: `function startServer(` opens nothing.
+    ...LISTENING_FACTORIES.map(
+      (name) =>
+        [`${name}(`, new RegExp(String.raw`(?<!\bfunction\s*\*?\s*)\b${name}\s*\(`, 'g')] as const,
+    ),
   ];
   const LISTENING_MODULE = /^(?:node:)?(?:net|dgram)$|^ws(?:\/|$)/;
+
+  /**
+   * The names a module exports that exist at runtime, plus a marker for an
+   * export this cannot name (`export *`, an anonymous default), so an unnamed
+   * door fails the comparison instead of passing it.
+   */
+  function runtimeExports(source: string): string[] {
+    const code = codeOf(source);
+    const declared = [
+      ...code.matchAll(
+        /\bexport\s+(?:default\s+)?(?:async\s+)?(?:const\s+enum\b|function\b\s*\*?|class\b|const\b|let\b|var\b|enum\b)\s*([\w$]+)/g,
+      ),
+    ].map((match) => match[1] ?? '');
+    const listed = [...code.matchAll(/\bexport\s*(type\s+)?\{([^}]*)\}/g)]
+      .filter((match) => match[1] === undefined)
+      .flatMap((match) => (match[2] ?? '').split(','))
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== '' && !/^type\s/.test(entry))
+      .map((entry) => entry.split(/\s+as\s+/).pop() ?? entry);
+    const unnamed = [
+      ...code.matchAll(
+        /\bexport\s*\*|\bexport\s+default\s+(?!(?:async\s+)?(?:function\b\s*\*?\s*[\w$]|class\s+[\w$]))/g,
+      ),
+    ].map((match) => match[0].trim().replace(/\s+/g, ' '));
+    return [...new Set([...declared, ...listed, ...unnamed])].sort();
+  }
 
   /** Every listen-capable construct in one file's code, one entry per occurrence. */
   function listenSites(source: string): string[] {
@@ -1258,6 +1321,57 @@ describe('a listening socket forces the privacy copy to change', () => {
     expect(sites).toContain("import 'ws'");
   });
 
+  it('names every runtime export of the host it skips, so a new one cannot be called unseen', () => {
+    const host = scanned.filter(sanctioned);
+    const exported = [
+      ...new Set(host.flatMap((file) => runtimeExports(readFileSync(file, 'utf8')))),
+    ].sort();
+    expect(
+      exported,
+      `${SANCTIONED} exports something this inventory has not classified. The host is skipped, so ` +
+        'an app calling a new export would open a socket nothing here counts. Add it to ' +
+        'HOST_EXPORTS in the same change: as "listens", with its name in LISTENING_FACTORIES, or ' +
+        'as "binds nothing".',
+    ).toEqual(Object.keys(HOST_EXPORTS).sort());
+    for (const [name, kind] of Object.entries(HOST_EXPORTS)) {
+      if (kind === 'listens') expect(LISTENING_FACTORIES, name).toContain(name);
+    }
+
+    // The reader is measured, not trusted: it has to see each way to export a
+    // runtime name, and to refuse to name what it cannot.
+    for (const [source, names] of [
+      ['export async function createTunnelHost(options = {}) {}', ['createTunnelHost']],
+      ['export interface TunnelHost {}\nexport type TunnelClose = 1;', []],
+      ["export const LOOPBACK_HOST = '127.0.0.1';", ['LOOPBACK_HOST']],
+      ["export { attach as attachTunnel, type Attach } from './attach.js';", ['attachTunnel']],
+      ["export type { TlsMaterial } from './tls.js';", []],
+      ["export * from './listener.js';", ['export *']],
+      ['export default (server) => server.listen(0);', ['export default']],
+      ['/* export function attachTunnel() {} */', []],
+    ] as const) {
+      expect(runtimeExports(source), source).toEqual(names);
+    }
+  });
+
+  it('holds the bridge’s .listen( inside startServer, so counting its callers counts the bridge', () => {
+    // The inventory reads `main.ts -> startServer(` as the bridge being opened.
+    // That stays true only while the `.listen(` is in `startServer`'s body: in
+    // a function with another name, THAT name's callers open the socket.
+    const bridge = scanned.find((file) => repoPath(file) === 'apps/server/src/index.ts');
+    const code = codeOf(readFileSync(bridge!, 'utf8'));
+    const start = code.indexOf('export async function startServer(');
+    const end = code.indexOf('\n}\n', start);
+    const listens = [...code.matchAll(/\.\s*listen\s*\(/g)].map((match) => match.index);
+    expect(start, 'apps/server/src/index.ts no longer declares startServer').toBeGreaterThanOrEqual(0);
+    expect(listens.length).toBeGreaterThan(0);
+    for (const at of listens) {
+      expect(
+        at > start && at < end,
+        `a .listen( in apps/server/src/index.ts sits outside startServer; count that function's callers`,
+      ).toBe(true);
+    }
+  });
+
   it('the matcher sees each way to listen, and not a comment or an import that opens nothing', () => {
     for (const form of [
       'server.listen(port, host)',
@@ -1268,6 +1382,7 @@ describe('a listening socket forces the privacy copy to change', () => {
       'server.once("upgrade", h)',
       'await createTunnelListener(b)',
       'const host = await createTunnelHost()',
+      'const running = await startServer({ binding })',
       "import net from 'node:net'",
       "import { createSocket } from 'dgram'",
       "const { WebSocketServer } = await import('ws')",
@@ -1286,6 +1401,9 @@ describe('a listening socket forces the privacy copy to change', () => {
       "socket.on('message', h)",
       "window.addEventListener('message', h)",
       "import { toWsUrl } from './ws-url'",
+      // Declaring the factory, or importing it, opens nothing; calling it does.
+      'export async function startServer(options: ServerOptions): Promise<RunningServer> {',
+      "import { startServer } from './index.js'",
     ]) {
       expect(listenSites(opensNothing), opensNothing).toEqual([]);
     }
@@ -1296,8 +1414,13 @@ describe('a listening socket forces the privacy copy to change', () => {
       .filter((file) => !sanctioned(file))
       .flatMap((file) =>
         listenSites(readFileSync(file, 'utf8')).map((site) => `${repoPath(file)} -> ${site}`),
-      );
-    expect(inventory, CHECKLIST).toEqual(['apps/server/src/index.ts -> .listen(']);
+      )
+      .sort();
+    // The bridge's socket, and the one place that opens it.
+    expect(inventory, CHECKLIST).toEqual([
+      'apps/server/src/index.ts -> .listen(',
+      'apps/server/src/main.ts -> startServer(',
+    ]);
   });
 });
 
