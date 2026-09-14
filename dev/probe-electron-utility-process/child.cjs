@@ -3,14 +3,15 @@
 // It speaks the inference host's wire shape: `boot` on start, `pong` for a
 // `ping`, and a `ret` for any `call`. A few call methods make it die in the
 // ways a real host can: on its own, by abort, by an unhandled throw, by a V8
-// fatal error, or by wedging its event loop so only a kill can end it.
+// heap-limit out-of-memory, by a V8 API fatal error (the one Electron reports
+// as 'error'), or by wedging its event loop so only a kill can end it.
 const port = process.parentPort;
 if (port === undefined) {
   console.error('probe child: no parentPort; run it through main.cjs');
   process.exit(1);
 }
 
-function die(method) {
+function die(method, options) {
   switch (method) {
     case 'exitSelf':
       setImmediate(() => process.exit(3));
@@ -49,6 +50,16 @@ function die(method) {
       });
       return true;
     }
+    case 'v8ApiFatal': {
+      // A failed V8 API check, from fatal-api.c's load-time constructor. V8
+      // hands it to the embedder's fatal error handler, which in Electron's
+      // utility process reports it to main as UtilityProcess 'error' and then
+      // crashes this process. dlopen never returns. If it throws instead (no
+      // such file, a symbol that did not resolve), that is an unhandled throw,
+      // and the scenario shows an exit with no 'error'.
+      setImmediate(() => process.dlopen({ exports: {} }, options.addon));
+      return true;
+    }
     default:
       return false;
   }
@@ -62,7 +73,7 @@ port.on('message', (event) => {
     return;
   }
   if (message.k === 'call') {
-    if (die(message.method)) {
+    if (die(message.method, message.args?.[0] ?? {})) {
       port.postMessage({ k: 'ret', id: message.id, ok: true, data: { dying: message.method } });
       return;
     }

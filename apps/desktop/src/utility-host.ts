@@ -3,7 +3,7 @@
  *
  * It lives outside `main.ts` for the same reason `permissions.ts` does:
  * `main.ts` cannot be imported by a test, and this is logic. It imports no
- * Electron. It is typed against the four `UtilityProcess` members it uses, so
+ * Electron. It is typed against the `UtilityProcess` members it uses, so
  * `tests/desktop-utility-host.test.ts` drives it over a fake process.
  *
  * WHY IT IS A LATCH AND NOT A TRY/CATCH. Measured with
@@ -43,6 +43,38 @@
  * with `HANDLE_LOST`. A post that would have crashed main, or been dropped
  * into a dead process and left its call waiting, becomes a settled
  * `HANDLE_LOST`.
+ *
+ * A V8 FATAL ERROR IS THE SAME LOSS, ONE DISPATCH EARLIER. When the child hits
+ * a non-continuable V8 error, Electron emits the experimental `'error'` event,
+ * `('FatalError', location, report)`, and then `'exit'`. Measured (a failed V8
+ * API check in the child; a heap-limit out-of-memory emits no `'error'`):
+ *
+ *   - `'error'` is a plain `EventEmitter` emit in main. With NO listener it
+ *     throws `ERR_UNHANDLED_ERROR` out of Electron's native callback into
+ *     main's `uncaughtException`. `main.ts` installs no handler for that, so
+ *     Electron's default one shows a modal error box, and main's JavaScript
+ *     stalled inside it: the `'exit'` that followed was never seen, and so
+ *     the supervisor would never have heard the host was gone.
+ *   - `'exit'` followed `'error'` within 3 ms in every run.
+ *   - A post and a `kill()` made from inside the `'error'` dispatch both
+ *     survived, 11 of 11 each. See the probe README.
+ *
+ * So the adapter listens for `'error'` itself, first, with `on` and not
+ * `once`, so no emit can find it gone. It marks the process exited, the same
+ * latch `'exit'` sets, so no post reaches Electron from then on, and it reports
+ * the close to every `onClose` listener at once, so pending calls settle as
+ * `HANDLE_LOST` even if the `'exit'` never comes. Each listener is told once:
+ * the `'exit'` that follows is the same loss, not a second one.
+ *
+ * It reads none of the event's arguments. The report is a Node diagnostic
+ * report of the child: its environment variables, working directory, command
+ * line (with the model directory) and stacks. None of it is kept, logged, or
+ * put in the close reason, which becomes a message renderers are shown.
+ *
+ * A fatal error does NOT stop `kill`. Until `'exit'` is dispatched there may
+ * be a process to terminate, and `#retire` kills the host it gives up on, in
+ * this same dispatch, so that a replacement never runs beside a host that
+ * reported its end and did not reach it.
  */
 
 import type { HostHandle } from './bridge/protocol.js';
@@ -51,6 +83,7 @@ import type { HostHandle } from './bridge/protocol.js';
 export interface UtilityProcessLike {
   postMessage(message: unknown): void;
   on(event: 'message', listener: (message: unknown) => void): unknown;
+  on(event: 'error', listener: (type: string, location: string, report: string) => void): unknown;
   once(event: 'exit', listener: (code: number) => void): unknown;
   kill(): boolean;
 }
@@ -58,17 +91,32 @@ export interface UtilityProcessLike {
 /** The start of the message a post to an exited host throws with. */
 export const HOST_EXITED = 'the inference host has exited';
 
+/** The close reason for a host whose process reported a V8 fatal error. */
+const FATAL_ERROR = 'fatal V8 error';
+
 /**
  * Build the handle the supervisor talks to one forked utility process through.
  *
  * MUST be called in the same synchronous turn as `utilityProcess.fork`, before
- * anything else listens for `'exit'`. EventEmitter runs listeners in the order
- * they were registered, and the latch is only first if it is registered first.
+ * anything else listens for `'exit'` or `'error'`. EventEmitter runs listeners
+ * in the order they were registered, and the latch is only first if it is
+ * registered first.
  */
 export function utilityHostHandle(child: UtilityProcessLike): HostHandle {
+  // Set by the fatal error or the exit, whichever is dispatched first. No post
+  // reaches Electron once it is set.
   let exited = false;
+  // Set by the exit alone. Until then there may still be a process to kill.
+  let reaped = false;
+  const fatalListeners: Array<(reason: string) => void> = [];
+
+  child.on('error', () => {
+    exited = true;
+    for (const tell of [...fatalListeners]) tell(FATAL_ERROR);
+  });
   child.once('exit', () => {
     exited = true;
+    reaped = true;
   });
 
   return {
@@ -83,15 +131,23 @@ export function utilityHostHandle(child: UtilityProcessLike): HostHandle {
         child.on('message', (message: unknown) => listener(message));
       },
       onClose: (listener) => {
-        child.once('exit', (code: number) => listener(`exit code ${code}`));
+        let told = false;
+        const tell = (reason: string): void => {
+          if (told) return;
+          told = true;
+          listener(reason);
+        };
+        fatalListeners.push(tell);
+        child.once('exit', (code: number) => tell(`exit code ${code}`));
       },
     },
     // Idempotent and safe after exit, as `HostHandle` requires. The call that
     // matters is the one for a host declared lost while its process is still
     // running: an unanswered ping means wedged, not dead, and a wedged host
-    // still holds the GPU its replacement is about to ask for.
+    // still holds the GPU its replacement is about to ask for. A host that
+    // reported a fatal error is in the same position until its exit arrives.
     kill: () => {
-      if (exited) return;
+      if (reaped) return;
       child.kill();
     },
   };

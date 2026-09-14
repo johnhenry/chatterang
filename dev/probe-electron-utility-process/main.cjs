@@ -20,7 +20,13 @@
 // --bare installs NO uncaughtException listener, so an exception that escapes
 // is handled by Electron's own default. The default run installs one to RECORD
 // what escapes. main.ts installs none.
+//
+// The FatalError scenarios load fatal-api.c into the child, built with the
+// system C compiler into a temporary directory, to reach Electron's
+// experimental UtilityProcess 'error' event. See that file for why a heap-limit
+// out-of-memory does not.
 const { app, utilityProcess } = require('electron');
+const { execFileSync } = require('node:child_process');
 const { mkdtempSync, rmSync, writeSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
@@ -80,9 +86,36 @@ let nextId = 1;
 const call = (method, extra) => ({ k: 'call', id: nextId++, plugin: 'LlamaCpp', method, args: [{ requestId: `probe-${nextId}`, handle: 'h', prompt: 'p', ...extra }] });
 const ping = () => ({ k: 'ping', id: nextId++ });
 
+// Temporary directories to remove when the run ends.
+const TEMP_DIRS = [];
+let addonPath;
+/** fatal-api.c, built once per run, only by a scenario that needs it. */
+function fatalApiAddon() {
+  if (addonPath) return addonPath;
+  if (process.platform === 'win32') throw new Error('fatal-api.c is built with a POSIX cc; not on win32');
+  const dir = mkdtempSync(join(tmpdir(), 'probe-utilproc-addon-'));
+  TEMP_DIRS.push(dir);
+  const outFile = join(dir, 'fatal-api.node');
+  const flags = process.platform === 'darwin' ? ['-bundle', '-undefined', 'dynamic_lookup'] : ['-shared', '-fPIC'];
+  execFileSync('cc', [...flags, '-o', outFile, join(__dirname, 'fatal-api.c')], { stdio: ['ignore', 'ignore', 'pipe'] });
+  addonPath = outFile;
+  return outFile;
+}
+
+/** The top-level keys of a FatalError's diagnostic report. Never its values. */
+function reportKeys(report) {
+  try {
+    return Object.keys(JSON.parse(String(report)));
+  } catch {
+    return 'not JSON';
+  }
+}
+
 /**
  * One forked child plus everything observed about it. `errorListener` decides
- * whether an 'error' listener is attached — main.ts attaches none.
+ * whether an 'error' listener is attached, and what it does: false (none, as
+ * main.ts on main), 'record', 'post' (posts from inside the dispatch) or
+ * 'kill' (calls child.kill() from inside it).
  */
 async function fork(name, { errorListener = false, execArgv } = {}) {
   const modelRoot = mkdtempSync(join(tmpdir(), 'probe-utilproc-'));
@@ -101,6 +134,11 @@ async function fork(name, { errorListener = false, execArgv } = {}) {
     const emit = child.emit;
     child.emit = function (event, ...args) {
       state.events.push({ at: ms(), event: String(event) });
+      // Recorded before the emit, which throws if nobody listens for 'error'.
+      if (event === 'error') {
+        state.errorSeen = true;
+        state.errorAt ??= ms();
+      }
       return emit.call(this, event, ...args);
     };
   }
@@ -118,7 +156,13 @@ async function fork(name, { errorListener = false, execArgv } = {}) {
   });
   child.on('message', (message) => state.messages.push(message?.k));
   if (errorListener) {
-    child.on('error', (type, location, report) => state.errorEvents.push({ type, location, reportBytes: String(report ?? '').length }));
+    child.on('error', (type, location, report) => {
+      state.errorSeen = true;
+      state.errorAt ??= ms();
+      state.errorEvents.push({ at: ms(), type, location, exitedYet: state.exited, reportBytes: String(report ?? '').length, reportKeys: reportKeys(report) });
+      if (errorListener === 'post') post(state, 'in error handler', ping());
+      if (errorListener === 'kill') state.killInErrorReturned = child.kill();
+    });
   }
   const booted = new Promise((resolve) => child.on('message', (m) => m?.k === 'boot' && resolve(true)));
   const ok = await Promise.race([booted, sleep(10_000).then(() => false)]);
@@ -134,7 +178,7 @@ async function fork(name, { errorListener = false, execArgv } = {}) {
 }
 
 function post(state, label, message) {
-  const record = { label, beforeExit: !state.exited, at: ms() };
+  const record = { label, beforeExit: !state.exited, afterError: Boolean(state.errorSeen), at: ms() };
   try {
     const returned = state.child.postMessage(message);
     record.threw = false;
@@ -311,19 +355,43 @@ const scenarios = {
     post(s, 'same tick as kill', call('generate'));
     await burstAcrossExit(s, 'burst');
   },
-  async 'V8 fatal error, WITH an error listener'(s) {
+  async 'V8 heap-limit out of memory, WITH an error listener'(s) {
     post(s, 'the call that is fatal', call('fatal'));
     await burstAcrossExit(s, 'burst', 500);
   },
-  async 'V8 fatal error, NO error listener (as main.ts)'(s) {
+  async 'V8 heap-limit out of memory, NO error listener'(s) {
     post(s, 'the call that is fatal', call('fatal'));
     await burstAcrossExit(s, 'burst', 500);
+  },
+  // A failed V8 API check in the child (fatal-api.c): the error V8 reports
+  // through the embedder's fatal error handler, which is what Electron turns
+  // into UtilityProcess 'error' ('FatalError', location, report).
+  async 'V8 API fatal error (FatalError), WITH an error listener'(s) {
+    post(s, 'the call that is fatal', call('v8ApiFatal', { addon: fatalApiAddon() }));
+    await burstAcrossExit(s, 'burst', 500);
+  },
+  async 'V8 API fatal error (FatalError), NO error listener (as main.ts on main)'(s) {
+    post(s, 'the call that is fatal', call('v8ApiFatal', { addon: fatalApiAddon() }));
+    await burstAcrossExit(s, 'burst', 500);
+  },
+  // No burst in these two, so the only post or kill near the death is the one
+  // made from inside the 'error' dispatch.
+  async 'V8 API fatal error (FatalError), post inside the error listener'(s) {
+    post(s, 'the call that is fatal', call('v8ApiFatal', { addon: fatalApiAddon() }));
+    await waitExit(s);
+  },
+  async 'V8 API fatal error (FatalError), kill() inside the error listener'(s) {
+    post(s, 'the call that is fatal', call('v8ApiFatal', { addon: fatalApiAddon() }));
+    await waitExit(s);
   },
 };
 
 const OPTIONS = {
-  'V8 fatal error, WITH an error listener': { errorListener: true, execArgv: ['--max-old-space-size=16'] },
-  'V8 fatal error, NO error listener (as main.ts)': { execArgv: ['--max-old-space-size=16'] },
+  'V8 heap-limit out of memory, WITH an error listener': { errorListener: 'record', execArgv: ['--max-old-space-size=16'] },
+  'V8 heap-limit out of memory, NO error listener': { execArgv: ['--max-old-space-size=16'] },
+  'V8 API fatal error (FatalError), WITH an error listener': { errorListener: 'record' },
+  'V8 API fatal error (FatalError), post inside the error listener': { errorListener: 'post' },
+  'V8 API fatal error (FatalError), kill() inside the error listener': { errorListener: 'kill' },
 };
 
 function summarise(state) {
@@ -344,8 +412,12 @@ function summarise(state) {
     returned: [...new Set(posts.map((p) => p.returned).filter(Boolean))],
     events: counts,
     errorEvents: state.errorEvents,
+    errorEmitted: Boolean(state.errorSeen),
+    errorToExitMs: state.errorAt != null && state.exitAt != null ? state.exitAt - state.errorAt : null,
+    postsAfterErrorBeforeExit: posts.filter((p) => p.afterError && p.beforeExit).length,
     killReturned: state.killReturned,
     killAgainReturned: state.killAgainReturned,
+    killInErrorReturned: state.killInErrorReturned,
     pidInHandler: state.pidInHandler,
     labels: [...new Set(posts.map((p) => `${p.label}${p.beforeExit ? ' [before exit]' : ' [after exit]'}`))],
     stderrFirst: state.stderrFirst,
@@ -400,7 +472,9 @@ async function main() {
 
 app.whenReady().then(async () => {
   if (process.platform === 'darwin') app.dock?.hide();
-  const cleanUp = () => rmSync(USER_DATA, { recursive: true, force: true });
+  const cleanUp = () => {
+    for (const dir of [USER_DATA, ...TEMP_DIRS]) rmSync(dir, { recursive: true, force: true });
+  };
   if (LIST) {
     out('PROBE_LIST ' + JSON.stringify(Object.keys(scenarios)));
     cleanUp();

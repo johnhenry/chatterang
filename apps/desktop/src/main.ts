@@ -329,11 +329,15 @@ function spawnInferenceHost(engineName: string): HostHandle {
   child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`${tag} ${chunk}`));
 
   // THROUGH THE ADAPTER, and in this same turn, before anything listens for
-  // 'exit'. Measured on Electron 44 (dev/probe-electron-utility-process):
+  // 'exit' or 'error'. Measured on Electron 44 (dev/probe-electron-utility-process):
   // `postMessage` never throws for a dead child, but a post made from inside
   // its 'exit' dispatch killed this process with SIGSEGV. The adapter marks
   // the child exited in the first 'exit' listener and refuses every post after
   // that, and the supervisor settles a refused post as HANDLE_LOST.
+  // A V8 fatal error in the child arrives first as 'error', which with no
+  // listener throws into this process and leaves Electron's modal error box
+  // blocking it. The adapter is that listener: it latches the same way and
+  // reports the loss at once. Nothing here may listen for either event.
   return utilityHostHandle(child);
 }
 

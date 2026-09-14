@@ -5,9 +5,22 @@ Run (from the repo root):
 ```bash
 node dev/probe-electron-utility-process/run.cjs                       # every scenario, one Electron each
 node dev/probe-electron-utility-process/run.cjs --match=inside --repeat=10
+node dev/probe-electron-utility-process/run.cjs --match='V8 API fatal error' --repeat=10
+node dev/probe-electron-utility-process/run.cjs --match='NO error listener (as main.ts on main)' \
+  --bare --limit=15000                                                # Electron's own exception handler
 node_modules/.bin/electron dev/probe-electron-utility-process/main.cjs \
   --only='kill, post same tick' -ApplePersistenceIgnoreState YES     # one scenario, directly
 ```
+
+`--bare` installs no `uncaughtException` listener in main, so Electron's
+default handler deals with anything that escapes, as it would in the app.
+Without it, the probe installs one to record what escapes. `--limit=MS` sets
+how long a stalled run gets before `run.cjs` samples it with macOS `sample`,
+names the blocking frames it finds, and SIGKILLs it.
+
+The FatalError scenarios compile `fatal-api.c` with the system `cc` into a
+temporary directory, so they need a C compiler (Xcode's command line tools on
+macOS). No binary is committed.
 
 `main.cjs` forks `child.cjs` the way `apps/desktop/src/main.ts` forks the
 inference host: `utilityProcess.fork`, the same two argv entries, a
@@ -68,8 +81,10 @@ made before and after the probe's first `'exit'` listener ran.
 | kill, 1000 posts same tick, then burst | survived | never | 1001 / 170 | none | nothing |
 | kill, 20 x 5 MB posts across exit | survived | never | 2 / 23 | none | nothing |
 | wedged child, kill() (the condemn path) | survived | never | 4 / 168 | none | nothing |
-| V8 heap-limit fatal error, WITH an error listener | survived | never | 6670 / 429 | none (exit code 5) | nothing |
-| V8 heap-limit fatal error, NO error listener (as main.ts) | survived | never | 4413 / 434 | none (exit code 5) | nothing |
+| V8 heap-limit out of memory, WITH an error listener | survived | never | 6670 / 429 | none (exit code 5) | nothing |
+| V8 heap-limit out of memory, NO error listener | survived | never | 4413 / 434 | none (exit code 5) | nothing |
+
+The `FatalError` scenarios have their own section below.
 
 Every exit-handler scenario ten more times (`run.cjs --match='exit handler'
 --repeat=10`), each in a fresh Electron:
@@ -111,6 +126,7 @@ native code called from JavaScript, under `node::InternalMakeCallback`, which
 is how the `'exit'` event reaches JavaScript. Symbol names in the release
 binary's crash report are nearest-export guesses and say nothing more
 specific. Three reports, from two runs, have the same address and shape.
+The crash is reported upstream as electron/electron#53923.
 
 ## What each result decided
 
@@ -148,11 +164,96 @@ specific. Three reports, from two runs, have the same address and shape.
   `'exit'` never came, the liveness ping would condemn the host within
   `pingIntervalMs + pingTimeoutMs`. Both paths are tested against the real
   `Supervisor`.
-- **A V8 heap-limit fatal error emitted no `'error'` event.** It exited with
-  code 5, with and without a listener, so a missing `'error'` listener in
-  `main.ts` did not surface as an uncaught exception here. The documented
-  `FatalError` path itself was not reached. This probe did not measure whether
-  an unlistened `'error'` would escape.
+- **A V8 heap-limit out-of-memory emits no `'error'` event.** It exited with
+  code 5, with and without a listener. That is not the `FatalError` path, as
+  the next section shows. An error that does take that path emits `'error'`,
+  and with no listener it escapes into main.
+
+## A V8 fatal error: `UtilityProcess` `'error'` (`FatalError`)
+
+### What emits it, from Electron 44.0.0's source
+
+- The utility process installs `V8FatalErrorCallback` as V8's fatal error
+  handler (`shell/services/node/node_service.cc`, `SetFatalErrorHandler`,
+  overriding the handler `NodeBindings` set). The callback builds a Node
+  diagnostic report, sends `OnV8FatalError(location, report)` to main, and then
+  writes through a null pointer to crash the child.
+- In main, `UtilityProcessWrapper::OnV8FatalError` calls
+  `EmitWithoutEvent("error", "FatalError", location, report)`
+  (`shell/browser/api/electron_api_utility_process.cc`).
+- `ForkUtilityProcess` (`lib/browser/api/utility-process.ts`) extends Node's
+  `EventEmitter`. It replaces the native handle's `emit`, special-cases
+  `'exit'`, `'stdout'` and `'stderr'`, and forwards everything else, `'error'`
+  included, to `this.emit(channel, ...args)`. So `'error'` is a plain
+  `EventEmitter` `'error'` in main. With no listener, `EventEmitter#emit`
+  throws `ERR_UNHANDLED_ERROR`, from inside a native callback.
+- Electron's main-process bootstrap (`lib/browser/init.ts`) installs a default
+  `uncaughtException` listener. If no one else has installed one, it shows
+  `dialog.showErrorBox('A JavaScript error occurred in the main process', …)`.
+  `main.ts` installs none.
+
+A heap-limit out-of-memory does not reach that handler: Node installs its own
+OOM handler, and the child exits with code 5. What does reach it is an error V8
+reports through the fatal error handler, such as a failed API check.
+`fatal-api.c` makes one: `v8::api_internal::ToLocalEmpty()`, the check behind
+`MaybeLocal<T>::ToLocalChecked()` on an empty handle, which Electron Framework
+exports. `child.cjs` loads it with `process.dlopen` when asked for
+`v8ApiFatal`.
+
+### Measured — Electron 44.0.0, Chrome 152.0.7977.54, Node 24.18.1, darwin-arm64
+
+One run of each scenario, then ten more of each (`--repeat=10`), each in a
+fresh Electron. The `--bare` rows are separate runs. "Error to exit" is the gap
+between main seeing `'error'` and seeing `'exit'`.
+
+| scenario | runs | `'error'` emitted | child exit code | error to exit | main process | escaped into main |
+|---|---|---|---|---|---|---|
+| WITH an error listener | 11 | 11 | 11 (SIGSEGV) | 0–1 ms | survived 11 | nothing |
+| NO error listener, probe records exceptions | 11 | 11 | 11 | 0–3 ms | survived 11 | `uncaughtException` `ERR_UNHANDLED_ERROR` "Unhandled error. ('FatalError')", 11 of 11 |
+| NO error listener, `--bare` (Electron's default handler, as `main.ts` on main) | 3 | - | - | - | **stalled 3 of 3**, sampled in `runModal` / `NSAlert`; its `'exit'` step never ran; SIGKILLed at 15–20 s | (to the error box) |
+| WITH an error listener, `--bare` (control) | 3 | 3 | 11 | - | survived 3 | nothing |
+| post inside the error listener | 11 | 11 | 11 | 1–2 ms | survived 11; the post returned `undefined` | nothing |
+| `kill()` inside the error listener | 11 | 11 | 0 | 0–1 ms | survived 11; `kill()` returned `true` 11 of 11 | nothing |
+
+The location was `v8::ToLocalChecked` every time. The report was about 117 KB
+of JSON with the top-level keys `header`, `javascriptStack`, `javascriptHeap`,
+`nativeStack`, `resourceUsage`, `uvthreadResourceUsage`, `libuv`, `workers`,
+`environmentVariables`, `userLimits` and `sharedObjects`. The probe records
+those key names and the size, never the values. A child killed from inside the
+listener exited with code 0 because Electron reports a killed child's SIGTERM
+as 0.
+
+### What each result decided
+
+- **An unlistened `'error'` does escape into main.** It is an `EventEmitter`
+  `'error'`, and it threw `ERR_UNHANDLED_ERROR` into main's `uncaughtException`
+  in every run. With no handler of the app's own, as in `main.ts`, Electron's
+  default handler opened a modal error box, and main's JavaScript stopped
+  inside it. The `'exit'` that followed within milliseconds was not delivered
+  to JavaScript before the runner killed main, 15 to 20 seconds later. In the
+  app, the supervisor would not learn the host was gone, and every pending
+  call would wait on someone dismissing a box. What happens after the box is
+  dismissed was not measured.
+- **The control shows the listener is the whole difference.** The same `--bare`
+  run with an `'error'` listener survived 3 of 3.
+- **So `apps/desktop/src/utility-host.ts` listens for `'error'`.** It does so
+  first, in the same turn as the fork, with `on` and not `once`. The listener
+  marks the child exited, the same latch `'exit'` sets, so no post reaches
+  Electron after it. It reports the close to every `onClose` listener at once,
+  so pending calls settle as `HANDLE_LOST` without waiting for `'exit'`, and
+  the `'exit'` that follows is not reported as a second loss. It reads none of
+  the arguments: the report carries the child's environment variables and
+  command line.
+- **`kill()` stays live until `'exit'`.** `Supervisor#retire` kills the host it
+  gives up on, from inside that dispatch, and `kill()` inside the `'error'`
+  listener survived 11 of 11. A process that reported a fatal error and never
+  exited is terminated, not left running beside its replacement.
+- **A post inside the `'error'` dispatch did not crash main (11 of 11)**, unlike
+  one inside `'exit'`. The adapter refuses it anyway: the child is about to
+  crash, and the post could go nowhere.
+- **Not shown here:** other platforms; other Electron versions; and whether
+  every kind of V8 fatal error takes this path. A Node `CHECK` or
+  `process.abort()` does not: the abort scenarios above emitted no `'error'`.
 
 ## Gotchas found while building it
 
@@ -173,3 +274,11 @@ specific. Three reports, from two runs, have the same address and shape.
 - **`app.on('child-process-gone')` is not a substitute for `'exit'`** for this
   purpose. The probe records it, but the supervisor's contract is the
   `UtilityProcess` `'exit'`.
+- **A `--bare` run whose exception escapes puts an error box on screen.** It
+  is Electron's default `uncaughtException` handler, and it blocks main until
+  the runner kills it. A release build's `sample` shows `runModal` and
+  `NSAlert`, not `ShowErrorBox`, because that symbol is not exported.
+- **A heap-limit out-of-memory is not a `FatalError`.** Shrinking
+  `--max-old-space-size` ends the child through Node's OOM handler, with exit
+  code 5 and no `'error'`. Reaching `'error'` takes an error V8 reports through
+  its fatal error handler. `fatal-api.c` uses a failed API check.
