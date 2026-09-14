@@ -86,6 +86,19 @@ export type TurnId = string;
  */
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The WebSocket close code a listener refuses a connection with when it is
+ * already holding as many tunnels as its caller allowed (#169).
+ *
+ * In 4000-4999, the range RFC 6455 leaves to applications and `ws` accepts;
+ * 4000 plus HTTP's 503, which is what the refusal is. It lives HERE rather than
+ * in the host because the client has to recognise it and may not import the
+ * host half. Without a number both ends share, a refusal reaches the phone as
+ * PEER_GONE — a pulled cable mid-stream, which is neither what happened nor
+ * something a screen can explain.
+ */
+export const TUNNEL_CAP_CLOSE_CODE = 4503;
+
 /** Frames that belong to one turn, and carry its id. */
 export type TurnFrame =
   /** A turn going up. `body` is the request; the codec decides what may cross. */

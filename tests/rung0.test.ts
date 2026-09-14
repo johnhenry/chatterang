@@ -496,4 +496,68 @@ describe('the listener lifecycle', () => {
     open.push(host);
     expect(() => host.server.emit('error', new Error('after listen'))).toThrow('after listen');
   });
+
+  it('the single-tunnel host sends to the peer it admitted', async () => {
+    /*
+     * The host is a listener capped at one tunnel now, so `send` forwards to
+     * that tunnel. Every other test here streams through the GREETING, which a
+     * forward that went nowhere would leave undisturbed.
+     */
+    const { host, client } = await pair();
+    await host.send(chunk(0, 'the '));
+    await host.close();
+    expect(textOf(await drain(client.receive()))).toBe('the ');
+  });
+
+  it('the single-tunnel host stops accepting once its tunnel ends', async () => {
+    /*
+     * RUNG 0's HOST IS ONE TUNNEL'S LIFETIME, and the socket now agrees. It
+     * used to keep listening after its tunnel ended, so a late peer completed
+     * a handshake onto a tunnel that would never read another frame, and the
+     * port reported "on" while serving nothing. ECONNREFUSED is the honest
+     * answer.
+     */
+    const host = await createTunnelHost({});
+    open.push(host);
+    const { port } = host.server.address() as AddressInfo;
+
+    const { WebSocket: RawSocket } = await import('ws');
+    const connect = () =>
+      new Promise<InstanceType<typeof RawSocket>>((resolve, reject) => {
+        const peer = new RawSocket(`ws://127.0.0.1:${port}`);
+        open.push({ close: async () => peer.terminate() });
+        peer.on('open', () => resolve(peer));
+        peer.on('error', reject);
+      });
+
+    (await connect()).terminate();
+    await host.closed;
+    expect(host.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
+
+    await expect(connect()).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+  });
+
+  it('the single-tunnel host receives from the peer it admitted', async () => {
+    // The mirror of `sends to the peer it admitted`. No other test here reads
+    // `host.receive()`, so a forward that yielded nothing would pass them all.
+    const { host, client } = await pair();
+    await client.send(chunk(0, 'up the wire'));
+    await client.close();
+    expect(textOf(await drain(host.receive()))).toBe('up the wire');
+    expect(host.ended()).toEqual({ kind: 'clean' });
+  });
+
+  it('a host closed before any peer arrives ends clean, and says so', async () => {
+    /*
+     * The one path with no tunnel behind it. `closed` must still resolve and
+     * `receive()` must still end, or a caller that shuts down an unused host
+     * waits forever for a peer that is never coming.
+     */
+    const host = await createTunnelHost({});
+    open.push(host);
+    await host.close('never used');
+    await host.closed;
+    expect(host.ended()).toEqual({ kind: 'clean', reason: 'never used' });
+    expect(await drain(host.receive())).toEqual([]);
+  });
 });
