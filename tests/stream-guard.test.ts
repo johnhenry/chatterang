@@ -209,6 +209,75 @@ describe('isMessage', () => {
   });
 });
 
+describe('one count per turn, not per tunnel (#7)', () => {
+  const chunkOf = (turn: string, sequence: number, type = 'content'): TunnelFrame => ({
+    v: TUNNEL_WIRE_VERSION,
+    kind: 'chunk',
+    turn,
+    body:
+      type === 'done'
+        ? { type, sequence, finishReason: 'stop', message: { role: 'assistant', content: 'x' } }
+        : { type, sequence, delta: 'x' },
+  });
+
+  it('counts each turn’s stream from 0, however they interleave', () => {
+    /*
+     * RED BEFORE THE CORRECTION. One count per tunnel read t2's 0 as a repeat
+     * of t1's, so a second turn on the same socket failed as SEQUENCE_BROKEN.
+     */
+    const guard = createSequenceGuard();
+    expect(guard.check(chunkOf('t1', 0))).toBeNull();
+    expect(guard.check(chunkOf('t2', 0))).toBeNull();
+    expect(guard.check(chunkOf('t1', 1))).toBeNull();
+    expect(guard.check(chunkOf('t2', 1, 'done'))).toBeNull();
+  });
+
+  it('still finds a gap inside one turn when another turn is between', () => {
+    const guard = createSequenceGuard();
+    guard.check(chunkOf('t1', 0));
+    guard.check(chunkOf('t2', 0));
+    expect(guard.check(chunkOf('t1', 2))).toEqual({ kind: 'gap', expected: 1, got: 2 });
+  });
+
+  it('knows which turn ended, and that a tunnel ended only when every turn did', () => {
+    const guard = createSequenceGuard();
+    guard.check(chunkOf('t1', 0, 'done'));
+    guard.check(chunkOf('t2', 0));
+    expect(guard.sawTerminal('t1')).toBe(true);
+    expect(guard.sawTerminal('t2')).toBe(false);
+    expect(guard.sawTerminal('never')).toBe(false);
+    expect(guard.sawTerminal()).toBe(false);
+    guard.check(chunkOf('t2', 1, 'done'));
+    expect(guard.sawTerminal()).toBe(true);
+  });
+
+  it('resumes a turn at the number its first frame carries, and only an unseen turn', () => {
+    const resumed = createSequenceGuard();
+    resumed.resume('t1');
+    expect(resumed.check(chunkOf('t1', 7, 'done'))).toBeNull();
+    expect(resumed.sawTerminal('t1')).toBe(true);
+
+    // Never from below 0.
+    const negative = createSequenceGuard();
+    negative.resume('t1');
+    expect(negative.check(chunkOf('t1', -1))).toEqual({ kind: 'repeat', sequence: -1 });
+
+    // A stream already counted cannot be restarted by asking.
+    const counted = createSequenceGuard();
+    counted.check(chunkOf('t1', 0));
+    counted.resume('t1');
+    expect(counted.check(chunkOf('t1', 5))).toEqual({ kind: 'gap', expected: 1, got: 5 });
+  });
+
+  it('forgets a turn’s count when told to', () => {
+    const guard = createSequenceGuard();
+    guard.check(chunkOf('t1', 0, 'done'));
+    guard.forget('t1');
+    expect(guard.sawTerminal('t1')).toBe(false);
+    expect(guard.check(chunkOf('t1', 0))).toBeNull();
+  });
+});
+
 describe('every fault has a sentence', () => {
   it('and none of them blames the model', () => {
     const faults = [

@@ -41,6 +41,18 @@
  * outbound promise, landing in the same change as the start path (#221,
  * #158). A listener that carries turns also waits on #7's background
  * substrate, per #169's ruling.
+ *
+ * WHAT #7 HAS HERE, AND WHAT IT DOES NOT. The wire now has #7's vocabulary —
+ * `waiting`, `prompt` and `answer`, `attach` and `ack`, and the refusal codes
+ * in `REFUSALS` — and every tunnel checks each frame against its turn's state
+ * in both directions (`createProtocolGate` in `stream/`). A frame from the peer
+ * that is outside that state is dropped unread and answered `FRAME_UNEXPECTED`;
+ * one this end tries to send outside it throws. That is the wire's part of #7
+ * and all of it. The wait list, the prompt timeout, held results, replacing a
+ * device's stale socket, and settling turns on quit and on suspend belong to
+ * the desktop's work broker, and none of those exists yet. Nothing here sends
+ * a refusal of its own accord: which refusal a host sends, and when, is the
+ * app's to decide, and no app has decided.
  */
 
 import { createServer } from 'node:http';
@@ -50,7 +62,7 @@ import type { Duplex } from 'node:stream';
 import { clearTimeout, setTimeout } from 'node:timers';
 
 import type { ClaimOutcome, PairingWindow, PairingWindows } from '../pairing/index.js';
-import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
+import { assertSendable, createProtocolGate, faultMessage } from '../stream/index.js';
 import {
   MAX_FRAME_BYTES,
   TUNNEL_CAP_CLOSE_CODE,
@@ -416,10 +428,12 @@ export interface TunnelListenerOptions {
    * {@link MAX_PAIRING_TUNNELS}, enforced the same way, so a connection that
    * presented nothing can never hold a paired phone's slot.
    *
-   * WHAT IS NOT HERE: replacing a device's stale socket with its new one, the
-   * #169 recommendation this does not build. Device identity exists now
-   * (`admission.deviceId`), so it is buildable; it is not built. Until it is, a
-   * reconnecting phone needs a free slot while its old socket times out.
+   * WHAT IS NOT HERE: replacing a device's stale socket with its new one. That
+   * was a #169 recommendation and is now the owner's ruling on #7 (ruling 4).
+   * Device identity exists now (`admission.deviceId`), so it is buildable; it
+   * is not built. Until it is, a reconnecting phone needs a free slot while its
+   * old socket times out. The frames it will use to collect a held result,
+   * `attach` and `ack`, exist on the wire.
    */
   readonly maxTunnels: number;
 }
@@ -481,7 +495,8 @@ function openTunnel(
   let closingStarted = false;
   /** Set in the turn this tunnel's device is revoked. */
   let revoked = false;
-  const guard = createSequenceGuard();
+  // This tunnel's own turn state and sequence counts: see `createProtocolGate`.
+  const gate = createProtocolGate();
 
   let settle!: () => void;
   const closed = new Promise<void>((resolve) => {
@@ -537,11 +552,11 @@ function openTunnel(
     socket.close(refused.closeCode, refused.closeCode === TUNNEL_PAIRING_CLOSED_CLOSE_CODE ? 'pairing closed' : 'pairing only');
   };
 
+  // A device tunnel's greeting goes through the gate like every other send, so
+  // it is held to the same obligations and counted in the same turn state as
+  // what follows it. A pairing tunnel gets none.
   if (admission.kind === 'device') {
-    for (const frame of greeting) {
-      assertSendable(frame);
-      socket.send(encodeFrame(frame));
-    }
+    for (const frame of greeting) socket.send(gate.send(frame));
   }
 
   socket.on('message', (data: Buffer) => {
@@ -572,8 +587,8 @@ function openTunnel(
       finish({ kind: 'clean', reason: frame.body?.reason });
       return;
     }
-    // BEFORE the inbox and before the sequence guard: a frame a pairing tunnel
-    // may not carry is never read into anything.
+    // BEFORE the inbox and before the gate: a frame a pairing tunnel may not
+    // carry is never read into anything.
     const refused = refusal(frame);
     if (refused) {
       refuse(refused);
@@ -588,10 +603,21 @@ function openTunnel(
       });
       return;
     }
+    /*
+     * A FRAME OUTSIDE ITS TURN'S STATE IS REFUSED, NOT PROCESSED (#7). It never
+     * reaches `receive()`, so nothing that reads this tunnel can act on an
+     * answer to a prompt that expired, a second attach, or a `waiting` a phone
+     * had no business sending. The peer is told which frame went nowhere, and
+     * the tunnel stays open: see `InboundVerdict` on why a race is not a cut.
+     */
+    const verdict = gate.receive(frame);
+    if (verdict.verdict === 'refuse') {
+      if (socket.readyState === socket.OPEN) socket.send(gate.send(verdict.reply));
+      return;
+    }
     // Contiguity, enforced. See the client's, which carries the argument.
-    const fault = guard.check(frame);
-    if (fault) {
-      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(fault) });
+    if (verdict.verdict === 'fault') {
+      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(verdict.fault) });
       socket.close();
       return;
     }
@@ -652,7 +678,7 @@ function openTunnel(
         refuse(refused);
         throw new Error(`tunnel: ${refused.message}`);
       }
-      socket.send(encodeFrame(frame));
+      socket.send(gate.send(frame));
     },
     async *receive() {
       for (;;) {
