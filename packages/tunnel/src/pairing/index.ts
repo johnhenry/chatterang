@@ -484,9 +484,10 @@ export function encodePairingUri(payload: PairingPayload): string {
 /* ── fitting a host's addresses into the budget (#127) ────────────────── */
 
 /**
- * How likely a phone is to reach an address as this payload carries it, most
- * likely first. {@link PAIRING_REACH_ORDER} is the order; see
- * {@link fitPairingPayload} for why it is this one.
+ * How likely a phone is to reach an address as this payload carries it.
+ * {@link PAIRING_REACH_ORDER} is the order a code carries them in, most likely
+ * first. `unroutable` is not in that order, because no code carries one. See
+ * {@link fitPairingPayload} for why the order is this one.
  */
 export type PairingReach =
   | 'private-ipv4'
@@ -494,7 +495,8 @@ export type PairingReach =
   | 'public-ipv4'
   | 'public-ipv6'
   | 'dns-name'
-  | 'unusable';
+  | 'link-local'
+  | 'unroutable';
 
 export const PAIRING_REACH_ORDER: readonly PairingReach[] = [
   'private-ipv4',
@@ -502,7 +504,7 @@ export const PAIRING_REACH_ORDER: readonly PairingReach[] = [
   'public-ipv4',
   'public-ipv6',
   'dns-name',
-  'unusable',
+  'link-local',
 ];
 
 /**
@@ -514,31 +516,44 @@ export function pairingAddressReach(address: PairingAddress): PairingReach {
   if (address.kind === ADDRESS_IPV4 && v.length === 4) {
     const [a, b] = [v[0]!, v[1]!];
     if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 'private-ipv4';
-    if (a === 0 || a === 127 || (a === 169 && b === 254) || a >= 224) return 'unusable';
+    if (a === 169 && b === 254) return 'link-local';
+    if (a === 0 || a === 127 || a >= 224) return 'unroutable';
     return 'public-ipv4';
   }
   if (address.kind === ADDRESS_IPV6 && v.length === 16) {
     if ((v[0]! & 0xfe) === 0xfc) return 'unique-local-ipv6';
-    if (v[0] === 0xfe && (v[1]! & 0xc0) === 0x80) return 'unusable';
-    if (v[0] === 0xff) return 'unusable';
+    if (v[0] === 0xfe && (v[1]! & 0xc0) === 0x80) return 'link-local';
+    if (v[0] === 0xff) return 'unroutable';
     let zeroes = 0;
     for (let i = 0; i < 15; i += 1) if (v[i] === 0) zeroes += 1;
-    if (zeroes === 15 && (v[15] === 0 || v[15] === 1)) return 'unusable';
+    if (zeroes === 15 && (v[15] === 0 || v[15] === 1)) return 'unroutable';
     return 'public-ipv6';
   }
-  if (address.kind === ADDRESS_DNS) return isMulticastDnsName(address) ? 'unusable' : 'dns-name';
-  return 'unusable';
+  if (address.kind === ADDRESS_DNS) return isMulticastDnsName(address) ? 'link-local' : 'dns-name';
+  // A malformed address. fitPairingPayload refuses it before asking.
+  return 'unroutable';
 }
 
 /** Why a payload could not be fitted into the budget at all. */
 export type PairingFitReason =
   /**
-   * Even the single most reachable address, beside the whole name, is over
-   * {@link MAX_PAIRING_URI_LENGTH}. Only a long DNS name can do it: the name is
-   * at most 64 bytes, and one IP address of either family always fits beside
-   * it, so this is a host whose every address is a name.
+   * Every address the host gave is one no phone can dial: loopback,
+   * unspecified, multicast or reserved. After those are dropped there is
+   * nothing left to put in a code, and the format needs at least one address.
    */
-  'no-address-fits';
+  | 'no-usable-address'
+  /**
+   * The most reachable address alone, beside the whole name, is over
+   * {@link MAX_PAIRING_URI_LENGTH}. Only a DNS name is that long. The name is
+   * at most 64 bytes, and one IP address of either family always fits beside
+   * it (an IPv6 address beside a 64-byte name is 226 characters), while a DNS
+   * name of 70 bytes or more does not. So this happens when no address ranks
+   * above the names (none private, unique-local or public) and the first name
+   * is too long to sit beside the device name. It happens EVEN IF a shorter
+   * name or a link-local address later in the order would fit alone, because
+   * addresses are dropped strictly from the end.
+   */
+  | 'no-address-fits';
 
 export class PairingFitError extends Error {
   override readonly name = 'PairingFitError';
@@ -579,40 +594,71 @@ export class PairingFitError extends Error {
  *   5. `dns-name` — a name costs the phone a lookup through whatever resolver
  *      it has, may resolve to any of the above, and costs 2 + its length bytes
  *      where an address costs 6 or 18, so dropping one frees the most room.
- *   6. `unusable` — what a phone cannot use AS CARRIED, dropped before anything
- *      else. IPv6 link-local (fe80::/10) is here, not beside the ULA as the
- *      ruling's summary put it, and the codec is why: an address holds sixteen
- *      bytes and no zone index, so a link-local address arrives with its
- *      interface left to chance — the reason `typed.ts` refuses a zone
+ *   6. `link-local` — what a phone can use only by luck AS CARRIED, so it is
+ *      dropped before anything else and carried only when there is room. IPv6
+ *      link-local (fe80::/10) is here, not beside the ULA as the ruling's
+ *      summary put it, and the codec is why: an address holds sixteen bytes
+ *      and no zone index, so a link-local address arrives with its interface
+ *      left to chance — the reason `typed.ts` refuses a zone
  *      (`zone-index-unsupported`) and `apps/server/src/addresses.ts` never
  *      advertises fe80::/10 at all. With it: IPv4 link-local 169.254/16 (DHCP
- *      failed, per the same file), loopback 127/8 and ::1, the unspecified
- *      0/8 and ::, multicast and reserved IPv4 224/3 and IPv6 ff00::/8, and a
- *      `.local` name ({@link isMulticastDnsName}: v1 resolves no mDNS).
+ *      failed, per the same file), and a `.local` name, whose multicast DNS is
+ *      link-scoped and which v1 does not resolve ({@link isMulticastDnsName}).
  *
  * Classes 1–4 are the ranks `apps/server/src/addresses.ts` already gives the
  * addresses a headless server advertises, restated because this half imports
  * nothing; `tests/tunnel-pairing-fit.test.ts` holds the two to the same order.
+ *
+ * NEVER AN ADDRESS NO PHONE CAN DIAL, whether or not there is room. Class
+ * `unroutable` is dropped before ranking: loopback 127/8 and ::1 (on the phone
+ * they name the phone), the unspecified 0/8 and :: (bind addresses, not
+ * places to dial), and multicast and reserved IPv4 224/3 and IPv6 ff00::/8. It
+ * is what `apps/server/src/addresses.ts` leaves out as `internal`, extended to
+ * the ranges a host enumerating its own interfaces would not see there. A
+ * link-local address stays, because on one network it can work.
+ *
+ * ONE OF EACH. A repeated address (the same kind and bytes, a DNS name
+ * compared without ASCII case) reaches nothing the first did not, so only the
+ * first is kept. Otherwise a host that listed one ULA four times would push a
+ * genuinely different route out of a code under pressure.
+ * `apps/server/src/addresses.ts` removes duplicates for the same reason.
  *
  * STRICTLY FROM THE END. A shorter address later in the order is never carried
  * in place of a longer one earlier that does not fit; that would put a less
  * reachable address in the code instead of a more reachable one, which is a
  * reordering the ruling did not make.
  *
- * AT LEAST ONE ADDRESS, because the format requires one (`no-addresses`). If
- * the most reachable address alone does not fit beside the name, this throws
- * {@link PairingFitError} `no-address-fits` rather than returning a code that
- * could not be dialled.
+ * AT LEAST ONE ADDRESS, because the format requires one. A payload with none
+ * is refused as `no-addresses`. One whose every address is unroutable throws
+ * {@link PairingFitError} `no-usable-address`, and one whose most reachable
+ * address does not fit beside the name throws `no-address-fits`. Neither
+ * returns a code that could not be dialled.
  *
- * FAILS CLOSED ON EVERYTHING ELSE. Only `too-long` is fitted. Any other refusal
- * from {@link encodePairingUri} — a bad name, no addresses, more than
- * {@link MAX_ADDRESSES}, a malformed address — is thrown as it is: each is
- * wrong with every smaller payload too, and silently dropping a malformed
- * address would hide a host bug inside a code that happens to scan.
+ * FAILS CLOSED ON EVERYTHING ELSE. Only `too-long` is fitted. Every other
+ * refusal from {@link encodePairingUri} — a bad name, no addresses, more than
+ * {@link MAX_ADDRESSES}, a malformed address — is checked on the payload AS
+ * GIVEN, before anything is dropped, and thrown as it is. Each is wrong with
+ * every smaller payload too, and dropping a malformed address, or counting
+ * the list only after duplicates are gone, would hide a host bug inside a code
+ * that happens to scan.
  */
 export function fitPairingPayload(payload: PairingPayload): PairingPayload {
-  const ranked = payload.addresses
-    .map((address, index) => ({ address, index, rank: PAIRING_REACH_ORDER.indexOf(pairingAddressReach(address)) }))
+  try {
+    encodePairingUri(payload);
+  } catch (error) {
+    if (!(error instanceof PairingParseError) || error.reason !== 'too-long') throw error;
+  }
+
+  const kept: { address: PairingAddress; index: number; rank: number }[] = [];
+  payload.addresses.forEach((address, index) => {
+    const reach = pairingAddressReach(address);
+    if (reach === 'unroutable') return;
+    if (kept.some((entry) => sameAddress(entry.address, address))) return;
+    kept.push({ address, index, rank: PAIRING_REACH_ORDER.indexOf(reach) });
+  });
+  if (kept.length === 0) throw new PairingFitError('no-usable-address');
+
+  const ranked = kept
     // The index breaks ties, so the host's order within a class survives even
     // on an engine whose sort is not stable — V8 before 7.0 was not, and #223
     // is about exactly those runtimes.
@@ -629,6 +675,14 @@ export function fitPairingPayload(payload: PairingPayload): PairingPayload {
     }
     if (count <= 1) throw new PairingFitError('no-address-fits');
   }
+}
+
+/** The same address twice: one kind, the same bytes, a DNS name without ASCII case. */
+function sameAddress(a: PairingAddress, b: PairingAddress): boolean {
+  if (a.kind !== b.kind || a.value.length !== b.value.length) return false;
+  const fold = (c: number): number => (a.kind === ADDRESS_DNS && c >= 0x41 && c <= 0x5a ? c + 0x20 : c);
+  for (let i = 0; i < a.value.length; i += 1) if (fold(a.value[i]!) !== fold(b.value[i]!)) return false;
+  return true;
 }
 
 /**

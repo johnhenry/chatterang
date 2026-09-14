@@ -188,6 +188,15 @@ describe('it drops from the end, only as many as it must, and never the name', (
     const name = 'x'.repeat(MAX_NAME_BYTES);
     expect(reasonOf(() => fitPairingPayload(payload([long, short], name)))).toBe('no-address-fits');
     expect(fitPairingPayload(payload([short, long], name)).addresses).toEqual([short]);
+
+    // The same holds when what comes after the name is a link-local address,
+    // which ranks last and alone would fit: no IP address ranks above the
+    // name, so the name is the most reachable address and it does not fit.
+    const link = at('fe80::1');
+    expect(reasonOf(() => fitPairingPayload(payload([link, long], name)))).toBe('no-address-fits');
+    expect(fitPairingPayload(payload([link], name)).addresses).toEqual([link]);
+    // One IP address that ranks above the names is enough to fit.
+    expect(fitPairingPayload(payload([long, at('2001:db8::1')], name)).addresses).toHaveLength(1);
   });
 });
 
@@ -209,42 +218,54 @@ describe('the order is reachability from a phone', () => {
     ['100.127.255.255', 'public-ipv4'],
     ['8.8.8.8', 'public-ipv4'],
     ['223.255.255.255', 'public-ipv4'],
-    ['224.0.0.251', 'unusable'],
-    ['255.255.255.255', 'unusable'],
-    ['169.254.1.1', 'unusable'],
+    ['224.0.0.251', 'unroutable'],
+    ['240.0.0.1', 'unroutable'],
+    ['255.255.255.255', 'unroutable'],
+    ['169.254.1.1', 'link-local'],
+    ['169.254.255.255', 'link-local'],
     ['169.253.1.1', 'public-ipv4'],
-    ['127.0.0.1', 'unusable'],
-    ['0.0.0.0', 'unusable'],
+    ['169.255.0.1', 'public-ipv4'],
+    ['127.0.0.1', 'unroutable'],
+    ['127.255.255.255', 'unroutable'],
+    ['126.255.255.255', 'public-ipv4'],
+    ['128.0.0.1', 'public-ipv4'],
+    ['0.0.0.0', 'unroutable'],
+    ['0.255.255.255', 'unroutable'],
+    ['1.0.0.0', 'public-ipv4'],
     ['fbff::1', 'public-ipv6'],
     ['fc00::1', 'unique-local-ipv6'],
     ['fdff:ffff::1', 'unique-local-ipv6'],
     ['fe7f::1', 'public-ipv6'],
-    ['fe80::1', 'unusable'],
-    ['febf::1', 'unusable'],
+    ['fe80::1', 'link-local'],
+    ['febf::1', 'link-local'],
     ['fec0::1', 'public-ipv6'],
-    ['ff02::1', 'unusable'],
-    ['::1', 'unusable'],
-    ['::', 'unusable'],
+    ['ff02::1', 'unroutable'],
+    ['feff::1', 'public-ipv6'],
+    ['::1', 'unroutable'],
+    ['::', 'unroutable'],
     ['::2', 'public-ipv6'],
+    ['1::1', 'public-ipv6'],
     ['2001:db8::1', 'public-ipv6'],
   ];
 
   it('classifies each boundary', () => {
     for (const [text, reach] of cases) expect(pairingAddressReach(at(text)), text).toBe(reach);
     expect(pairingAddressReach(dns('desk.tailnet-abcd.ts.net'))).toBe('dns-name');
-    expect(pairingAddressReach(dns('desk.local'))).toBe('unusable');
-    expect(pairingAddressReach(dns('Desk.LOCAL'))).toBe('unusable');
+    expect(pairingAddressReach(dns('desk.local'))).toBe('link-local');
+    expect(pairingAddressReach(dns('Desk.LOCAL'))).toBe('link-local');
+    expect(pairingAddressReach(dns('desk.localhost'))).toBe('dns-name');
   });
 
-  it('is private IPv4, unique-local IPv6, public IPv4, public IPv6, names, then what a phone cannot use', () => {
+  it('is private IPv4, unique-local IPv6, public IPv4, public IPv6, names, then link-local, and never the unroutable', () => {
     expect(PAIRING_REACH_ORDER).toEqual([
       'private-ipv4',
       'unique-local-ipv6',
       'public-ipv4',
       'public-ipv6',
       'dns-name',
-      'unusable',
+      'link-local',
     ]);
+    expect(PAIRING_REACH_ORDER).not.toContain('unroutable');
   });
 
   const PRIVATE = at('192.168.1.4');
@@ -278,7 +299,7 @@ describe('the order is reachability from a phone', () => {
       // Within a class, the host's order stands.
       const hostOrder = (a: string, b: string) => name(host).indexOf(a) < name(host).indexOf(b);
       expect(hostOrder(got[2]!, got[3]!), `public IPv4 in ${name(host).join(',')}`).toBe(true);
-      expect(hostOrder(got[6]!, got[7]!), `unusable in ${name(host).join(',')}`).toBe(true);
+      expect(hostOrder(got[6]!, got[7]!), `link-local in ${name(host).join(',')}`).toBe(true);
     }
     expect(name(fitPairingPayload(payload(orderings[0]!)).addresses)).toEqual(expected);
   });
@@ -346,8 +367,89 @@ describe('everything but the budget fails closed', () => {
      * happens to scan is how it would never be found.
      */
     const broken: PairingAddress = { kind: ADDRESS_IPV4, value: Uint8Array.of(192, 168, 1, 4, 0) };
-    expect(pairingAddressReach(broken)).toBe('unusable');
+    expect(pairingAddressReach(broken)).toBe('unroutable');
     const over = payload([...MEASURED_ADDRESSES.slice(0, 4), broken], 'x'.repeat(MAX_NAME_BYTES));
     expect(reasonOf(() => fitPairingPayload(over))).toBe('bad-address-length');
+    // And with room to spare, where it would be dropped as unroutable instead.
+    expect(reasonOf(() => fitPairingPayload(payload([LAN, broken])))).toBe('bad-address-length');
+    const emptyName: PairingAddress = { kind: ADDRESS_DNS, value: new Uint8Array(0) };
+    expect(reasonOf(() => fitPairingPayload(payload([LAN, emptyName])))).toBe('bad-address-length');
+  });
+
+  it('counts the addresses as given, before duplicates or unroutable ones are dropped', () => {
+    const nine = [...Array.from({ length: MAX_ADDRESSES }, () => LAN), at('127.0.0.1')];
+    expect(reasonOf(() => fitPairingPayload(payload(nine)))).toBe('too-many-addresses');
+    expect(fitPairingPayload(payload(nine.slice(0, MAX_ADDRESSES))).addresses).toEqual([LAN]);
+  });
+});
+
+describe('a code never carries an address no phone can dial, or the same address twice', () => {
+  const UNROUTABLE = ['127.0.0.1', '127.1.2.3', '::1', '0.0.0.0', '::', '224.0.0.251', '239.255.255.250', '240.0.0.1', '255.255.255.255', 'ff02::1'];
+
+  it('drops loopback, unspecified, multicast and reserved addresses even when there is room for them', () => {
+    const host = [at('127.0.0.1'), LAN, at('::1'), at('0.0.0.0'), at('::'), at('224.0.0.251'), at('ff02::1'), ULA];
+    const fitted = fitPairingPayload(payload(host));
+    expect(label(fitted.addresses)).toEqual(['LAN', 'ULA']);
+    expect(encodePairingUri(fitted).length).toBeLessThan(MAX_PAIRING_URI_LENGTH);
+    // The control: every one of them is a well-formed address the encoder
+    // would carry, so the fitter is what keeps them out.
+    expect(reasonOf(() => encodePairingUri(payload(host)))).toBeNull();
+  });
+
+  it('keeps what can work on one network, when there is room: link-local of both families and a .local name', () => {
+    const LINK4 = at('169.254.10.20');
+    const MDNS = dns('desk.local');
+    const name = labeller({ LAN, LINK, LINK4, MDNS });
+    expect(name(fitPairingPayload(payload([MDNS, LINK4, at('127.0.0.1'), LINK, LAN])).addresses)).toEqual([
+      'LAN',
+      'MDNS',
+      'LINK4',
+      'LINK',
+    ]);
+  });
+
+  it('refuses, naming why, when every address is one no phone can dial', () => {
+    for (const text of UNROUTABLE) {
+      expect(reasonOf(() => fitPairingPayload(payload([at(text)]))), text).toBe('no-usable-address');
+    }
+    expect(reasonOf(() => fitPairingPayload(payload(UNROUTABLE.slice(0, MAX_ADDRESSES).map(at))))).toBe('no-usable-address');
+    const error = (() => {
+      try {
+        fitPairingPayload(payload([at('127.0.0.1')]));
+        return null;
+      } catch (caught) {
+        return caught;
+      }
+    })();
+    expect(error).toBeInstanceOf(PairingFitError);
+    // The control: one address a phone could reach is enough.
+    expect(label(fitPairingPayload(payload([at('127.0.0.1'), LINK])).addresses)).toEqual(['LINK']);
+  });
+
+  it('keeps the first of a repeated address, so a repeat cannot push a different route out', () => {
+    const tight = 'x'.repeat(MAX_NAME_BYTES);
+    const ULA_B = at('fd00::1');
+    const ULA_C = at('fd00:0:0:0:0:0:0:1'); // the same sixteen bytes, written another way
+    const ULA_D = at('fd00::1');
+    const PUBLIC6 = at('2001:db8::1');
+    const name = labeller({ LAN, ULA_B, ULA_C, ULA_D, PUBLIC6 });
+
+    const fitted = fitPairingPayload(payload([ULA_B, ULA_C, ULA_D, ULA_B, LAN, PUBLIC6], tight));
+    expect(name(fitted.addresses)).toEqual(['LAN', 'ULA_B', 'PUBLIC6']);
+    expect(fitted.addresses[1]).toBe(ULA_B);
+    // The control: without the repeats the same three fit, so it was the
+    // repeats, not the budget, that would have cost PUBLIC6 its place.
+    expect(name(fitPairingPayload(payload([ULA_B, LAN, PUBLIC6], tight)).addresses)).toEqual(['LAN', 'ULA_B', 'PUBLIC6']);
+    // And the same bytes under a different kind are not a repeat.
+    expect(fitPairingPayload(payload([at('10.0.0.1'), dns('\n\0\0')])).addresses).toHaveLength(2);
+  });
+
+  it('treats a DNS name as the same name in any ASCII case, and keeps the host’s spelling of the first', () => {
+    const upper = dns('Desk.Example.COM');
+    const lower = dns('desk.example.com');
+    const other = dns('desk.example.org');
+    const fitted = fitPairingPayload(payload([upper, lower, other]));
+    expect(fitted.addresses).toEqual([upper, other]);
+    expect(fitted.addresses[0]).toBe(upper);
   });
 });
