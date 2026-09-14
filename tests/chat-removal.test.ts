@@ -569,6 +569,9 @@ describe('a chat deleted while a turn is running in it', () => {
 
       let removing: Promise<void> = Promise.resolve();
       let sending: Promise<void> = Promise.resolve();
+      // Read before the cleanup below answers whatever is still up, which would
+      // empty the list whether or not the delete or Stop took the sheet down.
+      let sheetsOnceSettled: number | undefined;
       try {
         toolRegistry.register(probe.tool);
         engine.router.replace(QWEN.engine, recordingBackend([MCP_CALL, 'Done.']).adapter);
@@ -579,13 +582,14 @@ describe('a chat deleted while a turn is running in it', () => {
         if (how === 'deleted') removing = useChats.getState().removeChat(id);
         else useChats.getState().stop();
         await Promise.all([removing, sending]);
+        sheetsOnceSettled = useApp.getState().approvals.length;
       } finally {
         for (const approval of useApp.getState().approvals) useApp.getState().answerApproval(approval.id, false);
         await Promise.all([removing, sending]);
         toolRegistry.unregister(probe.tool.id);
       }
 
-      expect(useApp.getState().approvals, 'the sheet is taken down').toEqual([]);
+      expect(sheetsOnceSettled, 'the sheet is taken down').toBe(0);
       expect(probe.call, 'nothing left for the call').not.toHaveBeenCalled();
       if (how === 'deleted') {
         expect(rowsFor(id), 'no row carries the not-sent record back').toEqual([]);
