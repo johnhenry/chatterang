@@ -426,6 +426,21 @@ describe('CSP_PRODUCTION', () => {
     }),
   );
 
+  /**
+   * ONE CLAUSE PER DIRECTIVE, OR THE PINS BELOW MAY READ THE WRONG ONE.
+   *
+   * The Map above keeps the LAST clause of a repeated name. A browser keeps one
+   * and ignores the others, and nothing here shows it keeps the same one. So
+   * `"connect-src *"` written above the real clause passed every test in this
+   * file, the exact #284 pin included, because the pin read the clause after
+   * it. Whichever copy a browser honours, a repeated directive in a literal
+   * policy is a mistake.
+   */
+  it('names each directive exactly once', () => {
+    const names = CSP_PRODUCTION.split('; ').map((part) => part.split(' ')[0]);
+    expect(names).toEqual([...new Set(names)]);
+  });
+
   it('locks scripts to self with no inline escape hatch', () => {
     // `'unsafe-inline'` in script-src would make the rest of this policy
     // decorative.
@@ -497,8 +512,17 @@ describe('CSP_PRODUCTION', () => {
       'data:',
       'https://fonts.gstatic.com',
     ]);
+    // Nor any other blanket scheme. `http:`, now in connect-src (#284), is the
+    // one most likely to be copied in beside it, and in img-src it would reopen
+    // the markdown-image exfiltration over plain http. A check for `https:`
+    // alone let that through. `data:` and `blob:` are the only schemes these
+    // directives carry, and neither names a host.
     for (const directive of ['style-src', 'font-src', 'img-src', 'script-src', 'default-src']) {
-      expect(directives.get(directive), directive).not.toContain('https:');
+      const schemes = (directives.get(directive) ?? []).filter((v) => /^[a-z][a-z0-9+.-]*:$/.test(v));
+      expect(
+        schemes.filter((scheme) => scheme !== 'data:' && scheme !== 'blob:'),
+        directive,
+      ).toEqual([]);
     }
     // And there are exactly two, so a third arriving is a decision someone has
     // to make on purpose.
