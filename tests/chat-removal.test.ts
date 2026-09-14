@@ -995,7 +995,10 @@ describe('a chat deleted while something is written to its thread', () => {
     await macrotask();
     expect(signals, 'while the rename is still being written').toEqual([]);
     // Nor put on screen: no reply being written appears in a chat going away.
-    expect(useChats.getState().messages.map((message) => message.id)).toEqual(['queued_turn_user']);
+    // The regeneration never started, so it discarded nothing, and the thread
+    // is as it was until the delete lands.
+    expect(useChats.getState().messages.some((message) => message.streaming)).toBe(false);
+    expect(useChats.getState().messages.map((message) => message.id)).toEqual(['queued_turn_user', 'queued_turn_reply']);
     expect(useChats.getState().generating).toBe(false);
 
     fake.release('chats.put');

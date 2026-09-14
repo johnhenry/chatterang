@@ -767,16 +767,20 @@ export const useChats = create<ChatState>((set, get) => ({
     const target = messages[index];
     if (!target || target.role !== 'assistant') return;
 
-    // Everything after this assistant turn is discarded; the turn itself is
-    // kept so its previous text becomes a variant the user can flip back to.
-    const removed = messages.slice(index + 1);
-    for (const message of removed) await deleteMessageRow(message.id);
-
     const chatId = get().activeChatId;
     if (!chatId) return;
 
+    // Everything after this assistant turn is discarded; the turn itself is
+    // kept so its previous text becomes a variant the user can flip back to.
+    //
+    // ONLY ONCE A TURN HAS STARTED. They were deleted first, and the turn once
+    // `runGeneration` returned, whether or not it had started anything. One that
+    // could not start — no model, a chat being deleted — replaced them with
+    // nothing: the turn and what came after it were gone from disk and screen,
+    // an MCP receipt saying arguments went included.
+    const removed = messages.slice(index + 1);
     set({ messages: messages.slice(0, index) });
-    await runGeneration(set, get, {
+    const ran = await runGeneration(set, get, {
       chatId,
       overrideModelId,
       // Not `target.content`. What is carried forward is the whole generation
@@ -785,8 +789,18 @@ export const useChats = create<ChatState>((set, get) => ({
       // words.
       previousVariants: generationsSoFar(target),
       replaceMessageId: target.id,
+      // All made in one step. See `beforeEngine`.
+      beforeEngine: async () => {
+        await Promise.all(removed.map((message) => deleteMessageRow(message.id)));
+      },
     });
-    await deleteMessageRow(target.id);
+    if (ran) {
+      await deleteMessageRow(target.id);
+      return;
+    }
+    // Nothing started, so nothing was discarded: the thread goes back on screen
+    // as it was, if it is still the one open.
+    if (get().activeChatId === chatId) set({ messages });
   },
 
   async editMessage(messageId, text) {
@@ -923,29 +937,36 @@ interface RunOptions {
   /** Complete generations this turn has already had — see `generationsSoFar`. */
   previousVariants?: MessageVariant[];
   replaceMessageId?: string;
+  /**
+   * Run once nothing more can refuse the turn, in the same step it is handed to
+   * the engine. What a regeneration discards goes here, so a turn that never
+   * starts discards nothing.
+   */
+  beforeEngine?: () => Promise<void>;
 }
 
+/** Hands one turn to the engine. Resolves true if it did, false if it refused before that. */
 async function runGeneration(
   set: (partial: Partial<ChatState>) => void,
   get: () => ChatState,
   options: RunOptions,
-): Promise<void> {
+): Promise<boolean> {
   const app = useApp.getState();
   const engine = app.engine;
   if (!engine) {
     app.toast('The engine is still starting up.', 'warn');
-    return;
+    return false;
   }
 
   const chat = get().chats.find((entry) => entry.id === options.chatId);
   // Nor in a chat whose delete has been asked for: it stays in the store until
   // the delete lands. See `removedChats`.
-  if (!chat || removedChats.has(chat.id)) return;
+  if (!chat || removedChats.has(chat.id)) return false;
 
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
     app.toast('Choose a model first — none is installed or connected yet.', 'warn');
-    return;
+    return false;
   }
   if (choice.kind === 'refused') {
     // Refused before anything is spent: no placeholder message, no activity
@@ -953,7 +974,7 @@ async function runGeneration(
     // model, and counting it would push a speech model up the "recently used"
     // ordering that the pickers sort by.
     app.toast(choice.message, 'warn');
-    return;
+    return false;
   }
   const { target } = choice;
 
@@ -1027,8 +1048,14 @@ async function runGeneration(
     // here: the engine can still raise a sheet before its first request.
     if (removedChats.has(chat.id)) {
       patch((message) => ({ ...message, streaming: false }));
-      return;
+      return false;
     }
+    // Started, not awaited: an await here would let a delete in between the
+    // check above and the hand-off below. Its writes are made now, and it is
+    // awaited once the stream has ended.
+    const discarding = options.beforeEngine?.();
+    // Only so a stream that throws first does not leave it unhandled.
+    discarding?.catch(() => {});
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -1231,6 +1258,7 @@ async function runGeneration(
           break;
       }
     }
+    await discarding;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Generation failed.';
     const failed: Message = {
@@ -1257,6 +1285,7 @@ async function runGeneration(
       preview: last?.content.slice(0, 120) ?? chatNow.preview,
     }));
   }
+  return true;
 }
 
 /* ── Tool-output egress ──────────────────────────────────────────────── */
