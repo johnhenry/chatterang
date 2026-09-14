@@ -52,6 +52,7 @@ import { readFile } from 'node:fs/promises';
 import { BrowserWindow, Menu, app, dialog, ipcMain, protocol, session, shell, utilityProcess } from 'electron';
 
 import { installPermissionHandlers } from './permissions.js';
+import { utilityHostHandle } from './utility-host.js';
 import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
@@ -327,30 +328,13 @@ function spawnInferenceHost(engineName: string): HostHandle {
   child.stdout?.on('data', (chunk: Buffer) => process.stdout.write(`${tag} ${chunk}`));
   child.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`${tag} ${chunk}`));
 
-  let exited = false;
-  child.once('exit', () => {
-    exited = true;
-  });
-
-  return {
-    link: {
-      postMessage: (message) => child.postMessage(message),
-      onMessage: (listener) => {
-        child.on('message', (message: unknown) => listener(message));
-      },
-      onClose: (listener) => {
-        child.once('exit', (code: number) => listener(`exit code ${code}`));
-      },
-    },
-    // Idempotent and safe after exit, as `HostHandle` requires. The call that
-    // matters is the one for a host declared lost while its process is still
-    // running: an unanswered ping means wedged, not dead, and a wedged host
-    // still holds the GPU its replacement is about to ask for.
-    kill: () => {
-      if (exited) return;
-      child.kill();
-    },
-  };
+  // THROUGH THE ADAPTER, and in this same turn, before anything listens for
+  // 'exit'. Measured on Electron 44 (dev/probe-electron-utility-process):
+  // `postMessage` never throws for a dead child, but a post made from inside
+  // its 'exit' dispatch killed this process with SIGSEGV. The adapter marks
+  // the child exited in the first 'exit' listener and refuses every post after
+  // that, and the supervisor settles a refused post as HANDLE_LOST.
+  return utilityHostHandle(child);
 }
 
 /* ── The menu, and the second door into the dispatch layer ────────────── */
