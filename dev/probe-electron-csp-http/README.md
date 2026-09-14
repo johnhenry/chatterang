@@ -214,16 +214,20 @@ is set from a shell (the Shells residual below). At `capacitor://localhost`, and
 at no other origin, it also says the value is shared with other iOS apps (the
 iOS residual below). Both were ruled by the owner on #284.
 
-On desktop the note reads:
+On desktop the whole note reads:
 
-> Ollama refuses this app until its `OLLAMA_ORIGINS` setting allows it. Add
-> `chatterang-desktop:*//app` to that setting. If it already has a value, put a
-> comma between them, with no spaces. If you set it from a shell, put the value
-> in quotes. Restart Ollama for the change to take effect.
+> A model server on your own machine or network. Requests go to the address you
+> give. Nothing here checks that it is on your network. Ollama refuses this app
+> until its `OLLAMA_ORIGINS` setting allows it. Add `chatterang-desktop:*//app`
+> to that setting. If it already has a value, put a comma between them, with no
+> spaces. If you set it from a shell, put the value in quotes. Restart Ollama for
+> the change to take effect.
 
-On iOS it reads:
+On iOS the whole note reads:
 
-> Ollama refuses this app until its `OLLAMA_ORIGINS` setting allows it. Add
+> A model server on your own machine or network. Requests go to the address you
+> give. Nothing here checks that it is on your network. Ollama refuses this app
+> until its `OLLAMA_ORIGINS` setting allows it. Add
 > `capacitor:*//localhost` to that setting. Other iOS apps built on the same
 > framework send the same origin as this app by default, so this value also lets
 > them reach Ollama if they can reach the machine it runs on. If it already has a
@@ -373,12 +377,36 @@ Residuals:
   shows the value on iOS and says so, at `capacitor://localhost` only. Only a
   distinct `iosScheme` or `hostname` would narrow it; that moves the app's
   stored data to a new origin, and it is not part of this change.
+- **Android, not ruled.** `capacitor.config.ts` sets no `server.androidScheme`
+  or `server.hostname`, and the pinned `@capacitor/android` 8.5.0 defaults them
+  to `https` and `localhost` (`CapConfig.java`), so the app's Android origin is
+  `https://localhost`. That origin is one of Ollama's defaults, so the note
+  shows no value there (200 with nothing set, in the third run). The same
+  default means every other default-configured Capacitor Android app, and any
+  page served at `https://localhost`, reaches an Ollama it can reach with
+  nothing set at all. Ollama's defaults did that before this change. The note
+  says nothing about it on Android, because the ruling gave the shared-origin
+  sentence to `capacitor://localhost` alone. Whether the Android note should
+  say so is left to the owner.
 - **Shells.** The value contains `*`. Typed unquoted as a command argument in
   zsh, macOS's default shell, it stops the command with "no matches found".
   Measured: `zsh -c 'print -r -- chatterang-desktop:*//app'` and the same with
   `*chatterang-desktop://app` both printed that and exited 1. With no matching
   file, `bash -c 'printf "%s\n" chatterang-desktop:*//app'` and
   `sh -c 'printf "%s\n" capacitor:*//localhost'` printed the value unchanged and
-  exited 0, so the failure is zsh's, and loud. The owner ruled that
-  the note says, in platform-neutral words, to put the value in quotes when it is
-  set from a shell. It says so wherever it shows a value, and nowhere else.
+  exited 0, so the failure is zsh's, and loud. An assignment is different.
+  Review ran zsh 5.9 in an empty directory:
+  `export PROBE_ORIGINS=chatterang-desktop:*//app` and
+  `PROBE2=capacitor:*//localhost` each kept the value unchanged and exited 0,
+  while `print -r --` with the value failed as above. zsh's manual agrees: a
+  scalar assignment globs only under `GLOB_ASSIGN`, which is off by default,
+  and `export` parses its arguments as assignments. Ollama's FAQ sets its
+  variables on macOS with `launchctl setenv`, which takes the value as a
+  command argument, so that is the form the advice protects. A prefix
+  assignment (`OLLAMA_ORIGINS=… ollama serve`, the form of the FAQ's
+  browser-extension example) is an assignment too, by the manual, but it was
+  not run. The owner ruled that the note says, in platform-neutral words, to
+  put the value in quotes when it is set from a shell. It says so wherever it
+  shows a value, and nowhere else. Whether `cmd.exe` on Windows keeps the
+  quotes as part of the value was neither run nor checked against
+  documentation.
