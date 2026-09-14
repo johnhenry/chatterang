@@ -1073,25 +1073,80 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     expect(row.variants?.[0]?.toolCalls?.[0]?.receipt?.outcome).toBe('failed');
   });
 
-  it('is not a reason to keep an empty turn when it records a call that was not sent', async () => {
-    // A withheld record says nothing left, so there is no egress for an empty
-    // generation to be the only trace of (#92, OD7).
-    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
+  /*
+   * NOT-SENT RECORDS SURVIVE REGENERATION (#92, owner ruling). The
+   * recommendation was to drop a version whose only records say "not sent"
+   * like any empty reply, since nothing left the device; the owner chose to
+   * keep it. The export prints its records as belonging to a version not
+   * shown — the treatment a version that did send already gets — and once.
+   */
+  it.each([
+    ['not-allowed', 'it was not allowed'],
+    ['declined', 'it could change data there, and was declined'],
+    ['server-changed', 'the server changed before it went'],
+    ['stopped', 'the reply was stopped before it went'],
+  ] as const)('is kept when a turn whose only record says a call was not sent (%s) is regenerated', async (why, reason) => {
+    const withheld: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'withheld', why } };
+    // A turn that wrote nothing but the record, as a stopped or refused one does.
+    script = [
+      { text: '', provenance: ON_DEVICE, tool: withheld },
+      { text: 'NEW ANSWER', provenance: ON_DEVICE },
+    ];
+    await useChats.getState().send('hello');
+    expect(assistantRow().content).toBe('');
+    await useChats.getState().regenerate(assistantRow().id);
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['', 'NEW ANSWER']);
+    expect(row.variantIndex).toBe(1);
+    expect(row.variants?.[0]?.toolCalls?.[0]?.receipt).toEqual(withheld.receipt);
+
+    const transcript = renderTranscript(useChats.getState().chats[0]!, useChats.getState().messages);
+    expect(transcript).toContain(
+      `\n- notes.search was not sent to notes.example (notes) at 2023-11-14 22:13:20 UTC — ${reason} (from a version of this reply not shown).\n`,
+    );
+    expect(transcript.split('notes.example').length - 1, 'printed once').toBe(1);
+  });
+
+  it('is kept when a failed regeneration whose only record says a call was not sent is regenerated again', async () => {
+    // The row shows a generation that was never appended to its list, as in
+    // "is kept when a regeneration that failed after sending is regenerated again".
+    const withheld: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'withheld', why: 'stopped' } };
     useChats.setState({
       messages: [
         USER,
-        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [withheld], provenance: ON_DEVICE },
+        {
+          id: 'msg_a',
+          chatId: 'c1',
+          role: 'assistant',
+          content: '',
+          createdAt: 2,
+          toolCalls: [withheld],
+          error: 'This reply ended before it was complete.',
+          variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
+          variantIndex: 1,
+        },
       ],
     });
     script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
     await useChats.getState().regenerate('msg_a');
 
-    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['FIRST ANSWER', '', 'NEW ANSWER']);
+    expect(row.variants?.[1]?.toolCalls?.[0]?.receipt).toEqual(withheld.receipt);
+
+    const transcript = renderTranscript(useChats.getState().chats[0]!, useChats.getState().messages);
+    expect(transcript).toContain(
+      '\n- notes.search was not sent to notes.example (notes) at 2023-11-14 22:13:20 UTC — the reply was stopped before it went (from a version of this reply not shown).\n',
+    );
+    expect(transcript.split('notes.example').length - 1, 'printed once').toBe(1);
   });
 
   it('is not written down mid-turn when it records a call that was not sent', async () => {
     // The paired control is "is written down while the turn is still running":
-    // the same held-open turn, with a receipt that says something left.
+    // the same held-open turn, with a receipt that says something left. The
+    // ruling that keeps a not-sent record through regeneration does not move it
+    // into this write: it is kept with the row the turn ends on.
     const turn = heldOpen();
     const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
     script = [{ text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, hang: turn.hang }];

@@ -679,13 +679,16 @@ function editedVariant(message: Message, text: string): Message {
  * its own only generation. Empty text is dropped: a turn that failed before it
  * wrote anything is not a version anyone can flip back to.
  *
- * UNLESS IT HANDED SOMETHING TO A SERVER. A generation carrying an MCP receipt
- * is kept with no text, because the receipt is the only record that those
- * bytes left, and regenerating is not a reason to forget that. For the same
- * reason a regeneration that failed or was interrupted — a row whose index is
- * past the end of its list, showing a generation whose record was never
- * appended — is appended here when it carries one. Without a receipt it is
- * dropped, as it always was.
+ * UNLESS IT RECORDS AN MCP CALL. A generation carrying any MCP receipt — sent,
+ * failed or not sent — is kept with no text. A receipt that says bytes may have
+ * left is the only record that they did, and regenerating is not a reason to
+ * forget that. One that says a call was not sent is kept too, by owner ruling
+ * on #92: a stopped or refused turn's earlier version stays in the history with
+ * its not-sent records, and the export prints them as a version not shown. For
+ * the same reasons a regeneration that failed or was interrupted — a row whose
+ * index is past the end of its list, showing a generation whose record was
+ * never appended — is appended here when it carries one. Without a receipt it
+ * is dropped, as it always was.
  */
 function generationsSoFar(target: Message): MessageVariant[] {
   const listed = target.variants;
@@ -699,13 +702,16 @@ function generationsSoFar(target: Message): MessageVariant[] {
 }
 
 /**
- * Did any tool call in this generation hand its arguments to an MCP server?
+ * Does any tool call in this generation record what became of an MCP call?
  *
- * A withheld call did not, so a generation holding only that record is not
- * kept for it: nothing left for the record to be the only trace of.
+ * Any outcome counts, `withheld` included, and so does one a later build added
+ * (#92, owner ruling that not-sent records survive regeneration). This is not
+ * `mayHaveLeft`, which asks whether bytes may have left: that question still
+ * decides the mid-turn write in `runGeneration`, and this ruling does not widen
+ * it.
  */
 function carriesReceipt(variant: MessageVariant): boolean {
-  return variant.toolCalls?.some((call) => mayHaveLeft(call.receipt)) ?? false;
+  return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */
