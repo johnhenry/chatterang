@@ -30,6 +30,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InstalledModel } from '@/db';
 import type { Message, Provenance, ToolInvocation } from '@/domain/chat';
+import type { McpCallReceipt } from '@/domain/mcp';
 
 /* ── The database, stubbed at the table boundary ────────────────────── */
 
@@ -129,6 +130,14 @@ interface Turn {
    * the store has to handle without throwing away what the user already read.
    */
   readonly failWith?: string;
+  /** Hold the turn open BEFORE its tool event until this settles. */
+  readonly beforeTool?: Promise<void>;
+  /** Called once the store has finished handling the tool event. */
+  readonly onToolHandled?: () => void;
+  /** Hold the turn open after its tool event until this settles. */
+  readonly hang?: Promise<void>;
+  /** Throw after the tool event instead of finishing — the store's `catch`. */
+  readonly throwWith?: string;
 }
 
 /** Turns the fake engine hands back, in order. */
@@ -146,7 +155,15 @@ function scriptedEngine(): unknown {
     async *stream() {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
-      if (turn.tool) yield { type: 'tool', tool: turn.tool };
+      if (turn.beforeTool) await turn.beforeTool;
+      if (turn.tool) {
+        yield { type: 'tool', tool: turn.tool };
+        // A generator resumes only when its consumer asks for the next event,
+        // which the store does once its `tool` case has run to the end.
+        turn.onToolHandled?.();
+      }
+      if (turn.hang) await turn.hang;
+      if (turn.throwWith !== undefined) throw new Error(turn.throwWith);
       if (turn.failWith !== undefined) {
         // Deltas first, exactly as a real turn does, THEN the failure — so the
         // row has streamed content at the moment the error arrives.
@@ -751,5 +768,353 @@ describe('a failed turn keeps what the user already saw (#260, #185)', () => {
     await useChats.getState().send('hello');
     expect(assistantRow().content).toBe('a whole reply');
     expect(assistantRow().error).toBeUndefined();
+  });
+});
+
+/* ── A receipt outlives the turn it was taken in ─────────────────────── */
+
+const RECEIPT: McpCallReceipt = {
+  outcome: 'sent',
+  serverId: 'mcp_notes',
+  serverName: 'notes',
+  host: 'notes.example',
+  toolName: 'notes.search',
+  bytes: 22,
+  at: 1_700_000_000_000,
+};
+
+const SENT: ToolInvocation = {
+  id: 'call_mcp',
+  name: 'notes.search',
+  input: { q: 'bank details' },
+  output: 'found',
+  receipt: RECEIPT,
+};
+
+/** Every row the store handed to the database, in order. */
+function storedRows(): Message[] {
+  return (tables.messages.put.mock.calls as unknown as [Message][]).map(([row]) => row);
+}
+
+/** Yield to the event loop until `condition` holds, or fail. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let tries = 0; tries < 200; tries += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error('the condition never held');
+}
+
+/** A turn that stays open after its tool event until `release` is called. */
+function heldOpen(): { hang: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const hang = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { hang, release };
+}
+
+/** Serve `rows` as the stored thread while `body` runs. */
+async function withStoredRows(rows: Message[], body: () => Promise<void>): Promise<void> {
+  const messages = tables.messages as { where: unknown };
+  const original = messages.where;
+  messages.where = () => ({ equals: () => ({ sortBy: async () => rows, toArray: async () => rows }) });
+  try {
+    await body();
+  } finally {
+    messages.where = original;
+  }
+}
+
+const USER: Message = { id: 'msg_u', chatId: 'c1', role: 'user', content: 'hello', createdAt: 1 };
+
+/**
+ * #92's record is only a record if it is still there after something goes
+ * wrong. Until this, nothing reached the database before a turn ended, and the
+ * error and catch rows were built from a placeholder that had no tool calls —
+ * so a call that left the device and was followed by a failure left no trace.
+ */
+describe('an MCP receipt survives the turn it was taken in (#92)', () => {
+  it('is on the stored row when the turn finishes', async () => {
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT }];
+    await useChats.getState().send('hello');
+
+    const finished = storedRows().filter((row) => row.role === 'assistant' && !row.streaming).at(-1);
+    expect(finished?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+  });
+
+  it('is on the stored row when the turn ends in an error', async () => {
+    script = [
+      {
+        text: 'Found',
+        provenance: ON_DEVICE,
+        tool: SENT,
+        failWith: 'This reply ended before it was complete.',
+      },
+    ];
+    await useChats.getState().send('hello');
+
+    const failed = storedRows().filter((row) => row.error !== undefined).at(-1);
+    expect(failed, 'the failure was stored').toBeDefined();
+    expect(failed?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+  });
+
+  it('is on the stored row when the stream throws', async () => {
+    script = [{ text: '', provenance: ON_DEVICE, tool: SENT, throwWith: 'the adapter fell over' }];
+    await useChats.getState().send('hello');
+
+    const failed = storedRows().filter((row) => row.error === 'the adapter fell over').at(-1);
+    expect(failed, 'the failure was stored').toBeDefined();
+    expect(failed?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+  });
+
+  it('is written down while the turn is still running', async () => {
+    // The kill, measured the only way a test can: the turn cannot end while the
+    // assertion runs, so anything that waits for `done` or `error` to write has
+    // written nothing yet.
+    const turn = heldOpen();
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    const sending = useChats.getState().send('hello');
+    try {
+      await until(() => storedRows().some((row) => row.streaming === true));
+      expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
+      const inFlight = storedRows().find((row) => row.streaming === true);
+      expect(inFlight?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+    } finally {
+      turn.release();
+      await sending;
+    }
+  });
+
+  it('is written down while the turn is running even when another chat is open', async () => {
+    // The store's `messages` is the thread ON SCREEN. Open another chat while
+    // the model works and the running row is no longer in that list, so a
+    // mid-turn write that looked the row up there wrote nothing — and a kill
+    // before `done` lost the record. The test above is the paired control: the
+    // same turn, with the user still looking at it.
+    const beforeTool = heldOpen();
+    const handled = heldOpen();
+    const turn = heldOpen();
+    script = [
+      {
+        text: 'Found it.',
+        provenance: ON_DEVICE,
+        tool: SENT,
+        beforeTool: beforeTool.hang,
+        onToolHandled: handled.release,
+        hang: turn.hang,
+      },
+    ];
+    const sending = useChats.getState().send('hello');
+    try {
+      await until(() => script.length === 0);
+      await useChats.getState().openChat('c2');
+      expect(useChats.getState().messages, 'the running row is off screen').toEqual([]);
+
+      beforeTool.release();
+      await handled.hang;
+
+      expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
+      const inFlight = storedRows().find((row) => row.streaming === true);
+      expect(inFlight?.chatId).toBe('c1');
+      expect(inFlight?.toolCalls?.[0]?.receipt, 'the receipt reached the database mid-turn').toEqual(
+        RECEIPT,
+      );
+    } finally {
+      beforeTool.release();
+      turn.release();
+      await sending;
+    }
+  });
+
+  it('comes back from an interrupted turn as a failed one, receipt intact', async () => {
+    const stale: Message = {
+      id: 'msg_stale',
+      chatId: 'c1',
+      role: 'assistant',
+      content: 'Looking that up',
+      createdAt: 2,
+      streaming: true,
+      toolCalls: [SENT],
+    };
+    await withStoredRows([USER, stale], () => useChats.getState().openChat('c1'));
+
+    const row = assistantRow();
+    expect(row.streaming).toBe(false);
+    expect(row.error).toBe('This reply was interrupted before it finished.');
+    expect(row.content, 'what had streamed is kept').toBe('Looking that up');
+    expect(row.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+    // Stored that way too, so it is not an interrupted row the next time.
+    expect(storedRows()).toContainEqual(
+      expect.objectContaining({ id: 'msg_stale', streaming: false }),
+    );
+  });
+
+  it('leaves the running generation’s own row streaming', async () => {
+    const turn = heldOpen();
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    const sending = useChats.getState().send('hello');
+    try {
+      await until(() => storedRows().some((row) => row.streaming === true));
+      const live = storedRows().find((row) => row.streaming === true)!;
+      const stale: Message = { ...live, id: 'msg_stale', createdAt: live.createdAt + 1 };
+      tables.messages.put.mockClear();
+
+      await withStoredRows([USER, live, stale], () => useChats.getState().openChat('c1'));
+
+      const rows = useChats.getState().messages;
+      expect(rows.find((row) => row.id === live.id)?.streaming, 'the live row').toBe(true);
+      expect(rows.find((row) => row.id === live.id)?.error).toBeUndefined();
+      expect(rows.find((row) => row.id === 'msg_stale')?.error).toBe(
+        'This reply was interrupted before it finished.',
+      );
+      expect(storedRows().map((row) => row.id)).toEqual(['msg_stale']);
+    } finally {
+      turn.release();
+      await sending;
+    }
+  });
+
+  it('recovers a row whose generation has ended, even one this session ran', async () => {
+    // The finished row's own write can fail — a full disk, a closed database —
+    // and leave the mid-turn copy as the stored one. Once the turn is over that
+    // row is not live, whichever session wrote it, and must not stay streaming.
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT }];
+    await useChats.getState().send('hello');
+    expect(useChats.getState().generating).toBe(false);
+
+    const leftBehind = storedRows().find((row) => row.streaming === true);
+    expect(leftBehind, 'the turn wrote a mid-turn row').toBeDefined();
+    await withStoredRows([USER, leftBehind!], () => useChats.getState().openChat('c1'));
+
+    expect(assistantRow().streaming).toBe(false);
+    expect(assistantRow().error).toBe('This reply was interrupted before it finished.');
+  });
+
+  it('is kept when a turn that sent something and wrote nothing is regenerated', async () => {
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [SENT], provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['', 'NEW ANSWER']);
+    expect(row.variants?.[0]?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+  });
+
+  it('is the receipt keeping it: the same empty turn without one is dropped, as before', async () => {
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [TOOL], provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
+  });
+
+  it('is kept when a regeneration that failed after sending is regenerated again', async () => {
+    // The row shows a generation that was never appended to its list: its
+    // index is one past the end, where the failed regeneration was being made.
+    useChats.setState({
+      messages: [
+        USER,
+        {
+          id: 'msg_a',
+          chatId: 'c1',
+          role: 'assistant',
+          content: '',
+          createdAt: 2,
+          toolCalls: [SENT],
+          error: 'This reply ended before it was complete.',
+          variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
+          variantIndex: 1,
+        },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['FIRST ANSWER', '', 'NEW ANSWER']);
+    expect(row.variants?.[1]?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
+  });
+
+  it('is the receipt keeping that one too: a failed regeneration without one is dropped, as before', async () => {
+    useChats.setState({
+      messages: [
+        USER,
+        {
+          id: 'msg_a',
+          chatId: 'c1',
+          role: 'assistant',
+          content: 'half a repl',
+          createdAt: 2,
+          toolCalls: [TOOL],
+          error: 'This reply ended before it was complete.',
+          variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
+          variantIndex: 1,
+        },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual([
+      'FIRST ANSWER',
+      'NEW ANSWER',
+    ]);
+  });
+
+  it('takes the row a regeneration replaces out of the database once the new row holds it', async () => {
+    // Otherwise a kill after the new row is written leaves both, and the
+    // reopened thread shows the turn twice.
+    const turn = heldOpen();
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_old', chatId: 'c1', role: 'assistant', content: 'OLD ANSWER', createdAt: 2, provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    const regenerating = useChats.getState().regenerate('msg_old');
+    try {
+      await until(() => storedRows().some((row) => row.streaming === true));
+      const inFlight = storedRows().find((row) => row.streaming === true);
+      expect(inFlight?.variants?.map((variant) => variant.content)).toEqual(['OLD ANSWER']);
+      expect(tables.messages.delete).toHaveBeenCalledWith('msg_old');
+    } finally {
+      turn.release();
+      await regenerating;
+    }
+  });
+
+  it('keeps that row while nothing has been written in its place', async () => {
+    // The control: with no receipt nothing is written mid-turn, so the old row
+    // is the only copy until the turn ends, and it is deleted only then.
+    const turn = heldOpen();
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_old', chatId: 'c1', role: 'assistant', content: 'OLD ANSWER', createdAt: 2, provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: TOOL, hang: turn.hang }];
+    const regenerating = useChats.getState().regenerate('msg_old');
+    try {
+      await until(() => (assistantRow().toolCalls?.length ?? 0) > 0);
+      for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(tables.messages.delete).not.toHaveBeenCalledWith('msg_old');
+    } finally {
+      turn.release();
+      await regenerating;
+    }
+    expect(tables.messages.delete).toHaveBeenCalledWith('msg_old');
   });
 });

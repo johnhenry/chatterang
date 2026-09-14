@@ -19,7 +19,7 @@
 import { MCPClient } from '@johnhenry/mcp-query';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
-import type { McpServerConfig } from '@/domain/mcp';
+import { McpNotSent, type McpServerConfig } from '@/domain/mcp';
 
 export interface McpToolDescriptor {
   readonly server: string;
@@ -112,7 +112,9 @@ export class McpManager {
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<unknown> {
-    if (!this.#client) throw new McpConnectionError(server, 'No MCP client is configured.');
+    // With no client nothing can have been sent, so this is a refusal and not a
+    // failed call — and a failed call is recorded as one whose arguments left.
+    if (!this.#client) throw new McpNotSent('No MCP client is configured.');
     return this.#client.callTool(`${server}.${name}`, args, { signal } as never);
   }
 

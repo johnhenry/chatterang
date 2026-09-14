@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/mcp';
+import { McpNotSent, destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/mcp';
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
-import type { McpToolDescriptor } from '@/ai/mcp/client';
+import { McpManager, type McpToolDescriptor } from '@/ai/mcp/client';
+import { runToolCalls } from '@/ai/middleware/tools';
+import { BUILT_IN_TOOLS, ToolRegistry } from '@/ai/tools/registry';
 
 /**
  * `createMcpTool` returns `null` for a schema it will not vouch for. Every
@@ -58,7 +60,12 @@ describe('server URL validation', () => {
  * stricter than what the MCP spec or the server's own annotations imply.
  */
 describe('an MCP tool always declares that it leaves the device', () => {
-  const options = { serverUrl: 'https://api.acme.com/mcp', confirm: async () => true, call: async () => ({}) };
+  const options = {
+    serverId: 'mcp_1',
+    serverUrl: 'https://api.acme.com/mcp',
+    confirm: async () => true,
+    call: async () => ({}),
+  };
 
   it('is sensitive even when the server calls it read-only', () => {
     // read-only describes the SERVER's state, not your data. The arguments
@@ -90,6 +97,7 @@ describe('confirmation', () => {
     const confirm = vi.fn(async (_action: string) => true);
     const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] }));
     const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
+      serverId: 'mcp_1',
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call,
@@ -103,6 +111,7 @@ describe('confirmation', () => {
   it('does not call the server when the user declines', async () => {
     const call = vi.fn();
     const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
+      serverId: 'mcp_1',
       serverUrl: 'https://api.acme.com/mcp',
       confirm: async () => false,
       call,
@@ -117,6 +126,7 @@ describe('confirmation', () => {
     // The server is the party we can verify least. Absent must mean "ask".
     const confirm = vi.fn(async (_action: string) => true);
     const tool = mustCreateMcpTool(descriptor({ readOnly: false }), {
+      serverId: 'mcp_1',
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call: async () => ({}),
@@ -128,6 +138,7 @@ describe('confirmation', () => {
   it('does not prompt per call for a read-only tool — the per-chat opt-in is the boundary', async () => {
     const confirm = vi.fn(async (_action: string) => true);
     const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      serverId: 'mcp_1',
       serverUrl: 'https://api.acme.com/mcp',
       confirm,
       call: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
@@ -160,6 +171,174 @@ describe('result rendering', () => {
 
   it('does not claim success when a server returns nothing', () => {
     expect(renderResult({}).output).toMatch(/no content/i);
+  });
+});
+
+/**
+ * The receipt (#92): the record that a call's arguments were handed to a
+ * server. What these pin is WHEN one exists — once the arguments are on their
+ * way, and never for a call that did not leave — and that what it says is
+ * measured, not assumed.
+ */
+describe('an MCP call receipt', () => {
+  const at = new Date('2026-08-30T12:00:00Z');
+  const acme = {
+    serverId: 'mcp_1',
+    serverUrl: 'https://api.acme.com/mcp',
+    confirm: async () => true,
+  };
+  const ok = async () => ({ content: [{ type: 'text', text: 'ok' }] });
+
+  it('is preceded by a destination every MCP tool declares, by server id', () => {
+    const tool = mustCreateMcpTool(descriptor(), { ...acme, call: ok });
+    expect(tool.destination).toEqual({
+      kind: 'mcp',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      url: 'https://api.acme.com/mcp',
+    });
+  });
+
+  it('records server, host, bytes and time for a call handed to the server', async () => {
+    const call = vi.fn(ok);
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), { ...acme, call });
+
+    const result = await tool.execute({ q: 'héllo' }, { now: () => at });
+
+    expect(call).toHaveBeenCalledOnce();
+    expect(result.receipt).toEqual({
+      outcome: 'sent',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      // `{"q":"héllo"}` is 13 characters and 14 bytes: `é` is two in UTF-8. A
+      // receipt that counted characters would say 13.
+      bytes: 14,
+      at: at.getTime(),
+    });
+  });
+
+  it('is not taken for a destructive call the user declined, and is for one they allowed', async () => {
+    const call = vi.fn(ok);
+    const declined = mustCreateMcpTool(descriptor({ readOnly: false }), {
+      ...acme,
+      confirm: async () => false,
+      call,
+    });
+    const refused = await declined.execute({ q: 'x' }, { now: () => at });
+    expect(call).not.toHaveBeenCalled();
+    expect(refused.receipt).toBeUndefined();
+
+    // The paired control, and the timing: the sheet takes a while to answer,
+    // and the receipt says when the arguments LEFT — after the answer, not when
+    // the call was first asked for.
+    let clock = 1_000;
+    const allowed = mustCreateMcpTool(descriptor({ readOnly: false }), {
+      ...acme,
+      confirm: async () => {
+        clock = 2_000;
+        return true;
+      },
+      call,
+    });
+    const sent = await allowed.execute({ q: 'x' }, { now: () => new Date(clock) });
+    expect(call).toHaveBeenCalledOnce();
+    expect(sent.receipt?.outcome).toBe('sent');
+    expect(sent.receipt?.at).toBe(2_000);
+  });
+
+  it('records a call that threw as a failed attempt, timed when it was handed over', async () => {
+    const now = vi.fn(() => at);
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        throw new Error('socket hang up');
+      },
+    });
+
+    const result = await tool.execute({ q: 'x' }, { now });
+
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('acme.search failed: socket hang up');
+    expect(result.receipt?.outcome).toBe('failed');
+    expect(result.receipt?.at).toBe(at.getTime());
+    // Read once, before the hand-off. A second read in the catch would time
+    // the failure, not the moment the arguments left.
+    expect(now).toHaveBeenCalledOnce();
+  });
+
+  it('is timed when the arguments left, not when a slow server answered', async () => {
+    // Reading the clock once is not enough: once AFTER the call is also once.
+    // So the clock moves while the call is out, on a call that answers and on
+    // one that throws, and the receipt keeps the earlier time on both.
+    let clock = 1_000;
+    const now = () => new Date(clock);
+    const answers = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        clock = 31_000;
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    });
+    const sent = await answers.execute({ q: 'x' }, { now });
+    expect(sent.receipt?.outcome).toBe('sent');
+    expect(sent.receipt?.at).toBe(1_000);
+
+    clock = 1_000;
+    const drops = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        clock = 31_000;
+        throw new Error('socket hang up');
+      },
+    });
+    const failed = await drops.execute({ q: 'x' }, { now });
+    expect(failed.receipt?.outcome).toBe('failed');
+    expect(failed.receipt?.at).toBe(1_000);
+  });
+
+  it('is not taken for a call refused before anything was sent', async () => {
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        throw new McpNotSent('the server changed since this call was prepared');
+      },
+    });
+
+    const result = await tool.execute({ q: 'x' }, { now: () => at });
+
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('acme.search was not sent: the server changed');
+    expect(result.receipt).toBeUndefined();
+  });
+
+  it('is refused as not sent by a client that has no connection', async () => {
+    // Nothing is configured, so nothing can have left. Thrown as an ordinary
+    // error this would be recorded as a failed attempt at a host never reached.
+    await expect(new McpManager().callTool('acme', 'search', {})).rejects.toBeInstanceOf(McpNotSent);
+  });
+
+  it('reaches the dispatcher’s record, and a tool that runs here has none', async () => {
+    const mcp = mustCreateMcpTool(descriptor({ readOnly: true }), { ...acme, call: ok });
+    const registry = new ToolRegistry([...BUILT_IN_TOOLS, mcp]);
+
+    const { executed } = await runToolCalls(
+      registry,
+      [
+        // Called by its id, which the dispatcher allows. The receipt still
+        // carries the qualified name, so both spellings are recorded alike.
+        { type: 'tool_use', id: 'c1', name: mcp.id, input: { q: 'x' } },
+        { type: 'tool_use', id: 'c2', name: 'calculate', input: { expression: '1 + 1' } },
+      ],
+      { enabledIds: [mcp.id, 'calculator'] },
+    );
+
+    expect(executed[0]?.receipt?.host).toBe('api.acme.com');
+    expect(executed[0]?.receipt?.toolName).toBe('acme.search');
+    expect(executed[1]?.isError).toBe(false);
+    expect(executed[1]?.receipt).toBeUndefined();
   });
 });
 

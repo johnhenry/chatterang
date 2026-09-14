@@ -65,3 +65,62 @@ export function destinationHost(url: string): string {
 export function qualifiedToolName(serverName: string, toolName: string): string {
   return `${serverName}.${toolName}`;
 }
+
+/**
+ * Where a tool sends its arguments, carried on the tool itself.
+ *
+ * COPIED IN, as `PairedDevice` in domain/chat.ts is: the name and host are what
+ * they were when the tool was registered. `serverId` is the part a name cannot
+ * give. A server removed and re-added under the same name is a different server
+ * with a different id, and the tool's own id (`mcp:<name>.<tool>`) cannot tell
+ * the two apart.
+ */
+export interface ToolDestination {
+  readonly kind: 'mcp';
+  readonly serverId: string;
+  readonly serverName: string;
+  readonly host: string;
+  readonly url: string;
+}
+
+/**
+ * The record that a tool call's arguments were handed to an MCP server (#92).
+ *
+ * Taken when the call is handed over, not when it returns, so `at` is when the
+ * arguments left and a call that then failed still has one. A call that never
+ * left — declined at the confirm sheet, or refused with {@link McpNotSent} — has
+ * none: a receipt says something left, and nothing did.
+ *
+ * `outcome` is a discriminant rather than optional flags so that every reader
+ * has to say what it does with each value.
+ *
+ * `bytes` is the UTF-8 length of the arguments as JSON — the part the model
+ * composed — not the size of the request envelope around them. There is no
+ * hash: the arguments themselves are stored beside this, on the invocation.
+ */
+export interface McpCallReceipt {
+  readonly outcome: 'sent' | 'failed';
+  readonly serverId: string;
+  readonly serverName: string;
+  readonly host: string;
+  /** Server-qualified (`notes.search`), whichever spelling the model called it by. */
+  readonly toolName: string;
+  readonly bytes: number;
+  /** Epoch milliseconds, taken as the arguments were handed to the server. */
+  readonly at: number;
+}
+
+/**
+ * A refusal made BEFORE any byte left: there is no client, or the server a call
+ * was prepared for is no longer the server its name points at.
+ *
+ * Distinct from every other failure because it is the one that must not leave a
+ * receipt. Any other error may arrive after the arguments were delivered, and
+ * recording such a call as not sent would be wrong in the flattering direction.
+ */
+export class McpNotSent extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'McpNotSent';
+  }
+}

@@ -255,6 +255,79 @@ describe('adding an MCP server', () => {
   });
 });
 
+describe('a call prepared for one server', () => {
+  /**
+   * THE WINDOW THE PRUNE CANNOT SEE. The dispatcher resolves a tool when the
+   * model calls it and then holds the object, and a destructive call waits on a
+   * confirm sheet that never times out. The client routes by NAME. Remove the
+   * server and add another under that name while the sheet is open, and the
+   * held tool would hand its arguments to the newcomer under a receipt naming
+   * the host it was built for. Measured by holding the tool object across the
+   * change, exactly as the dispatcher does.
+   */
+  const at = { now: () => new Date(0) };
+  const A = server('mcp_a', 'notes', 'https://a.example/mcp');
+
+  async function heldTool() {
+    useMcp.setState({ servers: [A] });
+    await useMcp.getState().reconnect();
+    const held = toolRegistry.get('mcp:notes.search');
+    expect(held?.destination?.host).toBe('a.example');
+    // The server RECORD's id, not its name: the name is exactly what a
+    // successor shares, so a destination keyed on it could not tell them apart.
+    expect(held?.destination?.serverId).toBe('mcp_a');
+    return held!;
+  }
+
+  it('does not go to its same-name successor', async () => {
+    const held = await heldTool();
+
+    // The paired control: before anything changes, the held tool does reach it.
+    const before = await held.execute({ q: 'x' }, at);
+    expect(manager.callTool).toHaveBeenCalledOnce();
+    expect(before.receipt?.host).toBe('a.example');
+    expect(before.receipt?.serverId).toBe('mcp_a');
+    manager.callTool.mockClear();
+
+    await useMcp.getState().remove('mcp_a');
+    await useMcp.getState().add({ name: 'notes', url: 'https://b.example/mcp' });
+
+    const after = await held.execute({ q: 'x' }, at);
+    expect(manager.callTool, 'a call built for a.example went to its successor').not.toHaveBeenCalled();
+    expect(after.receipt).toBeUndefined();
+    expect(after.output).toContain('was not sent');
+  });
+
+  it('is not sent to that server once it is switched off', async () => {
+    const held = await heldTool();
+    await useMcp.getState().toggle('mcp_a', false);
+    manager.callTool.mockClear();
+
+    const result = await held.execute({ q: 'x' }, at);
+    expect(manager.callTool).not.toHaveBeenCalled();
+    expect(result.receipt).toBeUndefined();
+  });
+
+  it('is not sent once the record it was built for names another address or name', async () => {
+    // No edit flow exists (state/mcp.ts offers add, remove and toggle), so the
+    // record is changed in place here. This is the check such a flow would lean
+    // on: same id, different destination.
+    const held = await heldTool();
+    manager.callTool.mockClear();
+
+    useMcp.setState({ servers: [{ ...A, url: 'https://elsewhere.example/mcp' }] });
+    expect((await held.execute({ q: 'x' }, at)).receipt).toBeUndefined();
+    useMcp.setState({ servers: [{ ...A, name: 'renamed' }] });
+    expect((await held.execute({ q: 'x' }, at)).receipt).toBeUndefined();
+    expect(manager.callTool).not.toHaveBeenCalled();
+
+    // The control: the record as the tool was built for it, and the call goes.
+    useMcp.setState({ servers: [A] });
+    expect((await held.execute({ q: 'x' }, at)).receipt?.outcome).toBe('sent');
+    expect(manager.callTool).toHaveBeenCalledOnce();
+  });
+});
+
 describe('switching a server off', () => {
   it('keeps its tools enabled in chats — the same server comes back', async () => {
     // The deliberate asymmetry with removal: a toggle brings back the same row

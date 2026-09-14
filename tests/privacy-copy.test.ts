@@ -369,10 +369,10 @@ describe('the privacy command', () => {
         destructive: false,
         inputSchema: { type: 'object', properties: {} },
       },
-      { serverUrl: 'https://notes.example/mcp', confirm, call },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm, call },
     );
 
-    await tool.execute({ text: SECRET }, { signal: undefined } as never);
+    await tool.execute({ text: SECRET }, { signal: undefined, now: () => new Date(0) });
 
     expect(confirm).not.toHaveBeenCalled();
     expect(call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
@@ -405,7 +405,7 @@ describe('the privacy command', () => {
         destructive: false,
         inputSchema: { type: 'object', properties: {} },
       },
-      { serverUrl: 'https://notes.example/mcp', confirm: vi.fn(async () => true), call },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: vi.fn(async () => true), call },
     );
     const registry = new ToolRegistry([mcp]);
     const use = [{ type: 'tool_use' as const, id: 'c1', name: mcp.name, input: { text: SECRET } }];
@@ -449,10 +449,10 @@ describe('the privacy command', () => {
         destructive: true,
         inputSchema: { type: 'object', properties: {} },
       },
-      { serverUrl: 'https://notes.example/mcp', confirm, call },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm, call },
     );
 
-    await tool.execute({ text: SECRET }, { signal: undefined } as never);
+    await tool.execute({ text: SECRET }, { signal: undefined, now: () => new Date(0) });
 
     const asked = String(confirm.mock.calls.at(0)?.at(0) ?? '');
     expect(asked).toContain('may change data there');
@@ -734,7 +734,7 @@ describe('the tools hint in a chat', () => {
         destructive: false,
         inputSchema: { type: 'object', properties: {} },
       },
-      { serverUrl: 'https://notes.example/mcp', confirm: async () => true, call: async () => ({}) },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => true, call: async () => ({}) },
     );
     expect(tool.id.startsWith('mcp:')).toBe(true);
     expect(tool.summary).toContain('notes.example');

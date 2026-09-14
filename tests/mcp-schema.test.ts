@@ -136,6 +136,7 @@ describe('checkToolSchema', () => {
 
 describe('createMcpTool with a schema it will not vouch for', () => {
   const options = {
+    serverId: 'mcp_1',
     serverUrl: 'https://api.acme.com/mcp',
     confirm: vi.fn(async () => true),
     call: vi.fn(async () => 'ok'),

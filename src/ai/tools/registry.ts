@@ -9,6 +9,8 @@
 
 import type { IRTool, JSONSchema } from '@johnhenry/aimatey-types';
 
+import type { McpCallReceipt, ToolDestination } from '@/domain/mcp';
+
 export interface ToolContext {
   /** Signals cancellation when the user stops generation. */
   readonly signal?: AbortSignal;
@@ -22,6 +24,8 @@ export interface ToolResult {
   /** Optional payload the UI renders instead of raw text. */
   readonly display?: { readonly kind: 'html' | 'json' | 'text'; readonly value: string };
   readonly isError?: boolean;
+  /** Set by a tool that handed its arguments to an MCP server. See `McpCallReceipt`. */
+  readonly receipt?: McpCallReceipt;
 }
 
 export interface ChatterangTool {
@@ -33,6 +37,11 @@ export interface ChatterangTool {
   readonly summary: string;
   /** Tools that touch device state are opt-in per chat. */
   readonly sensitive?: boolean;
+  /**
+   * Where calling this tool sends its arguments, on a tool that leaves the
+   * device. Absent on the built-ins, which run here.
+   */
+  readonly destination?: ToolDestination;
   execute(input: Record<string, unknown>, context: ToolContext): Promise<ToolResult>;
 }
 
