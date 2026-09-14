@@ -54,6 +54,10 @@ describe('how the sheet is reached', () => {
     expect(settings).toContain("import { PairingEntry } from '@/features/pairing/PairingEntry';");
     expect(settings).toContain('<PairingEntry />');
     expect(settings).not.toMatch(/PairingSheet|features\/pairing\/(?!PairingEntry')/);
+    // Whatever a statement binds, the only one that reaches into the feature is
+    // that import: a second name taken from PairingEntry would be a way past it.
+    const reaching = settings.match(/\b(?:import|export)\b[^;]*?\bfrom\s*['"][^'"]*pairing\/[^'"]*['"]/g) ?? [];
+    expect(reaching).toEqual(["import { PairingEntry } from '@/features/pairing/PairingEntry'"]);
   });
 
   it('the entry loads the sheet only through lazy(), never statically', () => {

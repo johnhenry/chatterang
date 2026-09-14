@@ -1290,4 +1290,43 @@ describe('only the pairing seam reaches the pairing building blocks', () => {
       expect(entries(at, allowed), allowed).toEqual([]);
     }
   });
+
+  /** Each `export` a file's code writes, up to the name it exports. Comments are stripped. */
+  const exportsOf = (source: string): string[] =>
+    [...codeOf(source).matchAll(/\bexport\b[^({;=<\n]*/g)].map((match) => match[0].replace(/\s+/g, ' ').trim());
+
+  it('what crosses the door is the gate: PairingEntry.tsx exports PairingEntry and nothing else', () => {
+    // The door rule checks which FILE is imported, not which NAME. An entry
+    // that also exported the lazy sheet, or the ungated section under its gate,
+    // would let Settings mount either with a hand-built `available: true`
+    // controller: no new import edge, and no read of the accessor, so neither
+    // rule above would see it.
+    const entry = files.find((file) => rel(file) === 'features/pairing/PairingEntry.tsx');
+    expect(entry, 'the entry moved, so this rule checks nothing').toBeDefined();
+    expect(
+      exportsOf(readFileSync(entry!, 'utf8')),
+      'PairingEntry.tsx exports something besides the gate. Whatever it exports, Settings can mount ' +
+        'without asking `pairingController()`.',
+    ).toEqual(['export function PairingEntry']);
+  });
+
+  it('the export reader sees every way of exporting a second name, and ignores a comment', () => {
+    const gate = 'export function PairingEntry(): ReactNode {\n  return null;\n}\n';
+    expect(exportsOf(gate)).toEqual(['export function PairingEntry']);
+    for (const second of [
+      'export { PairingSheet as PairingPanel };',
+      'export { PairingSection };',
+      'export default PairingSheet;',
+      'export const PairingPanel = PairingSheet;',
+      'export function PairingSection(): ReactNode {}',
+      "export * from '@/features/pairing/PairingSheet';",
+      "export { PairingSheet } from '@/features/pairing/PairingSheet';",
+      'export type { PairingSheetProps };',
+    ]) {
+      expect(exportsOf(gate + second), second).not.toEqual(['export function PairingEntry']);
+    }
+    for (const said of ['// export { PairingSheet as PairingPanel };', '/* export default PairingSheet; */']) {
+      expect(exportsOf(gate + said), said).toEqual(['export function PairingEntry']);
+    }
+  });
 });
