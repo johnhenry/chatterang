@@ -1030,9 +1030,12 @@ describe('on Linux, a plain key from before the keyring is refused once the keyr
  * so everything it does to files is real. What only Windows can print — the SID
  * `whoami` reports and the SDDL Get-Acl returns — comes from a runner answering
  * with fixtures in the shapes those tools print, which records what it was asked
- * to run. NONE OF THIS RAN ON WINDOWS. The descriptors follow the SDDL in
- * PowerShell's Get-Acl reference and the entries a directory under C:\Users
- * inherits; a Windows run is what would confirm them.
+ * to run. NONE OF THIS RAN ON WINDOWS. The descriptors follow the one SDDL
+ * sample PowerShell documents — in ConvertFrom-SddlString's reference, read from
+ * Get-Acl on C:\Windows, and used verbatim below — and the entries a directory
+ * under C:\Users is expected to inherit. The `whoami` line follows the options
+ * its reference documents, which show no sample line. A Windows run is what
+ * would confirm them.
  */
 describe('on Windows, the key is sealed with DPAPI and the descriptor of everything on its path is read', () => {
   const SYSTEM_ROOT = 'C:\\Windows';
@@ -1042,7 +1045,10 @@ describe('on Windows, the key is sealed with DPAPI and the descriptor of everyth
   const USER = 'S-1-5-21-1004336348-1177238915-682003330-1001';
   const OTHER = 'S-1-5-21-1004336348-1177238915-682003330-1002';
   const GROUP = 'S-1-5-21-1004336348-1177238915-682003330-513';
-  /** `whoami /user /fo csv /nh` as Windows prints it: quoted CSV, CRLF. */
+  /**
+   * `whoami /user /fo csv /nh` in the shape those documented options describe:
+   * quoted CSV, CRLF. No sample line is documented, and none was seen on Windows.
+   */
   const account = (sid: string): string => `"desktop-7f3k2q\\john","${sid}"\r\n`;
   /** A directory under a profile: SYSTEM, Administrators and the user, inherited by everything made inside. */
   const profileDirectory = (extra = '', owner = USER): string =>
@@ -1439,6 +1445,23 @@ describe('on Windows, the key is sealed with DPAPI and the descriptor of everyth
       );
       expect(error.message).toContain('not in a form this store reads');
       expect(readdirSync(base)).toEqual([]);
+    });
+
+    it('reads the one descriptor PowerShell documents, verbatim: refused as a data directory for what Users would inherit, and read without those entries', async () => {
+      // PowerShell's ConvertFrom-SddlString reference, from `(Get-Acl -Path C:\Windows).Sddl`.
+      const documented = 'O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;GRGWGX;;;BU)(A;OICI;GRGWGX;;;AU)';
+      const error = await refused(
+        onWindows({ tools: windowsTools((p) => (p === base ? documented : undefined)) }),
+        'data-directory-unsafe',
+      );
+      // Parsed, and refused by the rule — not as unreadable.
+      expect(error.message).not.toContain('not in a form this store reads');
+      expect(error.message).toContain('for BU that what is made inside it would inherit');
+      expect(readdirSync(base)).toEqual([]);
+
+      const withoutOthers = documented.replace('(A;OICI;GRGWGX;;;BU)(A;OICI;GRGWGX;;;AU)', '');
+      const created = await onWindows({ tools: windowsTools((p) => (p === base ? withoutOthers : undefined)) });
+      expect(created).toMatchObject({ created: true, protection: 'sealed' });
     });
 
     it('refuses when Get-Acl fails, without echoing what it printed, and makes nothing', async () => {

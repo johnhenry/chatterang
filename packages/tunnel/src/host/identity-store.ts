@@ -70,20 +70,31 @@
  *   - EVERYTHING ELSE is refused rather than trusted: the BSDs and illumos have
  *     NFSv4 ACLs of the macOS kind that nothing here reads.
  *
- * HOW WINDOWS IS READ, AND WHY NOT `icacls`. `icacls` prints account NAMES, in
- * the language Windows is installed in ("VORDEFINIERT\Administratoren"), so a
- * parser that knows "BUILTIN\Administrators" refuses every German desktop, and
+ * HOW WINDOWS IS READ, AND WHY NOT `icacls`. `icacls` shows accounts by name.
+ * Its reference takes a SID "in either numerical or friendly name format" and,
+ * as read for this change, carries no sample of what it prints. That the names
+ * of built-in accounts differ by install language ("VORDEFINIERT\Administratoren")
+ * is Windows behaviour this relies on, not something that reference says. A
+ * parser that knows "BUILTIN\Administrators" would refuse such a desktop, and
  * one that does not know names cannot tell an account from a group. The
- * security descriptor's SDDL string names SIDs, identically on every install:
- * `(Get-Acl -LiteralPath <path>).Sddl`, documented in PowerShell's Get-Acl
- * reference with the example `O:BAG:SYD:PAI(A;OICI;FA;;;BA)...`. So the store
- * runs Windows PowerShell for that one property — the path handed over in an
- * environment variable, never spliced into the command — and `whoami /user /fo
- * csv /nh` for the SID of the account it runs as. Both are run by absolute path
- * under `%SystemRoot%\System32`. Anything in either output this parser was not
- * written for — an ACE type other than allow and deny, a flag or right it has
- * no meaning for, an object ACE, a conditional expression — refuses the key
- * rather than being skipped.
+ * security descriptor's SDDL string names SIDs instead — two-letter aliases or
+ * `S-1-…` strings: `(Get-Acl -LiteralPath <path>).Sddl`. The one documented
+ * sample is in PowerShell's ConvertFrom-SddlString reference (not Get-Acl's),
+ * which reads `(Get-Acl -Path C:\Windows).Sddl` as
+ * `O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;GRGWGX;;;BU)(A;OICI;GRGWGX;;;AU)`.
+ * No page read for this change documents the ACE grammar, so the parser below
+ * is written from that sample and the Win32 access-mask constants, and the
+ * store's tests read the sample verbatim. So the store runs Windows PowerShell
+ * for that one property — the path handed over in an environment variable,
+ * never spliced into the command — and `whoami /user /fo csv /nh` for the SID of
+ * the account it runs as. `whoami`'s reference documents `/user`, `/fo csv` and
+ * `/nh` but shows no sample line, so the one line it is expected to print — a
+ * quoted name, a quoted SID — is an expectation nobody here has seen on Windows.
+ * Both are run by absolute path under `%SystemRoot%\System32`. Anything in
+ * either output this parser was not written for — an ACE type other than allow
+ * and deny, a flag or right it has no meaning for, an object ACE, a conditional
+ * expression, a `whoami` line of any other shape — refuses the key rather than
+ * being skipped.
  *
  * WHO MAY BE IN A WINDOWS DESCRIPTOR: this account, SYSTEM (`SY`) and
  * BUILTIN\Administrators (`BA`), as owner or in an allow entry; anyone in a deny
