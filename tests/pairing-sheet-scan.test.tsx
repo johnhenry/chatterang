@@ -30,6 +30,7 @@ vi.mock('@/lib/qr-decode', () => ({ decodeFrame: decoder.decodeFrame }));
 import {
   ADDRESS_DNS,
   ADDRESS_IPV4,
+  DEFAULT_WINDOW_MS,
   HOST_DESKTOP,
   TRUST_SPKI_PIN,
   TRUST_STATIC_KEY,
@@ -37,7 +38,12 @@ import {
   encodePairingUri,
   type PairingPayload,
 } from '@chatterang/tunnel/pairing';
-import type { PairingController, PairingOutcome, PairingRequest } from '@/lib/pairing';
+import {
+  validateScannedPayload,
+  type PairingController,
+  type PairingOutcome,
+  type PairingRequest,
+} from '@/lib/pairing';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
 import {
   CAMERA_BUSY,
@@ -359,6 +365,30 @@ describe('every exit turns the camera off', () => {
     expect(button('Scan again')).not.toBeNull();
   });
 
+  it('stops a stream that arrives while the app is in the background, and offers Scan again (D6)', async () => {
+    // The person pressed Scan with camera and left before the prompt answered,
+    // or the WebView went hidden around the system dialog. The only
+    // visibilitychange fired while the pane was still opening, and none comes
+    // while it stays hidden, so the pane has to look when the stream arrives.
+    const track = new FakeTrack();
+    const prompt = deferred<MediaStream>();
+    camera(() => prompt.promise);
+    await open(fakeController().controller);
+
+    await click(mustButton('Scan with camera'));
+    stub(document, 'hidden', { get: () => true });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    prompt.resolve(streamOf(track));
+    await until(() => button('Scan again'), 'Scan again');
+
+    expect(track.stop).toHaveBeenCalledTimes(1);
+    expect(video()).toBeNull();
+    expect(status()).toEqual([SCAN_END_WORDING.hidden]);
+    expect(decoder.decodeFrame).not.toHaveBeenCalled();
+  });
+
   it('ignores a visibilitychange that leaves the app visible', async () => {
     const track = new FakeTrack();
     camera(async () => streamOf(track));
@@ -412,6 +442,19 @@ describe('each way a scan ends without a code has its own words and Scan again',
     expect(Object.keys(SCAN_END_WORDING).sort()).toEqual(
       ['decode-failed', 'hidden', 'idle-timeout', 'invalid-code', 'track-ended'].sort(),
     );
+  });
+
+  it('says only what the phone measured when its window runs out, and claims no code expired', () => {
+    // The phone times its own scan with DEFAULT_WINDOW_MS. A code's deadline is
+    // whatever its host wrote into expiresAt, and a code still valid after the
+    // phone's window has run out passes validateScannedPayload. So the phone
+    // cannot say that a code shown when scanning began has expired.
+    const began = 1_900_000_000;
+    const windowEnd = began + DEFAULT_WINDOW_MS / 1000;
+    const longLived = decodePairingUri(code({ expiresAt: windowEnd + 600 }));
+    expect(validateScannedPayload(longLived, windowEnd + 1)).toEqual({ ok: true });
+    expect(SCAN_END_WORDING['idle-timeout']).toBe('No pairing code was found in time, so scanning stopped.');
+    expect(SCAN_END_WORDING['idle-timeout']).not.toMatch(/expire/i);
   });
 
   it('when the OS ends the track', async () => {
@@ -524,6 +567,21 @@ describe('a scanned code is checked before anything is sent', () => {
     const details = [...document.querySelectorAll('.confirm__detail li')].map((li) => reads(li));
     expect(details).toEqual(confirmDetail('John’s MacBook'));
     expect(details[0]).toBe('It calls itself “John’s MacBook”.');
+  });
+
+  it('does not quote a name that is only blank space, and says the code gives none', async () => {
+    // The parser admits any 1..64 bytes of UTF-8, so a single space is a name
+    // it accepts. Quoting it would draw empty marks as if they named a machine.
+    for (const blank of [' ', '   ', String.fromCharCode(0xa0)]) {
+      const { pair, mount } = await scanOnce(code({ name: blank }));
+      expect(confirmOpen(), JSON.stringify(blank)).toBe(true);
+      const details = [...document.querySelectorAll('.confirm__detail li')].map((li) => reads(li));
+      expect(details, JSON.stringify(blank)).toEqual(['The code gives no name.']);
+      expect(reads(document.body), JSON.stringify(blank)).not.toContain('calls itself');
+      expect(pair).not.toHaveBeenCalled();
+      await mount.unmount();
+    }
+    expect(confirmDetail('')).toEqual(['The code gives no name.']);
   });
 
   it('sends the payload exactly as it was read on Pair, and nothing on Cancel', async () => {

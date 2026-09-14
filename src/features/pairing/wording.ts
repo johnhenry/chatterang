@@ -47,13 +47,17 @@ export const CAMERA_BUSY = 'The camera is in use by something else right now.';
  * a cancel is the person closing the sheet. `hidden` is the pane's own cause,
  * recorded because `handle.stop()` reports every stop it asks for as
  * `cancelled`.
+ *
+ * `idle-timeout` says what the phone timed and nothing about the code. The
+ * phone's window is its own `DEFAULT_WINDOW_MS`; a code's deadline is whatever
+ * its host wrote into `expiresAt`, and a host may give it longer.
  */
 export const SCAN_END_WORDING: Readonly<Record<Exclude<ScanStopReason, 'result' | 'cancelled'> | 'hidden', string>> =
   Object.freeze({
     'track-ended': 'The camera stopped. Another app or a call may have taken it.',
     'decode-failed': 'The code reader could not run, so scanning stopped.',
     'invalid-code': 'That pairing code could not be read. Show a new one and scan again.',
-    'idle-timeout': 'No code was found in time, and any code shown when scanning began has expired.',
+    'idle-timeout': 'No pairing code was found in time, so scanning stopped.',
     hidden: 'Scanning stopped when Chatterang went to the background.',
   });
 
@@ -74,8 +78,13 @@ export const CONFIRM_BODY = 'Pair only if this code came from the screen in fron
  *
  * Whoever composed the code wrote it, and a code on a shared screen or a
  * photograph can call itself "John’s MacBook" as easily as John's can.
+ *
+ * A name that is only blank space names nothing. The parser admits one space
+ * as a name, and quoting it would draw empty marks as if they named a machine,
+ * so the detail says the code gives none.
  */
 export function confirmDetail(name: string): readonly string[] {
+  if (name.trim().length === 0) return ['The code gives no name.'];
   return [`It calls itself “${name}”.`, 'That name comes from the code, so whoever made the code chose it.'];
 }
 

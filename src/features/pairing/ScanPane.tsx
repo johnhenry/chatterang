@@ -26,7 +26,9 @@ import {
  *     the effect's cleanup;
  *   - the app going to the background (D6), through `visibilitychange`, because
  *     whether a phone mutes the track then is platform-dependent and a live
- *     camera nobody can see breaks the promise the usage string makes;
+ *     camera nobody can see breaks the promise the usage string makes — and
+ *     the app already being there when the stream arrives, because the event
+ *     fired while the permission prompt was up and will not fire again;
  *   - a stream that arrives after the pane is gone, because the person closed
  *     the sheet while the permission prompt was still up.
  *
@@ -132,6 +134,10 @@ export function ScanPane({ onResult, onUnavailable, busy }: ScanPaneProps): Reac
       handle.stop();
     };
     document.addEventListener('visibilitychange', onVisibility);
+    // A stream that arrives while the app is already hidden gets no event: the
+    // one that fired came while the pane was still opening, and nothing fires
+    // again until the app is shown. Look now instead of waiting to be told.
+    if (document.hidden) onVisibility();
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
       handle.stop();
