@@ -45,6 +45,8 @@ import { writeFileSync } from 'node:fs';
 
 import { app, BrowserWindow } from 'electron';
 
+import { createBudget, pollUntil, StageTimeout, withDeadline } from './probe-waits.mjs';
+
 const args = new Map(
   process.argv
     .slice(2)
@@ -78,6 +80,40 @@ const START = Date.now();
 const trace = (message) => {
   if (VERBOSE) process.stderr.write(`[probe +${Date.now() - START}ms] ${message}\n`);
 };
+
+/**
+ * THE BUDGETS, AND WHAT EACH ONE IS FOR.
+ *
+ * A stage budget bounds one thing the probe waits on; the overall budget
+ * (`--budget`, set by the test) bounds the run and caps every stage by what is
+ * left of it. The test's spawn timeout sits above the overall budget and its
+ * hook timeout above that, so the probe's own deadline always fires first and
+ * a failure arrives as a named stage in the JSON — never as a kill with
+ * nothing written.
+ *
+ * Generous, and the generosity is free: every wait is a CONDITION that returns
+ * the moment it holds, so a budget only costs time on a run that was going to
+ * fail. The flat 15s these replace is what a loaded runner ran out of.
+ */
+const BUDGET = createBudget(Number(args.get('budget') ?? '') || 150_000);
+/** Navigation: Vite answering, on a runner that may be busy with other files. */
+const LOAD_MS = 60_000;
+/** A condition in the page: mounted, seeded, opened, closed, stopped moving. */
+const WAIT_MS = 60_000;
+/** A width applied and laid out; see `setWidth`. */
+const SETTLE_MS = 60_000;
+/**
+ * One evaluation: a measurement, a click, the seed. Nothing makes it slow but
+ * a starved renderer, so it gets the same budget a settle does — and is NOT
+ * retried. `executeJavaScript` cannot be cancelled: an evaluation that has
+ * run out is still queued in the renderer, and a second copy would only queue
+ * behind it. One long deadline is the same tolerance without the duplicate,
+ * so a 35s stall inside the sheet list costs what a 35s stall inside a resize
+ * costs — time — where a 30s deadline here used to fail the file on it.
+ */
+const EVALUATE_MS = 60_000;
+/** One look inside a wait. A look that runs out is retried, not fatal. */
+const LOOK_MS = 10_000;
 
 /**
  * MOTION OFF, FOR THE WHOLE MEASUREMENT.
@@ -179,54 +215,121 @@ const seedScript = (count) => `
  * renderer that will never answer is not a slow probe, it is a probe that
  * writes nothing at all — which is how the previous version of this file
  * managed to fail without producing a single measurement or a single line of
- * error.
+ * error. The deadline is capped by what is left of the overall budget, and
+ * running out throws a `StageTimeout` that says what was being evaluated and
+ * for how long.
  */
-async function evaluate(contents, expression, what, timeoutMs = 15000) {
+async function evaluate(contents, expression, what, timeoutMs = EVALUATE_MS) {
   trace(`evaluating ${what}`);
-  let timer;
-  const deadline = new Promise((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out evaluating ${what}`)), timeoutMs);
+  const { ms, note } = BUDGET.cap(timeoutMs);
+  return withDeadline(contents.executeJavaScript(expression), {
+    stage: `evaluating ${what}`,
+    budgetMs: ms,
+    note,
   });
-  try {
-    return await Promise.race([contents.executeJavaScript(expression), deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Resolve once the page satisfies `predicate` (a JS expression), or throw. */
-async function waitFor(contents, predicate, what, timeoutMs = 30000) {
-  trace(`waiting for ${what}`);
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    let value = false;
-    try {
-      value = await evaluate(contents, `Boolean(${predicate})`, what, 5000);
-    } catch {
-      value = false;
-    }
-    if (value) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
 }
 
 /**
- * Set the viewport and let the engine finish with it.
+ * Resolve once the page satisfies `predicate` (a JS expression), or throw a
+ * `StageTimeout` naming `what`, the wait, and whether the last look found the
+ * predicate false (`unmet`: the page never got there) or got no answer from
+ * the renderer (`unanswered`: a harness timeout). A predicate that throws
+ * fails the wait at once, naming it.
+ */
+async function waitFor(contents, predicate, what, timeoutMs = WAIT_MS) {
+  trace(`waiting for ${what}`);
+  const { ms, note } = BUDGET.cap(timeoutMs);
+  return pollUntil({
+    stage: `waiting for ${what}`,
+    budgetMs: ms,
+    note,
+    attemptMs: LOOK_MS,
+    check: async (attemptMs) =>
+      (await evaluate(contents, `Boolean(${predicate})`, what, attemptMs))
+        ? { done: true, value: true }
+        : { done: false, observed: 'the condition was still false' },
+  });
+}
+
+/**
+ * The boxes the assertions read, as one string, so "has the layout stopped
+ * changing" is an equality rather than a judgement.
+ */
+const LAYOUT_SIGNATURE = `(() => {
+  const parts = [innerWidth, innerHeight, document.querySelectorAll('.list__item').length];
+  for (const selector of [
+    '.app', '.tabbar', '.history', '.chat__main', '.thread',
+    '.chat__history-toggle', '.composer__input',
+  ]) {
+    const el = document.querySelector(selector);
+    if (!el) {
+      parts.push(selector + ' absent');
+      continue;
+    }
+    const box = el.getBoundingClientRect();
+    parts.push(
+      selector + ' ' + getComputedStyle(el).display + ' ' +
+      [box.left, box.top, box.width, box.height].join(',')
+    );
+  }
+  return parts.join(' | ');
+})()`;
+
+/** One look: the layout now, two animation frames, the layout again. */
+const SETTLE_LOOK = `new Promise((resolve) => {
+  const before = ${LAYOUT_SIGNATURE};
+  requestAnimationFrame(() => requestAnimationFrame(() =>
+    resolve({ width: innerWidth, before, after: ${LAYOUT_SIGNATURE} })
+  ));
+})`;
+
+/**
+ * Set the viewport, and wait until the engine has laid the page out AT it.
  *
- * Two animation frames rather than one: the first flushes the resize into
- * style and layout, the second guarantees anything React scheduled in response
- * has committed before a rect is read.
+ * WHAT "SETTLED" MEANS. It used to mean "two animation frames answered within
+ * 15s", and on a loaded GitHub runner they did not (run 34872871078): the
+ * whole file failed on "timed out evaluating the engine to settle at 390px"
+ * while the same commit passed on a re-run. Two frames were also never checked
+ * to be frames AT the new width — `setContentSize` returns before the renderer
+ * has the resize. Settled is now three observations in the page:
+ *
+ *   - `innerWidth` is the width asked for: the resize reached the renderer;
+ *   - two animation frames ran after a first reading: style, layout, and
+ *     whatever React committed in response have had their turn;
+ *   - the boxes the assertions read are identical either side of those frames:
+ *     nothing is still moving.
+ *
+ * Each look has its own short deadline and is retried within a generous stage
+ * budget, so a long frame on a loaded runner costs time rather than the file,
+ * while a renderer that never answers still fails — naming the width, the
+ * milliseconds waited, and what the last look saw. On a laptop this is one
+ * look, about as fast as the two frames it replaces.
  */
 async function setWidth(window, width) {
   window.setContentSize(width, HEIGHT);
-  await evaluate(
-    window.webContents,
-    `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(
-      () => resolve(innerWidth)
-    )))`,
-    `the engine to settle at ${width}px`,
-  );
+  const what = `the engine to settle at ${width}px`;
+  trace(`waiting for ${what}`);
+  const { ms, note } = BUDGET.cap(SETTLE_MS);
+  await pollUntil({
+    stage: `waiting for ${what}`,
+    budgetMs: ms,
+    note,
+    attemptMs: LOOK_MS,
+    intervalMs: 16,
+    check: async (attemptMs) => {
+      const look = await evaluate(window.webContents, SETTLE_LOOK, what, attemptMs);
+      if (look.width !== width) {
+        return { done: false, observed: `innerWidth was ${look.width}, not yet ${width}` };
+      }
+      if (look.before !== look.after) {
+        return {
+          done: false,
+          observed: `innerWidth was ${width} but the layout changed across two frames`,
+        };
+      }
+      return { done: true, value: look.width };
+    },
+  });
 }
 
 /**
@@ -469,7 +572,7 @@ const geometry = `
 `;
 
 /** Filled as the probe goes, so a failure still reports what it did measure. */
-const out = { seeded: 0, widths: {}, sweep: {}, consoleErrors: [] };
+const out = { seeded: 0, widths: {}, sweep: {}, sweepViewport: {}, consoleErrors: [] };
 
 /**
  * Open the sheet the way a user does — the rail's button — and measure it.
@@ -502,8 +605,10 @@ async function measureSheet(contents) {
        globalThis.__probeSheetTop = top;
        return settled;
      })()`,
+    // The default wait budget, not a 5s one of its own: this is a condition,
+    // it returns as soon as two looks agree, and a starved renderer can
+    // delay those looks here exactly as it delays a settle.
     'the sheet geometry to stop moving',
-    5000,
   );
   const sheet = await evaluate(
     contents,
@@ -547,7 +652,17 @@ async function run() {
 
   try {
     trace(`loading ${URL_UNDER_TEST}`);
-    await contents.loadURL(URL_UNDER_TEST);
+    {
+      // Deadlined like everything else: an un-deadlined navigation used to be
+      // bounded only by the test's spawn timeout, which kills the probe with
+      // nothing written and nothing named.
+      const { ms, note } = BUDGET.cap(LOAD_MS);
+      await withDeadline(contents.loadURL(URL_UNDER_TEST), {
+        stage: `loading ${URL_UNDER_TEST}`,
+        budgetMs: ms,
+        note,
+      });
+    }
     trace('loaded');
     await waitFor(contents, `document.querySelector('.app')`, 'the app shell to mount');
     // The boot effect opens the most recent chat or creates one. Seeding before
@@ -613,15 +728,22 @@ async function run() {
         );
       }
       const measures = {};
+      const viewports = {};
       for (const width of SWEEP) {
         await setWidth(window, width);
-        measures[width] = await evaluate(
+        // `innerWidth` read in the SAME evaluation as the measure, so a
+        // reading taken at the previous width — the thing `setWidth` waits
+        // out — fails by name in the test instead of as a narrowing measure.
+        const reading = await evaluate(
           contents,
-          READING_MEASURE,
+          `({ width: innerWidth, measure: ${READING_MEASURE} })`,
           `the reading measure at ${width}px (${face})`,
         );
+        measures[width] = reading.measure;
+        viewports[width] = reading.width;
       }
       out.sweep[face] = measures;
+      out.sweepViewport[face] = viewports;
     }
     await evaluate(
       contents,
@@ -644,8 +766,14 @@ app.whenReady().then(async () => {
     // Partial measurements are still written. A probe that reported nothing on
     // the way to failing would make every failure a mystery.
     out.error = String(error && error.stack ? error.stack : error);
+    // A wait that ran out is recorded AS one — its kind, stage, how long it
+    // waited, its budget and what it last saw — so the test can tell "the
+    // renderer did not answer" (a harness timeout) from "the page never got
+    // there" (a real failure), and read neither as a layout finding.
+    if (error instanceof StageTimeout) out.failure = error.toJSON();
     failed = true;
   }
+  out.elapsedMs = Date.now() - START;
   writeFileSync(OUT, JSON.stringify(out, null, 2));
   app.exit(failed ? 1 : 0);
 });
