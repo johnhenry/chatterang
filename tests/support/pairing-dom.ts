@@ -44,6 +44,45 @@ export function reads(node: Element | null): string {
   return (node?.textContent ?? '').replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Only the text a person could see, whitespace collapsed.
+ *
+ * `reads()` is `textContent`, and `textContent` counts subtrees nobody can see,
+ * so "the dialog's text contains it" is not "it is on screen" (#124 ruled the
+ * typed-route admission on screen from the start). This walk drops what is
+ * `hidden`, `aria-hidden="true"` or `inert`, an inline `display: none` or
+ * `visibility: hidden`, and everything but the summary of a closed `<details>`,
+ * on the node itself, its ancestors and its descendants. jsdom loads no
+ * stylesheet, so a class that hides is not seen here.
+ */
+export function readsShown(node: Element | null): string {
+  const concealed = (el: Element): boolean => {
+    if (el.hasAttribute('hidden') || el.hasAttribute('inert') || el.getAttribute('aria-hidden') === 'true') return true;
+    const style = getComputedStyle(el);
+    return style.display === 'none' || style.visibility === 'hidden';
+  };
+  const closedDetails = (el: Element | null): el is HTMLDetailsElement =>
+    el instanceof HTMLDetailsElement && !el.open;
+  if (!node) return '';
+  for (let at: Element | null = node; at; at = at.parentElement) {
+    if (concealed(at)) return '';
+    if (closedDetails(at.parentElement) && at.tagName !== 'SUMMARY') return '';
+  }
+  const parts: string[] = [];
+  const walk = (el: Element): void => {
+    const shut = closedDetails(el);
+    for (const child of el.childNodes) {
+      if (child instanceof Text) {
+        if (!shut) parts.push(child.data);
+      } else if (child instanceof Element && !concealed(child) && !(shut && child.tagName !== 'SUMMARY')) {
+        walk(child);
+      }
+    }
+  };
+  walk(node);
+  return parts.join('').replace(/\s+/g, ' ').trim();
+}
+
 /** The open dialog, or null. */
 export function dialog(): HTMLElement | null {
   return document.querySelector<HTMLElement>('[role="dialog"]');

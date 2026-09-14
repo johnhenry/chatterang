@@ -111,6 +111,9 @@ async function open(controller: PairingController) {
   const onClose = vi.fn();
   mounted.push(await render(<Harness controller={controller} onOutcome={onOutcome} onClose={onClose} />));
   expect(dialog(), 'the sheet opened').not.toBeNull();
+  // Nothing is pressed to get here. Under jsdom the platform row is `web`,
+  // which can scan, and the sheet still opens on Type (#124).
+  expect(mustButton('Type').getAttribute('aria-pressed'), 'the sheet opened on Type').toBe('true');
   return { onOutcome, onClose, mount: mounted[mounted.length - 1]! };
 }
 

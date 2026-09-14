@@ -39,6 +39,7 @@ import {
 } from '@chatterang/tunnel/pairing';
 import { isLocalEngine } from '@/domain/manifest';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
+import { capabilities } from '@/lib/platform';
 import {
   pairingController,
   validateScannedPayload,
@@ -70,7 +71,7 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
-import { byLabel, click, mustButton, render, settle, typeInto } from './support/pairing-dom';
+import { byLabel, click, dialog, mustButton, readsShown, render, settle, typeInto } from './support/pairing-dom';
 import {
   SPECIFIER,
   codeOf,
@@ -1844,7 +1845,9 @@ describe('the camera usage string', () => {
   it('makes a promise about the frames that the app must then keep', () => {
     // The second sentence is the one #128 says "has to be true": frames never
     // touch the blob store and never reach a model. This pins the CLAIM; the
-    // conduct is pinned where the scanner lands.
+    // conduct is pinned where the scanner landed, in
+    // tests/pairing-scan-persists-nothing.test.tsx, which drives a scan through
+    // the real sheet to Cancel and to Pair and watches every store and route.
     expect(CAMERA_USAGE_DESCRIPTION).toMatch(/stored or sent anywhere/i);
   });
 });
@@ -2272,6 +2275,27 @@ describe('the pairing sheet admits what typing a code does not check', () => {
       "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
         'fingerprint; six typed digits do not.',
     );
+
+    // On screen from the start (#124): the sheet opens on Type even on a row
+    // that can scan, so the sentence is read before a route is picked, not only
+    // by someone who went looking for Type. Nothing is pressed first. Read as
+    // shown, not as textContent, which would count a hidden paragraph.
+    expect(capabilities().cameraScan, 'jsdom runs the web row, which can scan').toBe(true);
+    const opened = await render(
+      createElement(PairingSheet, {
+        controller: { available: true, pair: vi.fn(async (): Promise<PairingOutcome> => ({ kind: 'refused', reason: 'unreachable' })) },
+        onClose: () => {},
+        onOutcome: () => {},
+      }),
+    );
+    try {
+      expect(readsShown(dialog())).toContain(
+        "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
+          'fingerprint; six typed digits do not.',
+      );
+    } finally {
+      await opened.unmount();
+    }
 
     // Six typed digits do not: the typed request has no trust field, and no
     // payload that could carry one.
