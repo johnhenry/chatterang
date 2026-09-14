@@ -269,6 +269,36 @@ describe('an MCP call receipt', () => {
     expect(now).toHaveBeenCalledOnce();
   });
 
+  it('is timed when the arguments left, not when a slow server answered', async () => {
+    // Reading the clock once is not enough: once AFTER the call is also once.
+    // So the clock moves while the call is out, on a call that answers and on
+    // one that throws, and the receipt keeps the earlier time on both.
+    let clock = 1_000;
+    const now = () => new Date(clock);
+    const answers = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        clock = 31_000;
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    });
+    const sent = await answers.execute({ q: 'x' }, { now });
+    expect(sent.receipt?.outcome).toBe('sent');
+    expect(sent.receipt?.at).toBe(1_000);
+
+    clock = 1_000;
+    const drops = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: async () => {
+        clock = 31_000;
+        throw new Error('socket hang up');
+      },
+    });
+    const failed = await drops.execute({ q: 'x' }, { now });
+    expect(failed.receipt?.outcome).toBe('failed');
+    expect(failed.receipt?.at).toBe(1_000);
+  });
+
   it('is not taken for a call refused before anything was sent', async () => {
     const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
       ...acme,

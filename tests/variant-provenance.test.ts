@@ -130,6 +130,10 @@ interface Turn {
    * the store has to handle without throwing away what the user already read.
    */
   readonly failWith?: string;
+  /** Hold the turn open BEFORE its tool event until this settles. */
+  readonly beforeTool?: Promise<void>;
+  /** Called once the store has finished handling the tool event. */
+  readonly onToolHandled?: () => void;
   /** Hold the turn open after its tool event until this settles. */
   readonly hang?: Promise<void>;
   /** Throw after the tool event instead of finishing — the store's `catch`. */
@@ -151,7 +155,13 @@ function scriptedEngine(): unknown {
     async *stream() {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
-      if (turn.tool) yield { type: 'tool', tool: turn.tool };
+      if (turn.beforeTool) await turn.beforeTool;
+      if (turn.tool) {
+        yield { type: 'tool', tool: turn.tool };
+        // A generator resumes only when its consumer asks for the next event,
+        // which the store does once its `tool` case has run to the end.
+        turn.onToolHandled?.();
+      }
       if (turn.hang) await turn.hang;
       if (turn.throwWith !== undefined) throw new Error(turn.throwWith);
       if (turn.failWith !== undefined) {
@@ -871,6 +881,47 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
       const inFlight = storedRows().find((row) => row.streaming === true);
       expect(inFlight?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
     } finally {
+      turn.release();
+      await sending;
+    }
+  });
+
+  it('is written down while the turn is running even when another chat is open', async () => {
+    // The store's `messages` is the thread ON SCREEN. Open another chat while
+    // the model works and the running row is no longer in that list, so a
+    // mid-turn write that looked the row up there wrote nothing — and a kill
+    // before `done` lost the record. The test above is the paired control: the
+    // same turn, with the user still looking at it.
+    const beforeTool = heldOpen();
+    const handled = heldOpen();
+    const turn = heldOpen();
+    script = [
+      {
+        text: 'Found it.',
+        provenance: ON_DEVICE,
+        tool: SENT,
+        beforeTool: beforeTool.hang,
+        onToolHandled: handled.release,
+        hang: turn.hang,
+      },
+    ];
+    const sending = useChats.getState().send('hello');
+    try {
+      await until(() => script.length === 0);
+      await useChats.getState().openChat('c2');
+      expect(useChats.getState().messages, 'the running row is off screen').toEqual([]);
+
+      beforeTool.release();
+      await handled.hang;
+
+      expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
+      const inFlight = storedRows().find((row) => row.streaming === true);
+      expect(inFlight?.chatId).toBe('c1');
+      expect(inFlight?.toolCalls?.[0]?.receipt, 'the receipt reached the database mid-turn').toEqual(
+        RECEIPT,
+      );
+    } finally {
+      beforeTool.release();
       turn.release();
       await sending;
     }

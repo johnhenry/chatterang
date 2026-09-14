@@ -635,16 +635,26 @@ async function runGeneration(
           // recovers it if this generation never finishes. A call still in
           // flight when the app dies has no record — that write would have to
           // happen before the hand-off, inside the dispatcher.
+          //
+          // Built from this generation's own state, NOT looked up in
+          // `messages`: that list is the thread on screen, and once the user
+          // opens another chat mid-turn the running row is not in it — so the
+          // lookup found nothing and nothing was written. It is the row `patch`
+          // keeps on screen, field for field.
           if (event.tool.receipt) {
-            const inProgress = get().messages.find((message) => message.id === placeholder.id);
-            if (inProgress) {
-              await db.messages.put(inProgress);
-              // A regenerated turn's row now holds the generations of the row
-              // it replaces, so that row goes now rather than after the turn.
-              // Otherwise a kill from here on leaves both, and the reopened
-              // thread shows the turn twice.
-              if (options.replaceMessageId) await db.messages.delete(options.replaceMessageId);
-            }
+            const split = splitThinking(raw);
+            await db.messages.put({
+              ...placeholder,
+              content: split.content,
+              thinking: split.thinking || undefined,
+              toolCalls,
+              streaming: true,
+            });
+            // A regenerated turn's row now holds the generations of the row
+            // it replaces, so that row goes now rather than after the turn.
+            // Otherwise a kill from here on leaves both, and the reopened
+            // thread shows the turn twice.
+            if (options.replaceMessageId) await db.messages.delete(options.replaceMessageId);
           }
           break;
         }
