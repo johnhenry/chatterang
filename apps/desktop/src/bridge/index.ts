@@ -74,6 +74,15 @@ export type {
   UnitTerminal,
   WorkBrokerOptions,
 } from './work-broker.js';
+export {
+  LOCAL_EXECUTOR,
+  LOCAL_TURNS_PLUGIN,
+  TURN_WAITING_EVENT,
+  admitLocalTurns,
+  localTurnNotices,
+  withTurnProgress,
+} from './local-turns.js';
+export type { LocalTurns, LocalTurnsOptions } from './local-turns.js';
 export { HostRuntime, createHostRuntime } from './host-runtime.js';
 export type {
   CallGuard,

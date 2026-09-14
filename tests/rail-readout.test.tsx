@@ -385,3 +385,35 @@ describe('a chat pinned to a downloading model, with a provider enabled', () => 
     });
   });
 });
+
+/* ══ #7: a desktop turn waiting for the model it shares ══════════════ */
+
+describe('the rail says when this window’s turn is waiting for the model (#7)', () => {
+  it('shows the place in line while waiting, and nothing once it is not', async () => {
+    // The desktop's own turns and a paired phone's share one slot, and whoever
+    // waits is told, including the person here (#7, ruling 3). A silent wait
+    // is indistinguishable from a hung app (#169).
+    // FAULT INJECTED: deleting the `turnWaiting` chip from Rail.tsx failed the
+    // first assertion.
+    given({ pinned: QWEN.id, installed: [installedRecord(QWEN)] });
+    useApp.setState({ turnWaiting: 2 });
+
+    try {
+      await mounted(createElement(Rail, { title: 'Yesterday' }), async () => {
+        expect(reads(rail())).toContain('Waiting · #2 in line');
+
+        await act(async () => {
+          useApp.getState().setTurnWaiting(1);
+        });
+        expect(reads(rail())).toContain('Waiting · next in line');
+
+        await act(async () => {
+          useApp.getState().setTurnWaiting(null);
+        });
+        expect(reads(rail())).not.toContain('Waiting');
+      });
+    } finally {
+      useApp.setState({ turnWaiting: null });
+    }
+  });
+});

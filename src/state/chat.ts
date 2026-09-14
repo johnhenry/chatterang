@@ -1392,6 +1392,7 @@ async function runGeneration(
     if (liveTurns.size === 0) {
       app.setActivity('idle');
       app.setLiveRate(null);
+      app.setTurnWaiting(null);
     }
 
     // A turn never handed to the engine is not a use of the model, nor a reply.

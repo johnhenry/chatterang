@@ -64,12 +64,17 @@ import {
   HostFleet,
   LLAMA_ENGINE,
   LLAMA_PLUGIN,
+  LOCAL_TURNS_PLUGIN,
   MOUNT_PLUGIN,
   ONNX_ENGINE,
   ONNX_PLUGIN,
   PluginHost,
+  WorkBroker,
+  admitLocalTurns,
   createMainRouter,
+  localTurnNotices,
   releaseRendererOn,
+  withTurnProgress,
 } from './bridge/index.js';
 import type {
   BootManifest,
@@ -77,6 +82,7 @@ import type {
   FleetEntry,
   HostHandle,
   InvokeResult,
+  LocalTurns,
   RendererTeardownEvent,
 } from './bridge/index.js';
 import {
@@ -422,6 +428,23 @@ function start(): void {
   });
 
   /*
+   * ONE SLOT FOR EVERY GENERATION ON THIS COMPUTER (#7, ruling 3).
+   *
+   * The desktop user's own turns and a paired phone's share one slot and one
+   * first-come-first-served wait list, and whoever waits is told. The broker
+   * is built before the fleet because the fleet's events are proof of progress
+   * for it. No listener is started here: phone turns reach this broker only
+   * once #7's listener wiring (S7) lands, so today every unit it holds is a
+   * window's.
+   */
+  const broker = new WorkBroker({
+    notifyWindow: localTurnNotices((pluginName, eventName, data, ownerId) =>
+      pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+    ),
+    warn: (message) => console.warn(`[main:broker] ${message}`),
+  });
+
+  /*
    * ONE HOST PER ENGINE, and the per-host liveness budget the split makes safe.
    *
    * The `onnx` entry's `pingTimeoutMs` is the second half of the fix. A ping
@@ -462,8 +485,12 @@ function start(): void {
     // used to be `LLAMA_PLUGIN.name` hard-coded here, which is the same thing
     // as asserting that only one engine will ever emit an event — and which
     // would have delivered a second engine's events on llama.cpp's channels.
-    notify: (pluginName, eventName, data, ownerId) =>
+    //
+    // Wrapped so a turn's tokens also reset the broker's deadline for it; the
+    // event itself is forwarded unchanged, and a throw still propagates.
+    notify: withTurnProgress(broker, (pluginName, eventName, data, ownerId) =>
       pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+    ),
     onBoot: (hostName, status) => {
       console.log(
         status.mounted
@@ -477,7 +504,19 @@ function start(): void {
   // The facade each supervisor builds from its own engine's definition. The
   // fleet routes by plugin name, so registering a plugin no host serves throws
   // here at boot rather than failing every call at runtime.
-  pluginHost.register(LLAMA_PLUGIN, fleet.plugin(LLAMA_PLUGIN.name));
+  //
+  // llama.cpp's facade is registered THROUGH the broker's slot: a desktop
+  // `generate` waits its turn behind whatever holds the slot, and its window
+  // is told it is waiting. Registering the facade directly would let a local
+  // turn decode on the same sequence as a phone's.
+  const localTurns = admitLocalTurns({
+    broker,
+    facade: fleet.plugin(LLAMA_PLUGIN.name),
+    fleet,
+    notify: (pluginName, eventName, data, ownerId) =>
+      pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+  });
+  pluginHost.register(LOCAL_TURNS_PLUGIN, localTurns.plugin);
   pluginHost.register(ONNX_PLUGIN, fleet.plugin(ONNX_PLUGIN.name));
   /*
    * The filesystem, served from MAIN rather than through the supervisor.
@@ -576,7 +615,14 @@ function start(): void {
   // A quitting app must not fork a replacement host on its way out — for
   // EITHER host. `dispose` over the whole fleet, from the fleet, so a host
   // added later cannot be forgotten here.
-  app.once('will-quit', () => fleet.dispose());
+  //
+  // The broker first: every waiting and running generation ends
+  // DESKTOP_QUITTING, and a running one is cancelled in its host, before the
+  // fleet stops supervising the hosts.
+  app.once('will-quit', () => {
+    broker.quit();
+    fleet.dispose();
+  });
 
   // Before the first window, so the menu is up by the time it can be used.
   // `setApplicationMenu` REPLACES Electron's default, which on macOS is what
@@ -584,15 +630,15 @@ function start(): void {
   // carries the standard roles as well as ours. See `./menu.ts`.
   installMenu();
 
-  createWindow(pluginHost, fleet, senders);
+  createWindow(pluginHost, localTurns, senders);
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, fleet, senders);
+    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, localTurns, senders);
   });
 }
 
 function createWindow(
   pluginHost: PluginHost,
-  fleet: HostFleet,
+  localTurns: LocalTurns,
   senders: Map<number, WebContents>,
 ): BrowserWindow {
   const window = new BrowserWindow({
@@ -628,13 +674,16 @@ function createWindow(
   const teardown = (event: RendererTeardownEvent): void =>
     releaseRendererOn(event, contents.id, {
       releaseSender: (id) => pluginHost.releaseSender(id),
-      // OVER THE WHOLE FLEET. This is the one wiring mistake the split makes
-      // possible that fails SILENTLY: a teardown reaching only one supervisor
-      // leaks exactly the other engine's turns and sessions, for every window
-      // that ever closes, with no error and nothing a boot check can see. So
-      // the fan-out lives in `HostFleet`, where `tests/desktop-bridge.test.ts`
-      // drives it, and this call site cannot name one host.
-      releaseRenderer: (id, reason) => fleet.releaseRenderer(id, reason),
+      // OVER THE BROKER AND THE WHOLE FLEET. This is the one wiring mistake the
+      // split makes possible that fails SILENTLY: a teardown reaching only one
+      // supervisor leaks exactly the other engine's turns and sessions, for
+      // every window that ever closes, with no error and nothing a boot check
+      // can see. A teardown that skipped the broker would leave a departed
+      // window's waiting turn to start later, for nobody. So the fan-out lives
+      // in `admitLocalTurns` over `HostFleet`, where
+      // `tests/desktop-local-turns.test.ts` drives it, and this call site cannot
+      // name one host.
+      releaseRenderer: (id, reason) => localTurns.releaseRenderer(id, reason),
       forget: (id) => senders.delete(id),
     });
 

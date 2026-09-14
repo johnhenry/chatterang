@@ -25,6 +25,7 @@ import type {
   GenerateImage,
   GenerateResult,
   TokenEvent,
+  TurnWaitingEvent,
 } from '@/plugins/llama-cpp';
 import type { ModelManifest, SamplerSettings } from '@/domain/manifest';
 import { inferTemplate, renderPrompt, templateStopSequences } from '@/ai/prompt';
@@ -47,6 +48,25 @@ export interface LlamaCppBackendConfig {
   onWarning?: (message: string) => void;
   /** Called with per-token throughput so the UI can show a live readout. */
   onProgress?: (progress: { requestId: string; tokens: number; elapsedMs: number }) => void;
+  /**
+   * Called when a streamed generation is waiting for the model, and with
+   * `position: 0` when it starts (#7). Only the desktop reports this.
+   */
+  onWaiting?: (event: TurnWaitingEvent) => void;
+}
+
+/**
+ * The one subscription the contract does not declare.
+ *
+ * `llamaWaiting` is emitted by the desktop's main process alone (see
+ * `TurnWaitingEvent`), so it is typed here, at the one call site, rather than
+ * added to an interface every inference host implements.
+ */
+interface WaitingEvents {
+  addListener(
+    eventName: 'llamaWaiting',
+    listener: (event: TurnWaitingEvent) => void,
+  ): Promise<{ remove(): Promise<void> }>;
 }
 
 interface LoadedHandle {
@@ -327,6 +347,19 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
       wake();
     });
 
+    // #7: on the desktop, this turn can wait for the one slot it shares with a
+    // paired phone's turns, and this window is told where it stands. A
+    // platform that does not know the event may refuse the subscription; that
+    // means "never waits here", not a failed turn.
+    const waiting = await Promise.resolve()
+      .then(() =>
+        (LlamaCpp as unknown as WaitingEvents).addListener('llamaWaiting', (event) => {
+          if (event.requestId !== requestId) return;
+          this.#config.onWaiting?.(event);
+        }),
+      )
+      .catch(() => null);
+
     const abort = (): void => void LlamaCpp.cancel({ requestId }).catch(() => undefined);
     signal?.addEventListener('abort', abort, { once: true });
 
@@ -420,6 +453,7 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     } finally {
       signal?.removeEventListener('abort', abort);
       await listener.remove().catch(() => undefined);
+      await waiting?.remove().catch(() => undefined);
       await generation.catch(() => undefined);
     }
   }

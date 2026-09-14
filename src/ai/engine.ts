@@ -26,7 +26,11 @@ import type {
   Middleware,
 } from '@johnhenry/aimatey-types';
 
-import { LlamaCppBackendAdapter, type LlamaModelResolver } from '@/ai/backends/llama-cpp';
+import {
+  LlamaCppBackendAdapter,
+  type LlamaCppBackendConfig,
+  type LlamaModelResolver,
+} from '@/ai/backends/llama-cpp';
 import {
   createToolMiddleware,
   findToolCalls,
@@ -480,6 +484,8 @@ export interface EngineOptions {
   fallbackBackendId?: string | null;
   onWarning?: (message: string) => void;
   onFallback?: (event: FallbackEvent) => void;
+  /** A local generation is waiting for the desktop's shared slot, or has started (#7). */
+  onWaiting?: LlamaCppBackendConfig['onWaiting'];
   debug?: boolean;
 }
 
@@ -514,6 +520,7 @@ export class ChatterangEngine {
     this.llama = new LlamaCppBackendAdapter({
       resolver: options.resolver,
       onWarning: options.onWarning,
+      onWaiting: options.onWaiting,
     });
     this.router.register('llama-cpp', this.llama);
 
