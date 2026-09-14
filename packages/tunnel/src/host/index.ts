@@ -370,6 +370,15 @@ function openTunnel(socket: Socket, greeting: readonly TunnelFrame[]): Tunnel {
 /** A bound listener before anyone has decided what to do with its tunnels. */
 interface Bound {
   readonly server: Server;
+  /**
+   * Admit nobody else, from this turn on, and stop the server taking new
+   * connections. Open tunnels are left alone.
+   *
+   * NOT JUST `server.close()`, which is what rung 0's wrapper used to call. That
+   * refuses new TCP connections and still lets a connection already inside a
+   * request finish its upgrade; the flag this sets is read at the upgrade.
+   */
+  stopAccepting(): void;
   close(reason?: string): Promise<void>;
 }
 
@@ -401,33 +410,43 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
    * events are this file's alone. This is the `ws` README's own pattern.
    */
   const sockets = new WebSocketServer({ noServer: true });
-  server.on('upgrade', (request, socket, head) => {
-    sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit('connection', ws, request));
-  });
-
   const live = new Set<Tunnel>();
   let accepting = true;
 
-  sockets.on('connection', (socket: Socket) => {
-    // A refused socket belongs to no tunnel, and its protocol errors must not
-    // throw either. See `openTunnel`'s `error` handler for why they would.
-    const refuse = (): void => {
-      socket.on('error', () => undefined);
-    };
-
+  server.on('upgrade', (request, socket, head) => {
+    /*
+     * ADMISSION ENDS HERE, AT THE UPGRADE, and not at `server.close()`. Closing
+     * the server refuses new TCP connections, but a connection already inside
+     * an HTTP request is not idle, so it survives the close and can still
+     * finish upgrading. Measured on rung 0's wrapper: a peer whose request line
+     * reached the server while the tunnel was live got `101 Switching
+     * Protocols` after `closed` resolved, and became the host's tunnel. So a
+     * peer that is too late is dropped here, before `ws` writes a byte: the
+     * nearest a connected socket can come to ECONNREFUSED, and no close code
+     * that would claim the listener is full rather than going.
+     *
+     * The ONLY such check, because nothing can slip in after it. With no
+     * `verifyClient`, `handleUpgrade` reaches its callback synchronously
+     * (`completeUpgrade` in `ws/lib/websocket-server.js`), so `connection` runs
+     * in this same turn.
+     */
     if (!accepting) {
-      // Mid-shutdown: not full, just going. No code that would claim otherwise.
-      refuse();
-      socket.terminate();
+      socket.destroy();
       return;
     }
+    sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit('connection', ws, request));
+  });
+
+  sockets.on('connection', (socket: Socket) => {
     /*
      * THE CAP, AT ACCEPT TIME, AND FIRST (#169). Before the greeting and before
      * anything that reads from the socket, so a refused peer is told the code
      * and nothing else, and no frame it sends is ever read into anything.
      */
     if (live.size >= maxTunnels) {
-      refuse();
+      // A refused socket belongs to no tunnel, and its protocol errors must not
+      // throw either. See `openTunnel`'s `error` handler for why they would.
+      socket.on('error', () => undefined);
       socket.close(TUNNEL_CAP_CLOSE_CODE, 'tunnel limit reached');
       return;
     }
@@ -455,8 +474,14 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
 
   return {
     server,
+    stopAccepting() {
+      accepting = false;
+      server.close();
+    },
     close(reason) {
       closing ??= (async () => {
+        // In the first turn, before any wait below: those waits are real turns
+        // of the event loop, and an upgrade landing in one must not be admitted.
         accepting = false;
         // Every open tunnel says `bye` and goes, each through its own close.
         await Promise.all([...live].map((tunnel) => tunnel.close(reason)));
@@ -539,8 +564,9 @@ export async function createTunnelListener(options: TunnelListenerOptions): Prom
  * the moment that tunnel ends: rung 0's host is one tunnel's lifetime, and a
  * port that kept listening afterwards completed handshakes onto a tunnel that
  * would never read another frame, reporting "on" while serving nothing. A late
- * peer now gets ECONNREFUSED, and a second peer while the first is still
- * connected gets `TUNNEL_CAP_CLOSE_CODE`.
+ * peer now gets ECONNREFUSED; a peer that connected earlier but finishes its
+ * upgrade late is dropped at the upgrade, unanswered; and a second peer while
+ * the first is still connected gets `TUNNEL_CAP_CLOSE_CODE`.
  */
 export async function createTunnelHost(options: TunnelHostOptions = {}): Promise<TunnelHost> {
   let tunnel: Tunnel | null = null;
@@ -560,9 +586,11 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
     tunnel = admitted;
     arrive();
     void admitted.closed.then(() => {
-      // Stop accepting BEFORE `closed` resolves, so a caller that awaits it
-      // and then connects is refused rather than racing the listener.
-      bound.server.close();
+      // Stop admitting in the turn the tunnel ends, before the next connection
+      // or upgrade can be read, so a caller that awaits `closed` never races
+      // the listener: a new connection is refused, and one already mid-request
+      // is dropped at its upgrade. See `Bound.stopAccepting`.
+      bound.stopAccepting();
       settle();
     });
   });

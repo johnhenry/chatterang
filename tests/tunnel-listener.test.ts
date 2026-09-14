@@ -295,6 +295,45 @@ describe('one listener, many tunnels', () => {
     expect(await incoming.next()).toEqual({ done: true, value: undefined });
   });
 
+  it('an upgrade that lands once close() has begun is dropped, not handed out', async () => {
+    /*
+     * `close()` STOPS ADMITTING IN ITS FIRST TURN, before it waits on any
+     * tunnel's `bye`. Those waits are real turns of the event loop, and an
+     * upgrade landing in one would otherwise be admitted to a listener that is
+     * going: a 101, a tunnel queued for a loop that is about to end, and a
+     * terminate a moment later. Loopback gives no way to aim a peer's bytes at
+     * that turn, so the test holds one real upgrade back from the listener and
+     * delivers it itself, in the same turn as `close()`.
+     */
+    const { listener, port, incoming } = await listen({ maxTunnels: 2 });
+    await rawPeer(port);
+    await nextTunnel(incoming);
+
+    const handlers = listener.server.listeners('upgrade') as ((...args: unknown[]) => void)[];
+    listener.server.removeAllListeners('upgrade');
+    const held = new Promise<unknown[]>((resolve) => {
+      listener.server.once('upgrade', (...args: unknown[]) => resolve(args));
+    });
+    const { connect } = await import('node:net');
+    const late = connect(port, '127.0.0.1');
+    open.push({ close: () => late.destroy() });
+    late.on('error', () => undefined);
+    const answer = new Promise<string>((resolve) => {
+      late.once('data', (data: Buffer) => resolve(data.toString('latin1')));
+      late.once('close', () => resolve(''));
+    });
+    late.write(upgradeRequest(port));
+    const upgrade = await held;
+    for (const handler of handlers) listener.server.on('upgrade', handler);
+
+    const closing = listener.close();
+    listener.server.emit('upgrade', ...upgrade);
+    await closing;
+
+    expect(await answer).toBe('');
+    expect(await incoming.next()).toEqual({ done: true, value: undefined });
+  });
+
   it('refuses a cap that is not a positive integer', async () => {
     // No default and no clamping: a cap of 0 or NaN is a caller's mistake, and
     // a listener that quietly admitted everyone would hide it.
@@ -318,6 +357,20 @@ describe('one listener, many tunnels', () => {
   });
 });
 
+/** A complete WebSocket upgrade request, as the bytes a raw TCP peer writes. */
+const upgradeRequest = (port: number): string =>
+  [
+    'GET / HTTP/1.1',
+    `Host: 127.0.0.1:${String(port)}`,
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    // RFC 6455's own sample nonce: any 16 bytes, base64.
+    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+    'Sec-WebSocket-Version: 13',
+    '',
+    '',
+  ].join('\r\n');
+
 /**
  * A peer that breaks the WebSocket protocol itself, which no WebSocket client
  * will do on request — so it is written by hand over raw TCP, for the reason
@@ -335,19 +388,7 @@ async function protocolBreaker(port: number) {
         ? resolve()
         : reject(new Error('the listener did not upgrade the connection')),
     );
-    tcp.write(
-      [
-        'GET / HTTP/1.1',
-        `Host: 127.0.0.1:${String(port)}`,
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        // RFC 6455's own sample nonce: any 16 bytes, base64.
-        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
-        'Sec-WebSocket-Version: 13',
-        '',
-        '',
-      ].join('\r\n'),
-    );
+    tcp.write(upgradeRequest(port));
   });
   return {
     /** A text frame WITHOUT the mask RFC 6455 requires of every client frame. */
@@ -401,5 +442,30 @@ describe('a peer that breaks the WebSocket protocol', () => {
     expect(tunnelGood.ended()).toBeNull();
     expect(good.frames).toEqual([]);
     expect(listener.server.listening).toBe(true);
+  });
+
+  it('a refused peer that never answers the close does not hold listener.close() open', async () => {
+    /*
+     * RFC 6455 OBLIGES A PEER TO ANSWER A CLOSE FRAME, and `ws` waits 30
+     * seconds for that answer before giving up on the socket. A peer the cap
+     * refused is mid close-handshake: still one of `ws`'s clients and still one
+     * of the server's connections, which `closeAllConnections()` does not
+     * reach once upgraded and `server.close()` waits for. Measured with the
+     * step that terminates leftover clients removed: `listener.close()` took
+     * 30 seconds, and a quit hook waiting on it would too. Every other peer in
+     * these tests is a `ws` client, which answers a close by itself, so none of
+     * them could see it. The test timeout is the bound.
+     */
+    const { listener, port, incoming } = await listen({ maxTunnels: 1 });
+    await rawPeer(port);
+    await nextTunnel(incoming);
+
+    // Upgraded and refused in the same turn on the server's side, and it never
+    // writes another byte.
+    const silent = await protocolBreaker(port);
+
+    await listener.close();
+    await silent.gone;
+    expect(listener.server.listening).toBe(false);
   });
 });

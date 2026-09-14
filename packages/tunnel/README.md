@@ -69,8 +69,11 @@ a device's stale socket with its new one, is deferred because it needs device
 identity (#135), and none exists yet.
 
 `createTunnelHost` is rung 0's single tunnel on top of the listener: capped at
-one, and it stops accepting once that tunnel ends, so a late peer is refused at
-connect rather than handshaking onto a tunnel that is already over.
+one, and it stops accepting once that tunnel ends. A late peer is refused at
+connect, and a peer already mid-request is dropped at its upgrade, rather than
+either handshaking onto a tunnel that is already over. The check is at the
+upgrade because `server.close()` alone lets a connection that is already inside
+a request finish upgrading.
 
 ## What is deliberately not here
 
