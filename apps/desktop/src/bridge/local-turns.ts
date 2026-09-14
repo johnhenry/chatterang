@@ -4,9 +4,9 @@
  * `WorkBroker` holds one slot and one first-come-first-served wait list. A
  * paired phone's turn and the desktop user's own turn share them, and whoever
  * waits is told, including the person at the desktop. This file puts the
- * desktop's `LlamaCpp.generate` on that slot, WITHOUT changing the Supervisor.
- * The Supervisor still owns "every generation it starts ends exactly once".
- * This owns whether a generation may start yet.
+ * desktop's `LlamaCpp.generate` and `LlamaCpp.benchmark` on that slot, WITHOUT
+ * changing the Supervisor. The Supervisor still owns "every generation it
+ * starts ends exactly once". This owns whether a decode may start yet.
  *
  * WHAT THE WRAPPER CHANGES, method by method:
  *
@@ -19,7 +19,32 @@
  *     `llamaEnd` with `stopReason: 'cancelled'` and its `generate` resolves the
  *     way a cancelled generation does. A running turn's cancel goes to the
  *     Supervisor exactly as before.
- *   - Every other method is the facade's own and takes no slot.
+ *   - `benchmark` decodes too (a prefill and a run of tokens per repetition),
+ *     so it takes the slot as well. It does NOT wait: the benchmark screen has
+ *     no place in line to show, so a benchmark asked for while anything holds
+ *     or waits for the slot is refused `SLOT_BUSY`, and one that is running
+ *     makes every generation, local or phone, wait behind it.
+ *   - Every other method is the facade's own and takes no slot: none of them
+ *     decodes.
+ *
+ * A WINDOW'S UNIT IS ONE DECODE; A PHONE'S UNIT IS ONE TURN. The broker's slot
+ * is taken per `generate` here, because that is the only boundary main can
+ * see: a renderer's turn is a loop in `src/ai/engine.ts` (a tool call runs
+ * between two generates, and a local approval sheet waits between them
+ * holding nothing). So a phone's turn can take the slot between two decodes of
+ * a local tool turn. The GPU never runs two decodes, which is what the slot
+ * exists for; whether #169's "one turn at a time" also means a local tool loop
+ * keeps the slot across its tool calls is the owner's to rule.
+ *
+ * A WORKER'S GENERATIONS RUN UNDER THE UNIT IT RUNS. Ruling 1 puts a phone's
+ * turn in a hidden worker window (S5), whose engine calls `LlamaCpp.generate`
+ * through this same plugin. That unit already holds the slot; admitting its
+ * generate as a second unit would queue it behind itself for ever. So
+ * `hostedUnitOf` names, for a window that is a worker, the unit it runs: its
+ * `generate` goes straight to the host while that unit is running, one at a
+ * time, and is refused otherwise; and its tokens are progress for that unit.
+ * Main passes no `hostedUnitOf` until S5 creates a worker, so today every
+ * window is a user's.
  *
  * EXACTLY ONE `llamaEnd`, STILL:
  *
@@ -33,7 +58,7 @@
  *     page, nothing delivered.
  *   - A turn the broker REFUSES gets no `llamaEnd`, the same as a generate the
  *     Supervisor refuses before starting it (a duplicate requestId, a closed
- *     host).
+ *     host). So does a worker's generate refused for not running its unit.
  *
  * WHY `llamaWaiting` IS NOT IN `LLAMA_EVENTS`. The llama host is served with
  * `LLAMA_PLUGIN`, and the Supervisor drops any event that definition does not
@@ -62,6 +87,9 @@ export const TURN_WAITING_EVENT = 'llamaWaiting';
 /** The executor name the desktop's generations run on, for `WorkBroker.workerLost`. */
 export const LOCAL_EXECUTOR = 'llama';
 
+/** The one non-streamed llama method that decodes, and so takes the slot. */
+const BENCHMARK = 'benchmark';
+
 /**
  * What main registers for `LlamaCpp`: the llama definition plus the waiting
  * event. The methods are the same array, not a copy, so the renderer's reach
@@ -73,14 +101,38 @@ export const LOCAL_TURNS_PLUGIN: PluginDefinition = Object.freeze({
   events: Object.freeze([...LLAMA_EVENTS, TURN_WAITING_EVENT]),
 });
 
+/** The broker unit a worker window is running. */
+export interface HostedUnit {
+  readonly owner: Owner;
+  readonly unitId: string;
+}
+
+/**
+ * For a window that is a WORKER (S5), the unit whose work it runs; undefined
+ * for every other window. Main's, because only main knows which windows it
+ * created as workers.
+ */
+export type HostedUnitOf = (senderId: number) => HostedUnit | undefined;
+
+/** The broker's `notifyWindow` for the desktop, plus forgetting a window that went away. */
+export interface LocalTurnNotices {
+  (windowId: number, notice: BrokerNotice): boolean;
+  /** Forget everything remembered about a window. Its units' ends are never delivered to it. */
+  release(windowId: number): void;
+}
+
 export interface LocalTurnsOptions {
   readonly broker: WorkBroker;
   /** The `PluginImplementation` the fleet built for llama.cpp. */
   readonly facade: PluginImplementation;
   /** Whatever releases a departed window's turns and sessions across every host. */
   readonly fleet: { releaseRenderer(senderId: number, reason: string): void };
+  /** The notifier the broker was built with, so a departed window is forgotten there too. */
+  readonly notices: LocalTurnNotices;
   /** Emit one plugin event, to one window when `ownerId` is given. */
   readonly notify: NotifyListeners;
+  /** S5's worker windows. Omitted: no window is a worker. */
+  readonly hostedUnitOf?: HostedUnitOf | undefined;
 }
 
 export interface LocalTurns {
@@ -113,6 +165,16 @@ const ENDED: Readonly<Record<Exclude<UnitEnd, 'COMPLETED' | 'FAILED'>, string>> 
   DEADLINE: 'The generation produced nothing for too long.',
   HOST_SUSPENDED: 'The generation stopped because the computer went to sleep.',
   DESKTOP_QUITTING: 'The generation stopped because the app is quitting.',
+};
+
+const BENCHMARK_ENDED: Readonly<Record<Exclude<UnitEnd, 'COMPLETED' | 'FAILED'>, string>> = {
+  WORKER_LOST: 'The process running the benchmark stopped.',
+  OWNER_LOST: 'The window that started the benchmark went away.',
+  OWNER_REVOKED: 'This window is no longer allowed to run the benchmark.',
+  CANCELLED: 'The benchmark was cancelled.',
+  DEADLINE: 'The benchmark took too long.',
+  HOST_SUSPENDED: 'The benchmark stopped because the computer went to sleep.',
+  DESKTOP_QUITTING: 'The benchmark stopped because the app is quitting.',
 };
 
 function codedError(message: string, code: string): Error {
@@ -157,7 +219,7 @@ function requestIdOf(options: unknown): string | undefined {
  *   not take.
  */
 export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
-  const { broker, facade, fleet, notify } = options;
+  const { broker, facade, fleet, notices, notify, hostedUnitOf } = options;
   const stream = llamaStream();
   const methods = facade as unknown as Record<string | symbol, unknown>;
 
@@ -199,11 +261,37 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     }
   };
 
+  /** Hosted units with a generate in flight: one decode at a time under one slot. */
+  const hostedBusy = new Set<string>();
+
+  /** A worker's generate: its unit's work, under its unit's slot. */
+  const generateHosted = async (senderId: number, request: unknown, hosted: HostedUnit): Promise<unknown> => {
+    const key = `${hosted.owner.kind}:${String(hosted.owner.id)} ${hosted.unitId}`;
+    if (!broker.isRunning(hosted.owner, hosted.unitId)) {
+      throw codedError(
+        'desktop bridge: this worker’s unit does not hold the slot, so it may not generate.',
+        'NOT_RUNNING',
+      );
+    }
+    if (hostedBusy.has(key)) {
+      throw codedError('desktop bridge: this worker already has a generation running under its unit.', 'SLOT_BUSY');
+    }
+    hostedBusy.add(key);
+    try {
+      return await call(stream.start, senderId, request as GenerateOptions);
+    } finally {
+      hostedBusy.delete(key);
+    }
+  };
+
   const generate = async (senderId: number, request: unknown): Promise<unknown> => {
     const requestId = requestIdOf(request);
     if (requestId === undefined) {
       throw new Error(`desktop bridge: ${LLAMA_PLUGIN.name}.${stream.start} requires a requestId.`);
     }
+    const hosted = hostedUnitOf?.(senderId);
+    if (hosted !== undefined) return generateHosted(senderId, request, hosted);
+
     const owner: Owner = { kind: 'window', id: senderId };
     const admission = broker.admit({
       owner,
@@ -250,18 +338,43 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     return call(stream.cancel, senderId, request);
   };
 
+  let benchmarks = 0;
+  const benchmark = async (senderId: number, request: unknown): Promise<unknown> => {
+    benchmarks += 1;
+    const admission = broker.admit({
+      owner: { kind: 'window', id: senderId },
+      // A benchmark has no requestId. Were a page ever to choose this same id
+      // for a generation, one of the two is refused DUPLICATE_UNIT: never both
+      // running.
+      unitId: `benchmark ${String(benchmarks)}`,
+      executor: LOCAL_EXECUTOR,
+      wait: false,
+      // Not sender-scoped below the wrapper: the facade takes the options alone.
+      start: () => call(BENCHMARK, request),
+    });
+    if (!admission.admitted) throw codedError(REFUSED[admission.refusal], admission.refusal);
+    const terminal = await admission.settled;
+    if (terminal.end === 'COMPLETED') return terminal.value;
+    if (terminal.end === 'FAILED') throw terminal.error;
+    throw codedError(BENCHMARK_ENDED[terminal.end], terminal.end);
+  };
+
   const implementation: Record<string | symbol, unknown> = {};
   for (const name of LLAMA_METHODS) {
     if (name === stream.start) implementation[name] = generate;
     else if (name === stream.cancel) implementation[name] = cancel;
+    else if (name === BENCHMARK) implementation[name] = benchmark;
     else implementation[name] = (...args: unknown[]) => call(name, ...args);
   }
-  implementation[SENDER_SCOPED] = [stream.start, stream.cancel];
+  // The benchmark is scoped HERE, for the slot's owner, and not below: the
+  // facade's scoping is checked above to be exactly start and cancel.
+  implementation[SENDER_SCOPED] = [stream.start, stream.cancel, BENCHMARK];
 
   return {
     plugin: implementation as unknown as PluginImplementation,
     releaseRenderer(senderId, reason) {
       broker.releaseWindow(senderId);
+      notices.release(senderId);
       fleet.releaseRenderer(senderId, reason);
     },
   };
@@ -276,45 +389,70 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
  * is not re-sent: a desktop generation's terminal is its `llamaEnd` and its
  * `generate` promise. Prompts are not relayed to windows: a desktop turn
  * answers its prompts in its own page.
+ *
+ * What it remembers about a window, it forgets on `release`: the broker never
+ * tells a window that went away how its units ended.
  */
-export function localTurnNotices(notify: NotifyListeners): (windowId: number, notice: BrokerNotice) => boolean {
-  const waited = new Set<string>();
-  const key = (windowId: number, unitId: string): string => `${String(windowId)} ${unitId}`;
-  return (windowId, notice) => {
+export function localTurnNotices(notify: NotifyListeners): LocalTurnNotices {
+  const waited = new Map<number, Set<string>>();
+  const notifier = (windowId: number, notice: BrokerNotice): boolean => {
     switch (notice.kind) {
-      case 'waiting':
-        waited.add(key(windowId, notice.unitId));
+      case 'waiting': {
+        const units = waited.get(windowId) ?? new Set<string>();
+        units.add(notice.unitId);
+        waited.set(windowId, units);
         notify(LLAMA_PLUGIN.name, TURN_WAITING_EVENT, { requestId: notice.unitId, position: notice.position }, windowId);
         return true;
+      }
       case 'started':
-        if (waited.delete(key(windowId, notice.unitId))) {
+        if (forget(windowId, notice.unitId)) {
           notify(LLAMA_PLUGIN.name, TURN_WAITING_EVENT, { requestId: notice.unitId, position: 0 }, windowId);
         }
         return true;
       case 'terminal':
-        waited.delete(key(windowId, notice.terminal.unitId));
+        forget(windowId, notice.terminal.unitId);
         return true;
       case 'prompt':
         return false;
     }
   };
+  function forget(windowId: number, unitId: string): boolean {
+    const units = waited.get(windowId);
+    if (units === undefined || !units.delete(unitId)) return false;
+    if (units.size === 0) waited.delete(windowId);
+    return true;
+  }
+  return Object.assign(notifier, {
+    release(windowId: number): void {
+      waited.delete(windowId);
+    },
+  });
 }
 
 /**
  * The fleet's `notify` for the desktop: a llama.cpp progress event is proof of
- * progress for its turn's broker unit as well as for the Supervisor.
+ * progress for its turn's broker unit as well as for the Supervisor. For a
+ * worker window (`hostedUnitOf`), that unit is the one the worker runs.
  *
  * Without this the broker's idle deadline would be a cap on total generation
  * time, which is the defect the Supervisor's own deadline was written not to
  * have. The event is forwarded unchanged, and a throw from `notify` still
  * reaches the Supervisor (defect [13]).
  */
-export function withTurnProgress(broker: WorkBroker, notify: NotifyListeners): NotifyListeners {
+export function withTurnProgress(
+  broker: WorkBroker,
+  notify: NotifyListeners,
+  hostedUnitOf?: HostedUnitOf,
+): NotifyListeners {
   const progress = new Set(llamaStream().progress);
   return (pluginName, eventName, data, ownerId) => {
     if (pluginName === LLAMA_PLUGIN.name && ownerId !== undefined && progress.has(eventName)) {
       const requestId = requestIdOf(data);
-      if (requestId !== undefined) broker.progress({ kind: 'window', id: ownerId }, requestId);
+      if (requestId !== undefined) {
+        const hosted = hostedUnitOf?.(ownerId);
+        if (hosted !== undefined) broker.progress(hosted.owner, hosted.unitId);
+        else broker.progress({ kind: 'window', id: ownerId }, requestId);
+      }
     }
     notify(pluginName, eventName, data, ownerId);
   };

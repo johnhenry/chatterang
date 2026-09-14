@@ -695,6 +695,9 @@ describe('main.ts wiring', () => {
     // building `admitLocalTurns` without `fleet` fails the second.
     expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*localTurns\.releaseRenderer\(/);
     expect(source).toMatch(/admitLocalTurns\(\{[^}]*\bfleet,/);
+    // And over the notifier the broker was built with, so a departed window is
+    // forgotten there too.
+    expect(source).toMatch(/admitLocalTurns\(\{[^}]*\bnotices,/);
     // And the quit path, which has the same shape and the same silence.
     expect(source).toContain('fleet.dispose()');
     // No supervisor is constructed here at all any more. One built beside the
@@ -722,7 +725,8 @@ describe('main.ts wiring', () => {
     // 3. Tokens reach the broker as progress, and waiting positions reach the
     //    window that owns the turn.
     expect(source).toMatch(/notify:\s*withTurnProgress\(broker,/);
-    expect(source).toMatch(/notifyWindow:\s*localTurnNotices\(/);
+    expect(source).toMatch(/const notices = localTurnNotices\(/);
+    expect(source).toMatch(/notifyWindow:\s*notices,/);
     // 4. On quit the broker ends every generation before the fleet stops.
     expect(source).toMatch(/broker\.quit\(\);\s*fleet\.dispose\(\);/);
     // 5. No listener: #169 ruled a turn-carrying listener waits for #7.

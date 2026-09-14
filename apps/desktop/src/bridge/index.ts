@@ -82,7 +82,7 @@ export {
   localTurnNotices,
   withTurnProgress,
 } from './local-turns.js';
-export type { LocalTurns, LocalTurnsOptions } from './local-turns.js';
+export type { HostedUnit, HostedUnitOf, LocalTurnNotices, LocalTurns, LocalTurnsOptions } from './local-turns.js';
 export { HostRuntime, createHostRuntime } from './host-runtime.js';
 export type {
   CallGuard,

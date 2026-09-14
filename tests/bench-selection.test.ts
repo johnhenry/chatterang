@@ -370,6 +370,26 @@ describe('running a benchmark on a model the harness cannot load', () => {
     expect(useBench.getState().runs[0]!.modelId).toBe(QWEN.id);
     expect(useBench.getState().running).toBeNull();
   });
+
+  it('unloads the model it loaded when the benchmark is refused, says why, and unloads once when it is not', async () => {
+    // #7: on the desktop a benchmark takes the one generation slot and does not
+    // wait for it, so it is refused while a turn is using the model.
+    // FAULT INJECTED: removing the unload from `run`'s `finally` left the
+    // refused run's handle loaded.
+    const refusal = 'Another turn is using the model on this computer. Run the benchmark again when it has finished.';
+    plugin.benchmark.mockRejectedValueOnce(Object.assign(new Error(refusal), { code: 'SLOT_BUSY' }));
+    await useBench.getState().run(QWEN.id);
+    expect(plugin.unload).toHaveBeenCalledTimes(1);
+    expect(plugin.unload).toHaveBeenCalledWith({ handle: 'h1' });
+    expect(messagesTheUserSaw()).toContain(refusal);
+    expect(useBench.getState().runs).toEqual([]);
+    expect(useBench.getState().running).toBeNull();
+
+    vi.clearAllMocks();
+    await useBench.getState().run(QWEN.id);
+    expect(useBench.getState().runs).toHaveLength(1);
+    expect(plugin.unload).toHaveBeenCalledTimes(1);
+  });
 });
 
 /* ══ 4. The shell, which types an id instead of picking from a list ═══ */

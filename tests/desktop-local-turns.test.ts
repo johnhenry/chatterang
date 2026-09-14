@@ -11,6 +11,7 @@ import {
   PluginHost,
   SENDER_SCOPED,
   TURN_WAITING_EVENT,
+  UNIT_IDLE_TIMEOUT_MS,
   WorkBroker,
   admitLocalTurns,
   localTurnNotices,
@@ -21,6 +22,7 @@ import type {
   EventPayload,
   HostCall,
   HostMessage,
+  HostedUnitOf,
   NotifyListeners,
   OwnerChannel,
   PluginImplementation,
@@ -123,7 +125,7 @@ interface FakeHost {
   send(message: HostMessage): void;
 }
 
-function rig() {
+function rig(options: { hostedUnitOf?: HostedUnitOf } = {}) {
   const clock = manualClock();
   const hosts: FakeHost[] = [];
   const warnings: string[] = [];
@@ -138,7 +140,8 @@ function rig() {
 
   // The same construction order as `main.ts`: broker, then fleet, then the
   // wrapper over the fleet's facade.
-  const broker = new WorkBroker({ notifyWindow: localTurnNotices(notify), timers: clock });
+  const notices = localTurnNotices(notify);
+  const broker = new WorkBroker({ notifyWindow: notices, timers: clock });
   const fleet = new HostFleet({
     spawn: () => {
       const listeners: ((message: unknown) => void)[] = [];
@@ -155,7 +158,7 @@ function rig() {
             const message = raw as HostMessage;
             host.posted.push(message);
             if (message.k === 'ping') host.send({ k: 'pong', id: message.id });
-            if (message.k === 'call' && message.method !== 'generate') {
+            if (message.k === 'call' && message.method !== 'generate' && message.method !== 'benchmark') {
               const data = message.method === 'getCapabilities' ? { simulated: true } : null;
               host.send({ k: 'ret', id: message.id, ok: true, data });
             }
@@ -166,12 +169,19 @@ function rig() {
         kill: () => undefined,
       };
     },
-    notify: withTurnProgress(broker, notify),
+    notify: withTurnProgress(broker, notify, options.hostedUnitOf),
     entries: [{ engine: LLAMA_ENGINE, host: 'llama' }],
     warn: (_host, message) => warnings.push(message),
     timers: clock,
   });
-  const localTurns = admitLocalTurns({ broker, facade: fleet.plugin(LLAMA_PLUGIN.name), fleet, notify });
+  const localTurns = admitLocalTurns({
+    broker,
+    facade: fleet.plugin(LLAMA_PLUGIN.name),
+    fleet,
+    notices,
+    notify,
+    hostedUnitOf: options.hostedUnitOf,
+  });
   pluginHost.register(LOCAL_TURNS_PLUGIN, localTurns.plugin);
 
   let subscriptionId = 1;
@@ -184,6 +194,7 @@ function rig() {
     broker,
     fleet,
     localTurns,
+    notices,
     pluginHost,
     warnings,
     subscribe(senderId: number): void {
@@ -212,6 +223,21 @@ function rig() {
     },
     cancelled(): string[] {
       return calls('cancel').map((call) => (call.args[0] as { requestId: string }).requestId);
+    },
+    benchmark(senderId: number): Promise<unknown> {
+      const run = pluginHost.invoke(senderId, LLAMA_PLUGIN.name, 'benchmark', [{ handle: 'h' }]);
+      void run.catch(() => undefined);
+      return run;
+    },
+    /** The argument lists the llama host was sent for `benchmark`, in order. */
+    benchmarkArgs(): unknown[][] {
+      return calls('benchmark').map((call) => [...call.args]);
+    },
+    /** The host returns the last benchmark it was sent. */
+    finishBenchmark(data: unknown): void {
+      const call = calls('benchmark').at(-1);
+      if (call === undefined) throw new Error('the host was never asked to benchmark');
+      host().send({ k: 'ret', id: call.id, ok: true, data });
     },
     /** Deliver any envelope from the current llama host. */
     hostSend(message: HostMessage): void {
@@ -462,7 +488,7 @@ describe('a window that goes away takes its turns out of the broker AND the flee
 
 /* ══ The shape of the wiring ════════════════════════════════════════════ */
 
-describe('the wrapper changes generate and cancel, and nothing else', () => {
+describe('the wrapper changes generate, cancel and benchmark, and nothing else', () => {
   it('every other method is the facade’s own and takes no slot', async () => {
     const r = rig();
     r.phoneTurn('p');
@@ -508,12 +534,12 @@ describe('the wrapper changes generate and cancel, and nothing else', () => {
     const missing = { ...facade };
     delete missing['benchmark'];
     expect(() =>
-      admitLocalTurns({ broker: r.broker, facade: missing as unknown as PluginImplementation, fleet: r.fleet, notify }),
+      admitLocalTurns({ broker: r.broker, facade: missing as unknown as PluginImplementation, fleet: r.fleet, notices: r.notices, notify }),
     ).toThrow(/has no "benchmark"/);
 
     const unscoped = { ...facade, [SENDER_SCOPED]: ['generate'] };
     expect(() =>
-      admitLocalTurns({ broker: r.broker, facade: unscoped as unknown as PluginImplementation, fleet: r.fleet, notify }),
+      admitLocalTurns({ broker: r.broker, facade: unscoped as unknown as PluginImplementation, fleet: r.fleet, notices: r.notices, notify }),
     ).toThrow(/must scope exactly/);
   });
 
@@ -528,5 +554,166 @@ describe('the wrapper changes generate and cancel, and nothing else', () => {
         throw new Error('not cloneable');
       })('LlamaCpp', 'llamaToken', { requestId: 'x' }, 1),
     ).toThrow('not cloneable');
+  });
+});
+
+/* ══ A benchmark decodes, so it takes the slot ══════════════════════════ */
+
+describe('a benchmark takes the one slot too, and does not wait for it', () => {
+  it('is refused SLOT_BUSY while a turn holds the slot, and a phone unit and a desktop turn wait behind a running one', async () => {
+    // Review: `benchmark` was forwarded straight to the facade, so it decoded
+    // beside whatever held the slot (#7 ruling 3: one model on one GPU).
+    // FAULT INJECTED: forwarding `benchmark` to the facade (the BENCHMARK case
+    // removed from `admitLocalTurns`) sent it to the host while `local-1` was
+    // generating, and this test failed on `benchmarkArgs()`.
+    const r = rig();
+    r.subscribe(1);
+    const turn = r.generate(1, 'local-1');
+    await settle();
+    await expect(r.benchmark(2)).rejects.toMatchObject({ code: 'SLOT_BUSY' });
+    expect(r.benchmarkArgs()).toEqual([]);
+    expect(r.broker.waitingCount).toBe(0);
+    r.finish('local-1');
+    await turn;
+    await settle();
+
+    const bench = r.benchmark(2);
+    await settle();
+    // Sent once, with the page's options alone: the window id stays in main.
+    expect(r.benchmarkArgs()).toEqual([[{ handle: 'h' }]]);
+    expect(r.broker.slotCount).toBe(1);
+
+    const phone = r.phoneTurn('p1');
+    const local = r.generate(1, 'local-2');
+    await settle();
+    expect(phone.starts).toBe(0);
+    expect(r.generated()).toEqual(['local-1']);
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local-2', position: 2 }]);
+
+    r.finishBenchmark({ generateTokensPerSecond: 1 });
+    await expect(bench).resolves.toEqual({ generateTokensPerSecond: 1 });
+    await settle();
+    expect(phone.starts).toBe(1);
+    phone.resolve('done');
+    await settle();
+    expect(r.generated()).toEqual(['local-1', 'local-2']);
+    r.finish('local-2');
+    await local;
+  });
+});
+
+/* ══ S5's worker window ═════════════════════════════════════════════════ */
+
+describe('a worker window’s generations run under the unit it runs, not behind it', () => {
+  const WORKER = 7;
+  const hosted = { owner: { kind: 'device', id: 'phone' } as const, unitId: 'phone-turn' };
+  const workerRig = () => rig({ hostedUnitOf: (senderId) => (senderId === WORKER ? hosted : undefined) });
+
+  it('a phone unit whose work generates through the plugin reaches the host at once, keeps the one slot, and its tokens are its progress', async () => {
+    // Review repro: with the worker's generate admitted as a window unit of its
+    // own, it waited at position 1 behind the phone unit that was waiting on
+    // it; the phone unit ended DEADLINE and nothing ran again until quit.
+    // FAULT INJECTED: ignoring `hostedUnitOf` in `generate` left `worker-gen`
+    // waiting and failed on `generated()`; ignoring it in `withTurnProgress`
+    // ended the phone unit DEADLINE mid-answer and failed on `isRunning`.
+    const r = workerRig();
+    r.subscribe(WORKER);
+    r.subscribe(1);
+    let inner: Promise<unknown> = Promise.resolve();
+    const admission = r.broker.admit({
+      owner: hosted.owner,
+      unitId: hosted.unitId,
+      executor: 'worker',
+      start: () => {
+        inner = r.generate(WORKER, 'worker-gen');
+        return inner;
+      },
+    });
+    expect(admission.admitted).toBe(true);
+    await settle();
+    expect(r.generated()).toEqual(['worker-gen']);
+    expect(r.broker.slotCount).toBe(1);
+    expect(r.broker.positionOf({ kind: 'window', id: WORKER }, 'worker-gen')).toBeUndefined();
+
+    // A user's window still waits behind the phone's turn.
+    const local = r.generate(1, 'local-1');
+    await settle();
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local-1', position: 1 }]);
+
+    let elapsed = 0;
+    for (let index = 0; elapsed <= 2 * UNIT_IDLE_TIMEOUT_MS; index += 1) {
+      await r.clock.advance(100_000);
+      elapsed += 100_000;
+      r.token('worker-gen', index);
+    }
+    expect(r.broker.isRunning(hosted.owner, hosted.unitId)).toBe(true);
+
+    r.finish('worker-gen');
+    await inner;
+    await settle();
+    expect(r.events<GenerationEndEvent>(WORKER, 'llamaEnd')).toHaveLength(1);
+    expect(r.generated()).toEqual(['worker-gen', 'local-1']);
+    r.finish('local-1');
+    await local;
+  });
+
+  it('a worker whose unit is not running may not generate, and one generate at a time runs under a unit that is', async () => {
+    // FAULT INJECTED: removing the `isRunning` check from `generateHosted`
+    // sent `too-early` to the host; removing `hostedBusy` sent `second`.
+    const r = workerRig();
+    r.subscribe(WORKER);
+    r.subscribe(1);
+    await expect(r.generate(WORKER, 'too-early')).rejects.toMatchObject({ code: 'NOT_RUNNING' });
+
+    const blocker = r.generate(1, 'blocker');
+    await settle();
+    const job = work();
+    expect(
+      r.broker.admit({ owner: hosted.owner, unitId: hosted.unitId, executor: 'worker', start: job.start }),
+    ).toMatchObject({ admitted: true, position: 1 });
+    await expect(r.generate(WORKER, 'still-waiting')).rejects.toMatchObject({ code: 'NOT_RUNNING' });
+    expect(r.generated()).toEqual(['blocker']);
+    // Refused before it started: no llamaEnd, as for any refused generate.
+    expect(r.events(WORKER, 'llamaEnd')).toEqual([]);
+
+    r.finish('blocker');
+    await blocker;
+    await settle();
+    expect(job.starts).toBe(1);
+    const first = r.generate(WORKER, 'first');
+    await settle();
+    await expect(r.generate(WORKER, 'second')).rejects.toMatchObject({ code: 'SLOT_BUSY' });
+    expect(r.generated()).toEqual(['blocker', 'first']);
+    r.finish('first');
+    await first;
+    const third = r.generate(WORKER, 'third');
+    await settle();
+    expect(r.generated()).toEqual(['blocker', 'first', 'third']);
+    r.finish('third');
+    await third;
+    job.resolve('done');
+  });
+});
+
+/* ══ Nothing remembered for a window that went away ═════════════════════ */
+
+describe('the waiting notifier forgets a window that went away', () => {
+  it('a window closed while its turn waited leaves nothing remembered for it', async () => {
+    // Review: `localTurnNotices` remembered a waiting turn until it started or
+    // ended, and the broker tells a closed window neither, so one entry per
+    // such window stayed for the life of the app.
+    // FAULT INJECTED: dropping `notices.release` from `releaseRenderer` let the
+    // `started` below emit position 0, and this test failed.
+    const r = rig();
+    r.subscribe(1);
+    r.phoneTurn('p');
+    const waiting = r.generate(1, 'local-1');
+    await settle();
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local-1', position: 1 }]);
+
+    r.localTurns.releaseRenderer(1, 'The window was closed.');
+    await expect(waiting).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    r.notices(1, { kind: 'started', unitId: 'local-1' });
+    expect(r.events<TurnWaitingEvent>(1, TURN_WAITING_EVENT)).toEqual([{ requestId: 'local-1', position: 1 }]);
   });
 });

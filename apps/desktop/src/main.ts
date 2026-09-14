@@ -437,10 +437,15 @@ function start(): void {
    * once #7's listener wiring (S7) lands, so today every unit it holds is a
    * window's.
    */
+  const notices = localTurnNotices((pluginName, eventName, data, ownerId) =>
+    pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+  );
+  // No `condemnExecutor`. The only executor today is the llama host, and its
+  // Supervisor ends every call it serves on its own deadlines, so work the
+  // broker has stopped always returns and the slot is freed then. S5's worker
+  // window is the executor that will need one.
   const broker = new WorkBroker({
-    notifyWindow: localTurnNotices((pluginName, eventName, data, ownerId) =>
-      pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
-    ),
+    notifyWindow: notices,
     warn: (message) => console.warn(`[main:broker] ${message}`),
   });
 
@@ -507,12 +512,14 @@ function start(): void {
   //
   // llama.cpp's facade is registered THROUGH the broker's slot: a desktop
   // `generate` waits its turn behind whatever holds the slot, and its window
-  // is told it is waiting. Registering the facade directly would let a local
-  // turn decode on the same sequence as a phone's.
+  // is told it is waiting, and a benchmark, which decodes too, is refused while
+  // anything holds or waits for the slot. Registering the facade directly would
+  // let a local turn decode on the same sequence as a phone's.
   const localTurns = admitLocalTurns({
     broker,
     facade: fleet.plugin(LLAMA_PLUGIN.name),
     fleet,
+    notices,
     notify: (pluginName, eventName, data, ownerId) =>
       pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
   });
