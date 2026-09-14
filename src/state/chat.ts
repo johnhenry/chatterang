@@ -84,46 +84,93 @@ const HISTORY_TURNS = 64;
 let livePlaceholderId: string | null = null;
 
 /**
- * How many times each MCP server's grants have been withdrawn, by server id (#6).
+ * The withdrawals of one kind of grant, by the id a grant names: a connection's
+ * id (`providerWithdrawals`) or an MCP server record's id (`mcpWithdrawals`).
  *
- * Two things act on a conversation answer before its grant is stored: the
- * policy that took the answer (`mcpEgressPolicy`), and the write itself, which
- * can land after a revocation that read the chats first and so found nothing
- * to drop. Both compare this count instead of trusting the order things finish
- * in. Without it, switching a server off and back on during a long turn left
- * the answer in force — the live check in `state/mcp.ts` passes again for the
- * same record at the same address — and the privacy command's "Every grant to
- * a server is dropped when it is removed or switched off" was false.
+ * A grant lives in three places besides the table, and none of them can trust
+ * the order writes finish in:
  *
- * Counted per server, not per conversation: a revocation scoped to one chat
- * also makes other chats' in-flight answers to that server ask again, which
- * fails closed.
+ * - AN ANSWER HELD IN MEMORY — the engine's `decided` for a provider, the MCP
+ *   policy's `answered` — is taken with `count` and honoured only while that
+ *   stands. Switching a connection or server off and on again brings back the
+ *   same id, so nothing else says the answer is stale. A revocation counts
+ *   once when it STARTS, before it reads or awaits anything, and once more
+ *   when it has FINISHED, so an answer taken while one was under way does not
+ *   outlive it either.
+ * - A GRANT BEING WRITTEN is written with `void` from a policy, and can land
+ *   after a revocation that read the chats before it was among them and so
+ *   dropped nothing. `grantEgress` and `grantMcpEgress` note it with `write`
+ *   first, and withdraw it again when, once their write has settled, a
+ *   revocation has started since or is still under way.
+ * - A GRANT THE STORE STILL HOLDS may be one a revocation has not reached yet,
+ *   or one whose write outlasted a revocation and has not withdrawn itself
+ *   yet. `unsettled` says so, and the policies do not answer on it meanwhile —
+ *   otherwise the request or call decided in that window went out, and a yes
+ *   decided there was held for the rest of the turn.
+ *
+ * Per id, not per conversation: a revocation scoped to one chat also unsettles
+ * other chats' grants for that id while it runs, and makes their held answers
+ * ask again, which fails closed.
  */
-const mcpRevocations = new Map<string, number>();
-const mcpRevocationsOf = (serverId: string): number => mcpRevocations.get(serverId) ?? 0;
+function withdrawals() {
+  const counts = new Map<string, number>();
+  const underway = new Map<string, number>();
+  const writing = new Map<string, number[]>();
+  const count = (id: string): number => counts.get(id) ?? 0;
+  const bump = (id: string): void => {
+    counts.set(id, count(id) + 1);
+  };
 
-/**
- * How many times each connection's grants have been withdrawn, by connection id.
- *
- * The same count, for the same two reasons, on the provider side. A
- * conversation answer's grant is written with `void` (`egressPolicy`), so a
- * connection removed or switched off while that write was in flight had its
- * grants read before this one was among them, dropped nothing, and the grant
- * landed after it — permission to send tool output to a connection that had
- * been switched off. And the engine holds an answer for the rest of a turn
- * (`decided` in its `stream`): switching a connection off and on again
- * registers the same id, so nothing about the target said the answer was
- * stale, and the turn went on sending to it unasked. `grantEgress` withdraws
- * its own grant when this moved while it was written, and the engine honours a
- * yes only while this stands (`ToolEgressPolicy.revocations`).
- *
- * Per connection, like the MCP count: a revocation scoped to one chat also
- * makes other chats' in-flight answers to that connection ask again, which
- * fails closed.
- */
-const providerRevocations = new Map<string, number>();
-const providerRevocationsOf = (connectionId: string): number =>
-  providerRevocations.get(connectionId) ?? 0;
+  return {
+    count,
+
+    /**
+     * Start a revocation of `id`. Call it FIRST, before anything is read or
+     * awaited; call what it returns once the revocation's writes have settled,
+     * however they settled.
+     */
+    begin(id: string): () => void {
+      bump(id);
+      underway.set(id, (underway.get(id) ?? 0) + 1);
+      return () => {
+        bump(id);
+        const left = (underway.get(id) ?? 1) - 1;
+        if (left > 0) underway.set(id, left);
+        else underway.delete(id);
+      };
+    },
+
+    /**
+     * Note a grant for `id` about to be written. `stands` says, once the write
+     * has settled, whether the grant may be kept; `done` is called once it has
+     * been kept or withdrawn again.
+     */
+    write(id: string): { stands: () => boolean; done: () => void } {
+      const since = count(id);
+      writing.set(id, [...(writing.get(id) ?? []), since]);
+      return {
+        stands: () => !underway.has(id) && count(id) === since,
+        done: () => {
+          const rest = [...(writing.get(id) ?? [])];
+          rest.splice(rest.indexOf(since), 1);
+          if (rest.length > 0) writing.set(id, rest);
+          else writing.delete(id);
+        },
+      };
+    },
+
+    /** Whether a grant for `id` the store holds may be one that is being withdrawn. */
+    unsettled(id: string): boolean {
+      return underway.has(id) || (writing.get(id) ?? []).some((since) => since !== count(id));
+    },
+  };
+}
+
+/** Each MCP server's grants' withdrawals, by server id (#6). See `withdrawals`. */
+const mcpWithdrawals = withdrawals();
+
+/** Each connection's grants' withdrawals, by connection id. See `withdrawals`. */
+const providerWithdrawals = withdrawals();
 
 /**
  * A change to one chat: the fields to set, or a function of the chat AS IT
@@ -381,75 +428,91 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async grantEgress(chatId, connectionId) {
-    const revocations = providerRevocationsOf(connectionId);
-    // A function of the chat as it stands when this is written, so a grant
-    // withdrawn meanwhile is not carried back in with the list.
-    await get().updateChat(chatId, (chat) =>
-      holdsGrant(chat.egressGrants, { kind: 'provider', connectionId })
-        ? null
-        : { egressGrants: [...(chat.egressGrants ?? []), { connectionId, grantedAt: Date.now() }] },
-    );
-    // A revocation that started while this was queued or being written read the
-    // chat before the grant was in it, and dropped nothing. Checked after the
-    // write has finished, never inside it. See `providerRevocations`.
-    if (providerRevocationsOf(connectionId) !== revocations) {
-      await get().revokeEgress(connectionId, chatId);
+    const write = providerWithdrawals.write(connectionId);
+    try {
+      // A function of the chat as it stands when this is written, so a grant
+      // withdrawn meanwhile is not carried back in with the list.
+      await get().updateChat(chatId, (chat) =>
+        holdsGrant(chat.egressGrants, { kind: 'provider', connectionId })
+          ? null
+          : { egressGrants: [...(chat.egressGrants ?? []), { connectionId, grantedAt: Date.now() }] },
+      );
+      // A revocation that started while this was queued or being written read
+      // the chat before the grant was in it, and dropped nothing; one still under
+      // way finishes after it. Checked after the write has finished, never inside
+      // it. See `withdrawals`.
+      if (!write.stands()) await get().revokeEgress(connectionId, chatId);
+    } finally {
+      write.done();
     }
   },
 
   async revokeEgress(connectionId, chatId) {
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
-    providerRevocations.set(connectionId, providerRevocationsOf(connectionId) + 1);
-    const names = (grant: EgressGrant): boolean =>
-      grant.kind !== 'mcp' && grant.connectionId === connectionId;
-    const affected = get().chats.filter(
-      (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
-    );
-    for (const chat of affected) {
-      await get().updateChat(chat.id, (current) =>
-        (current.egressGrants ?? []).some(names)
-          ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
-          : null,
+    const finished = providerWithdrawals.begin(connectionId);
+    try {
+      const names = (grant: EgressGrant): boolean =>
+        grant.kind !== 'mcp' && grant.connectionId === connectionId;
+      const affected = get().chats.filter(
+        (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
       );
+      for (const chat of affected) {
+        await get().updateChat(chat.id, (current) =>
+          (current.egressGrants ?? []).some(names)
+            ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
+            : null,
+        );
+      }
+    } finally {
+      finished();
     }
   },
 
   async grantMcpEgress(chatId, { serverId, url }) {
-    const revocations = mcpRevocationsOf(serverId);
-    await get().updateChat(chatId, (chat) => {
-      if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return null;
-      // A grant for this server at an address it no longer has is REPLACED, not
-      // kept beside the new one. It covers nothing now, and a list that kept it
-      // would read as permission to send wherever the server used to be.
-      const egressGrants: EgressGrant[] = [
-        ...(chat.egressGrants ?? []).filter(
-          (grant) => grant.kind !== 'mcp' || grant.serverId !== serverId,
-        ),
-        { kind: 'mcp', serverId, url, grantedAt: Date.now() },
-      ];
-      return { egressGrants };
-    });
-    // A revocation that started while this was queued or being written read the
-    // chat before the grant was in it, and dropped nothing. Checked after the
-    // write has finished, never inside it. See `mcpRevocations`.
-    if (mcpRevocationsOf(serverId) !== revocations) await get().revokeMcpEgress(serverId, chatId);
+    const write = mcpWithdrawals.write(serverId);
+    try {
+      await get().updateChat(chatId, (chat) => {
+        if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return null;
+        // A grant for this server at an address it no longer has is REPLACED, not
+        // kept beside the new one. It covers nothing now, and a list that kept it
+        // would read as permission to send wherever the server used to be.
+        const egressGrants: EgressGrant[] = [
+          ...(chat.egressGrants ?? []).filter(
+            (grant) => grant.kind !== 'mcp' || grant.serverId !== serverId,
+          ),
+          { kind: 'mcp', serverId, url, grantedAt: Date.now() },
+        ];
+        return { egressGrants };
+      });
+      // A revocation that started while this was queued or being written read
+      // the chat before the grant was in it, and dropped nothing; one still under
+      // way finishes after it. Checked after the write has finished, never inside
+      // it. See `withdrawals`.
+      if (!write.stands()) await get().revokeMcpEgress(serverId, chatId);
+    } finally {
+      write.done();
+    }
   },
 
   async revokeMcpEgress(serverId, chatId) {
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
-    mcpRevocations.set(serverId, mcpRevocationsOf(serverId) + 1);
-    const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
-    const affected = get().chats.filter(
-      (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
-    );
-    for (const chat of affected) {
-      await get().updateChat(chat.id, (current) =>
-        (current.egressGrants ?? []).some(names)
-          ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
-          : null,
+    const finished = mcpWithdrawals.begin(serverId);
+    try {
+      const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
+      const affected = get().chats.filter(
+        (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
       );
+      for (const chat of affected) {
+        await get().updateChat(chat.id, (current) =>
+          (current.egressGrants ?? []).some(names)
+            ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
+            : null,
+        );
+      }
+    } finally {
+      finished();
     }
   },
 
@@ -1095,15 +1158,19 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
 
   return {
-    isGranted: (backendId) => holdsGrant(grantsFor(), { kind: 'provider', connectionId: backendId }),
+    // Not while a grant for this connection may be one being withdrawn: the
+    // store holds it until the revocation's write lands. See `withdrawals`.
+    isGranted: (backendId) =>
+      !providerWithdrawals.unsettled(backendId) &&
+      holdsGrant(grantsFor(), { kind: 'provider', connectionId: backendId }),
 
     onGranted: (backendId) => {
       void useChats.getState().grantEgress(chatId, backendId);
     },
 
     // What ends the answer the engine holds for the rest of the turn, once the
-    // connection it names is removed or switched off. See `providerRevocations`.
-    revocations: (backendId) => providerRevocationsOf(backendId),
+    // connection it names is removed or switched off. See `withdrawals`.
+    revocations: (backendId) => providerWithdrawals.count(backendId),
 
     async request({ backendId, modelName, tools, characters }) {
       const app = useApp.getState();
@@ -1193,31 +1260,44 @@ export function mcpSendSheet({ destination, calls }: DestinationRequest): McpSen
  * the server's revocation count when it was given, and honoured only while that
  * count stands: switching a server off and on again brings back the same record
  * at the same address, so the live check in `state/mcp.ts` cannot be what ends
- * it. See `mcpRevocations`.
+ * it. The count is the one from BEFORE the sheet was raised: an answer given
+ * while the server's grants were being withdrawn covers the calls it listed,
+ * and nothing of it is kept. See `withdrawals`.
  */
 function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
   const answered = new Map<string, number>();
+  const askedAt = new Map<string, number>();
   const keyOf = (destination: ToolDestination): string => `${destination.serverId} ${destination.url}`;
 
   return {
+    // Not while a grant for this server may be one being withdrawn: the store
+    // holds it until the revocation's write lands, and the dispatcher reads a
+    // held grant again just before each call.
     isGranted: (destination) =>
-      answered.get(keyOf(destination)) === mcpRevocationsOf(destination.serverId) ||
-      holdsGrant(grantsFor(), {
-        kind: 'mcp',
-        serverId: destination.serverId,
-        url: destination.url,
-      }),
+      !mcpWithdrawals.unsettled(destination.serverId) &&
+      (answered.get(keyOf(destination)) === mcpWithdrawals.count(destination.serverId) ||
+        holdsGrant(grantsFor(), {
+          kind: 'mcp',
+          serverId: destination.serverId,
+          url: destination.url,
+        })),
 
     onGranted: (destination) => {
-      answered.set(keyOf(destination), mcpRevocationsOf(destination.serverId));
+      const key = keyOf(destination);
+      const since = askedAt.get(key);
+      askedAt.delete(key);
+      // Nobody was asked, or the server's grants were withdrawn while they were.
+      if (since === undefined || since !== mcpWithdrawals.count(destination.serverId)) return;
+      answered.set(key, since);
       void useChats
         .getState()
         .grantMcpEgress(chatId, { serverId: destination.serverId, url: destination.url });
     },
 
     async request(asked) {
+      askedAt.set(keyOf(asked.destination), mcpWithdrawals.count(asked.destination.serverId));
       const { action, ...prompt } = mcpSendSheet(asked);
       let extended = false;
       const allowed = await useApp.getState().requestApproval(action, {

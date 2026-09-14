@@ -1357,4 +1357,124 @@ describe('the MCP send sheet, through the store’s own policy', () => {
     expect(mcpAnswers).toEqual([{ decision: 'calls', granted: false }]);
     expect(grants()).toEqual([]);
   });
+
+  const NOTES_GRANT = { kind: 'mcp' as const, serverId: 'mcp_notes', url: 'https://notes.example/mcp', grantedAt: 1 };
+  const OTHER = {
+    kind: 'mcp' as const,
+    serverId: 'mcp_other',
+    serverName: 'other',
+    host: 'other.example',
+    url: 'https://other.example/mcp',
+  };
+  const OTHER_GRANT = { kind: 'mcp' as const, serverId: OTHER.serverId, url: OTHER.url, grantedAt: 1 };
+  const holdsNotes = (): boolean => grants().some((grant) => grant.kind === 'mcp' && grant.serverId === 'mcp_notes');
+
+  /** Every chat write held open until `release`, counting those started. */
+  function holdingEveryChatWrite() {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    tables.chats.put.mockImplementation((async () => {
+      started += 1;
+      await held;
+    }) as never);
+    return {
+      started: () => started,
+      release: () => release(),
+      restore: () => {
+        release();
+        tables.chats.put.mockImplementation(async () => {});
+      },
+    };
+  }
+
+  it('keeps nothing of a conversation answer given while the server was being switched off', async () => {
+    // The sheet was up when the server's grants were withdrawn. The answer is
+    // about a server the person has since switched off: the calls on the sheet
+    // are what it covered, and nothing of it is kept — neither the policy's
+    // memory of it for the rest of the turn, nor a grant that would come back
+    // into force when the server is switched on again.
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      requestApproval: async (_action: string, prompt?: ApprovalPrompt) => {
+        await revokeMcpGrantsFor('mcp_notes');
+        prompt?.onExtended?.();
+        return true;
+      },
+    });
+    mcpAnswers = [];
+    try {
+      script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
+      await useChats.getState().send('file it');
+    } finally {
+      useApp.setState({ requestApproval: original });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: false }]);
+    expect(grants()).toEqual([]);
+    const written = tables.chats.put.mock.calls as unknown as [{ egressGrants?: readonly unknown[] }][];
+    expect(written.some(([chat]) => Boolean(chat.egressGrants?.length)), 'no grant was ever written').toBe(false);
+  });
+
+  it('does not answer for a held grant while its revocation is still being written', async () => {
+    // The store holds the grant until the revocation's write has landed. A call
+    // checked in that window — the dispatcher reads a held grant again before
+    // each call — must not go on it. Another server's grant is not this one's.
+    useChats.setState({ chats: [{ ...CHAT, egressGrants: [NOTES_GRANT, OTHER_GRANT] }] });
+    const seen: { notes: boolean; other: boolean; stored: boolean }[] = [];
+    let write: ReturnType<typeof holdingEveryChatWrite> | undefined;
+    try {
+      await answering('no', async (policy) => {
+        write = holdingEveryChatWrite();
+        const revoking = revokeMcpGrantsFor('mcp_notes');
+        await vi.waitFor(() => expect(write!.started()).toBe(1));
+        seen.push({ notes: policy.isGranted(ASK.destination), other: policy.isGranted(OTHER), stored: holdsNotes() });
+        write.release();
+        await revoking;
+        seen.push({ notes: policy.isGranted(ASK.destination), other: policy.isGranted(OTHER), stored: holdsNotes() });
+        write.restore();
+      });
+    } finally {
+      write?.restore();
+    }
+
+    expect(seen).toEqual([
+      { notes: false, other: true, stored: true },
+      { notes: false, other: true, stored: false },
+    ]);
+  });
+
+  it('does not answer for a grant whose write outlasted a revocation, before it withdraws itself', async () => {
+    // A revocation that starts and ends while a grant is still being written
+    // reads the chat before the grant is in it, and has nothing to drop. The
+    // grant then lands in the store, and withdraws itself only once its write
+    // has settled. In between, it is in the store and must not answer.
+    const seen: boolean[] = [];
+    let write: ReturnType<typeof holdingEveryChatWrite> | undefined;
+    let unsubscribe = () => {};
+    try {
+      await answering('no', async (policy) => {
+        write = holdingEveryChatWrite();
+        const granting = useChats.getState().grantMcpEgress('c1', { serverId: 'mcp_notes', url: ASK.destination.url });
+        await vi.waitFor(() => expect(write!.started()).toBe(1));
+        await useChats.getState().revokeMcpEgress('mcp_notes');
+        unsubscribe = useChats.subscribe(() => {
+          if (holdsNotes()) seen.push(policy.isGranted(ASK.destination));
+        });
+        write.restore();
+        await granting;
+        unsubscribe();
+      });
+    } finally {
+      unsubscribe();
+      write?.restore();
+    }
+
+    expect(seen.length, 'the store held the grant for a moment').toBeGreaterThan(0);
+    expect(seen).not.toContain(true);
+    expect(grants()).toEqual([]);
+  });
 });

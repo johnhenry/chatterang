@@ -361,6 +361,8 @@ function holdingChatWrites() {
     pending: () => waiting.length,
     /** Let the oldest put still waiting finish. */
     releaseFirst: () => waiting.shift()?.(),
+    /** Let the newest put still waiting finish. */
+    releaseLast: () => waiting.pop()?.(),
     /** Let every put finish, and every later one go straight through. */
     releaseAll,
     restore: () => {
@@ -657,4 +659,277 @@ describe('an answer the running turn holds about a connection', () => {
       expect(connectionsOf('c1')).toEqual([]);
     },
   );
+
+  /**
+   * One turn through the real store, `toggleConnection` and engine, in which
+   * the second tool run switches the connection off WITHOUT waiting for it —
+   * as a click in Settings during a tool run would — and switches it back on
+   * while the revocation's write is still held open. The third tool run lets
+   * the write land and waits for the switch-off to finish, so every request
+   * from the fourth on is built after the grant is gone from the store and
+   * the table.
+   */
+  async function switchedOffWhileWritten(answers: ('turn' | 'conversation' | 'no')[]) {
+    const db = holdingChatWrites();
+    db.releaseAll();
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, CALL, CALL, CALL, 'Done.']);
+    engine.router.register('conn_openai', cloud.adapter);
+
+    let runs = 0;
+    let holding: ReturnType<typeof holdingChatWrites> | null = null;
+    let switchingOff: Promise<void> | null = null;
+    toolRegistry.register({
+      ...leakyTool,
+      execute: async () => {
+        runs += 1;
+        if (runs === 2) {
+          holding = holdingChatWrites();
+          switchingOff = useApp.getState().toggleConnection('conn_openai', false);
+          await vi.waitFor(() => expect(holding!.pending()).toBeGreaterThan(0));
+          engine.router.register('conn_openai', cloud.adapter);
+        }
+        if (runs === 3) {
+          holding!.releaseAll();
+          await switchingOff;
+        }
+        return leakyTool.execute();
+      },
+    });
+
+    const asked: string[] = [];
+    const queue = [...answers];
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      engine: engine as never,
+      connections: [{ ...OPENAI }],
+      requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+        asked.push(action);
+        const answer = queue.shift() ?? 'no';
+        if (answer === 'conversation') prompt?.onExtended?.();
+        return answer !== 'no';
+      },
+    });
+    useChats.setState({
+      loaded: true,
+      generating: false,
+      controller: null,
+      messages: [],
+      activeChatId: 'c1',
+      chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
+    });
+
+    try {
+      await useChats.getState().send('what is in my chats?');
+      await macrotask();
+    } finally {
+      toolRegistry.unregister('leaky');
+      (holding as ReturnType<typeof holdingChatWrites> | null)?.restore();
+      useApp.setState({ engine: null, connections: [], requestApproval: original });
+      db.restore();
+    }
+    // Every put went through one of the two recorders; the later one has the
+    // puts made from the second tool run on, which is where c1 was last written.
+    const stored = (holding as ReturnType<typeof holdingChatWrites> | null)?.stored ?? db.stored;
+    return { asked, requests: sent(cloud.seen), stored };
+  }
+
+  it('is not taken from a grant whose revocation is still being written, nor held once it has landed', async () => {
+    // The store keeps the grant until the revocation's write lands. A request
+    // decided in that window must not go on it, and — worse — must not hold
+    // that yes for the rest of the turn, after the grant is gone.
+    const { asked, requests, stored } = await switchedOffWhileWritten(['conversation', 'no']);
+
+    expect(requests.length).toBeGreaterThanOrEqual(4);
+    expect(requests[1], 'the answer, while it stood').toContain(SECRET);
+    expect(requests[2], 'decided while the revocation was being written').not.toContain(SECRET);
+    expect(requests[3], 'built after the revocation had landed').not.toContain(SECRET);
+    expect(asked).toHaveLength(2);
+    expect(connectionsOf('c1')).toEqual([]);
+    expect(storedConnections(stored, 'c1'), 'the table').toEqual([]);
+  });
+
+  it.each(['turn', 'conversation'] as const)(
+    'is asked again once a revocation that was being written while it was given has landed (“%s”)',
+    async (during) => {
+      // A yes given while the connection's grants were being withdrawn is
+      // honoured for the request it was asked about. It does not outlive the
+      // withdrawal: not in the turn, and not as a grant.
+      const { asked, requests, stored } = await switchedOffWhileWritten(['conversation', during, 'no']);
+
+      expect(requests.length).toBeGreaterThanOrEqual(4);
+      expect(requests[3], 'built after the revocation had landed').not.toContain(SECRET);
+      expect(asked).toHaveLength(3);
+      expect(connectionsOf('c1')).toEqual([]);
+      expect(storedConnections(stored, 'c1'), 'the table').toEqual([]);
+    },
+  );
+
+  it('is not kept, nor written down, when the connection was switched off while its sheet was up', async () => {
+    const db = holdingChatWrites();
+    db.releaseAll();
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, CALL, 'Done.']);
+    engine.router.register('conn_openai', cloud.adapter);
+    toolRegistry.register({ ...leakyTool });
+
+    const asked: string[] = [];
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      engine: engine as never,
+      connections: [{ ...OPENAI }],
+      requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+        asked.push(action);
+        if (asked.length > 1) return false;
+        // While the sheet is up, the connection is switched off, all the way,
+        // and back on under the same id.
+        await useApp.getState().toggleConnection('conn_openai', false);
+        engine.router.register('conn_openai', cloud.adapter);
+        prompt?.onExtended?.();
+        return true;
+      },
+    });
+    useChats.setState({
+      loaded: true,
+      generating: false,
+      controller: null,
+      messages: [],
+      activeChatId: 'c1',
+      chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
+    });
+
+    try {
+      await useChats.getState().send('what is in my chats?');
+      await macrotask();
+    } finally {
+      toolRegistry.unregister('leaky');
+      useApp.setState({ engine: null, connections: [], requestApproval: original });
+      db.restore();
+    }
+
+    const requests = sent(cloud.seen);
+    expect(requests.length).toBeGreaterThanOrEqual(3);
+    expect(asked, 'the answer was not held for the next request').toHaveLength(2);
+    expect(requests[2]).not.toContain(SECRET);
+    expect(connectionsOf('c1')).toEqual([]);
+    expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+  });
+});
+
+describe('the store’s provider policy, while a grant is being withdrawn', () => {
+  type ToolEgressPolicy = import('@/ai/engine').ToolEgressPolicy;
+
+  /** The policy the store hands the engine for c1, taken from a real turn. */
+  async function storePolicy(): Promise<ToolEgressPolicy> {
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('conn_openai', recordingBackend(['Done.']).adapter);
+    let policy: ToolEgressPolicy | undefined;
+    const stream = engine.stream.bind(engine);
+    engine.stream = ((request: Parameters<typeof stream>[0]) => {
+      policy = request.egress;
+      return stream(request);
+    }) as typeof engine.stream;
+    useApp.setState({ engine: engine as never, connections: [{ ...OPENAI }] });
+    useChats.setState({ loaded: true, generating: false, controller: null, messages: [], activeChatId: 'c1' });
+    try {
+      await useChats.getState().send('hello');
+    } finally {
+      useApp.setState({ engine: null });
+    }
+    expect(policy).toBeDefined();
+    return policy!;
+  }
+
+  beforeEach(() => {
+    seed();
+    chatsTable.put.mockClear();
+  });
+
+  it('does not answer for a held grant while its revocation is still being written', async () => {
+    const policy = await storePolicy();
+    await useChats.getState().grantEgress('c1', 'conn_openai');
+    await useChats.getState().grantEgress('c1', 'conn_ollama');
+    const db = holdingChatWrites();
+    try {
+      const switchingOff = useApp.getState().toggleConnection('conn_openai', false);
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      expect(connectionsOf('c1'), 'the store still holds it').toContain('conn_openai');
+      expect(policy.isGranted('conn_openai')).toBe(false);
+      expect(policy.isGranted('conn_ollama'), 'another connection’s grant').toBe(true);
+
+      db.releaseAll();
+      await switchingOff;
+      expect(policy.isGranted('conn_openai')).toBe(false);
+      expect(policy.isGranted('conn_ollama')).toBe(true);
+
+      // The control: once it has settled, a grant given again answers again.
+      await useChats.getState().grantEgress('c1', 'conn_openai');
+      expect(policy.isGranted('conn_openai')).toBe(true);
+      expect(storedConnections(db.stored, 'c1')).toEqual(['conn_ollama', 'conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
+
+  it('does not answer for a grant whose write outlasted a revocation, before it withdraws itself', async () => {
+    // A revocation that starts and ends while the grant is being written reads
+    // c1 before the grant is in it, and has nothing to write. The grant lands
+    // in the store, and withdraws itself only once its write has settled.
+    const policy = await storePolicy();
+    const db = holdingChatWrites();
+    const seen: boolean[] = [];
+    const unsubscribe = useChats.subscribe(() => {
+      if (connectionsOf('c1').includes('conn_openai')) seen.push(policy.isGranted('conn_openai'));
+    });
+    try {
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await useChats.getState().revokeEgress('conn_openai');
+      db.releaseAll();
+      await granting;
+
+      expect(seen.length, 'the store held the grant for a moment').toBeGreaterThan(0);
+      expect(seen).not.toContain(true);
+      expect(connectionsOf('c1')).toEqual([]);
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+    } finally {
+      unsubscribe();
+      db.restore();
+    }
+  });
+
+  it('does not keep a grant given while its connection’s revocation is still being written', async () => {
+    // c1's revocation has landed and c2's is still held, so the revocation is
+    // under way when the grant for c1 is given, written, and checked.
+    await useChats.getState().grantEgress('c1', 'conn_openai');
+    await useChats.getState().grantEgress('c2', 'conn_openai');
+    const db = holdingChatWrites();
+    try {
+      const revoking = useChats.getState().revokeEgress('conn_openai');
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      db.releaseFirst();
+      await vi.waitFor(() => expect(connectionsOf('c1')).toEqual([]));
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      await vi.waitFor(() => expect(db.pending()).toBe(2));
+      db.releaseLast();
+      await vi.waitFor(() => expect(connectionsOf('c1')).toEqual(['conn_openai']));
+      // Its own check runs while c2's revocation is still held.
+      await macrotask();
+      db.releaseAll();
+      await Promise.all([revoking, granting]);
+
+      expect(connectionsOf('c1')).toEqual([]);
+      expect(connectionsOf('c2')).toEqual([]);
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+
+      // The control: a grant given after the revocation has finished is kept.
+      await useChats.getState().grantEgress('c1', 'conn_openai');
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
+      expect(storedConnections(db.stored, 'c1')).toEqual(['conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
 });

@@ -833,7 +833,12 @@ describe('the privacy command', () => {
     // written while the revocation was does not write the dropped grant back;
     // and an answer the running turn holds ends with it, through the real
     // engine, although the connection is back under the same id before the
-    // next request. The engine half is also in `tests/privacy.test.ts`.
+    // next request. While the revocation is still being written, the grant the
+    // store still holds answers nothing; a yes decided in that window, or on a
+    // sheet that was up while the connection was switched off, is not held
+    // past it and leaves no grant behind. The engine half is also in
+    // `tests/privacy.test.ts`; the MCP half of the same rule is in
+    // `tests/variant-provenance.test.ts`.
     expect(await privacyOutput({})).toContain(
       'Every grant is dropped when the provider it named is removed or switched off — `provider disable <id>`.',
     );
