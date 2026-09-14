@@ -8,7 +8,7 @@
 
 import { create } from 'zustand';
 
-import { blobToBase64 } from '@/lib/blobs';
+import { blobToBase64, deleteBlobs } from '@/lib/blobs';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
@@ -220,7 +220,7 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
 }
 
 /**
- * Chats being deleted, or deleted, in this session, by id.
+ * Chats whose delete has been asked for in this session, by id.
  *
  * `removeChat` waits its turn in `chatWrites` like any other write, so every
  * write already asked for lands before the delete, and the delete takes it with
@@ -231,21 +231,45 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
  * into the table: a conversation the person deleted, still on disk. So message
  * rows go through `putMessage`, which asks this.
  *
- * Added when the delete starts, and taken out again if it fails — the chat is
- * still there then, and so should be what is written to it.
+ * ADDED WHEN THE DELETE IS ASKED FOR, not when it starts, and nothing is SENT
+ * for a chat in here either. Deleting a chat stopped only its rows: the turn
+ * running in it went on calling MCP servers under an answer given for the
+ * conversation, measured through the real engine, and a turn asked for while
+ * an earlier write held the delete's place started. So the running turn is
+ * stopped as the delete is asked for (`liveTurn`), and `runGeneration` starts
+ * none in a chat in here, nor hands one to the engine.
+ *
+ * Taken out again if the delete fails — the chat is still there then, and so
+ * should be what is written to it from then on.
  */
 const removedChats = new Set<string>();
 
+/** The chat the running generation belongs to, and what stops it. */
+let liveTurn: { readonly chatId: string; readonly controller: AbortController } | null = null;
+
 /**
- * Write a message row, unless its chat is being or has been deleted. See
+ * Write a message row, unless its chat's delete has been asked for. See
  * `removedChats`.
+ *
+ * A row refused that way can name attachment payloads nothing else does: the
+ * composer writes an image's payload when it is attached, and the delete takes
+ * only the payloads the rows it found name. So those go too — in the chat's
+ * turn, once the delete has landed, and only if it did: a chat whose delete
+ * failed may still show them.
  */
 async function putMessage(message: Message): Promise<void> {
-  // Asked in the same step the put is made. A delete that starts after this
-  // makes its own write after the put, and the table applies them in that
-  // order, so it takes the row with it; one that started before is seen here.
-  if (removedChats.has(message.chatId)) return;
-  await db.messages.put(message);
+  // Asked in the same step the put is made. A delete asked for after this makes
+  // its own write after the put, and the table applies them in that order, so
+  // it takes the row with it; one asked for before is seen here.
+  if (!removedChats.has(message.chatId)) {
+    await db.messages.put(message);
+    return;
+  }
+  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
+  if (payloads.length === 0) return;
+  await writeInTurn(message.chatId, async () => {
+    if (removedChats.has(message.chatId)) await deleteBlobs(payloads);
+  });
 }
 
 /** The error an interrupted turn is recovered with. */
@@ -448,8 +472,13 @@ export const useChats = create<ChatState>((set, get) => ({
     // delete had taken it out: the chat came back the next time the app loaded.
     // Now what was asked for first lands first and goes with the chat, and what
     // is asked for after finds it gone. See `removedChats`.
+    //
+    // Marked, and its running turn stopped, NOW — before the delete has its
+    // turn. What that turn would send next is sent for a conversation the person
+    // has just deleted.
+    removedChats.add(chatId);
+    if (liveTurn?.chatId === chatId) liveTurn.controller.abort();
     return writeInTurn(chatId, async () => {
-      removedChats.add(chatId);
       try {
         await deleteChat(chatId);
       } catch (error) {
@@ -791,7 +820,9 @@ async function runGeneration(
   }
 
   const chat = get().chats.find((entry) => entry.id === options.chatId);
-  if (!chat) return;
+  // Nor in a chat whose delete has been asked for: it stays in the store until
+  // the delete lands. See `removedChats`.
+  if (!chat || removedChats.has(chat.id)) return;
 
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
@@ -823,6 +854,7 @@ async function runGeneration(
   };
 
   set({ generating: true, controller, messages: [...get().messages, placeholder] });
+  liveTurn = { chatId: chat.id, controller };
   app.setActivity(runsOnThisDevice(target) ? 'loading' : 'remote');
 
   const started = performance.now();
@@ -872,6 +904,12 @@ async function runGeneration(
   livePlaceholderId = placeholder.id;
 
   try {
+    // Deleted while the prompt was being built. A stopped signal is not enough
+    // here: the engine can still raise a sheet before its first request.
+    if (removedChats.has(chat.id)) {
+      patch((message) => ({ ...message, streaming: false }));
+      return;
+    }
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -1087,6 +1125,7 @@ async function runGeneration(
     app.toast(message, 'crit');
   } finally {
     if (livePlaceholderId === placeholder.id) livePlaceholderId = null;
+    if (liveTurn?.controller === controller) liveTurn = null;
     set({ generating: false, controller: null });
     app.setActivity('idle');
     app.setLiveRate(null);

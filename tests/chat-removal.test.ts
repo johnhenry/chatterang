@@ -23,11 +23,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * the store remembers which chats it has deleted for as long as it runs.
  */
 
-type Row = { id: string; chatId?: string; updatedAt?: number; createdAt?: number };
+type Row = {
+  id: string;
+  chatId?: string;
+  updatedAt?: number;
+  createdAt?: number;
+  attachments?: readonly { id: string }[];
+};
 
 const fake = vi.hoisted(() => {
   const chats = new Map<string, Row>();
   const messages = new Map<string, Row>();
+  /** Attachment payloads, by attachment id, as `lib/blobs.ts` keeps them. */
+  const blobs = new Map<string, Row>();
   const holding = new Set<string>();
   const waiting = new Map<string, (() => void)[]>();
   const clone = <T>(value: T): T => structuredClone(value);
@@ -82,14 +90,28 @@ const fake = vi.hoisted(() => {
         }),
       }),
     },
+    blobs: {
+      get: async (id: string) => {
+        const row = blobs.get(id);
+        await gate('blobs.get');
+        return row;
+      },
+      bulkDelete: vi.fn(async (ids: string[]) => {
+        for (const id of ids) blobs.delete(id);
+      }),
+    },
     models: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
     settings: { get: vi.fn(async () => undefined), put: vi.fn(async () => {}) },
     connections: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
   };
 
-  /** The cascade `db/index.ts` runs, applied when it is made. */
+  /** The cascade `db/index.ts` runs, attachment payloads included, applied when it is made. */
   const deleteChat = vi.fn(async (chatId: string) => {
-    for (const row of [...messages.values()]) if (row.chatId === chatId) messages.delete(row.id);
+    for (const row of [...messages.values()]) {
+      if (row.chatId !== chatId) continue;
+      for (const attachment of row.attachments ?? []) blobs.delete(attachment.id);
+      messages.delete(row.id);
+    }
     chats.delete(chatId);
     await gate('deleteChat');
   });
@@ -99,6 +121,7 @@ const fake = vi.hoisted(() => {
     deleteChat,
     chats,
     messages,
+    blobs,
     hold: (name: string): void => {
       holding.add(name);
     },
@@ -111,6 +134,7 @@ const fake = vi.hoisted(() => {
     reset: (): void => {
       chats.clear();
       messages.clear();
+      blobs.clear();
       holding.clear();
       for (const resolvers of waiting.values()) for (const resolve of resolvers.splice(0)) resolve();
     },
@@ -129,10 +153,14 @@ const { useModels } = await import('@/state/models');
 const { useApp } = await import('@/state/app');
 const { catalogEntry } = await import('@/data/catalog');
 const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
+const { ChatterangEngine } = await import('@/ai/engine');
+const { toolRegistry } = await import('@/ai/tools/registry');
+const { MCP_CALL, mcpProbe, probeResolver, recordingBackend } = await import('./support/egress-probe');
 
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
 type ToolInvocation = import('@/domain/chat').ToolInvocation;
+type ApprovalPrompt = import('@/state/app').ApprovalPrompt;
 
 const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
 
@@ -197,14 +225,19 @@ interface Turn {
 }
 
 let script: Turn[] = [];
+/** The signal each turn handed to the engine was given, in order. */
+let signals: (AbortSignal | undefined)[] = [];
 
 /**
  * The engine, replaced by a recorder. What is under test is what the STORE
  * writes while a turn runs and after it ends, so the generation is scripted.
+ * It ignores its signal, as a backend already past the point of checking it
+ * does: whether the turn was stopped is read from `signals`.
  */
 function scriptedEngine(): unknown {
   return {
-    async *stream() {
+    async *stream(request: { signal?: AbortSignal }) {
+      signals.push(request.signal);
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
       if (turn.beforeTool) await turn.beforeTool;
@@ -257,6 +290,7 @@ beforeEach(() => {
   fake.reset();
   vi.clearAllMocks();
   script = [];
+  signals = [];
   useModels.setState({
     loaded: true,
     activeModelId: QWEN.id,
@@ -451,6 +485,293 @@ describe('a chat deleted while a turn is running in it', () => {
     expect(rows.map((row) => row.role)).toEqual(['user', 'assistant']);
     expect(rows[1]?.streaming).toBe(false);
     expect(rows[1]?.toolCalls?.[0]?.receipt).toEqual(SENT.receipt);
+    expect(signals[0]?.aborted, 'nor is it stopped').toBe(false);
+  });
+
+  it('is stopped the moment the delete is asked for', async () => {
+    // The row was the only thing the delete stopped. The turn went on, and
+    // whatever it did next — a tool call to a server, a request to a provider —
+    // was done for a conversation the person had deleted.
+    given(chat('stopped', 1));
+    useChats.setState({ activeChatId: 'stopped' });
+    const turn = held();
+    script = [{ text: 'Here you go.', hang: turn.promise }];
+
+    const sending = useChats.getState().send('my bank details are 1234');
+    let removing: Promise<void> = Promise.resolve();
+    try {
+      await until(() => signals.length === 1);
+      removing = useChats.getState().removeChat('stopped');
+      expect(signals[0]?.aborted, 'as the delete is asked for').toBe(true);
+    } finally {
+      turn.release();
+      await Promise.all([removing, sending]);
+    }
+    expect(rowsFor('stopped')).toEqual([]);
+  });
+
+  it('sends no further MCP call, though the conversation had said yes to that server', async () => {
+    // The real engine and a real MCP tool, whose server is a spy. The first call
+    // is answered "for this conversation", and the person deletes the chat
+    // while it is out. The model calls the server again.
+    const probe = mcpProbe();
+    given({ ...chat('mcp_turn', 1), tools: [probe.tool.id] });
+    useChats.setState({ activeChatId: 'mcp_turn' });
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+
+    let removing: Promise<void> = Promise.resolve();
+    probe.call.mockImplementationOnce(async () => {
+      removing = useChats.getState().removeChat('mcp_turn');
+      return { content: [{ type: 'text', text: 'filed' }] };
+    });
+    const asked: string[] = [];
+    const original = useApp.getState().requestApproval;
+
+    try {
+      toolRegistry.register(probe.tool);
+      engine.router.replace(QWEN.engine, recordingBackend([MCP_CALL, MCP_CALL, 'Done.']).adapter);
+      useApp.setState({
+        engine: engine as never,
+        requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+          asked.push(action);
+          if (asked.length > 1) return false;
+          prompt?.onExtended?.();
+          return true;
+        },
+      });
+      await useChats.getState().send('file my bank details');
+      await removing;
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+      useApp.setState({ requestApproval: original });
+    }
+
+    expect(probe.call, 'the arguments reached the server once, before the delete').toHaveBeenCalledOnce();
+    expect(asked).toHaveLength(1);
+    expect(fake.chats.has('mcp_turn')).toBe(false);
+    expect(rowsFor('mcp_turn')).toEqual([]);
+  });
+
+  it('does not hand the turn to the engine when the delete is asked for while its prompt is being built', async () => {
+    // An image in the thread is read back from its payload while the prompt is
+    // built. A stopped signal handed to the engine still lets it raise a sheet
+    // for a remote model before any request is made.
+    given(chat('building', 1));
+    const earlier: Message = {
+      id: 'building_image',
+      chatId: 'building',
+      role: 'user',
+      content: 'look at this',
+      attachments: [{ kind: 'image', id: 'att_building', mediaType: 'image/png', bytes: 3 }],
+      createdAt: 1,
+    };
+    const reply: Message = { id: 'building_reply', chatId: 'building', role: 'assistant', content: 'A cat.', createdAt: 2 };
+    for (const row of [earlier, reply]) fake.messages.set(row.id, structuredClone(row));
+    fake.blobs.set('att_building', { id: 'att_building' });
+    useChats.setState({ activeChatId: 'building', messages: [earlier, reply] });
+    script = [{ text: 'Here you go.' }];
+    fake.hold('blobs.get');
+
+    const sending = useChats.getState().send('and this one?');
+    await until(() => fake.pending('blobs.get') === 1);
+    const removing = useChats.getState().removeChat('building');
+    fake.release('blobs.get');
+    await Promise.all([removing, sending]);
+
+    expect(signals, 'no turn reached the engine').toEqual([]);
+    expect(rowsFor('building')).toEqual([]);
+  });
+
+  it('gets no row back from a turn that finishes while the delete is still being carried out', async () => {
+    given(chat('finishing', 1));
+    useChats.setState({ activeChatId: 'finishing' });
+    const turn = held();
+    script = [{ text: 'Here you go.', hang: turn.promise }];
+
+    const sending = useChats.getState().send('my bank details are 1234');
+    await until(() => useChats.getState().generating);
+    fake.hold('deleteChat');
+    const removing = useChats.getState().removeChat('finishing');
+    await until(() => fake.pending('deleteChat') === 1);
+
+    turn.release();
+    // The finished row has been written, or refused, while the delete is held.
+    await until(() =>
+      useChats.getState().messages.some((message) => message.role === 'assistant' && message.streaming === false),
+    );
+    fake.release('deleteChat');
+    // Not `sending` first: the turn's closing count waits behind the delete.
+    await Promise.all([removing, sending]);
+
+    expect(rowsFor('finishing'), 'the finished row').toEqual([]);
+  });
+
+  it.each(['an error from the model', 'a stream that throws'] as const)(
+    'gets no row back from a turn that ends in %s',
+    async (how) => {
+      const id = how === 'an error from the model' ? 'errored' : 'thrown';
+      given(chat(id, 1));
+      useChats.setState({ activeChatId: id });
+      const turn = held();
+      useApp.setState({
+        engine: {
+          async *stream() {
+            await turn.promise;
+            if (how === 'a stream that throws') throw new Error('The socket closed.');
+            yield { type: 'error', message: 'The model stopped.' };
+          },
+        } as never,
+      });
+
+      const sending = useChats.getState().send('my bank details are 1234');
+      await until(() => useChats.getState().generating);
+      await useChats.getState().removeChat(id);
+      turn.release();
+      await sending;
+
+      expect(rowsFor(id), 'the failed row').toEqual([]);
+    },
+  );
+});
+
+describe('a chat deleted while something is written to its thread', () => {
+  /**
+   * A chat that is open, with its delete asked for and held part-way. Wrapped,
+   * because a promise returned from an async function is waited on.
+   */
+  async function deleting(id: string, thread: Message[] = []): Promise<{ removing: Promise<void> }> {
+    given(chat(id, 1));
+    for (const row of thread) fake.messages.set(row.id, structuredClone(row));
+    useChats.setState({ activeChatId: id, messages: thread });
+    fake.hold('deleteChat');
+    const removing = useChats.getState().removeChat(id);
+    await until(() => fake.pending('deleteChat') === 1);
+    // Still listed, and still the open chat, until the delete has landed.
+    expect(inStore(id)).toBe(true);
+    return { removing };
+  }
+
+  it('gets no row from a message sent meanwhile, and starts no turn', async () => {
+    const { removing } = await deleting('sent_during');
+
+    const sending = useChats.getState().send('hello');
+    await macrotask();
+    fake.release('deleteChat');
+    await Promise.all([removing, sending]);
+
+    expect(rowsFor('sent_during')).toEqual([]);
+    expect(signals).toEqual([]);
+  });
+
+  it('keeps none of that message’s attachments on the device', async () => {
+    // The composer writes an image's payload when it is attached, before any
+    // message names it. The delete takes the payloads its rows name, and the
+    // row that would have named this one was never written.
+    const { removing } = await deleting('attached_during');
+    fake.blobs.set('att_during', { id: 'att_during' });
+
+    const sending = useChats
+      .getState()
+      .send('look at this', [{ kind: 'image', id: 'att_during', mediaType: 'image/png', bytes: 3 }]);
+    await macrotask();
+    fake.release('deleteChat');
+    await Promise.all([removing, sending]);
+
+    expect(rowsFor('attached_during')).toEqual([]);
+    expect(fake.blobs.has('att_during'), 'the image').toBe(false);
+  });
+
+  it.each(['an edit', 'a flip to the other reply'] as const)(
+    'gets no row back from %s made meanwhile',
+    async (what) => {
+      const id = what === 'an edit' ? 'edited_during' : 'flipped_during';
+      const { removing } = await deleting(id, [
+        { id: `${id}_user`, chatId: id, role: 'user', content: 'hello', createdAt: 1 },
+        {
+          id: `${id}_reply`,
+          chatId: id,
+          role: 'assistant',
+          content: 'Second.',
+          createdAt: 2,
+          variants: [{ content: 'First.' }, { content: 'Second.' }],
+          variantIndex: 1,
+        },
+      ]);
+
+      const writing =
+        what === 'an edit'
+          ? useChats.getState().editMessage(`${id}_reply`, 'Changed.')
+          : useChats.getState().cycleVariant(`${id}_reply`, -1);
+      await macrotask();
+      fake.release('deleteChat');
+      await Promise.all([removing, writing]);
+
+      expect(rowsFor(id)).toEqual([]);
+    },
+  );
+
+  it('keeps the attachment of a row its chat still has when the delete fails', async () => {
+    // The control for the payload: only once the delete has landed is a payload
+    // left over from a refused row taken. A chat whose delete was refused still
+    // shows this image.
+    given(chat('kept_image', 1));
+    const row: Message = {
+      id: 'kept_image_user',
+      chatId: 'kept_image',
+      role: 'user',
+      content: 'look',
+      attachments: [{ kind: 'image', id: 'att_kept', mediaType: 'image/png', bytes: 3 }],
+      createdAt: 1,
+    };
+    fake.messages.set(row.id, structuredClone(row));
+    fake.blobs.set('att_kept', { id: 'att_kept' });
+    useChats.setState({ activeChatId: 'kept_image', messages: [row] });
+    const refusing = held();
+    fake.deleteChat.mockImplementationOnce(async () => {
+      await refusing.promise;
+      throw new Error('The disk is full.');
+    });
+
+    const removing = useChats.getState().removeChat('kept_image');
+    await until(() => fake.deleteChat.mock.calls.length === 1);
+    const editing = useChats.getState().editMessage('kept_image_user', 'look again');
+    await macrotask();
+    refusing.release();
+    await expect(removing).rejects.toThrow('The disk is full.');
+    await editing;
+
+    expect(inStore('kept_image')).toBe(true);
+    expect(fake.messages.has('kept_image_user')).toBe(true);
+    expect(fake.blobs.has('att_kept'), 'its image').toBe(true);
+  });
+
+  it('does not start a turn asked for after the delete, while an earlier write still holds its turn', async () => {
+    given(chat('queued_turn', 1));
+    const thread: Message[] = [
+      { id: 'queued_turn_user', chatId: 'queued_turn', role: 'user', content: 'hello', createdAt: 1 },
+      { id: 'queued_turn_reply', chatId: 'queued_turn', role: 'assistant', content: 'Hi.', createdAt: 2 },
+    ];
+    for (const row of thread) fake.messages.set(row.id, structuredClone(row));
+    useChats.setState({ activeChatId: 'queued_turn', messages: thread });
+    script = [{ text: 'Hi again.' }];
+    fake.hold('chats.put');
+
+    const renaming = useChats.getState().renameChat('queued_turn', 'Renamed');
+    await until(() => fake.pending('chats.put') === 1);
+    const removing = useChats.getState().removeChat('queued_turn');
+    const regenerating = useChats.getState().regenerate('queued_turn_reply');
+    await macrotask();
+    expect(signals, 'while the rename is still being written').toEqual([]);
+    // Nor put on screen: no reply being written appears in a chat going away.
+    expect(useChats.getState().messages.map((message) => message.id)).toEqual(['queued_turn_user']);
+    expect(useChats.getState().generating).toBe(false);
+
+    fake.release('chats.put');
+    await Promise.all([renaming, removing, regenerating]);
+
+    expect(signals).toEqual([]);
+    expect(fake.chats.has('queued_turn')).toBe(false);
+    expect(rowsFor('queued_turn')).toEqual([]);
   });
 });
 
