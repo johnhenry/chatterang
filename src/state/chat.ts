@@ -8,7 +8,7 @@
 
 import { create } from 'zustand';
 
-import { blobToBase64 } from '@/lib/blobs';
+import { blobToBase64, deleteBlobs } from '@/lib/blobs';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
@@ -219,6 +219,136 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
   return written;
 }
 
+/**
+ * Chats whose delete has been asked for in this session, by id.
+ *
+ * `removeChat` waits its turn in `chatWrites` like any other write, so every
+ * write already asked for lands before the delete, and the delete takes it with
+ * the chat. What is asked for after is a no-op. A chat write sees that for
+ * itself — the chat is no longer in the store when it runs — but a message row
+ * names its chat and nothing more, and a turn still running in a deleted
+ * conversation, or the recovery of an interrupted row, wrote it straight back
+ * into the table: a conversation the person deleted, still on disk. So message
+ * rows go through `putMessage`, which asks this.
+ *
+ * ADDED WHEN THE DELETE IS ASKED FOR, not when it starts, and nothing is SENT
+ * for a chat in here either. Deleting a chat stopped only its rows: the turn
+ * running in it went on calling MCP servers under an answer given for the
+ * conversation, measured through the real engine, and a turn asked for while
+ * an earlier write held the delete's place started. So every turn running in
+ * it is stopped as the delete is asked for (`liveTurns`), and `runGeneration`
+ * starts none in a chat in here, nor hands one to the engine.
+ *
+ * Taken out again if the delete fails — the chat is still there then, and so
+ * should be what is written to it from then on, and what was refused while the
+ * delete ran is written then. See `refusedRows`.
+ */
+const removedChats = new Set<string>();
+
+/**
+ * Rows `putMessage` refused while a chat's delete was under way, by chat, the
+ * latest version of each row by message id. Present from the moment the delete
+ * is asked for until it has landed or failed.
+ *
+ * A delete can fail — a full disk — and the chat is then still there. Dropping
+ * a refused row outright lost it for good: the row recording that a call's
+ * arguments went to an MCP server, a finished turn carrying a not-sent record, a
+ * regenerated turn holding the generations of the row it replaced (which was
+ * deleted). The thread on screen showed them; reopening or exporting the chat
+ * showed nothing. So they are kept here, and written if the delete fails.
+ */
+const refusedRows = new Map<string, Map<string, Message>>();
+
+/**
+ * Every generation still running, with the chat it belongs to and what stops it.
+ *
+ * A SET, NOT ONE SLOT. More than one turn can be running: editing a user message
+ * starts a turn without asking whether one is already running, and the edit
+ * button is on screen while one is. One slot held the turn started last, and
+ * deleting the chat the earlier one ran in stopped nothing — its model went on
+ * calling an MCP server under the conversation's earlier yes, measured through
+ * the real engine.
+ */
+const liveTurns = new Set<{ readonly chatId: string; readonly controller: AbortController }>();
+
+/**
+ * Write a message row, unless its chat's delete has been asked for. See
+ * `removedChats`.
+ *
+ * Refused while the delete is under way, the row is kept in `refusedRows`:
+ * `removeChat` writes it if the delete fails.
+ *
+ * A row refused that way can name attachment payloads nothing else does: the
+ * composer writes an image's payload when it is attached, and the delete takes
+ * only the payloads the rows it found name. So those go too — once the delete
+ * has landed, and only if it did: a chat whose delete failed may still show
+ * them.
+ */
+async function putMessage(message: Message): Promise<void> {
+  // Asked in the same step the put is made. A delete asked for after this makes
+  // its own write after the put, and the table applies them in that order, so
+  // it takes the row with it; one asked for before is seen here.
+  if (!removedChats.has(message.chatId)) {
+    await db.messages.put(message);
+    return;
+  }
+  const refused = refusedRows.get(message.chatId);
+  if (refused) {
+    refused.set(message.id, message);
+    return;
+  }
+  // The delete has landed: nothing will write this row, and nothing else names
+  // its payloads.
+  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
+  if (payloads.length === 0) return;
+  await writeInTurn(message.chatId, async () => {
+    if (removedChats.has(message.chatId)) await deleteBlobs(payloads);
+  });
+}
+
+/**
+ * Delete a message row. A version of it refused while its chat's delete is under
+ * way goes too, or a delete that then failed would write back a row the person
+ * had deleted meanwhile. See `refusedRows`.
+ */
+async function deleteMessageRow(messageId: string): Promise<void> {
+  for (const refused of refusedRows.values()) refused.delete(messageId);
+  await db.messages.delete(messageId);
+}
+
+/**
+ * What was withdrawn before the chat list had loaded: connections' and MCP
+ * servers' grants, and MCP servers' tools by id prefix.
+ *
+ * The app is up — Settings included — once the engine is, and the list is read
+ * after that (App.tsx). A withdrawal drops grants from the chats in the store,
+ * and until the list has landed there are none. So it dropped nothing, the list
+ * then brought the grant in from disk, and switching the connection or server
+ * back on honoured it without asking. A removed server's tools came back the
+ * same way, and their prune is what keeps them from coming on under the next
+ * server to take the name (#6). So `load` takes these out of what it read
+ * before the store holds any of it, and writes that back.
+ */
+const beforeTheList = {
+  connections: new Set<string>(),
+  servers: new Set<string>(),
+  toolPrefixes: new Set<string>(),
+};
+
+/** A chat read from disk without what was withdrawn before the list loaded, or null when that is nothing. */
+function withdrawnBeforeTheList(chat: Chat): Chat | null {
+  const grants = chat.egressGrants ?? [];
+  const egressGrants = grants.filter((grant) =>
+    grant.kind === 'mcp'
+      ? !beforeTheList.servers.has(grant.serverId)
+      : !beforeTheList.connections.has(grant.connectionId),
+  );
+  const prefixes = [...beforeTheList.toolPrefixes];
+  const tools = chat.tools.filter((id) => !prefixes.some((prefix) => id.startsWith(prefix)));
+  if (egressGrants.length === grants.length && tools.length === chat.tools.length) return null;
+  return { ...chat, egressGrants, tools };
+}
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -296,8 +426,36 @@ export const useChats = create<ChatState>((set, get) => ({
   controller: null,
 
   async load() {
-    const chats = await db.chats.orderBy('updatedAt').reverse().toArray();
-    set({ loaded: true, chats: sortChats(chats) });
+    const stored = await db.chats.orderBy('updatedAt').reverse().toArray();
+    // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
+    // the engine is, before this read lands, and ⌘N there starts a chat. A read
+    // taken before that chat was written replaced the store without it, and the
+    // screen was left on a thread nothing could be sent to. What the store holds
+    // was written to the table before it was set, so it is never older than the
+    // read; a chat being deleted is left out, or the read would bring it back.
+    const held = get().chats;
+    const known = new Set(held.map((chat) => chat.id));
+    const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
+    // Without what was withdrawn before this could see it, in the store from
+    // the first moment it holds these chats. See `beforeTheList`.
+    const stripped = unseen.map(withdrawnBeforeTheList);
+    beforeTheList.connections.clear();
+    beforeTheList.servers.clear();
+    beforeTheList.toolPrefixes.clear();
+    set({ loaded: true, chats: sortChats([...held, ...unseen.map((chat, at) => stripped[at] ?? chat)]) });
+    // And on disk, in each chat's turn.
+    await Promise.all(
+      stripped.flatMap((chat) =>
+        chat
+          ? [
+              writeInTurn(chat.id, async () => {
+                const current = get().chats.find((entry) => entry.id === chat.id);
+                if (current) await db.chats.put(current);
+              }),
+            ]
+          : [],
+      ),
+    );
   },
 
   async openChat(chatId) {
@@ -310,12 +468,15 @@ export const useChats = create<ChatState>((set, get) => ({
       // receipts included — and becomes the failed turn it is.
       if (row.streaming && row.id !== livePlaceholderId) {
         const interrupted: Message = { ...row, streaming: false, error: INTERRUPTED };
-        await db.messages.put(interrupted);
+        await putMessage(interrupted);
         messages.push(interrupted);
       } else {
         messages.push(row);
       }
     }
+    // Deleted while its thread was being read: the thread read is from before,
+    // and opening it would put a deleted conversation back on screen.
+    if (removedChats.has(chatId)) return;
     set({ activeChatId: chatId, messages });
     get().refreshContext();
   },
@@ -393,19 +554,53 @@ export const useChats = create<ChatState>((set, get) => ({
         content: persona.firstMessage.replaceAll('{{char}}', persona.name).replaceAll('{{user}}', 'you'),
         createdAt: Date.now(),
       };
-      await db.messages.put(greeting);
+      await putMessage(greeting);
       set({ messages: [greeting] });
     }
 
     return chat.id;
   },
 
-  async removeChat(chatId) {
-    await deleteChat(chatId);
-    const chats = get().chats.filter((chat) => chat.id !== chatId);
-    set({
-      chats,
-      ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+  removeChat(chatId) {
+    // IN THE CHAT'S TURN, like every other write to it. Run straight away, the
+    // delete was under way while a write queued behind another one ran, found
+    // the chat still in the store, and put it back into the table after the
+    // delete had taken it out: the chat came back the next time the app loaded.
+    // Now what was asked for first lands first and goes with the chat, and what
+    // is asked for after finds it gone. See `removedChats`.
+    //
+    // Marked, and its running turn stopped, NOW — before the delete has its
+    // turn. What that turn would send next is sent for a conversation the person
+    // has just deleted.
+    removedChats.add(chatId);
+    if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
+    for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
+    return writeInTurn(chatId, async () => {
+      try {
+        await deleteChat(chatId);
+      } catch (error) {
+        // The chat is still there, and so is what the thread on screen shows:
+        // the rows refused while this ran are written. Each put is MADE before
+        // the mark comes off, so a write to the chat made after that is applied
+        // after it, and wins.
+        const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+        refusedRows.delete(chatId);
+        const writing = refused.map((message) => db.messages.put(message));
+        removedChats.delete(chatId);
+        await Promise.allSettled(writing);
+        throw error;
+      }
+      // Landed. The rows refused meanwhile are never written, and their payloads
+      // are named by nothing else.
+      const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
+        (message.attachments ?? []).map((attachment) => attachment.id),
+      );
+      refusedRows.delete(chatId);
+      if (payloads.length > 0) await deleteBlobs(payloads);
+      set({
+        chats: get().chats.filter((chat) => chat.id !== chatId),
+        ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+      });
     });
   },
 
@@ -457,6 +652,9 @@ export const useChats = create<ChatState>((set, get) => ({
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
     const finished = providerWithdrawals.begin(connectionId);
+    // Until the chat list has loaded there is nothing here to drop it from. See
+    // `beforeTheList`.
+    if (chatId === undefined && !get().loaded) beforeTheList.connections.add(connectionId);
     try {
       const names = (grant: EgressGrant): boolean =>
         grant.kind !== 'mcp' && grant.connectionId === connectionId;
@@ -505,6 +703,9 @@ export const useChats = create<ChatState>((set, get) => ({
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
     const finished = mcpWithdrawals.begin(serverId);
+    // Until the chat list has loaded there is nothing here to drop it from. See
+    // `beforeTheList`.
+    if (chatId === undefined && !get().loaded) beforeTheList.servers.add(serverId);
     try {
       const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
       const affected = get().chats.filter(
@@ -538,7 +739,7 @@ export const useChats = create<ChatState>((set, get) => ({
       createdAt: Date.now(),
     };
 
-    await db.messages.put(userMessage);
+    await putMessage(userMessage);
     set({ messages: [...get().messages, userMessage] });
 
     if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
@@ -566,16 +767,20 @@ export const useChats = create<ChatState>((set, get) => ({
     const target = messages[index];
     if (!target || target.role !== 'assistant') return;
 
-    // Everything after this assistant turn is discarded; the turn itself is
-    // kept so its previous text becomes a variant the user can flip back to.
-    const removed = messages.slice(index + 1);
-    for (const message of removed) await db.messages.delete(message.id);
-
     const chatId = get().activeChatId;
     if (!chatId) return;
 
+    // Everything after this assistant turn is discarded; the turn itself is
+    // kept so its previous text becomes a variant the user can flip back to.
+    //
+    // ONLY ONCE A TURN HAS STARTED. They were deleted first, and the turn once
+    // `runGeneration` returned, whether or not it had started anything. One that
+    // could not start — no model, a chat being deleted — replaced them with
+    // nothing: the turn and what came after it were gone from disk and screen,
+    // an MCP receipt saying arguments went included.
+    const removed = messages.slice(index + 1);
     set({ messages: messages.slice(0, index) });
-    await runGeneration(set, get, {
+    const ran = await runGeneration(set, get, {
       chatId,
       overrideModelId,
       // Not `target.content`. What is carried forward is the whole generation
@@ -584,8 +789,18 @@ export const useChats = create<ChatState>((set, get) => ({
       // words.
       previousVariants: generationsSoFar(target),
       replaceMessageId: target.id,
+      // All made in one step. See `beforeEngine`.
+      beforeEngine: async () => {
+        await Promise.all(removed.map((message) => deleteMessageRow(message.id)));
+      },
     });
-    await db.messages.delete(target.id);
+    if (ran) {
+      await deleteMessageRow(target.id);
+      return;
+    }
+    // Nothing started, so nothing was discarded: the thread goes back on screen
+    // as it was, if it is still the one open.
+    if (get().activeChatId === chatId) set({ messages });
   },
 
   async editMessage(messageId, text) {
@@ -597,12 +812,12 @@ export const useChats = create<ChatState>((set, get) => ({
     if (!message) return;
 
     const updated = editedVariant(message, text);
-    await db.messages.put(updated);
+    await putMessage(updated);
 
     // Editing a user turn invalidates everything after it.
     const after = messages.slice(index + 1);
     if (message.role === 'user' && after.length > 0) {
-      for (const stale of after) await db.messages.delete(stale.id);
+      for (const stale of after) await deleteMessageRow(stale.id);
       set({ messages: [...messages.slice(0, index), updated] });
       const chatId = get().activeChatId;
       if (chatId) await runGeneration(set, get, { chatId });
@@ -613,7 +828,7 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async deleteMessage(messageId) {
-    await db.messages.delete(messageId);
+    await deleteMessageRow(messageId);
     set({ messages: get().messages.filter((message) => message.id !== messageId) });
   },
 
@@ -635,7 +850,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // One call, so text and provenance cannot part company here. This is the
     // line the defect was on.
     const updated = applyVariant(message, next);
-    await db.messages.put(updated);
+    await putMessage(updated);
     set({ messages: get().messages.map((entry) => (entry.id === messageId ? updated : entry)) });
   },
 }));
@@ -722,27 +937,36 @@ interface RunOptions {
   /** Complete generations this turn has already had — see `generationsSoFar`. */
   previousVariants?: MessageVariant[];
   replaceMessageId?: string;
+  /**
+   * Run once nothing more can refuse the turn, in the same step it is handed to
+   * the engine. What a regeneration discards goes here, so a turn that never
+   * starts discards nothing.
+   */
+  beforeEngine?: () => Promise<void>;
 }
 
+/** Hands one turn to the engine. Resolves true if it did, false if it refused before that. */
 async function runGeneration(
   set: (partial: Partial<ChatState>) => void,
   get: () => ChatState,
   options: RunOptions,
-): Promise<void> {
+): Promise<boolean> {
   const app = useApp.getState();
   const engine = app.engine;
   if (!engine) {
     app.toast('The engine is still starting up.', 'warn');
-    return;
+    return false;
   }
 
   const chat = get().chats.find((entry) => entry.id === options.chatId);
-  if (!chat) return;
+  // Nor in a chat whose delete has been asked for: it stays in the store until
+  // the delete lands. See `removedChats`.
+  if (!chat || removedChats.has(chat.id)) return false;
 
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
     app.toast('Choose a model first — none is installed or connected yet.', 'warn');
-    return;
+    return false;
   }
   if (choice.kind === 'refused') {
     // Refused before anything is spent: no placeholder message, no activity
@@ -750,7 +974,7 @@ async function runGeneration(
     // model, and counting it would push a speech model up the "recently used"
     // ordering that the pickers sort by.
     app.toast(choice.message, 'warn');
-    return;
+    return false;
   }
   const { target } = choice;
 
@@ -769,6 +993,8 @@ async function runGeneration(
   };
 
   set({ generating: true, controller, messages: [...get().messages, placeholder] });
+  const live = { chatId: chat.id, controller };
+  liveTurns.add(live);
   app.setActivity(runsOnThisDevice(target) ? 'loading' : 'remote');
 
   const started = performance.now();
@@ -818,6 +1044,18 @@ async function runGeneration(
   livePlaceholderId = placeholder.id;
 
   try {
+    // Deleted while the prompt was being built. A stopped signal is not enough
+    // here: the engine can still raise a sheet before its first request.
+    if (removedChats.has(chat.id)) {
+      patch((message) => ({ ...message, streaming: false }));
+      return false;
+    }
+    // Started, not awaited: an await here would let a delete in between the
+    // check above and the hand-off below. Its writes are made now, and it is
+    // awaited once the stream has ended.
+    const discarding = options.beforeEngine?.();
+    // Only so a stream that throws first does not leave it unhandled.
+    discarding?.catch(() => {});
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -883,7 +1121,7 @@ async function runGeneration(
           // keeps on screen, field for field.
           if (mayHaveLeft(event.tool.receipt)) {
             const split = splitThinking(raw);
-            await db.messages.put({
+            await putMessage({
               ...placeholder,
               content: split.content,
               thinking: split.thinking || undefined,
@@ -894,7 +1132,7 @@ async function runGeneration(
             // it replaces, so that row goes now rather than after the turn.
             // Otherwise a kill from here on leaves both, and the reopened
             // thread shows the turn twice.
-            if (options.replaceMessageId) await db.messages.delete(options.replaceMessageId);
+            if (options.replaceMessageId) await deleteMessageRow(options.replaceMessageId);
           }
           break;
         }
@@ -981,7 +1219,7 @@ async function runGeneration(
             variants,
             variantIndex: variants ? variants.length - 1 : undefined,
           };
-          await db.messages.put(finished);
+          await putMessage(finished);
           patch(() => finished);
           break;
         }
@@ -1010,7 +1248,7 @@ async function runGeneration(
             streaming: false,
             error: event.message,
           };
-          await db.messages.put(failed);
+          await putMessage(failed);
           patch(() => failed);
           app.toast(event.message, 'crit');
           break;
@@ -1020,6 +1258,7 @@ async function runGeneration(
           break;
       }
     }
+    await discarding;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Generation failed.';
     const failed: Message = {
@@ -1028,11 +1267,12 @@ async function runGeneration(
       streaming: false,
       error: message,
     };
-    await db.messages.put(failed);
+    await putMessage(failed);
     patch(() => failed);
     app.toast(message, 'crit');
   } finally {
     if (livePlaceholderId === placeholder.id) livePlaceholderId = null;
+    liveTurns.delete(live);
     set({ generating: false, controller: null });
     app.setActivity('idle');
     app.setLiveRate(null);
@@ -1045,6 +1285,7 @@ async function runGeneration(
       preview: last?.content.slice(0, 120) ?? chatNow.preview,
     }));
   }
+  return true;
 }
 
 /* ── Tool-output egress ──────────────────────────────────────────────── */
@@ -1662,6 +1903,9 @@ installMcpGrantRevoker(async (serverId) => {
 // server name still over-prunes (`a` takes `a.b.search`), which fails closed.
 installMcpToolPruner(async (serverName) => {
   const prefix = `mcp:${serverName}.`;
+  // Until the chat list has loaded there is nothing here to prune. See
+  // `beforeTheList`.
+  if (!useChats.getState().loaded) beforeTheList.toolPrefixes.add(prefix);
   for (const chat of useChats.getState().chats) {
     if (!chat.tools.some((id) => id.startsWith(prefix))) continue;
     // A function of the chat as it stands when written, for the reason the

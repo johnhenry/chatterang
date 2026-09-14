@@ -877,10 +877,19 @@ function ChatSettingsSheet({
                 className="chip chip--button"
                 aria-pressed={enabled}
                 onClick={() =>
-                  void update(chat.id, {
-                    tools: enabled
-                      ? chat.tools.filter((id) => id !== tool.id)
-                      : [...chat.tools, tool.id],
+                  // ONE ID, IN THE LIST AS IT STANDS WHEN THIS IS WRITTEN — never
+                  // the list this sheet rendered. Removing an MCP server prunes
+                  // its tools from every chat, and a whole list built from a
+                  // render older than the prune wrote the pruned tool back on,
+                  // unasked (#6). And the way the chip SHOWED it: pressing a chip
+                  // that was on turns it off, so it never adds a tool the list no
+                  // longer holds. See `ChatPatch`.
+                  void update(chat.id, (current) => {
+                    const holds = current.tools.includes(tool.id);
+                    if (enabled) {
+                      return holds ? { tools: current.tools.filter((id) => id !== tool.id) } : null;
+                    }
+                    return holds ? null : { tools: [...current.tools, tool.id] };
                   })
                 }
                 title={tool.summary}
@@ -907,7 +916,9 @@ function ChatSettingsSheet({
             aria-checked={chat.showThinking}
             aria-label="Show reasoning"
             className="switch"
-            onClick={() => void update(chat.id, { showThinking: !chat.showThinking })}
+            onClick={() =>
+              void update(chat.id, (current) => ({ showThinking: !current.showThinking }))
+            }
           />
         </div>
       </div>

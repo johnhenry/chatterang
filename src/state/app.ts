@@ -237,6 +237,34 @@ export async function revokeMcpGrantsFor(serverId: string): Promise<void> {
   await revokeMcpGrants(serverId);
 }
 
+/**
+ * What follows disconnecting a connection that was removed or switched off: its
+ * grants withdrawn, and the fallback cleared if it was the fallback.
+ *
+ * THE WITHDRAWAL STARTS FIRST, before the settings write is awaited. It used to
+ * wait for it, and until a withdrawal starts nothing says an answer a running
+ * turn holds for this connection is stale (`withdrawals` in state/chat.ts).
+ * Switching the connection back on during that write registers the same id,
+ * and the next request carried tool output to it under that answer, unasked —
+ * measured through the real store and engine, for a "this turn" answer and a
+ * conversation one. Starting it here counts it at once; the settings write and
+ * the withdrawal's own writes then finish in either order.
+ */
+async function afterDisconnecting(get: () => AppState, id: string): Promise<void> {
+  const withdrawn = revokeEgressGrants(id);
+  // Awaited below whatever the settings write does. Marked handled now, so a
+  // withdrawal that fails while that write is still running is not reported as
+  // unhandled before it is awaited.
+  void withdrawn.catch(() => {});
+  try {
+    if (get().settings.fallbackBackendId === id) {
+      await get().updateSettings({ fallbackBackendId: null });
+    }
+  } finally {
+    await withdrawn;
+  }
+}
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   settings: DEFAULT_SETTINGS,
@@ -339,11 +367,7 @@ export const useApp = create<AppState>((set, get) => ({
     await db.connections.delete(id);
     get().engine?.disconnectProvider(id);
     set({ connections: get().connections.filter((connection) => connection.id !== id) });
-
-    if (get().settings.fallbackBackendId === id) {
-      await get().updateSettings({ fallbackBackendId: null });
-    }
-    await revokeEgressGrants(id);
+    await afterDisconnecting(get, id);
   },
 
   async toggleConnection(id, enabled) {
@@ -364,10 +388,7 @@ export const useApp = create<AppState>((set, get) => ({
         );
     } else {
       get().engine?.disconnectProvider(id);
-      if (get().settings.fallbackBackendId === id) {
-        await get().updateSettings({ fallbackBackendId: null });
-      }
-      await revokeEgressGrants(id);
+      await afterDisconnecting(get, id);
     }
   },
 

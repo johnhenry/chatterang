@@ -11,7 +11,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * silently applies to whatever next claims that id.
  */
 
-const chatsTable = vi.hoisted(() => ({ put: vi.fn(async () => {}) }));
+const chatsTable = vi.hoisted(() => {
+  // What the chat list reads at launch. Only the tests of loading it set this.
+  const listed = vi.fn(async (): Promise<unknown[]> => []);
+  return {
+    put: vi.fn(async () => {}),
+    listed,
+    orderBy: () => ({ reverse: () => ({ toArray: () => listed() }) }),
+  };
+});
 
 vi.mock('@/db', () => ({
   db: {
@@ -41,6 +49,7 @@ vi.mock('@/ai/mcp/client', () => ({
 
 const { useChats } = await import('@/state/chat');
 const { useApp } = await import('@/state/app');
+const { writeSetting } = await import('@/db');
 const { useMcp } = await import('@/state/mcp');
 const { holdsGrant } = await import('@/domain/chat');
 type EgressGrant = import('@/domain/chat').EgressGrant;
@@ -816,6 +825,108 @@ describe('an answer the running turn holds about a connection', () => {
   });
 });
 
+describe('an answer the running turn holds, while switching its connection off clears the fallback', () => {
+  /*
+   * `toggleConnection` and `removeConnection` disconnect, then — when the
+   * connection is the fallback — await the settings write, and only then
+   * withdraw the connection's grants. Until the withdrawal STARTS nothing says
+   * the answer the turn holds is stale. So the question is whether anything can
+   * reach the connection in that window.
+   *
+   * For a switch-off it can: switching it back on registers the same id, and
+   * the next request is built under the held answer. For a removal the id does
+   * not come back through the app (a new connection gets a new id), so the
+   * re-registration below stands in for nothing a person can do; it is measured
+   * anyway, because the two share the ordering.
+   */
+  beforeEach(() => {
+    seed();
+    chatsTable.put.mockClear();
+  });
+
+  it.each([
+    ['switched off', 'turn'],
+    ['switched off', 'conversation'],
+    ['removed', 'turn'],
+    ['removed', 'conversation'],
+  ] as const)('ends when the connection is %s, though it is back before the settings are written (“%s”)', async (how, first) => {
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, CALL, CALL, 'Done.']);
+    engine.router.register('conn_openai', cloud.adapter);
+
+    let releaseSettings = () => {};
+    const settingsHeld = new Promise<void>((resolve) => {
+      releaseSettings = resolve;
+    });
+    vi.mocked(writeSetting).mockImplementationOnce(() => settingsHeld);
+
+    let runs = 0;
+    let leaving: Promise<void> | null = null;
+    toolRegistry.register({
+      ...leakyTool,
+      execute: async () => {
+        runs += 1;
+        if (runs === 2) {
+          // Not awaited, as a click in Settings during a tool run is not.
+          leaving =
+            how === 'removed'
+              ? useApp.getState().removeConnection('conn_openai')
+              : useApp.getState().toggleConnection('conn_openai', false);
+          await vi.waitFor(() => expect(writeSetting).toHaveBeenCalled());
+          // Back on, under the same id, while the fallback setting is still
+          // being written.
+          engine.router.register('conn_openai', cloud.adapter);
+        }
+        if (runs === 3) {
+          releaseSettings();
+          await leaving;
+        }
+        return leakyTool.execute();
+      },
+    });
+
+    const asked: string[] = [];
+    const answers: ('turn' | 'conversation' | 'no')[] = [first, 'no'];
+    const original = useApp.getState().requestApproval;
+    const settings = useApp.getState().settings;
+    useApp.setState({
+      engine: engine as never,
+      connections: [{ ...OPENAI }],
+      settings: { ...settings, fallbackBackendId: 'conn_openai' },
+      requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+        asked.push(action);
+        const answer = answers.shift() ?? 'no';
+        if (answer === 'conversation') prompt?.onExtended?.();
+        return answer !== 'no';
+      },
+    });
+    useChats.setState({
+      loaded: true,
+      generating: false,
+      controller: null,
+      messages: [],
+      activeChatId: 'c1',
+      chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
+    });
+
+    try {
+      await useChats.getState().send('what is in my chats?');
+      await macrotask();
+    } finally {
+      releaseSettings();
+      toolRegistry.unregister('leaky');
+      useApp.setState({ engine: null, connections: [], requestApproval: original, settings });
+    }
+
+    const requests = sent(cloud.seen);
+    expect(requests.length).toBeGreaterThanOrEqual(3);
+    expect(requests[1], 'the answer, while it stood').toContain(SECRET);
+    expect(requests[2], 'built while the fallback setting was being written').not.toContain(SECRET);
+    expect(asked).toHaveLength(2);
+    expect(connectionsOf('c1')).toEqual([]);
+  });
+});
+
 describe('the store’s provider policy, while a grant is being withdrawn', () => {
   type ToolEgressPolicy = import('@/ai/engine').ToolEgressPolicy;
 
@@ -931,5 +1042,117 @@ describe('the store’s provider policy, while a grant is being withdrawn', () =
     } finally {
       db.restore();
     }
+  });
+});
+
+describe('a grant on disk, withdrawn before the chat list has loaded', () => {
+  /*
+   * The app is up — Settings included — once the engine is, and the chat list
+   * is read after that (App.tsx). A withdrawal drops grants from the chats in
+   * the store, and until the list has landed there are none. So it dropped
+   * nothing, the list then brought the grant in from disk, and switching the
+   * connection or server back on honoured it without asking. The same held for
+   * a removed server's tools, whose prune is what keeps them from coming back
+   * on under the next server to take the name (#6).
+   */
+  const EARLY = { serverId: 'mcp_early', url: 'https://early.example/mcp' };
+  const onDisk = (): Chat => ({
+    id: 'early',
+    title: 'Early',
+    mode: 'chat',
+    personaId: null,
+    modelId: null,
+    sampler: null,
+    tools: ['mcp:early.search', 'calculate'],
+    showThinking: false,
+    createdAt: 1,
+    updatedAt: 1,
+    messageCount: 0,
+    preview: '',
+    egressGrants: [
+      { connectionId: 'conn_early', grantedAt: 1 },
+      { kind: 'mcp', ...EARLY, grantedAt: 1 },
+      { connectionId: 'conn_kept', grantedAt: 1 },
+      { kind: 'mcp', serverId: 'mcp_kept', url: 'https://kept.example/mcp', grantedAt: 1 },
+    ],
+  });
+  const connectionsIn = (chat: Chat | undefined): string[] =>
+    (chat?.egressGrants ?? []).flatMap((grant) => (grant.kind === 'mcp' ? [] : [grant.connectionId]));
+  const serversIn = (chat: Chat | undefined): string[] =>
+    (chat?.egressGrants ?? []).flatMap((grant) => (grant.kind === 'mcp' ? [grant.serverId] : []));
+
+  beforeEach(() => {
+    seed();
+    useApp.setState({ connections: [{ ...OPENAI, id: 'conn_early', label: 'Early' }] });
+    useMcp.setState({
+      servers: [{ id: 'mcp_early', name: 'early', url: EARLY.url, enabled: true, createdAt: 1 }],
+      states: {},
+    });
+  });
+
+  /** Load the list from disk, with `withdraw` run while it is being read. */
+  async function loadedWhile(withdraw: () => Promise<void>): Promise<{ store?: Chat; table?: Chat }> {
+    const db = holdingChatWrites();
+    // Recorded, not held.
+    db.releaseAll();
+    let release = (): void => {};
+    const reading = new Promise<void>((resolve) => (release = resolve));
+    chatsTable.listed.mockClear();
+    chatsTable.listed.mockImplementationOnce(async () => {
+      const rows = [structuredClone(onDisk())];
+      await reading;
+      return rows;
+    });
+    useChats.setState({ loaded: false, chats: [], activeChatId: null, messages: [] });
+    try {
+      const loading = useChats.getState().load();
+      await vi.waitFor(() => expect(chatsTable.listed).toHaveBeenCalled());
+      await withdraw();
+      release();
+      await loading;
+      await macrotask();
+      return {
+        store: useChats.getState().chats.find((chat) => chat.id === 'early'),
+        table: db.stored.get('early'),
+      };
+    } finally {
+      release();
+      db.restore();
+    }
+  }
+
+  it('stays withdrawn when its connection was switched off', async () => {
+    const { store, table } = await loadedWhile(() => useApp.getState().toggleConnection('conn_early', false));
+
+    expect(connectionsIn(store), 'the store').toEqual(['conn_kept']);
+    expect(connectionsIn(table), 'the table').toEqual(['conn_kept']);
+    expect(serversIn(store), 'the other grants').toEqual(['mcp_early', 'mcp_kept']);
+  });
+
+  it('stays withdrawn when its MCP server was switched off', async () => {
+    const { store, table } = await loadedWhile(() => useMcp.getState().toggle('mcp_early', false));
+
+    expect(serversIn(store), 'the store').toEqual(['mcp_kept']);
+    expect(serversIn(table), 'the table').toEqual(['mcp_kept']);
+    expect(connectionsIn(store), 'the other grants').toEqual(['conn_early', 'conn_kept']);
+    // Switching a server off does not prune its tools; removing it does.
+    expect(store?.tools).toEqual(['mcp:early.search', 'calculate']);
+  });
+
+  it('stays withdrawn, and its tools stay off, when its MCP server was removed', async () => {
+    const { store, table } = await loadedWhile(() => useMcp.getState().remove('mcp_early'));
+
+    expect(serversIn(store), 'the store').toEqual(['mcp_kept']);
+    expect(store?.tools, 'the store').toEqual(['calculate']);
+    expect(serversIn(table), 'the table').toEqual(['mcp_kept']);
+    expect(table?.tools, 'the table').toEqual(['calculate']);
+  });
+
+  it('is loaded as it was on disk when nothing withdrew it', async () => {
+    // The control.
+    const { store, table } = await loadedWhile(async () => {});
+
+    expect(store).toEqual(onDisk());
+    expect(table, 'nothing to write').toBeUndefined();
   });
 });

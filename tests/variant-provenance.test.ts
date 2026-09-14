@@ -1232,6 +1232,48 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     ]);
   });
 
+  it.each(['no model to run it on', 'a chat whose delete has been asked for'] as const)(
+    'is kept, with the turns after it, when a regeneration cannot start: %s',
+    async (why) => {
+      // Regenerate took the turn and every later one off the screen, deleted the
+      // later rows, and deleted the turn itself once `runGeneration` returned —
+      // whether or not a turn had started. One that could not start replaced it
+      // with nothing: the record that a call's arguments went was gone from disk
+      // and screen.
+      // A chat of its own: the store remembers a chat whose delete was asked
+      // for as long as it runs, and every other test here writes to `c1`.
+      const chatId = why === 'no model to run it on' ? 'c_regen_no_model' : 'c_regen_deleting';
+      const thread: Message[] = [
+        { ...USER, chatId },
+        { id: 'msg_a', chatId, role: 'assistant', content: 'Filed.', createdAt: 2, toolCalls: [SENT], provenance: ON_DEVICE },
+        { id: 'msg_q2', chatId, role: 'user', content: 'and again?', createdAt: 3 },
+        { id: 'msg_b', chatId, role: 'assistant', content: 'Again.', createdAt: 4, provenance: ON_DEVICE },
+      ];
+      useChats.setState({ activeChatId: chatId, messages: thread, chats: [{ ...CHAT, id: chatId }] });
+      if (why === 'no model to run it on') {
+        useChats.setState({ chats: [{ ...CHAT, id: chatId, modelId: null }] });
+        useModels.setState({ activeModelId: null, installed: {} });
+      } else {
+        // A delete that never lands, so the chat stays in the store, marked.
+        const { deleteChat } = await import('@/db');
+        vi.mocked(deleteChat).mockImplementationOnce(() => new Promise<void>(() => {}));
+        void useChats.getState().removeChat(chatId);
+      }
+      script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+
+      await useChats.getState().regenerate('msg_a');
+
+      if (why === 'no model to run it on') {
+        expect(useApp.getState().toasts.map((toast) => toast.message)).toContain(
+          'Choose a model first — none is installed or connected yet.',
+        );
+      }
+      expect(script, 'no turn ran').toHaveLength(1);
+      expect(tables.messages.delete, 'nothing is deleted').not.toHaveBeenCalled();
+      expect(useChats.getState().messages, 'and the thread on screen is as it was').toEqual(thread);
+    },
+  );
+
   it('takes the row a regeneration replaces out of the database once the new row holds it', async () => {
     // Otherwise a kill after the new row is written leaves both, and the
     // reopened thread shows the turn twice.

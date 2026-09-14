@@ -25,8 +25,39 @@ export function SamplerPanel({ chat }: { chat: Chat }): ReactNode {
   const effective: SamplerSettings = { ...base, ...chat.sampler };
   const overrides = chat.sampler ?? {};
 
+  // Merged into the overrides AS THEY STAND WHEN THIS IS WRITTEN, not the ones
+  // this panel rendered: two changes made before the first had landed kept only
+  // the second. See `ChatPatch`.
   const set = (patch: Partial<SamplerSettings>): void => {
-    void update(chat.id, { sampler: { ...overrides, ...patch } });
+    void update(chat.id, (current) => ({ sampler: { ...current.sampler, ...patch } }));
+  };
+
+  // Saved from the overrides AS THEY STAND once every change already asked for
+  // has landed, not the ones this panel rendered: a slider change still being
+  // written was in neither what was saved nor what was left once the clear
+  // landed. And only what was saved is cleared, so a change made while the
+  // defaults were being written stays this chat's. See `ChatPatch`.
+  const saveAsDefaults = async (modelId: string): Promise<void> => {
+    const read: { values?: SamplerSettings } = {};
+    // A patch that writes nothing: it reads the chat in its turn.
+    await update(chat.id, (current) => {
+      read.values = {
+        ...(useModels.getState().installed[modelId]?.sampler ?? DEFAULT_SAMPLER),
+        ...current.sampler,
+      };
+      return null;
+    });
+    const saved = read.values;
+    if (!saved) return;
+    await useModels.getState().saveSampler(modelId, saved);
+    await update(chat.id, (current) => {
+      const held = Object.entries(current.sampler ?? {});
+      const left = held.filter(
+        ([key, value]) => JSON.stringify(value) !== JSON.stringify(saved[key as keyof SamplerSettings]),
+      );
+      if (left.length === held.length) return null;
+      return { sampler: left.length > 0 ? (Object.fromEntries(left) as Partial<SamplerSettings>) : null };
+    });
   };
 
   const overridden = (key: keyof SamplerSettings): boolean => key in overrides;
@@ -169,10 +200,7 @@ export function SamplerPanel({ chat }: { chat: Chat }): ReactNode {
         <button
           type="button"
           className="btn btn--secondary btn--block"
-          onClick={() => {
-            void useModels.getState().saveSampler(model.id, effective);
-            void update(chat.id, { sampler: null });
-          }}
+          onClick={() => void saveAsDefaults(model.id)}
         >
           Save these as {model.manifest.name}’s defaults
         </button>
