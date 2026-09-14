@@ -24,6 +24,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { stage } from './support/stage';
+import { anotherWindow } from './support/web-locks';
 
 const fake = vi.hoisted(() => {
   const blobs = new Map<string, { id: string }>();
@@ -242,5 +243,53 @@ describe('an image attached and sent', () => {
     // a hold that would have kept it on the device for ever.
     await sweepOrphanBlobs();
     expect(fake.blobs.has(id), 'the composer let go').toBe(false);
+  });
+});
+
+describe('an image whose write has reached the table but not returned', () => {
+  it('is held against a sweep that runs then', async () => {
+    // A write can be readable before its promise settles. The hold is taken
+    // before the write is made, not after it returns.
+    await mount();
+    let finish = (): void => {};
+    const returning = new Promise<void>((resolve) => (finish = resolve));
+    fake.db.blobs.put.mockImplementationOnce(async (row: { id: string }) => {
+      fake.blobs.set(row.id, row);
+      await returning;
+      fake.landed.add(row.id);
+    });
+    const id = await pick();
+    try {
+      expect(fake.blobs.has(id), 'the control: the table has it, and the write has not returned').toBe(true);
+
+      await sweepOrphanBlobs();
+
+      expect(fake.blobs.has(id), 'a draft still being written').toBe(true);
+    } finally {
+      await act(async () => {
+        finish();
+        await macrotask();
+      });
+    }
+  });
+});
+
+describe('an image being composed, while another window of the app launches', () => {
+  it('is not deleted by that window’s sweep', async () => {
+    // The server profile serves this bundle to browser tabs, which share one
+    // database; this window's holds are not in the other's memory.
+    await mount();
+    const id = await attach();
+    const other = await anotherWindow(() => import('@/lib/blobs'));
+    expect(other.loaded.sweepOrphanBlobs, 'the control: a module graph of its own').not.toBe(sweepOrphanBlobs);
+
+    try {
+      await other.loaded.sweepOrphanBlobs();
+    } finally {
+      other.close();
+    }
+
+    expect(fake.blobs.has(id), 'still on screen as a chip here').toBe(true);
+    expect(chip()).not.toBeNull();
   });
 });

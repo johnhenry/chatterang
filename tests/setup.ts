@@ -9,6 +9,18 @@
 
 import { vi } from 'vitest';
 
+import { setNavigatorLocks, webLocks } from './support/web-locks';
+
+// Web Locks, which `src/lib/blobs.ts` uses to see whether another window of the
+// origin is open before its launch sweep deletes anything. jsdom has none, and
+// without them no sweep runs. A fresh set for every file, in memory: Node's own
+// are per thread and outlive a file. See `tests/support/web-locks.ts`.
+{
+  const locks = webLocks();
+  (globalThis as { __webLocks?: unknown }).__webLocks = locks;
+  setNavigatorLocks(locks.window());
+}
+
 if (!('crypto' in globalThis) || typeof globalThis.crypto.randomUUID !== 'function') {
   Object.defineProperty(globalThis, 'crypto', {
     value: {

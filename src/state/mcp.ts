@@ -42,6 +42,10 @@ async function revokeMcpGrantsFor(serverId: string): Promise<void> {
   await (await import('@/state/app')).revokeMcpGrantsFor(serverId);
 }
 
+async function noticeMcpServerSwitchedOn(serverId: string): Promise<void> {
+  (await import('@/state/app')).noticeMcpServerSwitchedOn(serverId);
+}
+
 interface McpState {
   servers: McpServerConfig[];
   states: Record<string, McpServerState>;
@@ -135,6 +139,9 @@ export const useMcp = create<McpState>((set, get) => ({
     await db.mcpServers.update(id, { enabled });
     set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
     try {
+      // Switched on: a launch still withdrawing the grants on disk that named it
+      // off stops counting a yes given from here on as one it withdraws.
+      if (enabled) await noticeMcpServerSwitchedOn(id);
       if (!enabled) await revokeMcpGrantsFor(id);
     } finally {
       await get().reconnect();

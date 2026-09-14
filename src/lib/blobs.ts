@@ -29,7 +29,68 @@ import { db } from '@/db';
 // tests/layering.test.ts caught — the db owns the shape of its own rows.
 export type { StoredBlob } from '@/db';
 
+/*
+ * ── Other windows ────────────────────────────────────────────────────────
+ *
+ * WHAT A SWEEP CANNOT SEE FROM HERE. The holds below (`holdBlobs`) are this
+ * window's memory. The server profile serves this bundle to ordinary browser
+ * tabs, and every tab of one origin shares one database. So a tab that had just
+ * launched swept away the image a draft in another tab was still showing as a
+ * chip, and the image of a message another tab sent while its sweep was
+ * reading: neither was in the rows it read, and neither hold was in its memory.
+ *
+ * So a sweep runs only in a window that is the only one open. Each window holds
+ * a Web Lock of its own name, under `WINDOW`, for as long as it is open; the
+ * browser lets go of it when the window goes. A sweep holds `SWEEP`
+ * exclusively, asks which locks are held, and deletes nothing if another
+ * window's is among them. A window takes its own lock while it holds `SWEEP`
+ * shared, so no window joins between a sweep's question and its deletes; and a
+ * window writes no payload until it has joined (`putBlob`).
+ *
+ * Where there are no Web Locks — an origin that is not a secure context — no
+ * other window can be seen, so no sweep runs. A draft let go still deletes its
+ * own payloads (`Composer`).
+ */
+const locks: LockManager | undefined = globalThis.navigator?.locks;
+const SWEEP = 'chatterang:attachment-sweep';
+const WINDOW = 'chatterang:attachment-window:';
+const ownWindow = `${WINDOW}${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}`;
+
+/**
+ * Settles once this window holds its own lock, or once it cannot take one.
+ * Taken as the module loads, so a window is seen from the moment it is open,
+ * whether or not it has written anything yet.
+ */
+const joined: Promise<void> = locks ? join(locks) : Promise.resolve();
+
+function join(manager: LockManager): Promise<void> {
+  return new Promise<void>((settle) => {
+    try {
+      manager
+        .request(SWEEP, { mode: 'shared' }, () =>
+          new Promise<void>((entered) => {
+            manager
+              .request(ownWindow, () => {
+                entered();
+                // Held until this window goes.
+                return new Promise<never>(() => {});
+              })
+              .catch(() => entered());
+          }),
+        )
+        .then(
+          () => settle(),
+          () => settle(),
+        );
+    } catch {
+      settle();
+    }
+  });
+}
+
 export async function putBlob(id: string, data: Blob): Promise<void> {
+  // Not before another window's sweep can see this one. See "Other windows".
+  await joined;
   await db.blobs.put({
     id,
     mediaType: data.type || 'application/octet-stream',
@@ -127,21 +188,36 @@ export function holdBlobs(ids: readonly string[]): () => void {
  * what was read. So the sweep is registered before it reads anything, and every
  * hold taken while it runs is noted against it.
  *
+ * AND EVERYTHING, WHILE ANOTHER WINDOW IS OPEN. Its holds are not here to be
+ * seen. Nothing is deleted then, nor while a window is joining or another is
+ * sweeping, nor where there are no Web Locks; the next launch of a window that
+ * is alone sweeps. See "Other windows" at the top of this file.
+ *
  * Every payload in the table is an attachment's (see the top of this file). A
  * read that fails deletes nothing.
  */
 export async function sweepOrphanBlobs(): Promise<void> {
+  if (!locks) return;
+  const manager = locks;
   const kept = new Set(holds.keys());
   sweeps.add(kept);
   try {
-    const named = new Set<string>();
-    const [stored] = await Promise.all([
-      db.blobs.toCollection().primaryKeys(),
-      db.messages.each((row) => {
-        for (const attachment of row.attachments ?? []) named.add(attachment.id);
-      }),
-    ]);
-    await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
+    await manager.request(SWEEP, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
+      if (!lock) return;
+      const { held = [], pending = [] } = await manager.query();
+      const others = [...held, ...pending].some(
+        ({ name }) => name !== undefined && name.startsWith(WINDOW) && name !== ownWindow,
+      );
+      if (others) return;
+      const named = new Set<string>();
+      const [stored] = await Promise.all([
+        db.blobs.toCollection().primaryKeys(),
+        db.messages.each((row) => {
+          for (const attachment of row.attachments ?? []) named.add(attachment.id);
+        }),
+      ]);
+      await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
+    });
   } finally {
     sweeps.delete(kept);
   }

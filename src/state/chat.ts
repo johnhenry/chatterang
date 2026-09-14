@@ -65,8 +65,10 @@ import {
   type FitResult,
 } from '@/ai/context';
 import {
+  installConnectionSwitchedOn,
   installEgressRevoker,
   installMcpGrantRevoker,
+  installMcpServerSwitchedOn,
   installMcpToolPruner,
   useApp,
 } from '@/state/app';
@@ -179,6 +181,50 @@ const mcpWithdrawals = withdrawals();
 
 /** Each connection's grants' withdrawals, by connection id. See `withdrawals`. */
 const providerWithdrawals = withdrawals();
+
+/**
+ * The withdrawals `load` has under way, of grants on disk that name a connection
+ * or MCP server that was missing or off, by id: each ends once the writes that
+ * drop those grants have settled, or once that connection or server is switched
+ * on again, whichever is first.
+ *
+ * Under way, a yes given to that id goes with the grants on disk, as one given
+ * while a switch-off is still being written does (`withdrawals`). But a person
+ * can switch the connection or server back on before those writes land, and be
+ * asked: that yes was given to something that is there, and was withdrawn all
+ * the same, and asked for again at the next request. Ending the withdrawal at
+ * the switch is safe because the store never holds the grants read from disk
+ * (see `load`): what it holds for that id after the switch was given after it.
+ */
+const launchWithdrawals = {
+  connections: new Map<string, (() => void)[]>(),
+  servers: new Map<string, (() => void)[]>(),
+};
+
+/** Begin a launch withdrawal of `id`. What it returns ends it; calling that again does nothing. */
+function beginAtLaunch(
+  under: Map<string, (() => void)[]>,
+  kind: ReturnType<typeof withdrawals>,
+  id: string,
+): () => void {
+  const finish = kind.begin(id);
+  let finished = false;
+  const end = (): void => {
+    if (finished) return;
+    finished = true;
+    finish();
+    const rest = (under.get(id) ?? []).filter((entry) => entry !== end);
+    if (rest.length > 0) under.set(id, rest);
+    else under.delete(id);
+  };
+  under.set(id, [...(under.get(id) ?? []), end]);
+  return end;
+}
+
+/** End every launch withdrawal of `id`: it has been switched on. */
+function switchedOn(under: Map<string, (() => void)[]>, id: string): void {
+  for (const end of [...(under.get(id) ?? [])]) end();
+}
 
 /**
  * A change to one chat: the fields to set, or a function of the chat AS IT
@@ -563,16 +609,31 @@ export const useChats = create<ChatState>((set, get) => ({
     beforeTheList.servers.clear();
     beforeTheList.toolPrefixes.clear();
     // Grants on disk naming a connection or server that is not there as it was
-    // granted. Counted as being withdrawn before the store holds them, as a
-    // revocation counts before it reads: neither policy answers on one
-    // meanwhile, and a yes given to one of those destinations while they go goes
-    // with them. See `grantsThatStand` and `withdrawals`.
+    // granted, as read. Counted as being withdrawn before the store holds the
+    // chats, as a revocation counts before it reads, so a yes given to one of
+    // those destinations while they go goes with them — until it is switched on
+    // again. See `grantsThatStand` and `launchWithdrawals`.
     const standing = grantsThatStand(connections, servers, unseen);
+    const stale = new Set(
+      unseen.flatMap((chat) => (chat.egressGrants ?? []).filter((grant) => !standing.stands(grant))),
+    );
     const finishes = [
-      ...[...standing.connections].map((id) => providerWithdrawals.begin(id)),
-      ...[...standing.servers].map((id) => mcpWithdrawals.begin(id)),
+      ...[...standing.connections].map((id) => beginAtLaunch(launchWithdrawals.connections, providerWithdrawals, id)),
+      ...[...standing.servers].map((id) => beginAtLaunch(launchWithdrawals.servers, mcpWithdrawals, id)),
     ];
-    set({ loaded: true, chats: sortChats([...held, ...unseen.map((chat, at) => stripped[at] ?? chat)]) });
+    // NOR DOES THE STORE EVER HOLD THEM. Held until their write landed, a grant
+    // whose connection was switched back on meanwhile was honoured once the
+    // switch had ended the withdrawal. Only the grants read are left out: a
+    // grant given since is another object.
+    const withoutStale = (chat: Chat): Chat => {
+      const grants = chat.egressGrants ?? [];
+      const egressGrants = grants.filter((grant) => !stale.has(grant));
+      return egressGrants.length === grants.length ? chat : { ...chat, egressGrants };
+    };
+    set({
+      loaded: true,
+      chats: sortChats([...held, ...unseen.map((chat, at) => withoutStale(stripped[at] ?? chat))]),
+    });
     // And on disk, in each chat's turn.
     const rewritten = stripped.flatMap((chat) =>
       chat
@@ -584,21 +645,27 @@ export const useChats = create<ChatState>((set, get) => ({
           ]
         : [],
     );
-    // Queued in the step the store took the chats, each a function of the chat
-    // as it stands when written, so a grant written before it lands is judged
-    // and one written after is not touched. Not activity in the conversation.
-    const withdrawn = Promise.all(
+    // And on disk: queued in the step the store took the chats, each a function
+    // of the chat as it stands when written. It drops the grants read and
+    // nothing else, so one given since is never touched; the store already
+    // holds the chat without them, so it is written even when there is nothing
+    // left to drop. Not activity in the conversation.
+    //
+    // The withdrawals end once EVERY write has settled. Ended at the first that
+    // failed, a yes given to a connection still off, in a chat whose write was
+    // still queued, was kept.
+    const withdrawn = Promise.allSettled(
       unseen
-        .filter((chat) => (chat.egressGrants ?? []).some((grant) => !standing.stands(grant)))
+        .filter((chat) => (chat.egressGrants ?? []).some((grant) => stale.has(grant)))
         .map((chat) =>
-          get().updateChat(chat.id, (current) => {
-            const grants = current.egressGrants ?? [];
-            const egressGrants = grants.filter(standing.stands);
-            return egressGrants.length === grants.length ? null : { egressGrants, updatedAt: current.updatedAt };
-          }),
+          get().updateChat(chat.id, (current) => ({
+            egressGrants: (current.egressGrants ?? []).filter((grant) => !stale.has(grant)),
+            updatedAt: current.updatedAt,
+          })),
         ),
-    ).finally(() => {
+    ).then((settled) => {
       for (const finish of finishes) finish();
+      for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
     });
     // And the attachment payloads no message names. See `sweepOrphanBlobs`.
     await Promise.all([...rewritten, withdrawn, sweepOrphanBlobs()]);
@@ -2127,6 +2194,11 @@ installEgressRevoker(async (connectionId) => {
 installMcpGrantRevoker(async (serverId) => {
   await useChats.getState().revokeMcpEgress(serverId);
 });
+
+// A connection or MCP server switched on again ends the launch's withdrawal of
+// the grants on disk that named it. See `launchWithdrawals`.
+installConnectionSwitchedOn((connectionId) => switchedOn(launchWithdrawals.connections, connectionId));
+installMcpServerSwitchedOn((serverId) => switchedOn(launchWithdrawals.servers, serverId));
 
 // Registered at module load for the same reason. An MCP tool id is
 // `mcp:<server name>.<tool>` (src/ai/mcp/tools.ts), so a server's tools are

@@ -244,6 +244,36 @@ export async function revokeMcpGrantsFor(serverId: string): Promise<void> {
 }
 
 /**
+ * Tell the chat store a connection, or an MCP server, has been switched on.
+ *
+ * Registered for the reason the hooks above are. At launch the chat store
+ * withdraws every grant on disk that names a connection or server that was
+ * missing or off — left there by a withdrawal the app was killed in — and
+ * counts that withdrawal as under way until its writes have landed, so a yes
+ * given meanwhile to one of those goes with it (`launchWithdrawals` in
+ * state/chat.ts). A person who switched it back on in that time and was then
+ * asked said yes to something that is there, and that yes was withdrawn too.
+ *
+ * The uninstalled defaults do nothing: without the chat store there is no
+ * launch withdrawal to end.
+ */
+let connectionSwitchedOn: (connectionId: string) => void = () => {};
+
+export function installConnectionSwitchedOn(notice: (connectionId: string) => void): void {
+  connectionSwitchedOn = notice;
+}
+
+let mcpServerSwitchedOn: (serverId: string) => void = () => {};
+
+export function installMcpServerSwitchedOn(notice: (serverId: string) => void): void {
+  mcpServerSwitchedOn = notice;
+}
+
+export function noticeMcpServerSwitchedOn(serverId: string): void {
+  mcpServerSwitchedOn(serverId);
+}
+
+/**
  * What follows disconnecting a connection that was removed or switched off: its
  * grants withdrawn, and the fallback cleared if it was the fallback.
  *
@@ -393,6 +423,7 @@ export const useApp = create<AppState>((set, get) => ({
     set({ connections });
 
     if (enabled) {
+      connectionSwitchedOn(id);
       await get()
         .engine?.connectProvider(changed)
         .catch((error: unknown) =>
