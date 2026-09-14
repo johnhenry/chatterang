@@ -42,6 +42,13 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
+import {
+  SPECIFIER,
+  codeOf,
+  repoPath,
+  sourceFiles,
+  workspaceSourceRoots,
+} from './support/source-scan';
 
 /**
  * `createMcpTool` returns `null` for a schema it will not vouch for. Every
@@ -1110,6 +1117,187 @@ describe('adding a way off the device forces the public list to change', () => {
       'README.md’s Privacy list changed length. The `privacy` command is the generated version ' +
         'of this list — change both, then change both numbers.',
     ).toBe(5);
+  });
+});
+
+/* ── A socket another machine can reach, which no sentence here admits ── */
+
+/**
+ * EVERY SENTENCE THIS FILE PINS DESCRIBES A DEVICE NOTHING CONNECTS TO, AND
+ * NOTHING HERE WOULD NOTICE THAT STOPPING BEING TRUE.
+ *
+ * `shipped()` reads `src/` only. README's list is things that leave. The
+ * server's own header says "Two things, and they are the whole list". A
+ * listener another machine can connect to (#158) falsifies each of them and
+ * fails no test above, because every test above measures bytes going out.
+ *
+ * So this guard counts CONDUCT: code that can accept a connection. It is not
+ * keyed on importing `@chatterang/tunnel/host`, because importing a constant
+ * or a type from that entry opens nothing, and a guard that fires on a move
+ * that opens nothing teaches people to route around it. Nor does it grade the
+ * new wording — the inbound sentences are the owner's to write (#221). It
+ * fails, names every surface that has to move, and stops there.
+ *
+ * WHAT IT READS: `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` and
+ * `.cjs` under every `apps/<app>/src` and `packages/<package>/src`, comments
+ * stripped, for a `.listen(` call, `new WebSocketServer`, an `'upgrade'`
+ * handler, a call to `createTunnelHost` or `createTunnelListener`, and any
+ * import of `net`, `dgram` or `ws`.
+ *
+ * WHAT IT SKIPS ON PURPOSE: `packages/tunnel/src/host`, the sanctioned
+ * implementation. It reaches a user only by being called, and the call from an
+ * app is what this counts.
+ *
+ * WHAT IT CANNOT SEE, so a green run is not read as more than it is:
+ *
+ *   - a listener in another process: a spawned binary handed a `--port`, or
+ *     whatever `fork`/`utilityProcess` starts from a file outside these
+ *     directories;
+ *   - any other file type — Swift, Kotlin, Java, C/C++, a native Capacitor
+ *     plugin, a shell script;
+ *   - any other directory: `src/` (the webview bundle, which cannot bind, and
+ *     which `layering.test.ts` already holds to no `node:` builtin and no
+ *     undeclared package such as `ws`), `scripts/`, `dev/` (whose probes do
+ *     listen, on loopback, and do not ship) and generated `build/` output;
+ *   - a spelling none of the patterns match. It is a lexical scan, not a
+ *     parse, and `server['lis' + 'ten']` walks straight past it.
+ */
+describe('a listening socket forces the privacy copy to change', () => {
+  const SCANNED = /\.(?:[cm]?[jt]s|[jt]sx)$/;
+  const SANCTIONED = 'packages/tunnel/src/host/';
+
+  const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [
+    ['.listen(', /\.\s*listen\s*\(/g],
+    ['new WebSocketServer', /\bnew\s+(?:[\w$]+\s*\.\s*)*WebSocketServer\b/g],
+    [
+      "an 'upgrade' handler",
+      /\.\s*(?:on|once|addListener|prependListener|prependOnceListener)\s*\(\s*['"`]upgrade['"`]/g,
+    ],
+    ['createTunnelHost(', /\bcreateTunnelHost\s*\(/g],
+    ['createTunnelListener(', /\bcreateTunnelListener\s*\(/g],
+  ];
+  const LISTENING_MODULE = /^(?:node:)?(?:net|dgram)$|^ws(?:\/|$)/;
+
+  /** Every listen-capable construct in one file's code, one entry per occurrence. */
+  function listenSites(source: string): string[] {
+    const code = codeOf(source);
+    return [
+      ...LISTENS.flatMap(([name, pattern]) => [...code.matchAll(pattern)].map(() => name)),
+      ...[...code.matchAll(new RegExp(SPECIFIER.source, 'g'))]
+        .map((match) => match[1] ?? '')
+        .filter((specifier) => LISTENING_MODULE.test(specifier))
+        .map((specifier) => `import '${specifier}'`),
+    ];
+  }
+
+  const roots = workspaceSourceRoots();
+  const scanned = roots.flatMap((root) => sourceFiles(root, SCANNED));
+  const sanctioned = (file: string): boolean => repoPath(file).startsWith(SANCTIONED);
+
+  const CHECKLIST = [
+    'The code that can accept a connection changed. Every privacy sentence this suite pins was',
+    'written about a device nothing connects to, and each of these goes false with a listener.',
+    'In the SAME change, take the socket back out or move all of them with it:',
+    '',
+    '  - README.md’s Privacy list: an item for what can reach this device, then the count in',
+    '    "README.md’s Privacy section has exactly five numbered items".',
+    '  - src/shell/commands.ts, the `privacy` command’s "Leaves this device:" list, then both',
+    '    counts in "has exactly five routes…" and "and the no-provider case…".',
+    '  - src/features/chat/ChatScreen.tsx, `startProse`: "Nothing you type is sent anywhere unless',
+    '    you explicitly connect a remote provider", pinned in tests/selection-copy.test.ts as',
+    '    `start.body` and as a MEASURED_CLAIMS entry.',
+    '  - src/features/onboarding/Onboarding.tsx, the privacy paragraph, pinned in',
+    '    tests/selection-copy.test.ts as `onboarding.privacy`.',
+    '  - apps/server/src/index.ts, the header: "Two things, and they are the whole list", and',
+    '    "WHAT IT OWNS".',
+    '  - apps/server/README.md: "and nothing else", and "Where it may listen".',
+    '  - the tunnel surface declaration, asserted before the listener binds (#170).',
+    '',
+    'Then update the inventory in this test, and replace each old sentence’s pin with a pin of',
+    'the sentence the owner approved (#221). A change that only MOVES an existing listener',
+    'changes the inventory and none of the copy — say so in the commit.',
+  ].join('\n');
+
+  it('reads every app and every package, so a clean inventory is about something', () => {
+    // A guard that walks an empty directory passes and proves nothing — the
+    // failure mode of every "no offenders" assertion in `layering.test.ts`.
+    expect(roots.map(repoPath)).toEqual(
+      expect.arrayContaining(['apps/desktop/src', 'apps/server/src', 'packages/tunnel/src']),
+    );
+    for (const root of roots) {
+      expect(
+        scanned.filter((file) => repoPath(file).startsWith(`${repoPath(root)}/`)).length,
+        `${repoPath(root)} was not read`,
+      ).toBeGreaterThan(0);
+    }
+
+    // Every extension a Node process will load, and not the ones it will not.
+    for (const name of ['a.ts', 'a.tsx', 'a.mts', 'a.cts', 'a.js', 'a.jsx', 'a.mjs', 'a.cjs']) {
+      expect(SCANNED.test(name), name).toBe(true);
+    }
+    for (const name of ['a.json', 'a.md', 'a.swift']) {
+      expect(SCANNED.test(name), name).toBe(false);
+    }
+
+    // And the one real positive in production code, found by the same scan:
+    // the headless server's bridge.
+    const bridge = scanned.find((file) => repoPath(file) === 'apps/server/src/index.ts');
+    expect(bridge, 'apps/server/src/index.ts was not read').toBeDefined();
+    expect(listenSites(readFileSync(bridge!, 'utf8'))).toContain('.listen(');
+  });
+
+  it('skips the tunnel host, and the host really listens, so the skip is load-bearing', () => {
+    // If the host half moved or were renamed, the exclusion would be excluding
+    // nothing — and a listener written at the new path would be read as an
+    // app's own, or not at all. Asserted in the positive direction instead.
+    const host = scanned.filter(sanctioned);
+    expect(host.length, `${SANCTIONED} is empty or has moved`).toBeGreaterThan(0);
+    const sites = host.flatMap((file) => listenSites(readFileSync(file, 'utf8')));
+    expect(sites).toContain('.listen(');
+    expect(sites).toContain('new WebSocketServer');
+    expect(sites).toContain("import 'ws'");
+  });
+
+  it('the matcher sees each way to listen, and not a comment or an import that opens nothing', () => {
+    for (const form of [
+      'server.listen(port, host)',
+      'server\n  .listen(0)',
+      'new WebSocketServer({ noServer: true })',
+      'new ws.WebSocketServer({ port })',
+      "server.on('upgrade', h)",
+      'server.once("upgrade", h)',
+      'await createTunnelListener(b)',
+      'const host = await createTunnelHost()',
+      "import net from 'node:net'",
+      "import { createSocket } from 'dgram'",
+      "const { WebSocketServer } = await import('ws')",
+      "const WebSocket = require('ws')",
+    ]) {
+      expect(listenSites(form).length, form).toBeGreaterThan(0);
+    }
+
+    for (const opensNothing of [
+      '/* server.listen(port, host) */',
+      '// new WebSocketServer({ noServer: true })',
+      // THE CONTROL THAT MATTERS: taking a constant or a type from the host
+      // entry binds nothing, so it must be able to land without copy.
+      "import { asTlsMaterial } from '@chatterang/tunnel/host'",
+      "import type { TlsMaterial } from '@chatterang/tunnel/host'",
+      "socket.on('message', h)",
+      "window.addEventListener('message', h)",
+      "import { toWsUrl } from './ws-url'",
+    ]) {
+      expect(listenSites(opensNothing), opensNothing).toEqual([]);
+    }
+  });
+
+  it('is exactly the headless server’s bridge, and anything more moves the copy with it', () => {
+    const inventory = scanned
+      .filter((file) => !sanctioned(file))
+      .flatMap((file) =>
+        listenSites(readFileSync(file, 'utf8')).map((site) => `${repoPath(file)} -> ${site}`),
+      );
+    expect(inventory, CHECKLIST).toEqual(['apps/server/src/index.ts -> .listen(']);
   });
 });
 
