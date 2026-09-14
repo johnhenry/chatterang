@@ -49,7 +49,9 @@ import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
-import { BrowserWindow, Menu, app, dialog, ipcMain, protocol, shell, utilityProcess } from 'electron';
+import { BrowserWindow, Menu, app, dialog, ipcMain, protocol, session, shell, utilityProcess } from 'electron';
+
+import { installPermissionHandlers } from './permissions.js';
 import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
@@ -675,6 +677,10 @@ function createWindow(
 }
 
 void app.whenReady().then(() => {
+  // FIRST, before anything can load a page. Electron approves every permission
+  // request when no handler is installed, and the window `start()` creates is
+  // a page that can ask. See `DESKTOP_GRANTED_PERMISSIONS` in security.ts.
+  installPermissionHandlers(session.defaultSession, DEV_SERVER_URL);
   protocol.handle(APP_SCHEME, serveBundle);
   start();
 });

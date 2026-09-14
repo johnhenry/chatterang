@@ -132,9 +132,8 @@ describe('the capability table', () => {
       // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal
       // a person accepted.
       folderGrants: true,
-      // The desktop draws codes rather than scanning them — and with no
-      // Electron permission handler installed, a camera request would be
-      // approved silently. False until that handler exists.
+      // The desktop draws codes rather than scanning them, and its Electron
+      // permission handler (apps/desktop/src/permissions.ts) denies `media`.
       cameraScan: false,
     });
   });

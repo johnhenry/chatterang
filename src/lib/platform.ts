@@ -182,11 +182,13 @@ export interface PlatformCapabilities {
    * (`dev/probe-128/` holds the experiment). Without the patch this row would
    * be a lie on iOS.
    *
-   * `electron` is false for a second, sharper reason. The shell installs no
-   * Electron permission handler, and Electron approves every permission request
-   * automatically when none is set (its security tutorial, "Handle session
-   * permission requests"). A camera row of true there would be a camera granted
-   * without the app ever asking. It stays false until that handler exists.
+   * `electron` is false for two reasons. The desktop DRAWS codes rather than
+   * scanning them. And its Electron permission handler
+   * (`apps/desktop/src/permissions.ts`) denies `media`: Electron approves every
+   * permission request when no handler is installed, so the shell now installs
+   * one that grants only clipboard write. Flipping this row to true without
+   * adding `media` to `DESKTOP_GRANTED_PERMISSIONS` would offer a Scan button
+   * whose camera request is refused.
    */
   readonly cameraScan: boolean;
 }
@@ -246,9 +248,8 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // `showOpenDialog` behind `MountHost.pick`, so a grant here is a modal a
     // person dismissed or accepted.
     folderGrants: true,
-    // The desktop DRAWS pairing codes; it does not scan them. And the shell
-    // sets no Electron permission handler, so Electron would approve a camera
-    // request silently — see the field's doc.
+    // The desktop DRAWS pairing codes; it does not scan them. Its permission
+    // handler also denies `media` — see the field's doc.
     cameraScan: false,
   },
   /*
