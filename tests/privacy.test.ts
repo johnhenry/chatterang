@@ -728,6 +728,54 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(mirror.call).not.toHaveBeenCalled();
   });
 
+  it('does not send a later call once its server’s held grant is withdrawn while an earlier call runs', async () => {
+    // The grant is read when the batch is asked about, and an earlier call can
+    // run for as long as its server takes. Switching the later call's server
+    // off and on meanwhile withdraws the grant and brings back the same record
+    // at the same address, so only reading the grant again at the call stops it.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const withdrawing = async (withdraw: boolean) => {
+      const { probe, run } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+      const archive = mcpProbe({
+        serverName: 'archive',
+        serverId: 'mcp_archive',
+        serverUrl: 'https://archive.example/mcp',
+      });
+      toolRegistry.register(archive.tool);
+      const held = new Set([PROBE_SERVER.serverId, 'mcp_archive']);
+      probe.call.mockImplementation(async () => {
+        if (withdraw) held.delete('mcp_archive');
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+      const request = ask('conversation');
+
+      const events = await run(
+        { isGranted: (destination) => held.has(destination.serverId), request },
+        { toolIds: [probe.tool.id, archive.tool.id] },
+      );
+      toolRegistry.unregister(archive.tool.id);
+      toolRegistry.unregister(probe.tool.id);
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, archive, request, tools };
+    };
+
+    // The control: nothing withdrawn, both go, nobody asked.
+    const kept = await withdrawing(false);
+    expect(kept.probe.call).toHaveBeenCalledOnce();
+    expect(kept.archive.call).toHaveBeenCalledOnce();
+
+    const withdrawn = await withdrawing(true);
+    expect(withdrawn.probe.call).toHaveBeenCalledOnce();
+    expect(withdrawn.archive.call).not.toHaveBeenCalled();
+    // Refused, not asked again mid-batch: the sheet the person answers lists
+    // a batch before it runs.
+    expect(withdrawn.request).not.toHaveBeenCalled();
+    expect(withdrawn.tools.map((tool) => tool.output)).toEqual([
+      'filed',
+      'This call’s arguments were not sent to archive.example: this conversation’s permission for that server was withdrawn before it went.',
+    ]);
+  });
+
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {
     const { probe, run } = setUp();
     const onGranted = vi.fn();

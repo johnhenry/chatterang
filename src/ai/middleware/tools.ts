@@ -275,7 +275,7 @@ export async function runToolCalls(
   const tools = calls.map((call) => enabledTool(registry, options.enabledIds, call.name));
   // Asked BEFORE any call in the batch runs, so a sheet lists every call its
   // answer covers, and a destructive call's own confirm comes after it.
-  const refused = await refusedDestinations(calls, tools, options.destinations);
+  const { refused, onHeldGrant } = await refusedDestinations(calls, tools, options.destinations);
 
   for (const [index, call] of calls.entries()) {
     if (options.signal?.aborted) break;
@@ -295,6 +295,16 @@ export async function runToolCalls(
       // Written by this app from the destination's host, which the person
       // typed; nothing in it came from the model or the server.
       output = refused.get(index)!;
+      isError = true;
+    } else if (tool.destination && onHeldGrant.has(index) && !options.destinations.isGranted(tool.destination)) {
+      // A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was
+      // asked about. An earlier call in the batch can run for as long as its
+      // server takes, and switching this server off and on again meanwhile
+      // withdraws the grant but brings back the same record at the same
+      // address, so the live check in `state/mcp.ts` passes. Without this the
+      // call went anyway, after the privacy command's "Every grant to a server
+      // is dropped when it is removed or switched off" had become true.
+      output = `This call’s arguments were not sent to ${tool.destination.host}: this conversation’s permission for that server was withdrawn before it went.`;
       isError = true;
     } else {
       try {
@@ -343,13 +353,19 @@ export async function runToolCalls(
  * Fails closed twice. A tool with an `mcp:` id that declares no destination is
  * not sent, because nothing can say where it would go. And any answer other
  * than `calls` or `conversation` is a refusal.
+ *
+ * `onHeldGrant` names the calls let through only by a grant the conversation
+ * already held, which the dispatcher reads again before each one runs. An
+ * answer given in this batch is not in it: whether withdrawing a grant voids
+ * the calls a person just allowed on screen is not ruled.
  */
 async function refusedDestinations(
   calls: readonly ToolUseContent[],
   tools: readonly (ChatterangTool | undefined)[],
   policy: ToolDestinationPolicy,
-): Promise<Map<number, string>> {
+): Promise<{ refused: Map<number, string>; onHeldGrant: Set<number> }> {
   const refused = new Map<number, string>();
+  const onHeldGrant = new Set<number>();
   const groups = new Map<string, { destination: ToolDestination; indices: number[] }>();
 
   tools.forEach((tool, index) => {
@@ -368,7 +384,10 @@ async function refusedDestinations(
   });
 
   for (const { destination, indices } of groups.values()) {
-    if (policy.isGranted(destination)) continue;
+    if (policy.isGranted(destination)) {
+      for (const index of indices) onHeldGrant.add(index);
+      continue;
+    }
 
     let decision: DestinationDecision = 'deny';
     if (policy.request) {
@@ -390,7 +409,7 @@ async function refusedDestinations(
     for (const index of indices) refused.set(index, reason);
   }
 
-  return refused;
+  return { refused, onHeldGrant };
 }
 
 function structuredToolCalls(message: IRMessage): ToolUseContent[] {
