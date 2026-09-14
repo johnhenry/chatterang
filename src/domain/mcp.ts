@@ -134,7 +134,11 @@ export interface McpCallFields {
   /** Server-qualified (`notes.search`), whichever spelling the model called it by. */
   readonly toolName: string;
   readonly bytes: number;
-  /** Epoch milliseconds: when the arguments were handed to the server, or were withheld. */
+  /**
+   * Epoch milliseconds: when the arguments were handed to the server, or were
+   * withheld. For a call Stop held back, that is when Stop landed — or, stopped
+   * before its batch was dispatched, when the batch was.
+   */
   readonly at: number;
 }
 
@@ -159,6 +163,11 @@ export interface McpCallFields {
  *   dispatched; and one already allowed — by a grant the conversation held or
  *   an answer given in this batch — that had not yet run when Stop came, at
  *   another server's sheet or while an earlier call ran.
+ *
+ * A call here is one read from a model turn that finished, under the turn's
+ * limit on tool rounds. A call in text the model was still writing when Stop
+ * came, or written in a turn past that limit, was never read as a call: it was
+ * not sent, and it has no record.
  *
  * Each reads differently in the thread and the export, because each is a
  * different thing to have happened.

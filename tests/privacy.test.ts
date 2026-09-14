@@ -1068,10 +1068,15 @@ describe('MCP arguments do not leave the device without a grant', () => {
     toolRegistry.register(mirror.tool);
     const controller = new AbortController();
     let stoppedAt = 0;
+    let stoppedBy = 0;
     probe.call.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       stoppedAt = Date.now();
       controller.abort();
+      stoppedBy = Date.now();
+      // A server that does not stop when asked: the call runs on after Stop,
+      // and the records must still say when Stop landed, not when it ended.
+      await new Promise((resolve) => setTimeout(resolve, 50));
       return { content: [{ type: 'text', text: 'filed' }] };
     });
     const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => 'calls');
@@ -1090,7 +1095,6 @@ describe('MCP arguments do not leave the device without a grant', () => {
         }),
       ),
     );
-    const finishedAt = Date.now();
     toolRegistry.unregister(archive.tool.id);
     toolRegistry.unregister(mirror.tool.id);
 
@@ -1112,8 +1116,9 @@ describe('MCP arguments do not leave the device without a grant', () => {
     });
     expect(tools[2]!.receipt).toMatchObject({ serverName: 'mirror', host: 'mirror.example' });
     for (const tool of tools.slice(1)) {
+      // Stamped when Stop landed, which the export prints.
       expect(tool.receipt?.at).toBeGreaterThanOrEqual(stoppedAt);
-      expect(tool.receipt?.at).toBeLessThanOrEqual(finishedAt);
+      expect(tool.receipt?.at).toBeLessThanOrEqual(stoppedBy);
       expect(tool.output).toBe(`This call’s arguments were not sent to ${tool.receipt?.host}: the reply was stopped.`);
     }
   });
