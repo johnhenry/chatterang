@@ -49,7 +49,7 @@ import {
   fitToContext,
   type FitResult,
 } from '@/ai/context';
-import { installEgressRevoker, useApp } from '@/state/app';
+import { installEgressRevoker, installMcpToolPruner, useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
 
@@ -1031,4 +1031,19 @@ function sortChats(chats: Chat[]): Chat[] {
 // the grants that named it without this store having to be open.
 installEgressRevoker(async (connectionId) => {
   await useChats.getState().revokeEgress(connectionId);
+});
+
+// Registered at module load for the same reason. An MCP tool id is
+// `mcp:<server name>.<tool>` (src/ai/mcp/tools.ts), so a server's tools are
+// exactly the ids under that prefix. THE TRAILING DOT IS LOAD-BEARING: without
+// it, removing `notes` would also switch off `notesbook.search`. A dotted
+// server name still over-prunes (`a` takes `a.b.search`), which fails closed.
+installMcpToolPruner(async (serverName) => {
+  const prefix = `mcp:${serverName}.`;
+  for (const chat of useChats.getState().chats) {
+    if (!chat.tools.some((id) => id.startsWith(prefix))) continue;
+    await useChats.getState().updateChat(chat.id, {
+      tools: chat.tools.filter((id) => !id.startsWith(prefix)),
+    });
+  }
 });

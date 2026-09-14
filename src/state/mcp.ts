@@ -8,6 +8,11 @@
  * One thing worth stating plainly: connecting to a server does NOT make its
  * tools usable in a chat. Every MCP tool is `sensitive`, so it still has to be
  * enabled per chat like the `bash` tool. Connecting only makes them offerable.
+ *
+ * And the converse: adding or removing a server switches that NAME's tools off
+ * in every chat. Tool ids are keyed on the server name, so without this an
+ * enable given to one server would carry over to a different server that later
+ * took the same name, at a different URL.
  */
 
 import { create } from 'zustand';
@@ -18,6 +23,14 @@ import { validateServerUrl, type McpServerConfig, type McpServerState } from '@/
 import { mcpManager, type McpToolDescriptor } from '@/ai/mcp/client';
 import { createMcpTool } from '@/ai/mcp/tools';
 import { toolRegistry } from '@/ai/tools/registry';
+
+/*
+ * Imported lazily to avoid a cycle, as `confirm` below is: state/app builds the
+ * engine, which reads the tool registry this writes into.
+ */
+async function pruneMcpToolsFor(serverName: string): Promise<void> {
+  await (await import('@/state/app')).pruneMcpToolsFor(serverName);
+}
 
 interface McpState {
   servers: McpServerConfig[];
@@ -56,6 +69,14 @@ export const useMcp = create<McpState>((set, get) => ({
     // servers' tools indistinguishable to the model.
     if (get().servers.some((s) => s.name === trimmed)) return `There is already a server called “${trimmed}”.`;
 
+    // A new server has a new id, so no chat can legitimately have its tools on
+    // yet. Any `mcp:<name>.*` a chat still holds was given to an EARLIER server
+    // under this name — including one removed before removal pruned anything —
+    // and would otherwise apply to this one unasked. Pruned before the server is
+    // stored or connected, so there is no moment its tools are registered while
+    // a stale enable still points at them.
+    await pruneMcpToolsFor(trimmed);
+
     const server: McpServerConfig = {
       id: newId('mcp'),
       name: trimmed,
@@ -71,14 +92,26 @@ export const useMcp = create<McpState>((set, get) => ({
   },
 
   async remove(id) {
+    const removed = get().servers.find((s) => s.id === id);
     await db.mcpServers.delete(id);
     set({
       servers: get().servers.filter((s) => s.id !== id),
       states: Object.fromEntries(Object.entries(get().states).filter(([k]) => k !== id)),
     });
-    await get().reconnect();
+    // The reconnect is what unregisters the removed server's tools, so it runs
+    // even when the prune does not finish. A chat write refused half-way — a
+    // full disk — must not leave tools callable for a server the panel has
+    // just said is gone. The failure still reaches the caller.
+    try {
+      if (removed) await pruneMcpToolsFor(removed.name);
+    } finally {
+      await get().reconnect();
+    }
   },
 
+  // Deliberately does NOT prune. Switching a server off and on again brings
+  // back the same row at the same URL, so an enable given to it is still an
+  // enable given to that server. Removal is what ends that.
   async toggle(id, enabled) {
     await db.mcpServers.update(id, { enabled });
     set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });

@@ -157,7 +157,7 @@ export function McpPanel(): ReactNode {
         title="Remove this server?"
         body={
           confirmRemove
-            ? `“${confirmRemove.name}” and its tools will be removed from this device. Nothing on ${destinationHost(confirmRemove.url)} changes.`
+            ? `“${confirmRemove.name}” and its tools will be removed from this device, and from every chat that had them on. Nothing on ${destinationHost(confirmRemove.url)} changes.`
             : ''
         }
         confirmLabel="Remove"
