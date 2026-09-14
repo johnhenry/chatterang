@@ -42,6 +42,7 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
+import { stage } from './support/stage';
 
 /**
  * These assert the promises the product makes, not just that the code runs.
@@ -812,24 +813,53 @@ describe('MCP arguments do not leave the device without a grant', () => {
    * covered is recorded as not sent.
    */
 
-  /** `running`, or a failure if it is still waiting on a sheet nobody will answer. */
+  /**
+   * `running`, or a failure if it is still waiting on a sheet nobody will answer.
+   *
+   * The bound tells a hang from a slow runner and nothing more: a turn waiting
+   * on a sheet nobody answers never ends. The turns here also wait on their own
+   * 5ms and 50ms timers, and a runner that stalls between starting this clock
+   * and starting those can overrun a short bound with a turn about to end. So
+   * it is `stage`'s: generous, and inside the test's own 5s, so a hang still
+   * says why and for how long.
+   */
   function settled<T>(running: Promise<T>): Promise<T> {
-    return Promise.race([
-      running,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('the turn is still waiting on a sheet nobody answered')), 1000),
-      ),
-    ]);
+    return stage('the turn to end: it is still waiting on a sheet nobody answered', running);
+  }
+
+  /**
+   * Give `late`, then run everything it sets going before anything is asserted.
+   *
+   * Not a window of ticks. The clock is faked from before `late` is given, so
+   * every promise callback it queues runs, and every timer those set — however
+   * far ahead — is run in turn, with the callbacks it queues, until none is
+   * left. A grant kept or a call sent from a late answer, directly or behind a
+   * timer, has happened by the time this returns; nothing on these paths waits
+   * on real I/O (the policy, the sheet and the server call are all fakes here).
+   */
+  async function afterEverythingFrom(late: () => void): Promise<void> {
+    vi.useFakeTimers();
+    try {
+      late();
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
   }
 
   it('sends nothing after Stop while the send sheet is open, and keeps nothing answered after', async () => {
     const { engine, probe } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
     const controller = new AbortController();
     let answer: (decision: DestinationDecision) => void = () => {};
+    let raised = () => {};
+    const sheetUp = new Promise<void>((resolve) => {
+      raised = resolve;
+    });
     const request = vi.fn(
       (_asked: DestinationRequest, _signal?: AbortSignal) =>
         new Promise<DestinationDecision>((resolve) => {
           answer = resolve;
+          raised();
         }),
     );
     const onGranted = vi.fn();
@@ -843,15 +873,15 @@ describe('MCP arguments do not leave the device without a grant', () => {
         signal: controller.signal,
       }),
     );
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    await stage('the send sheet to be raised', sheetUp);
+    expect(request).toHaveBeenCalledOnce();
     expect(request.mock.calls[0]![1], 'the sheet is handed the turn’s signal').toBe(controller.signal);
 
     controller.abort();
     // Nobody answered, and the turn still ends.
     const events = await settled(running);
-    // An answer that arrives after Stop reaches nothing.
-    answer('conversation');
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // An answer that arrives after Stop reaches nothing, then or later.
+    await afterEverythingFrom(() => answer('conversation'));
 
     expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
     expect(onGranted, 'no grant is kept from a sheet answered after Stop').not.toHaveBeenCalled();
@@ -1128,10 +1158,15 @@ describe('MCP arguments do not leave the device without a grant', () => {
     // after Stop, so the other sheet a call waits on is held to it too.
     const probe = mcpProbe({ readOnly: false });
     let yes: (approved: boolean) => void = () => {};
+    let raised = () => {};
+    const confirmUp = new Promise<void>((resolve) => {
+      raised = resolve;
+    });
     probe.confirm.mockImplementation(
       (_action: string, _signal?: AbortSignal) =>
         new Promise<boolean>((resolve) => {
           yes = resolve;
+          raised();
         }),
     );
     toolRegistry.register(probe.tool);
@@ -1148,13 +1183,14 @@ describe('MCP arguments do not leave the device without a grant', () => {
         signal: controller.signal,
       }),
     );
-    await vi.waitFor(() => expect(probe.confirm).toHaveBeenCalledOnce());
+    await stage('the data-change confirm to be raised', confirmUp);
+    expect(probe.confirm).toHaveBeenCalledOnce();
     expect(probe.confirm.mock.calls[0]![1], 'the confirm is handed the turn’s signal').toBe(controller.signal);
 
     controller.abort();
     const events = await settled(running);
-    yes(true);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // A yes that arrives after Stop sends nothing, then or later.
+    await afterEverythingFrom(() => yes(true));
 
     expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
     const tool = events.find((event) => event.type === 'tool');
