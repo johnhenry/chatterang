@@ -162,9 +162,15 @@ export function createMcpTool(
         );
         return { ...renderResult(result), receipt: receipt('sent') };
       } catch (error) {
-        // Refused before anything left, so there is nothing to record.
+        // REFUSED BEFORE ANYTHING LEFT (#92, owner ruling OD7): the server this
+        // call was prepared for changed while it waited, or no client is left to
+        // send it. Recorded as not sent, and as nobody's refusal.
         if (error instanceof McpNotSent) {
-          return { output: `${qualified} was not sent: ${error.message}`, isError: true };
+          return {
+            output: `${qualified} was not sent: ${error.message}`,
+            isError: true,
+            receipt: { ...fields(at), outcome: 'withheld', why: 'server-changed' },
+          };
         }
         // Anything else may have failed after the arguments were delivered — a
         // server error, a connection dropped mid-response. It is recorded as an

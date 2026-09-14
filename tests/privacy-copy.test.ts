@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { ChatterangEngine, targetFor, type ToolEgressRequest } from '@/ai/engine';
 import { createMcpTool } from '@/ai/mcp/tools';
+import { McpManager } from '@/ai/mcp/client';
 import { renderPrompt } from '@/ai/prompt';
 import { getProvider, PROVIDERS } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
@@ -816,7 +817,63 @@ describe('the privacy command', () => {
       'notes.note was not sent to notes.example; this app wrote its reply',
     );
     expect(toolOutputSheetBody([], [{ toolCalls: [record] }], 'GPT-4o mini', 40)).toContain(
-      'notes.note, which was not sent to notes.example',
+      'including notes.note, which was not sent to notes.example. ',
+    );
+  });
+
+  /*
+   * A CALL WHOSE SERVER CHANGED WHILE IT WAITED IS RECORDED AS NOT SENT (#92,
+   * owner ruling OD7), and says nobody refused it. Measured through the real
+   * dispatcher and the real client, which has nothing left to send with.
+   */
+  it('says a call whose server changed was not sent — and it was not', async () => {
+    expect(shipped('features/chat/MessageView.tsx')).toContain(
+      'return `Not sent to ${where} — the server changed before it went.`;',
+    );
+
+    const client = new McpManager();
+    const tool = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: true,
+        destructive: false,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        serverId: 'mcp_notes',
+        serverUrl: 'https://notes.example/mcp',
+        confirm: async () => true,
+        call: (server, name, args, signal) => client.callTool(server, name, args, signal),
+      },
+    );
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }],
+      { enabledIds: [tool.id], destinations: { isGranted: () => true } },
+    );
+    const record = executed[0]!;
+    expect(record.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
+
+    const thread = await threadText(record);
+    expect(thread).toContain('Not sent to notes.example (notes) — the server changed before it went.');
+    expect(thread).not.toMatch(/Sent \d+ bytes|Tried to send|was not allowed|was declined/);
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'I could not file it.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note was not sent to notes.example (notes) at ${utc(record.receipt!.at)} — the server changed before it went.`,
+    );
+
+    // The model is told in this app's words, so the sheet can say so.
+    expect(record.output).toBe('notes.note was not sent: No MCP client is configured.');
+    expect(toolOutputSheetBody([record], [], 'GPT-4o mini', 40)).toContain(
+      'notes.note was not sent to notes.example; this app wrote its reply',
+    );
+    expect(toolOutputSheetBody([], [{ toolCalls: [record] }], 'GPT-4o mini', 40)).toContain(
+      'including notes.note, which was not sent to notes.example. ',
     );
   });
 
@@ -1220,7 +1277,7 @@ describe('the tool-output sheet', () => {
     expect(withheldBody).not.toContain('did not complete');
     // And on a turn after it.
     const withheldEarlier = toolOutputSheetBody([], [{ toolCalls: [withheld] }], 'GPT-4o mini', 40);
-    expect(withheldEarlier).toContain('notes.note, which was not sent to notes.example');
+    expect(withheldEarlier).toContain('including notes.note, which was not sent to notes.example. ');
     expect(withheldEarlier).not.toContain('returned from');
 
     // A record a later build wrote: a reason, or an outcome, this build has no

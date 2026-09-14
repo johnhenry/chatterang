@@ -145,12 +145,14 @@ export interface McpCallFields {
  *   no to the send sheet, or nobody could be asked (#6).
  * - `declined`: the server was allowed, and the person said no when asked about
  *   a call the server does not call read-only changing data there.
+ * - `server-changed`: nobody refused it. The server record it was prepared for
+ *   was removed, switched off, renamed or pointed elsewhere while it waited, or
+ *   no client was left to send it ({@link McpNotSent}).
  *
  * Each reads differently in the thread and the export, because each is a
- * different thing to have happened, and only one of them was a person refusing
- * to send.
+ * different thing to have happened.
  */
-export type WithheldWhy = 'not-allowed' | 'declined';
+export type WithheldWhy = 'not-allowed' | 'declined' | 'server-changed';
 
 /**
  * Could this call's arguments have reached the server?
@@ -202,9 +204,10 @@ export function unhandledWhy(why: never): string {
  * A refusal made BEFORE any byte left: there is no client, or the server a call
  * was prepared for is no longer the server its name points at.
  *
- * Distinct from every other failure because it is the one that must not leave a
- * receipt. Any other error may arrive after the arguments were delivered, and
- * recording such a call as not sent would be wrong in the flattering direction.
+ * Distinct from every other failure because it is the one recorded as not sent
+ * (`withheld`, why `server-changed`) rather than as an attempt. Any other error
+ * may arrive after the arguments were delivered, and recording such a call as
+ * not sent would be wrong in the flattering direction.
  */
 export class McpNotSent extends Error {
   constructor(message: string) {

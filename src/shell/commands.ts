@@ -1063,6 +1063,8 @@ function receiptClause(receipt: McpCallReceipt): string {
           return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
         case 'declined':
           return `${receipt.toolName} was not sent to ${where} at ${when} — it could change data there, and was declined`;
+        case 'server-changed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the server changed before it went`;
         default:
           return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
       }

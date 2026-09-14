@@ -389,7 +389,7 @@ describe('an MCP call receipt', () => {
     expect(failed.receipt?.at).toBe(1_000);
   });
 
-  it('is not taken for a call refused before anything was sent', async () => {
+  it('records a call refused before anything was sent as not sent, because its server changed', async () => {
     const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
       ...acme,
       call: async () => {
@@ -401,13 +401,31 @@ describe('an MCP call receipt', () => {
 
     expect(result.isError).toBe(true);
     expect(result.output).toContain('acme.search was not sent: the server changed');
-    expect(result.receipt).toBeUndefined();
+    // Not an attempt, and nobody's refusal (#92, owner ruling OD7).
+    expect(result.receipt).toEqual({
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 9,
+      at: at.getTime(),
+    });
   });
 
-  it('is refused as not sent by a client that has no connection', async () => {
+  it('is refused as not sent by a client that has no connection, and recorded so', async () => {
     // Nothing is configured, so nothing can have left. Thrown as an ordinary
     // error this would be recorded as a failed attempt at a host never reached.
-    await expect(new McpManager().callTool('acme', 'search', {})).rejects.toBeInstanceOf(McpNotSent);
+    const client = new McpManager();
+    await expect(client.callTool('acme', 'search', {})).rejects.toBeInstanceOf(McpNotSent);
+
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: (server, name, args, signal) => client.callTool(server, name, args, signal),
+    });
+    const result = await tool.execute({ q: 'x' }, { now: () => at });
+    expect(result.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
   });
 
   it('reaches the dispatcher’s record, and a tool that runs here has none', async () => {

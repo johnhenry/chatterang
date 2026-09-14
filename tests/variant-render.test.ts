@@ -635,6 +635,31 @@ describe('the record of what left follows the generation that sent it', () => {
     );
   });
 
+  it('says a call whose server changed while it waited was not sent, and that nobody refused it', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I could not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'notes.note was not sent: the server changed since this call was prepared',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'server-changed' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the server changed before it went.']);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send|was not allowed|was declined/);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+      },
+    );
+  });
+
   it('reads the receipt off the displayed generation even when the row disagrees', async () => {
     const { receipt: _none, ...unreceipted } = MCP_TOOL;
     await mounted(

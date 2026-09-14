@@ -577,6 +577,26 @@ describe('the receipts a turn kept, in the transcript', () => {
     );
   });
 
+  it('prints a call whose server changed as not sent, and says that was why', () => {
+    const changed = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...changed, receipt: { ...changed.receipt, outcome: 'withheld', why: 'server-changed' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — the server changed before it went.\n',
+    );
+    expect(transcript).not.toMatch(/was not allowed|was declined/);
+  });
+
   it('still exports when a stored receipt’s time cannot be read', () => {
     // `toISOString` throws on an invalid date. One bad row must cost its own
     // timestamp, not the whole file and every `/chats/*.md` beside it.
