@@ -197,6 +197,17 @@ function sliderLabelled(label: string): HTMLInputElement {
   return document.getElementById(labelElement!.htmlFor) as HTMLInputElement;
 }
 
+function saveButton(): HTMLButtonElement {
+  const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((element) =>
+    element.textContent?.trim().startsWith('Save these as'),
+  );
+  expect(button, 'the Save as defaults button is on screen').toBeDefined();
+  return button!;
+}
+
+/** The sampler values saved against the chat's model. */
+const savedSampler = () => useModels.getState().installed[QWEN.id]?.sampler;
+
 /** Set a form control the way a person does, so React's own handler runs. */
 async function choose(element: HTMLInputElement | HTMLSelectElement, value: string): Promise<void> {
   const prototype = element instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
@@ -304,6 +315,55 @@ describe('two changes from the settings sheet, made before the first has landed'
 
       expect(current()).toMatchObject({ tools: ['calculator'], modelId: LLAMA!.id });
       expect(storedChat()).toMatchObject({ tools: ['calculator'], modelId: LLAMA!.id });
+    });
+  });
+
+  it('saves a change still being written as the model’s default, and does not lose it', async () => {
+    // "Save these as defaults" saved the values this panel rendered, then
+    // cleared the chat's overrides. A slider change still being written was in
+    // neither: not in what was saved, and cleared once it landed.
+    given();
+
+    await mounted(async () => {
+      hold();
+      await choose(sliderLabelled('Temperature'), '1.3');
+      await vi.waitFor(() => expect(tables.waiting.length).toBe(1));
+      // The panel still shows the model's own temperature.
+      await click(saveButton());
+      await releaseAll();
+      await vi.waitFor(() => expect(savedSampler()?.temperature, 'the model’s defaults').toBe(1.3));
+      await vi.waitFor(() => expect(current().sampler).toBeNull());
+      await macrotask();
+
+      expect(current().sampler, 'the store').toBeNull();
+      expect(storedChat().sampler, 'the table').toBeNull();
+    });
+  });
+
+  it('keeps a change made while the defaults were being saved as this chat’s', async () => {
+    // The paired control: what is cleared is what was saved, not whatever
+    // overrides the chat holds by the time the defaults have been written.
+    given();
+
+    await mounted(async () => {
+      let releaseModel = (): void => {};
+      tables.models.put.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseModel = resolve)),
+      );
+      await click(saveButton());
+      await vi.waitFor(() => expect(tables.models.put).toHaveBeenCalled());
+
+      await choose(sliderLabelled('Top-P'), '0.5');
+      await vi.waitFor(() => expect(current().sampler).toEqual({ topP: 0.5 }));
+      await act(async () => {
+        releaseModel();
+        await macrotask();
+      });
+      await macrotask();
+
+      expect(current().sampler, 'the store').toEqual({ topP: 0.5 });
+      expect(storedChat().sampler, 'the table').toEqual({ topP: 0.5 });
+      expect(savedSampler()?.topP, 'not saved: it came after').toBe(DEFAULT_SAMPLER.topP);
     });
   });
 
