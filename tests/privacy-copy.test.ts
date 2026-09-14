@@ -12,7 +12,12 @@ import { McpManager } from '@/ai/mcp/client';
 import { renderPrompt } from '@/ai/prompt';
 import { getProvider, PROVIDERS } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
-import { runToolCalls, type DestinationRequest } from '@/ai/middleware/tools';
+import {
+  runToolCalls,
+  type DestinationRequest,
+  type ExecutedTool,
+  type ToolDestinationPolicy,
+} from '@/ai/middleware/tools';
 import { ToolRegistry, toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import {
   BACKUP_RULES_XML,
@@ -295,6 +300,143 @@ async function threadText(tool: ToolInvocation): Promise<string> {
 
 /** A receipt's time as the exported transcript prints it. */
 const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+
+/**
+ * The sentence the `privacy` command and README.md both carry beside "Each call
+ * handed to a server is recorded" (#92, owner ruling that the copy says both
+ * halves).
+ */
+const NOT_SENT_SENTENCE =
+  'A call that did not go — declined, stopped, or refused because its server changed — is recorded there as not sent.';
+
+/**
+ * What that sentence claims, measured: one call of each kind it names, each
+ * through the real dispatcher with a spy standing for its server, rendered by
+ * the real thread and the real transcript.
+ */
+async function expectEachCallThatDidNotGoRecordedAsNotSent(): Promise<void> {
+  const reached: string[] = [];
+  const toolOn = (
+    server: string,
+    readOnly: boolean,
+    confirm: () => Promise<boolean>,
+    call?: Parameters<typeof createMcpTool>[1]['call'],
+  ): ChatterangTool =>
+    mustCreateMcpTool(
+      {
+        server,
+        name: 'note',
+        description: 'File a note',
+        readOnly,
+        destructive: !readOnly,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        serverId: `mcp_${server}`,
+        serverUrl: `https://${server}.example/mcp`,
+        confirm,
+        call:
+          call ??
+          (async () => {
+            reached.push(server);
+            return { content: [{ type: 'text', text: 'filed' }] };
+          }),
+      },
+    );
+  const dispatch = async (
+    tools: ChatterangTool[],
+    destinations: ToolDestinationPolicy,
+    signal?: AbortSignal,
+  ): Promise<ExecutedTool[]> =>
+    (
+      await runToolCalls(
+        new ToolRegistry(tools),
+        tools.map((tool, index) => ({
+          type: 'tool_use' as const,
+          id: `c${index}`,
+          name: tool.name,
+          input: { text: SECRET },
+        })),
+        { enabledIds: tools.map((tool) => tool.id), destinations, signal },
+      )
+    ).executed;
+
+  // Declined at the send sheet.
+  const atSheet = await dispatch([toolOn('notes', true, async () => true)], {
+    isGranted: () => false,
+    request: async () => 'deny',
+  });
+  // Declined at the data-change confirm, its server allowed.
+  const atConfirm = await dispatch([toolOn('notes', false, async () => false)], { isGranted: () => true });
+  // Stopped at one server's sheet, beside a call to a server already allowed.
+  const controller = new AbortController();
+  const stopped = await dispatch(
+    [toolOn('notes', true, async () => true), toolOn('archive', true, async () => true)],
+    {
+      isGranted: (destination) => destination.serverId === 'mcp_archive',
+      request: async () => {
+        controller.abort();
+        return 'calls';
+      },
+    },
+    controller.signal,
+  );
+  // Refused because its server changed: no client is left to send it with.
+  const client = new McpManager();
+  const serverChanged = await dispatch(
+    [
+      toolOn('notes', true, async () => true, (server, name, args, signal) =>
+        client.callTool(server, name, args, signal),
+      ),
+    ],
+    { isGranted: () => true },
+  );
+
+  const expected = [
+    { record: atSheet[0], host: 'notes.example', server: 'notes', why: 'not-allowed', says: 'it was not allowed' },
+    {
+      record: atConfirm[0],
+      host: 'notes.example',
+      server: 'notes',
+      why: 'declined',
+      says: 'it could change data there, and was declined',
+    },
+    { record: stopped[0], host: 'notes.example', server: 'notes', why: 'stopped', says: 'the reply was stopped before it went' },
+    {
+      record: stopped[1],
+      host: 'archive.example',
+      server: 'archive',
+      why: 'stopped',
+      says: 'the reply was stopped before it went',
+    },
+    {
+      record: serverChanged[0],
+      host: 'notes.example',
+      server: 'notes',
+      why: 'server-changed',
+      says: 'the server changed before it went',
+    },
+  ];
+  expect(reached, 'none of them went').toEqual([]);
+
+  const records = expected.map(({ record }) => record);
+  expect(records.every((record) => record !== undefined), 'every one of them has a record').toBe(true);
+  const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+    { role: 'assistant', content: 'Nothing was filed.', createdAt: 1, toolCalls: records as ExecutedTool[] },
+  ]);
+  expect(transcript).not.toMatch(/ sent \d+ bytes| tried to send/);
+
+  for (const { record, host, server, why, says } of expected) {
+    const receipt = record!.receipt;
+    expect(receipt?.outcome === 'withheld' ? receipt.why : receipt?.outcome, `${server}: ${says}`).toBe(why);
+    const thread = await threadText(record!);
+    expect(thread).toContain(`Not sent to ${host} (${server}) — ${says}.`);
+    expect(thread).not.toMatch(/Sent \d+ bytes|Tried to send/);
+    expect(transcript).toContain(
+      `- ${server}.note was not sent to ${host} (${server}) at ${utc(receipt!.at)} — ${says}.\n`,
+    );
+  }
+}
 
 /* ── `privacy`, the one place that must not shade the truth ──────────── */
 
@@ -937,6 +1079,24 @@ describe('the privacy command', () => {
     expect(toolOutputSheetBody([], [{ toolCalls: [record] }], 'GPT-4o mini', 40)).toContain(
       'including notes.note, which was not sent to notes.example. ',
     );
+  });
+
+  /*
+   * THE OTHER HALF OF THE RECEIPT SENTENCE (#92, owner ruling that the copy
+   * says both). Beside "each call handed to a server is recorded", a call that
+   * did not go — declined, stopped, or refused because its server changed — is
+   * recorded as not sent. The sentence above is still pinned whole.
+   */
+  it('says a call that did not go is recorded as not sent — and each kind is', async () => {
+    const output = await privacyOutput({
+      mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
+    });
+    expect(output).toContain(
+      'how many bytes of arguments. A call that did not go — declined, stopped, or refused because its server changed — is recorded there as not sent.',
+    );
+    expect(output).toContain(NOT_SENT_SENTENCE);
+
+    await expectEachCallThatDidNotGoRecordedAsNotSent();
   });
 
   /**
@@ -2079,6 +2239,15 @@ describe('README.md’s privacy list', () => {
     expect(reads(section)).toContain(
       'Each call handed to a server is recorded in the thread and in an exported transcript.',
     );
+  });
+
+  it('says a call that did not go is recorded as not sent, as the command does — and it is', async () => {
+    // The same sentence on the public surface, beside the receipt sentence
+    // pinned above, measured against the same behaviour.
+    expect(reads(section)).toContain(
+      'Each call handed to a server is recorded in the thread and in an exported transcript. ' + NOT_SENT_SENTENCE,
+    );
+    await expectEachCallThatDidNotGoRecordedAsNotSent();
   });
 
   it('points at the command as the generated source of truth', () => {

@@ -694,7 +694,9 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
                 '    changing data there. The arguments are whatever the model wrote',
                 '    from the conversation. Each call handed to a server is recorded',
                 '    in the thread and in an exported transcript: the server, its',
-                '    host, when, and how many bytes of arguments.',
+                '    host, when, and how many bytes of arguments. A call that did',
+                '    not go — declined, stopped, or refused because its server',
+                '    changed — is recorded there as not sent.',
               ]
             : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
