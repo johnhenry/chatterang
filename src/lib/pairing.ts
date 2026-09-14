@@ -10,9 +10,16 @@
  *
  * So this file ships the SHAPE and an honest refusal, modelled on how
  * `MountHostWeb` refuses rather than pretends. `pairingController()` returns a
- * controller whose `available` is false; the UI keys everything on that one
- * value, so the day a real controller lands, the entry point appears and the
- * privacy copy's forcing function demands the new sentence in the same change.
+ * controller whose `available` is false. No screen offers pairing yet, and
+ * `tests/layering.test.ts` refuses any file in `src/` other than this one,
+ * `qr-scan.ts` and `qr-decode.ts` that reaches the pairing half, the scanner
+ * or the camera — so the entry point, when it is built, arrives as an edit to
+ * that allowlist rather than as an import nobody reviewed.
+ *
+ * The day `available` becomes true, `tests/privacy-copy.test.ts` fails until
+ * every privacy surface names a paired device, a paired-device panel is
+ * mounted, and a table holds the devices. That forces the copy to be revisited
+ * in the same change. It does not choose the sentence.
  *
  * It imports only the pairing half, which imports nothing, so it is safe on
  * every target — including the oldest phone #223 worries about.
