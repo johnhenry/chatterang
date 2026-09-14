@@ -272,6 +272,39 @@ async function putMessage(message: Message): Promise<void> {
   });
 }
 
+/**
+ * What was withdrawn before the chat list had loaded: connections' and MCP
+ * servers' grants, and MCP servers' tools by id prefix.
+ *
+ * The app is up — Settings included — once the engine is, and the list is read
+ * after that (App.tsx). A withdrawal drops grants from the chats in the store,
+ * and until the list has landed there are none. So it dropped nothing, the list
+ * then brought the grant in from disk, and switching the connection or server
+ * back on honoured it without asking. A removed server's tools came back the
+ * same way, and their prune is what keeps them from coming on under the next
+ * server to take the name (#6). So `load` takes these out of what it read
+ * before the store holds any of it, and writes that back.
+ */
+const beforeTheList = {
+  connections: new Set<string>(),
+  servers: new Set<string>(),
+  toolPrefixes: new Set<string>(),
+};
+
+/** A chat read from disk without what was withdrawn before the list loaded, or null when that is nothing. */
+function withdrawnBeforeTheList(chat: Chat): Chat | null {
+  const grants = chat.egressGrants ?? [];
+  const egressGrants = grants.filter((grant) =>
+    grant.kind === 'mcp'
+      ? !beforeTheList.servers.has(grant.serverId)
+      : !beforeTheList.connections.has(grant.connectionId),
+  );
+  const prefixes = [...beforeTheList.toolPrefixes];
+  const tools = chat.tools.filter((id) => !prefixes.some((prefix) => id.startsWith(prefix)));
+  if (egressGrants.length === grants.length && tools.length === chat.tools.length) return null;
+  return { ...chat, egressGrants, tools };
+}
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -359,7 +392,26 @@ export const useChats = create<ChatState>((set, get) => ({
     const held = get().chats;
     const known = new Set(held.map((chat) => chat.id));
     const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
-    set({ loaded: true, chats: sortChats([...held, ...unseen]) });
+    // Without what was withdrawn before this could see it, in the store from
+    // the first moment it holds these chats. See `beforeTheList`.
+    const stripped = unseen.map(withdrawnBeforeTheList);
+    beforeTheList.connections.clear();
+    beforeTheList.servers.clear();
+    beforeTheList.toolPrefixes.clear();
+    set({ loaded: true, chats: sortChats([...held, ...unseen.map((chat, at) => stripped[at] ?? chat)]) });
+    // And on disk, in each chat's turn.
+    await Promise.all(
+      stripped.flatMap((chat) =>
+        chat
+          ? [
+              writeInTurn(chat.id, async () => {
+                const current = get().chats.find((entry) => entry.id === chat.id);
+                if (current) await db.chats.put(current);
+              }),
+            ]
+          : [],
+      ),
+    );
   },
 
   async openChat(chatId) {
@@ -540,6 +592,9 @@ export const useChats = create<ChatState>((set, get) => ({
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
     const finished = providerWithdrawals.begin(connectionId);
+    // Until the chat list has loaded there is nothing here to drop it from. See
+    // `beforeTheList`.
+    if (chatId === undefined && !get().loaded) beforeTheList.connections.add(connectionId);
     try {
       const names = (grant: EgressGrant): boolean =>
         grant.kind !== 'mcp' && grant.connectionId === connectionId;
@@ -588,6 +643,9 @@ export const useChats = create<ChatState>((set, get) => ({
     // Counted before anything is read or awaited, so an answer or a write
     // already under way sees it however the rest of this interleaves.
     const finished = mcpWithdrawals.begin(serverId);
+    // Until the chat list has loaded there is nothing here to drop it from. See
+    // `beforeTheList`.
+    if (chatId === undefined && !get().loaded) beforeTheList.servers.add(serverId);
     try {
       const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
       const affected = get().chats.filter(
@@ -1755,6 +1813,9 @@ installMcpGrantRevoker(async (serverId) => {
 // server name still over-prunes (`a` takes `a.b.search`), which fails closed.
 installMcpToolPruner(async (serverName) => {
   const prefix = `mcp:${serverName}.`;
+  // Until the chat list has loaded there is nothing here to prune. See
+  // `beforeTheList`.
+  if (!useChats.getState().loaded) beforeTheList.toolPrefixes.add(prefix);
   for (const chat of useChats.getState().chats) {
     if (!chat.tools.some((id) => id.startsWith(prefix))) continue;
     // A function of the chat as it stands when written, for the reason the
