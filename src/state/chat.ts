@@ -799,7 +799,8 @@ export const useChats = create<ChatState>((set, get) => ({
       };
 
       await putMessage(userMessage);
-      set({ messages: [...get().messages, userMessage] });
+      // On screen only if its chat is still the one open. See `runGeneration`.
+      if (get().activeChatId === chatId) set({ messages: [...get().messages, userMessage] });
 
       if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
         await get().updateChat(chatId, { title: deriveTitle(text) });
@@ -1053,6 +1054,14 @@ async function runGeneration(
   // Nor in a chat whose delete has been asked for: it stays in the store until
   // the delete lands. See `removedChats`.
   if (!chat || removedChats.has(chat.id)) return false;
+  // NOR ONCE ANOTHER CHAT HAS BEEN OPENED. The prompt is built from the thread
+  // on screen, and the model, sampler and grants are the turn's own chat's. A
+  // send writes its message and its chat before this, and another chat opened
+  // meanwhile had its thread sent under the first chat's model and grants,
+  // measured, with the first chat's message and reply on the other's screen.
+  // Asked in the same step the placeholder goes on screen and the thread is
+  // read: nothing below waits before that.
+  if (get().activeChatId !== chat.id) return false;
 
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
@@ -1100,45 +1109,57 @@ async function runGeneration(
     });
   };
 
-  const built = await buildMessages(
-    chat,
-    get().messages,
-    options.previousVariants ? 1 : 0,
-    target.modelId,
-  );
-
-  // Tell the user what had to go, rather than letting the model quietly
-  // forget the start of the conversation.
-  if (built.fit.overflowed) {
-    app.toast(
-      'This message alone fills the model’s context. Shorten it, or switch to a model with a larger window.',
-      'warn',
-    );
-  } else if (built.fit.dropped > 0) {
-    app.toast(
-      `${built.fit.dropped} older message${built.fit.dropped === 1 ? '' : 's'} dropped to fit the context window.`,
-      'info',
-    );
-  }
-
-  set({
-    context: {
-      used: built.fit.estimatedTokens,
-      contextLength: contextLengthOf(target.modelId),
-      dropped: built.fit.dropped,
-      overflowed: built.fit.overflowed,
-      measured: false,
-    },
-  });
-
   livePlaceholderId = placeholder.id;
 
   try {
-    // Deleted or stopped while the prompt was being built. A stopped signal is
-    // not enough here: the engine does not read it before its first request —
-    // measured, a turn stopped while its prompt was built still reached the
-    // backend — and can raise a sheet before that. Nothing is handed over, and
-    // no reply is left on screen being written.
+    // INSIDE THE TRY, so a prompt that cannot be built still ends the turn in
+    // `finally`. It was awaited before it: a payload read that failed threw past
+    // that, and left a reply on screen being written and the activity indicator
+    // on. Refused like a turn stopped here — nothing handed over, no reply left
+    // on screen, and false, so a regeneration discards nothing — and said.
+    let built: Awaited<ReturnType<typeof buildMessages>>;
+    try {
+      built = await buildMessages(
+        chat,
+        get().messages,
+        options.previousVariants ? 1 : 0,
+        target.modelId,
+      );
+    } catch (error) {
+      set({ messages: get().messages.filter((message) => message.id !== placeholder.id) });
+      app.toast(error instanceof Error ? error.message : 'The message could not be prepared.', 'crit');
+      return false;
+    }
+
+    // Tell the user what had to go, rather than letting the model quietly
+    // forget the start of the conversation.
+    if (built.fit.overflowed) {
+      app.toast(
+        'This message alone fills the model’s context. Shorten it, or switch to a model with a larger window.',
+        'warn',
+      );
+    } else if (built.fit.dropped > 0) {
+      app.toast(
+        `${built.fit.dropped} older message${built.fit.dropped === 1 ? '' : 's'} dropped to fit the context window.`,
+        'info',
+      );
+    }
+
+    set({
+      context: {
+        used: built.fit.estimatedTokens,
+        contextLength: contextLengthOf(target.modelId),
+        dropped: built.fit.dropped,
+        overflowed: built.fit.overflowed,
+        measured: false,
+      },
+    });
+
+    // Deleted or stopped while the prompt was being built. The engine now reads
+    // a stopped signal before each request too — measured without that, a turn
+    // stopped while its prompt was built still reached the backend — but a turn
+    // handed over is counted as a use of the model and as a reply. Nothing is
+    // handed over here, and no reply is left on screen being written.
     if (removedChats.has(chat.id) || controller.signal.aborted) {
       set({ messages: get().messages.filter((message) => message.id !== placeholder.id) });
       return false;
@@ -1550,7 +1571,7 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     // connection it names is removed or switched off. See `withdrawals`.
     revocations: (backendId) => providerWithdrawals.count(backendId),
 
-    async request({ backendId, modelName, tools, characters }) {
+    async request({ backendId, modelName, tools, characters }, signal) {
       const app = useApp.getState();
       const label =
         app.connections.find((connection) => connection.id === backendId)?.label ?? backendId;
@@ -1559,17 +1580,25 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
       // is not a thing anybody can decide about; "`bash` read 3 files from this
       // app's own data" is.
       let extended = false;
-      const allowed = await app.requestApproval(`send tool output to ${label}`, {
-        title: `Send tool output to ${label}?`,
-        body: toolOutputSheetBody(tools, earlier, modelName, characters),
-        detail: tools.slice(0, 4).map((tool) => `${tool.name} · ${tool.output.length} chars`),
-        confirmLabel: 'Send this turn',
-        extendedLabel: 'Send for this conversation',
-        cancelLabel: 'Don’t send',
-        onExtended: () => {
-          extended = true;
+      // The turn's signal goes with the sheet, as in `mcpEgressPolicy`, so Stop
+      // takes it down. It did not: the sheet stayed up after Stop, and answering
+      // it sent the next request, the tool's output in it on a yes. The engine
+      // reads what follows as stopped, not as a refusal.
+      const allowed = await app.requestApproval(
+        `send tool output to ${label}`,
+        {
+          title: `Send tool output to ${label}?`,
+          body: toolOutputSheetBody(tools, earlier, modelName, characters),
+          detail: tools.slice(0, 4).map((tool) => `${tool.name} · ${tool.output.length} chars`),
+          confirmLabel: 'Send this turn',
+          extendedLabel: 'Send for this conversation',
+          cancelLabel: 'Don’t send',
+          onExtended: () => {
+            extended = true;
+          },
         },
-      });
+        signal,
+      );
 
       if (!allowed) return 'deny';
       return extended ? 'conversation' : 'turn';

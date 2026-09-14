@@ -32,6 +32,7 @@ import {
   findToolCalls,
   runToolCalls,
   stripToolSyntax,
+  unlessStopped,
   type ExecutedTool,
   type ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
@@ -90,8 +91,14 @@ export type ToolEgressDecision = 'turn' | 'conversation' | 'deny';
 export interface ToolEgressPolicy {
   /** Grants this conversation already holds, by backend id. */
   isGranted(backendId: string): boolean;
-  /** Ask. Absent means there is nobody to ask, which is a refusal. */
-  request?(request: ToolEgressRequest): Promise<ToolEgressDecision>;
+  /**
+   * Ask. Absent means there is nobody to ask, which is a refusal.
+   *
+   * `signal` is the turn's: a sheet raised here should come down when it
+   * aborts. The engine does not rely on that — an answer that arrives after
+   * Stop reaches nothing either way.
+   */
+  request?(request: ToolEgressRequest, signal?: AbortSignal): Promise<ToolEgressDecision>;
   /** Persist a `conversation` decision. */
   onGranted?(backendId: string): void;
   /**
@@ -866,13 +873,22 @@ export class ChatterangEngine {
             // the tool output.
             allowed = false;
           } else {
-            const decision = await request.egress.request({
+            const asked = {
               backendId: target.backendId,
               modelName: target.modelName,
               tools,
               characters,
-            });
-            allowed = decision !== 'deny';
+            };
+            const decision = request.signal?.aborted
+              ? undefined
+              : await unlessStopped(request.egress.request(asked, request.signal), request.signal);
+            // STOPPED WHILE ASKING, as the MCP gate is (#92, owner ruling OD7).
+            // Read off the signal, not the answer: an answer given after Stop,
+            // or a sheet Stop could not take down, sent the next request, the
+            // tool's output in it on a yes. Nothing is sent, recorded or kept.
+            if (request.signal?.aborted) break;
+            // Allowed only on a yes. Anything else a policy hands back withholds.
+            allowed = decision === 'turn' || decision === 'conversation';
             // An answer given while this destination's grants were being
             // withdrawn covers the request it was asked about, and nothing
             // more: it is not kept for the conversation, and — held with the
@@ -906,6 +922,14 @@ export class ChatterangEngine {
       // Taken as the request is built, beside the tool list `#toIR` declares.
       const offered = declaredTools(request.toolIds);
       const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
+
+      // STOPPED: no request goes to a backend, whether the turn was stopped
+      // before it started, between tool rounds, or while the receipt above was
+      // being read. The signal is handed to the adapter too, but whether an
+      // adapter reads one already aborted before it sends is the adapter's
+      // business, and a turn stopped before its first request still reached
+      // the backend.
+      if (request.signal?.aborted) break;
 
       let turn: TurnResult;
       let failure: unknown = null;

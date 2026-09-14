@@ -133,7 +133,8 @@ const { catalogEntry } = await import('@/data/catalog');
 const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { ChatterangEngine } = await import('@/ai/engine');
 const { toolRegistry } = await import('@/ai/tools/registry');
-const { MCP_CALL, mcpProbe, probeResolver, recordingBackend } = await import('./support/egress-probe');
+const { CALL, MCP_CALL, SECRET, cloudTarget, drainEvents, leakyTool, mcpProbe, probeResolver, recordingBackend, sent } =
+  await import('./support/egress-probe');
 
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
@@ -368,6 +369,39 @@ describe('a turn asked for while one is running', () => {
     expect(fake.messages.get('edit_moved_user'), 'the edit itself is written').toMatchObject({ content: 'hello again' });
   });
 
+  it('is not started from the thread of another chat opened while a sent message is being written', async () => {
+    // `send` writes the message and the chat before the turn is built, and the
+    // turn was built from the thread on screen — once another chat had been
+    // opened meanwhile, that chat's thread went out under the first chat's
+    // model and grants, and the first chat's message and reply landed on the
+    // other chat's screen.
+    given(chat('send_moved', 1), chat('send_moved_other', 2));
+    script = [{ text: 'Reply.' }];
+    fake.hold('messages.put');
+
+    const sending = useChats.getState().send('a question for the first chat');
+    try {
+      await until(() => fake.pending('messages.put') === 1);
+      await useChats.getState().openChat('send_moved_other');
+    } finally {
+      fake.release('messages.put');
+    }
+    await sending;
+
+    expect(signals, 'turns handed to the engine').toHaveLength(0);
+    expect(useChats.getState().activeChatId).toBe('send_moved_other');
+    expect(
+      useChats.getState().messages.map((message) => message.id),
+      'the thread on screen is the chat that was opened',
+    ).toEqual(['send_moved_other_user', 'send_moved_other_reply']);
+    expect(rowsFor('send_moved_other').map((row) => row.id)).toEqual(['send_moved_other_user', 'send_moved_other_reply']);
+    expect(useChats.getState().generating).toBe(false);
+    expect(
+      rowsFor('send_moved').map((row) => row.content),
+      'the message itself is written, to its own chat',
+    ).toContain('a question for the first chat');
+  });
+
   it('is not started by regenerating a reply (the control)', async () => {
     given(chat('regen_control', 1));
     const first = held();
@@ -588,5 +622,253 @@ describe('Stop', () => {
       useChats.getState().messages.some((message) => message.role === 'assistant' && message.streaming),
       'no reply is left being written on screen',
     ).toBe(false);
+  });
+
+  it.each(['Send this turn', 'Don’t send'] as const)(
+    'takes down the tool-output sheet a turn waits on, and nothing is sent after it, answered "%s"',
+    async (answer) => {
+      // The real engine, the real store policy and the real approval queue,
+      // over a connected provider. The model calls a tool that reads the
+      // person's own data, and sending its output to the provider raises the
+      // sheet. That sheet was not given the turn's signal, so Stop left it up,
+      // and the engine sent the next request however it was answered — with
+      // the tool's output in it on a yes.
+      const id = answer === 'Send this turn' ? 'output_yes' : 'output_no';
+      const remote = { ...chat(id, 1, ['leaky']), modelId: null };
+      given(remote);
+      useModels.setState({ activeModelId: null, installed: {} });
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      const cloud = recordingBackend([CALL, 'Done.']);
+      engine.router.register('conn_output', cloud.adapter);
+
+      let sending: Promise<void> = Promise.resolve();
+      let requestsAtStop = -1;
+      let sheetsAfterStop: number | undefined;
+      try {
+        toolRegistry.register(leakyTool);
+        useApp.setState({
+          engine: engine as never,
+          approvals: [],
+          connections: [
+            {
+              id: 'conn_output',
+              providerId: 'openai',
+              label: 'OpenAI',
+              apiKey: '',
+              baseUrl: '',
+              defaultModel: 'gpt-4o-mini',
+              enabled: true,
+              models: [],
+              createdAt: 0,
+            },
+          ] as never,
+        });
+
+        sending = useChats.getState().send('what is in my chats?');
+        await until(() => useApp.getState().approvals.length === 1);
+        expect(useApp.getState().approvals[0]?.title, 'the sheet the turn waits on').toBe('Send tool output to OpenAI?');
+        requestsAtStop = cloud.seen.length;
+
+        useChats.getState().stop();
+        await settledOr(sending, () => false).catch(() => {});
+        sheetsAfterStop = useApp.getState().approvals.length;
+      } finally {
+        // Read above, before this answers whatever is still up.
+        let settled = false;
+        void sending.then(() => {
+          settled = true;
+        });
+        for (let rounds = 0; rounds < 50 && !settled; rounds += 1) {
+          for (const approval of useApp.getState().approvals) {
+            useApp.getState().answerApproval(approval.id, answer === 'Send this turn');
+          }
+          await macrotask();
+        }
+        await sending;
+        toolRegistry.unregister('leaky');
+      }
+
+      expect(sheetsAfterStop, 'sheets still up after Stop').toBe(0);
+      expect(cloud.seen, 'provider requests after Stop').toHaveLength(requestsAtStop);
+      expect(sent(cloud.seen).some((request) => request.includes(SECRET)), 'the tool’s output, sent').toBe(false);
+      expect(useChats.getState().generating).toBe(false);
+    },
+  );
+});
+
+/* ── A prompt that cannot be built ──────────────────────────────────── */
+
+describe('a turn whose prompt cannot be built', () => {
+  it.each(['send', 'regenerate'] as const)(
+    'leaves no reply being written, discards nothing and settles, on %s',
+    async (how) => {
+      // An image's payload is read back while the prompt is built. The read
+      // failing threw out of the turn past the code that ends it: a reply was
+      // left on screen being written, the activity indicator stayed on, and a
+      // regeneration had already taken the reply it meant to replace off the
+      // screen.
+      const id = `unbuildable_${how}`;
+      given(chat(id, 1));
+      const withImage: Message[] = exchange(id).map((row) =>
+        row.role === 'user'
+          ? { ...row, attachments: [{ kind: 'image', id: `att_${id}`, mediaType: 'image/png', bytes: 3 }] }
+          : row,
+      );
+      for (const row of withImage) fake.messages.set(row.id, structuredClone(row));
+      useChats.setState({ messages: withImage });
+      script = [{ text: 'Never.' }];
+      const original = fake.db.blobs.get;
+      fake.db.blobs.get = async () => {
+        throw new Error('disk read failed');
+      };
+
+      let outcome = 'resolved';
+      try {
+        const turn =
+          how === 'send'
+            ? useChats.getState().send('and this one?')
+            : useChats.getState().regenerate(`${id}_reply`);
+        await turn.catch((error: unknown) => {
+          outcome = `rejected: ${String(error)}`;
+        });
+      } finally {
+        fake.db.blobs.get = original;
+      }
+
+      expect(signals, 'turns handed to the engine').toHaveLength(0);
+      expect(
+        useChats.getState().messages.some((message) => message.role === 'assistant' && message.streaming),
+        'a reply left on screen being written',
+      ).toBe(false);
+      expect(useApp.getState().activity, 'the activity indicator').toBe('idle');
+      expect(useChats.getState().generating).toBe(false);
+      expect(outcome, 'what the caller is handed').toBe('resolved');
+      expect(
+        useApp.getState().toasts.some((toast) => toast.tone === 'crit' && toast.message.includes('disk read failed')),
+        'the person is told why',
+      ).toBe(true);
+      expect(rowsFor(id).map((row) => row.id), 'nothing discarded').toEqual(expect.arrayContaining([`${id}_reply`]));
+      if (how === 'regenerate') {
+        expect(
+          useChats.getState().messages.map((message) => message.id),
+          'the thread on screen, as it was',
+        ).toEqual([`${id}_user`, `${id}_reply`]);
+      }
+    },
+  );
+});
+
+/* ── The engine, on its own ─────────────────────────────────────────── */
+
+describe('the engine, once its turn is stopped', () => {
+  it('hands the backend nothing for a turn stopped before it started', async () => {
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend(['Hi.']);
+    engine.router.register('cloud', cloud.adapter);
+    const controller = new AbortController();
+    controller.abort();
+
+    await drainEvents(
+      engine.stream({ messages: [{ role: 'user', content: 'go' }], target: cloudTarget, signal: controller.signal }),
+    );
+
+    expect(cloud.seen, 'provider requests').toHaveLength(0);
+  });
+
+  it('asks the tool-output question with the turn’s signal, and sends nothing on an answer given after Stop', async () => {
+    // A policy that ignores the signal and answers yes for the conversation
+    // once Stop has been pressed: the answer reaches nothing, and no grant is
+    // kept from it.
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+    const controller = new AbortController();
+    const askedWith: (AbortSignal | undefined)[] = [];
+    const onGranted = vi.fn();
+    const request = vi.fn(async (_asked: unknown, signal?: AbortSignal) => {
+      askedWith.push(signal);
+      controller.abort();
+      return 'conversation' as const;
+    });
+
+    let events: import('@/ai/engine').GenerationEvent[] = [];
+    try {
+      toolRegistry.register(leakyTool);
+      events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: cloudTarget,
+          toolIds: ['leaky'],
+          egress: { isGranted: () => false, request, onGranted },
+          signal: controller.signal,
+        }),
+      );
+    } finally {
+      toolRegistry.unregister('leaky');
+    }
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(askedWith, 'the signal the question was asked with').toEqual([controller.signal]);
+    expect(cloud.seen, 'provider requests: the one that asked for the tool, and none after').toHaveLength(1);
+    expect(onGranted, 'a grant kept from an answer given after Stop').not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === 'egress'), 'an egress receipt for a request never made').toBe(false);
+  });
+
+  it('ends the turn on Stop while the tool-output question waits on an answer that never comes', async () => {
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+    const controller = new AbortController();
+    const request = vi.fn(() => new Promise<'turn'>(() => {}));
+
+    let settled = false;
+    try {
+      toolRegistry.register(leakyTool);
+      void drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: cloudTarget,
+          toolIds: ['leaky'],
+          egress: { isGranted: () => false, request },
+          signal: controller.signal,
+        }),
+      ).then(() => {
+        settled = true;
+      });
+      await until(() => request.mock.calls.length === 1);
+      controller.abort();
+      // Read below: a turn that never ends fails the expectation, not this wait.
+      await until(() => settled).catch(() => {});
+    } finally {
+      toolRegistry.unregister('leaky');
+    }
+
+    expect(settled, 'the turn ended').toBe(true);
+    expect(cloud.seen, 'provider requests').toHaveLength(1);
+  });
+
+  it('withholds the tool’s output on an answer that is not a yes', async () => {
+    // Allowed was anything but `deny`, so an answer a policy got wrong — or the
+    // nothing a question cut short by Stop comes back with — sent the output.
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: cloudTarget,
+          toolIds: ['leaky'],
+          egress: { isGranted: () => false, request: async () => undefined as never },
+        }),
+      );
+    } finally {
+      toolRegistry.unregister('leaky');
+    }
+
+    expect(cloud.seen.length, 'the request after the tool ran').toBeGreaterThan(1);
+    expect(sent(cloud.seen).some((request) => request.includes(SECRET)), 'the tool’s output, sent').toBe(false);
   });
 });

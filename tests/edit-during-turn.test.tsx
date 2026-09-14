@@ -162,3 +162,79 @@ describe('the edit sheet', () => {
     });
   });
 });
+
+/*
+ * THE COMPOSER KEEPS WHAT WAS TYPED WHILE A TURN IS RUNNING.
+ *
+ * Send is not on screen during a turn — Stop is — but Enter in the field and
+ * the Send command still reached the composer's send, which handed the text to
+ * the store and cleared the field. The store refuses a turn while one runs, so
+ * what was typed was gone. The same loss the edit sheet above had.
+ */
+describe('the composer', () => {
+  const field = (): HTMLTextAreaElement =>
+    document.querySelector<HTMLTextAreaElement>('textarea.composer__input')!;
+
+  async function type(text: string): Promise<void> {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
+    await act(async () => {
+      setValue.call(field(), text);
+      field().dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(field().value, 'what was typed').toBe(text);
+  }
+
+  /** Each way of sending; the command also says whether anything claimed it. */
+  const WAYS: Record<string, () => Promise<boolean | undefined>> = {
+    'Mod+Enter in the field': async () => {
+      await act(async () => {
+        field().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+      });
+      return undefined;
+    },
+    'the Send command': async () => {
+      const { runCommand } = await import('@/lib/keys');
+      let handled = false;
+      await act(async () => {
+        handled = runCommand('chat.send');
+      });
+      return handled;
+    },
+  };
+
+  it.each(Object.keys(WAYS))(
+    'sends nothing and keeps the text while a turn is running, through %s',
+    async (way) => {
+      const original = useChats.getState().send;
+      const send = vi.fn(async () => {});
+      useChats.setState({ send });
+      try {
+        await mounted(async () => {
+          await act(async () => {
+            useChats.setState({ generating: true });
+          });
+          await type('my next question');
+          const handled = await WAYS[way]!();
+
+          expect(send, 'sends handed to the store').not.toHaveBeenCalled();
+          expect(field().value, 'the text, still in the field').toBe('my next question');
+          if (handled !== undefined) {
+            // Handed back, as a disabled composer hands it back: nothing sent.
+            expect(handled, 'the command, claimed while a turn runs').toBe(false);
+          }
+
+          // Once the turn has settled, the same press sends it.
+          await act(async () => {
+            useChats.setState({ generating: false });
+          });
+          const handledAfter = await WAYS[way]!();
+          expect(send).toHaveBeenCalledWith('my next question', []);
+          expect(field().value).toBe('');
+          if (handledAfter !== undefined) expect(handledAfter).toBe(true);
+        });
+      } finally {
+        useChats.setState({ send: original });
+      }
+    },
+  );
+});
