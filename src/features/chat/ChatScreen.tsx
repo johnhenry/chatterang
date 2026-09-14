@@ -1005,6 +1005,11 @@ function EditSheet({
   onClose: () => void;
 }): ReactNode {
   const [text, setText] = useState('');
+  // Saving starts a turn, and the store starts none while one is running. The
+  // sheet closed on the press either way, so a refused save threw away what
+  // was typed. Not offered then, as the composer does not offer Send, and the
+  // sheet stays open.
+  const generating = useChats((state) => state.generating);
 
   useEffect(() => {
     setText(message?.content ?? '');
@@ -1025,6 +1030,7 @@ function EditSheet({
           <button
             type="button"
             className="btn btn--primary grow"
+            disabled={generating}
             onClick={() => {
               void useChats.getState().editMessage(message.id, text);
               onClose();
@@ -1038,6 +1044,9 @@ function EditSheet({
       <p className="section__hint">
         Editing this message discards everything after it and generates a fresh reply.
       </p>
+      {generating ? (
+        <p className="section__hint">A reply is still being written. Stop it or let it finish, then save.</p>
+      ) : null}
       <textarea
         className="textarea"
         value={text}

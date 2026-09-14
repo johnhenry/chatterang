@@ -259,17 +259,65 @@ const removedChats = new Set<string>();
  */
 const refusedRows = new Map<string, Map<string, Message>>();
 
+/** A turn that has been claimed, with the chat it runs in and what stops it. */
+interface LiveTurn {
+  readonly chatId: string;
+  readonly controller: AbortController;
+}
+
 /**
- * Every generation still running, with the chat it belongs to and what stops it.
+ * Every turn claimed and not yet settled. See `claimTurn`.
  *
- * A SET, NOT ONE SLOT. More than one turn can be running: editing a user message
- * starts a turn without asking whether one is already running, and the edit
- * button is on screen while one is. One slot held the turn started last, and
- * deleting the chat the earlier one ran in stopped nothing — its model went on
- * calling an MCP server under the conversation's earlier yes, measured through
- * the real engine.
+ * A SET, NOT ONE SLOT. Editing a user message once started a turn without asking
+ * whether one was already running, and one slot held the turn started last:
+ * deleting the chat the earlier one ran in stopped nothing, and its model went
+ * on calling an MCP server under the conversation's earlier yes, measured
+ * through the real engine. One turn runs at a time now, and what stops turns —
+ * Stop, a chat's delete — still walks every one there is.
  */
-const liveTurns = new Set<{ readonly chatId: string; readonly controller: AbortController }>();
+const liveTurns = new Set<LiveTurn>();
+
+/** Whether a turn is running, on either sign of one. */
+function turnRunning(get: () => ChatState): boolean {
+  return get().generating || liveTurns.size > 0;
+}
+
+/**
+ * Claim the app's one running turn, for `chatId`, or null while a turn is running.
+ *
+ * ONE TURN AT A TIME, FOR THE WHOLE APP. `generating` is one flag, not one per
+ * chat, and the composer offers Stop in whatever chat is open while it is set,
+ * so `send` and `regenerate` already refused in every chat while any turn ran.
+ * `editMessage` did not ask at all, and `send` asked and then wrote the message
+ * and the chat before the turn set the flag, so a second send made meanwhile
+ * passed the same check. Two turns ran. Stop aborted the one started last, and
+ * that one's end cleared `generating` while the other still streamed, ran tools
+ * and handed MCP arguments to servers — with Send on screen where Stop had been.
+ *
+ * So the question and the claim are ONE STEP, with nothing awaited between them,
+ * and `runGeneration` cannot be called without a claimed turn. A claimed turn is
+ * in `liveTurns` from here, so Stop and a chat's delete reach it before it has
+ * reached the engine, and `runGeneration` hands no stopped turn over.
+ */
+function claimTurn(
+  set: (partial: Partial<ChatState>) => void,
+  get: () => ChatState,
+  chatId: string,
+): LiveTurn | null {
+  if (turnRunning(get)) return null;
+  const turn: LiveTurn = { chatId, controller: new AbortController() };
+  liveTurns.add(turn);
+  set({ generating: true, controller: turn.controller });
+  return turn;
+}
+
+/**
+ * Give a claimed turn back once it has settled, however it did. Calling it again
+ * does nothing. `generating` goes false only when no turn is left.
+ */
+function releaseTurn(set: (partial: Partial<ChatState>) => void, turn: LiveTurn): void {
+  if (liveTurns.delete(turn) && liveTurns.size === 0) set({ generating: false, controller: null });
+}
 
 /**
  * Write a message row, unless its chat's delete has been asked for. See
@@ -374,7 +422,10 @@ interface ChatState {
   generating: boolean;
   /** Live context accounting for the open chat. */
   context: ContextUsage | null;
-  /** Controller for the in-flight generation, so it can be stopped. */
+  /**
+   * The running turn's controller, or null. NOT WHAT STOPS TURNS: `stop()`
+   * aborts every claimed turn, and a chat's delete every one in that chat.
+   */
   controller: AbortController | null;
 
   load: () => Promise<void>;
@@ -409,6 +460,7 @@ interface ChatState {
 
   refreshContext: () => void;
   send: (text: string, attachments?: Attachment[]) => Promise<void>;
+  /** Stop every turn that is running, in whatever chat it runs. See `claimTurn`. */
   stop: () => void;
   regenerate: (messageId: string, overrideModelId?: string) => Promise<void>;
   editMessage: (messageId: string, text: string) => Promise<void>;
@@ -725,41 +777,51 @@ export const useChats = create<ChatState>((set, get) => ({
 
   async send(text, attachments = []) {
     const chatId = get().activeChatId;
-    if (!chatId || get().generating) return;
+    if (!chatId) return;
 
     const chat = get().chats.find((entry) => entry.id === chatId);
     if (!chat) return;
 
-    const userMessage: Message = {
-      id: newId('msg'),
-      chatId,
-      role: 'user',
-      content: text,
-      attachments: attachments.length > 0 ? attachments : undefined,
-      createdAt: Date.now(),
-    };
+    // Claimed BEFORE anything is written, in the step that asks. Asked here and
+    // set by the turn, a second send made while this one wrote passed the same
+    // check. See `claimTurn`.
+    const turn = claimTurn(set, get, chatId);
+    if (!turn) return;
 
-    await putMessage(userMessage);
-    set({ messages: [...get().messages, userMessage] });
+    try {
+      const userMessage: Message = {
+        id: newId('msg'),
+        chatId,
+        role: 'user',
+        content: text,
+        attachments: attachments.length > 0 ? attachments : undefined,
+        createdAt: Date.now(),
+      };
 
-    if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
-      await get().updateChat(chatId, { title: deriveTitle(text) });
+      await putMessage(userMessage);
+      set({ messages: [...get().messages, userMessage] });
+
+      if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
+        await get().updateChat(chatId, { title: deriveTitle(text) });
+      }
+      await get().updateChat(chatId, (current) => ({
+        messageCount: current.messageCount + 1,
+        preview: text.slice(0, 120),
+      }));
+
+      await runGeneration(set, get, { turn });
+    } finally {
+      releaseTurn(set, turn);
     }
-    await get().updateChat(chatId, (current) => ({
-      messageCount: current.messageCount + 1,
-      preview: text.slice(0, 120),
-    }));
-
-    await runGeneration(set, get, { chatId });
   },
 
   stop() {
-    get().controller?.abort();
+    // EVERY TURN, not the one started last, and one claimed that has not reached
+    // the engine yet. See `claimTurn`.
+    for (const turn of liveTurns) turn.controller.abort();
   },
 
   async regenerate(messageId, overrideModelId) {
-    if (get().generating) return;
-
     const messages = get().messages;
     const index = messages.findIndex((message) => message.id === messageId);
     if (index === -1) return;
@@ -770,37 +832,45 @@ export const useChats = create<ChatState>((set, get) => ({
     const chatId = get().activeChatId;
     if (!chatId) return;
 
-    // Everything after this assistant turn is discarded; the turn itself is
-    // kept so its previous text becomes a variant the user can flip back to.
-    //
-    // ONLY ONCE A TURN HAS STARTED. They were deleted first, and the turn once
-    // `runGeneration` returned, whether or not it had started anything. One that
-    // could not start — no model, a chat being deleted — replaced them with
-    // nothing: the turn and what came after it were gone from disk and screen,
-    // an MCP receipt saying arguments went included.
-    const removed = messages.slice(index + 1);
-    set({ messages: messages.slice(0, index) });
-    const ran = await runGeneration(set, get, {
-      chatId,
-      overrideModelId,
-      // Not `target.content`. What is carried forward is the whole generation
-      // — where it ran, what tools it used, what it cost — because the text
-      // alone is what let the new turn's chip end up over the old turn's
-      // words.
-      previousVariants: generationsSoFar(target),
-      replaceMessageId: target.id,
-      // All made in one step. See `beforeEngine`.
-      beforeEngine: async () => {
-        await Promise.all(removed.map((message) => deleteMessageRow(message.id)));
-      },
-    });
-    if (ran) {
-      await deleteMessageRow(target.id);
-      return;
+    // Nothing above waits, so this is the step that asks. See `claimTurn`.
+    const turn = claimTurn(set, get, chatId);
+    if (!turn) return;
+
+    try {
+      // Everything after this assistant turn is discarded; the turn itself is
+      // kept so its previous text becomes a variant the user can flip back to.
+      //
+      // ONLY ONCE A TURN HAS STARTED. They were deleted first, and the turn once
+      // `runGeneration` returned, whether or not it had started anything. One that
+      // could not start — no model, a chat being deleted — replaced them with
+      // nothing: the turn and what came after it were gone from disk and screen,
+      // an MCP receipt saying arguments went included.
+      const removed = messages.slice(index + 1);
+      set({ messages: messages.slice(0, index) });
+      const ran = await runGeneration(set, get, {
+        turn,
+        overrideModelId,
+        // Not `target.content`. What is carried forward is the whole generation
+        // — where it ran, what tools it used, what it cost — because the text
+        // alone is what let the new turn's chip end up over the old turn's
+        // words.
+        previousVariants: generationsSoFar(target),
+        replaceMessageId: target.id,
+        // All made in one step. See `beforeEngine`.
+        beforeEngine: async () => {
+          await Promise.all(removed.map((message) => deleteMessageRow(message.id)));
+        },
+      });
+      if (ran) {
+        await deleteMessageRow(target.id);
+        return;
+      }
+      // Nothing started, so nothing was discarded: the thread goes back on screen
+      // as it was, if it is still the one open.
+      if (get().activeChatId === chatId) set({ messages });
+    } finally {
+      releaseTurn(set, turn);
     }
-    // Nothing started, so nothing was discarded: the thread goes back on screen
-    // as it was, if it is still the one open.
-    if (get().activeChatId === chatId) set({ messages });
   },
 
   async editMessage(messageId, text) {
@@ -811,20 +881,35 @@ export const useChats = create<ChatState>((set, get) => ({
     const message = messages[index];
     if (!message) return;
 
-    const updated = editedVariant(message, text);
-    await putMessage(updated);
+    // REFUSED WHILE A TURN IS RUNNING, as `send` and `regenerate` are, and whole.
+    // It asked nothing: it deleted the rows after the edited message, the running
+    // turn's among them, and started a second turn beside the first, which Stop
+    // then could not reach. The edit sheet does not offer it meanwhile.
+    if (turnRunning(get)) return;
 
-    // Editing a user turn invalidates everything after it.
+    // Editing a user turn invalidates everything after it, and starts a turn:
+    // claimed here, in the same step as the question above. See `claimTurn`.
     const after = messages.slice(index + 1);
-    if (message.role === 'user' && after.length > 0) {
-      for (const stale of after) await deleteMessageRow(stale.id);
-      set({ messages: [...messages.slice(0, index), updated] });
-      const chatId = get().activeChatId;
-      if (chatId) await runGeneration(set, get, { chatId });
-      return;
-    }
+    const turn = message.role === 'user' && after.length > 0 ? claimTurn(set, get, message.chatId) : null;
 
-    set({ messages: messages.map((entry) => (entry.id === messageId ? updated : entry)) });
+    try {
+      const updated = editedVariant(message, text);
+      await putMessage(updated);
+
+      if (turn) {
+        for (const stale of after) await deleteMessageRow(stale.id);
+        // The turn is built from the thread on screen, so only while that is
+        // still the conversation that was edited.
+        if (get().activeChatId !== turn.chatId) return;
+        set({ messages: [...messages.slice(0, index), updated] });
+        await runGeneration(set, get, { turn });
+        return;
+      }
+
+      set({ messages: messages.map((entry) => (entry.id === messageId ? updated : entry)) });
+    } finally {
+      if (turn) releaseTurn(set, turn);
+    }
   },
 
   async deleteMessage(messageId) {
@@ -932,7 +1017,11 @@ function carriesReceipt(variant: MessageVariant): boolean {
 /* ── Generation ─────────────────────────────────────────────────────── */
 
 interface RunOptions {
-  chatId: string;
+  /**
+   * The turn `claimTurn` gave the caller, whose chat this runs in. Given back
+   * here once the turn has run, and by the caller however it went.
+   */
+  turn: LiveTurn;
   overrideModelId?: string;
   /** Complete generations this turn has already had — see `generationsSoFar`. */
   previousVariants?: MessageVariant[];
@@ -958,7 +1047,9 @@ async function runGeneration(
     return false;
   }
 
-  const chat = get().chats.find((entry) => entry.id === options.chatId);
+  const { turn } = options;
+  const { controller } = turn;
+  const chat = get().chats.find((entry) => entry.id === turn.chatId);
   // Nor in a chat whose delete has been asked for: it stays in the store until
   // the delete lands. See `removedChats`.
   if (!chat || removedChats.has(chat.id)) return false;
@@ -978,7 +1069,6 @@ async function runGeneration(
   }
   const { target } = choice;
 
-  const controller = new AbortController();
   const placeholder: Message = {
     id: newId('msg'),
     chatId: chat.id,
@@ -992,15 +1082,15 @@ async function runGeneration(
     variantIndex: options.previousVariants?.length,
   };
 
-  set({ generating: true, controller, messages: [...get().messages, placeholder] });
-  const live = { chatId: chat.id, controller };
-  liveTurns.add(live);
+  // `generating` has been set since the turn was claimed. See `claimTurn`.
+  set({ messages: [...get().messages, placeholder] });
   app.setActivity(runsOnThisDevice(target) ? 'loading' : 'remote');
 
   const started = performance.now();
   let raw = '';
   let toolCalls: ToolInvocation[] = [];
   let firstDelta = true;
+  let handedOver = false;
 
   const patch = (updater: (message: Message) => Message): void => {
     set({
@@ -1044,12 +1134,16 @@ async function runGeneration(
   livePlaceholderId = placeholder.id;
 
   try {
-    // Deleted while the prompt was being built. A stopped signal is not enough
-    // here: the engine can still raise a sheet before its first request.
-    if (removedChats.has(chat.id)) {
-      patch((message) => ({ ...message, streaming: false }));
+    // Deleted or stopped while the prompt was being built. A stopped signal is
+    // not enough here: the engine does not read it before its first request —
+    // measured, a turn stopped while its prompt was built still reached the
+    // backend — and can raise a sheet before that. Nothing is handed over, and
+    // no reply is left on screen being written.
+    if (removedChats.has(chat.id) || controller.signal.aborted) {
+      set({ messages: get().messages.filter((message) => message.id !== placeholder.id) });
       return false;
     }
+    handedOver = true;
     // Started, not awaited: an await here would let a delete in between the
     // check above and the hand-off below. Its writes are made now, and it is
     // awaited once the stream has ended.
@@ -1272,18 +1366,23 @@ async function runGeneration(
     app.toast(message, 'crit');
   } finally {
     if (livePlaceholderId === placeholder.id) livePlaceholderId = null;
-    liveTurns.delete(live);
-    set({ generating: false, controller: null });
-    app.setActivity('idle');
-    app.setLiveRate(null);
+    // `generating` stays set while another turn is still claimed.
+    releaseTurn(set, turn);
+    if (liveTurns.size === 0) {
+      app.setActivity('idle');
+      app.setLiveRate(null);
+    }
 
-    if (runsOnThisDevice(target)) void useModels.getState().noteUse(target.modelId);
+    // A turn never handed to the engine is not a use of the model, nor a reply.
+    if (handedOver) {
+      if (runsOnThisDevice(target)) void useModels.getState().noteUse(target.modelId);
 
-    const last = get().messages.at(-1);
-    await useChats.getState().updateChat(chat.id, (chatNow) => ({
-      messageCount: chatNow.messageCount + 1,
-      preview: last?.content.slice(0, 120) ?? chatNow.preview,
-    }));
+      const last = get().messages.at(-1);
+      await useChats.getState().updateChat(chat.id, (chatNow) => ({
+        messageCount: chatNow.messageCount + 1,
+        preview: last?.content.slice(0, 120) ?? chatNow.preview,
+      }));
+    }
   }
   return true;
 }

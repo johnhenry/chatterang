@@ -420,7 +420,9 @@ describe('a chat deleted while a turn is running in it', () => {
     script = [{ text: 'Here you go.', hang: turn.promise }];
 
     const sending = useChats.getState().send('my bank details are 1234');
-    await until(() => useChats.getState().generating);
+    // Handed to the engine. `generating` is set as the turn is claimed, before
+    // its message is written, and a delete asked for then stops it before that.
+    await until(() => signals.length === 1);
     await useChats.getState().removeChat('turn');
     expect(rowsFor('turn'), 'the delete took what was there').toEqual([]);
 
@@ -454,7 +456,7 @@ describe('a chat deleted while a turn is running in it', () => {
 
     const sending = useChats.getState().send('look up my bank details');
     try {
-      await until(() => useChats.getState().generating);
+      await until(() => signals.length === 1);
       await useChats.getState().removeChat('receipt');
       beforeTool.release();
       await until(() => handled);
@@ -555,12 +557,14 @@ describe('a chat deleted while a turn is running in it', () => {
   it.each(['opens another chat and edits a message there', 'only opens another chat'] as const)(
     'sends no further MCP call when, while the call is out, the person %s and then deletes it',
     async (how) => {
-      // Editing a user message starts a turn without asking whether one is
+      // Editing a user message started a turn without asking whether one was
       // running, and the edit button is on screen while one is. So the edit
-      // starts a second turn, in the other chat, while the first is still
+      // started a second turn, in the other chat, while the first was still
       // running. The store remembered only the turn started last, and deleting
       // the first chat stopped nothing: its model called the server again under
-      // the conversation's yes. The control only opens the other chat.
+      // the conversation's yes. The edit is now refused while a turn runs
+      // (stop-every-turn.test.ts), and the delete must still stop the first
+      // chat's turn. The control only opens the other chat.
       const edits = how === 'opens another chat and edits a message there';
       const id = edits ? 'two_turns' : 'one_turn';
       const other = `${id}_other`;
@@ -584,9 +588,9 @@ describe('a chat deleted while a turn is running in it', () => {
       });
       const asked: string[] = [];
       const original = useApp.getState().requestApproval;
-      // Requests in order: the first chat's, the edited chat's whole turn, then
-      // the first chat's next call and its last reply.
-      const backend = recordingBackend(edits ? [MCP_CALL, 'Edited reply.', MCP_CALL, 'Done.'] : [MCP_CALL, MCP_CALL, 'Done.']);
+      // Requests in order: the first chat's, then its next call and its last
+      // reply if nothing stops it. The refused edit asks for none.
+      const backend = recordingBackend([MCP_CALL, MCP_CALL, 'Done.']);
 
       try {
         toolRegistry.register(probe.tool);
@@ -612,8 +616,9 @@ describe('a chat deleted while a turn is running in it', () => {
       expect(fake.chats.has(id)).toBe(false);
       expect(rowsFor(id)).toEqual([]);
       if (edits) {
-        // The other chat's turn is not the one deleted, and ran to its end.
-        expect((rowsFor(other) as Message[]).map((row) => row.content)).toEqual(['hello again', 'Edited reply.']);
+        // Refused while the first chat's turn ran: the other chat is as it was.
+        expect((rowsFor(other) as Message[]).map((row) => row.content)).toEqual(['hello', 'Hi.']);
+        expect(backend.seen, 'no turn was started for the edit').toHaveLength(1);
       }
     },
   );
@@ -781,7 +786,7 @@ describe('a chat deleted while a turn is running in it', () => {
     script = [{ text: 'Here you go.', hang: turn.promise }];
 
     const sending = useChats.getState().send('my bank details are 1234');
-    await until(() => useChats.getState().generating);
+    await until(() => signals.length === 1);
     fake.hold('deleteChat');
     const removing = useChats.getState().removeChat('finishing');
     await until(() => fake.pending('deleteChat') === 1);
@@ -807,7 +812,8 @@ describe('a chat deleted while a turn is running in it', () => {
       const turn = held();
       useApp.setState({
         engine: {
-          async *stream() {
+          async *stream(request: { signal?: AbortSignal }) {
+            signals.push(request.signal);
             await turn.promise;
             if (how === 'a stream that throws') throw new Error('The socket closed.');
             yield { type: 'error', message: 'The model stopped.' };
@@ -816,7 +822,7 @@ describe('a chat deleted while a turn is running in it', () => {
       });
 
       const sending = useChats.getState().send('my bank details are 1234');
-      await until(() => useChats.getState().generating);
+      await until(() => signals.length === 1);
       await useChats.getState().removeChat(id);
       turn.release();
       await sending;
