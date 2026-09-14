@@ -26,6 +26,7 @@
  *     desktop, one IPv4, "Desk"                            130   164   v9   53 modules
  *     desktop, IPv4 + two IPv6, "John’s MacBook Pro"       199   233   v11  61
  *     server, 3 IPv4 + 3 IPv6, "homelab"                   222   256   v12  65
+ *     desktop, IPv4 + four IPv6, "John’s MacBook Pro"      247   281   v12  65
  *     desktop, IPv4 + two IPv6, 64-byte name               258   292   v13  69
  *     server, 2 IPv4 + IPv6 + tailnet DNS, 64-byte name    291   325   v13  69
  *     server, IPv4 + 4 IPv6, 57-byte name                  296   330   v13  69
@@ -38,6 +39,11 @@
  * the cap admits draw at v14 (298 and 300 are pinned; base64url has no 297,
  * and 299 lies between them). `MAX_PAIRING_URI_LENGTH` records what that means
  * for a terminal.
+ *
+ * The field limits admit payloads the cap does not: one IPv4 and four IPv6
+ * addresses with a 64-byte name is refused by `encodePairingUri` as too long
+ * (pinned in the test). So the screen that calls this has to choose which
+ * addresses, and how much of the name, to carry.
  *
  * ## Choices, and why
  *

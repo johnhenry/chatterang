@@ -503,6 +503,45 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
       expect(s.ends).toEqual([{ reason: 'result' }]);
     });
 
+    it('with the same shape but another artifact id is another code: the held session is let go, never fed', async () => {
+      /*
+       * THE ARTIFACT-ID COMPARISON, pinned in the loop. OAT's own decoder
+       * accepts a packet of the same shape from another artifact without a
+       * word (`tests/pairing-frames.test.ts`), and two codes for one host
+       * differ only in their token, so they ARE the same shape. Feeding one
+       * code's blocks to another's session would rebuild neither.
+       *
+       * FOUND BY MUTATION: with the comparison replaced by `return true`,
+       * every other test still passed.
+       */
+      const { openSession, opened } = watchedSessions();
+      const dusk = encodePairingUri({ ...decodePairingUri(VALID_URI), name: 'Dusk', token: new Uint8Array(32).fill(9) });
+      expect(dusk.length).toBe(VALID_URI.length);
+      const desk = codeInBlocks(VALID_URI, 16, 1);
+      const other = codeInBlocks(dusk, 16, 2);
+      const reads = [desk()];
+      const s = setup({ decode: async () => reads.shift() ?? other(), openSession });
+
+      s.scheduler.step();
+      await flush();
+      expect(opened).toHaveLength(1);
+      expect(s.ends).toEqual([]);
+
+      s.scheduler.step();
+      await flush();
+      expect(opened[0]!.release, 'the first code was not let go').toHaveBeenCalledOnce();
+      expect(openSession).toHaveBeenCalledTimes(2);
+
+      for (let i = 0; i < 300 && s.ends.length === 0; i += 1) {
+        s.scheduler.step();
+        await flush();
+      }
+      expect(s.ends).toEqual([{ reason: 'result' }]);
+      expect(s.onResult).toHaveBeenCalledOnce();
+      expect(s.onResult.mock.calls[0]![0].name).toBe('Dusk');
+      expect(s.onHint).not.toHaveBeenCalled();
+    });
+
     it('never crashes the loop: a session that throws is dropped and reading goes on', async () => {
       /*
        * OAT's decoder throws on a packet of another shape. The loop replaces

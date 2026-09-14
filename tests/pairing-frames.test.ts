@@ -10,8 +10,10 @@ import {
   ADDRESS_IPV6,
   HOST_DESKTOP,
   HOST_SERVER,
+  MAX_ADDRESSES,
   MAX_NAME_BYTES,
   MAX_PAIRING_URI_LENGTH,
+  PairingParseError,
   TRUST_SPKI_PIN,
   decodePairingUri,
   encodePairingUri,
@@ -104,6 +106,13 @@ const MEASURED: readonly {
     }),
     uri: 222,
     frame: 256,
+    version: 12,
+  },
+  {
+    label: 'desktop, IPv4 + four IPv6, "John’s MacBook Pro"',
+    payload: payload({ addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'John’s MacBook Pro' }),
+    uri: 247,
+    frame: 281,
     version: 12,
   },
   {
@@ -232,6 +241,29 @@ describe('a real pairing payload, framed, drawn and read back from pixels', () =
   it('draws at the level and quiet zone it states', () => {
     expect(PAIRING_FRAME_EC_LEVEL).toBe('M');
     expect(PAIRING_FRAME_QUIET_ZONE).toBe(4);
+  });
+
+  it('a payload every field limit admits can still be too long to encode, so a screen must choose what to leave out', () => {
+    /*
+     * NOT A REALISTIC-OR-NOT CLAIM, a measured edge. The table above picks
+     * names that fit; this one does not. One IPv4 and four IPv6 addresses — a
+     * laptop with a link-local, a ULA and temporary global addresses has that
+     * many — with a 64-byte name (21 CJK characters) is inside MAX_ADDRESSES
+     * and MAX_NAME_BYTES, and over MAX_PAIRING_URI_LENGTH. `encodePairingUri`
+     * refuses it, so #127's screen has to trim addresses or the name, and to
+     * stay at version 13 it has to reach 296 characters, not 300.
+     */
+    const over = payload({ addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'x'.repeat(MAX_NAME_BYTES) });
+    expect(over.addresses.length).toBeLessThanOrEqual(MAX_ADDRESSES);
+    let reason: unknown = null;
+    try {
+      encodePairingUri(over);
+    } catch (error) {
+      reason = error instanceof PairingParseError ? error.reason : error;
+    }
+    expect(reason).toBe('too-long');
+    // One address fewer fits, at the version the terminal budget allows.
+    expect(encodePairingUri({ ...over, addresses: over.addresses.slice(0, 4) }).length).toBeLessThanOrEqual(296);
   });
 });
 

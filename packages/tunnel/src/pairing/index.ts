@@ -236,10 +236,17 @@ export const TOKEN_BYTES = 32;
  * So the derivation holds up to 296 characters and NOT for the three longer
  * URIs this cap admits: 298, 299 and 300 characters draw at version 14, which
  * with the quiet zone above is 73 + 8 = 81 columns and does not fit 80. The cap
- * is deliberately left at 300. The largest realistic payload measured is 291
- * characters; whether to lower the cap to 296 belongs with the terminal
- * renderer (#124), not to a change that only measured it. Nothing has been
- * scanned by a camera yet — that is still #127's screen.
+ * is deliberately left at 300; whether to lower it to 296 belongs with the
+ * terminal renderer (#124), not to a change that only measured it.
+ *
+ * THE CAP BINDS BEFORE THE FIELD LIMITS DO, and a real host can reach it. One
+ * IPv4 and four IPv6 addresses — what a laptop with a link-local, a ULA and
+ * temporary global addresses carries — with a 64-byte name (21 CJK characters)
+ * is inside MAX_ADDRESSES and MAX_NAME_BYTES and is refused here as
+ * `too-long`; `tests/pairing-frames.test.ts` pins it. So whatever draws a code
+ * chooses which addresses, and how much of the name, to carry, and should aim
+ * at 296 characters rather than 300. Nothing has been scanned by a camera yet —
+ * that is still #127's screen.
  */
 export const MAX_PAIRING_URI_LENGTH = 300;
 

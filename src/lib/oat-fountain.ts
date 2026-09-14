@@ -29,6 +29,11 @@
  * scanner does not rely on either version: `src/lib/qr-scan.ts` refuses a
  * packet that does not describe a pairing-sized, self-consistent payload
  * BEFORE a decoder is constructed for it.
+ *
+ * 0.1.0 also keeps a module-level cache of one degree table per block count it
+ * has seen, and never empties it. The tables are numbers computed from the
+ * count, not packet contents; `src/lib/qr-scan.ts` records what that means for
+ * a scan.
  */
 
 export { FountainDecoder, decodePacket, generatePackets, prepareSource } from '@johnhenry/oat-qr-fountain';

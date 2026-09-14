@@ -31,6 +31,14 @@
  *     handed up — and in `teardown`, which every other ending (cancel, the
  *     pane unmounting or going to the background, the track ending, a decoder
  *     that will not load, a malformed code, the idle timeout) goes through.
+ *     `tests/pairing-scan-releases.test.ts` checks that with the garbage
+ *     collector: after each ending no decoder, packet, frame or payload is
+ *     reachable. ONE THING OUTLIVES THE SCAN, and it is OAT's, not this
+ *     loop's: 0.1.0 caches a degree table per block count in a module-level
+ *     `Map` (`robustSolitonTable` in its `lt.js`) that nothing clears. It holds
+ *     numbers derived from the block count alone, never a byte of any block,
+ *     and `classifyPacket` bounds the block count to 300, so at most 300
+ *     tables. A pairing code, with one block, adds only the table for 1.
  *   - A PACKET FROM ANOTHER CODE REPLACES THE ONE BEING COLLECTED. A different
  *     artifact id, block count, block size or length is a different code, and
  *     OAT's decoder throws on the last three. Ignoring the newcomer would tie
@@ -467,10 +475,13 @@ export function startQrScan(options: ScanOptions): ScanHandle {
       return;
     }
 
-    // Released BEFORE the text is parsed or anything is handed up.
+    // Released BEFORE the text is parsed or anything is handed up. Not zeroed:
+    // jsQR's result, the packet OAT decoded and the decoder each hold their own
+    // copy of these bytes, and this code can reach none of them. What makes
+    // them go is that nothing refers to them once the session is dropped —
+    // `tests/pairing-scan-releases.test.ts` asks the garbage collector.
     dropSession();
     const text = pairingUriFromBytes(bytes);
-    bytes.fill(0);
     if (text === null) {
       hint(delay);
       return;

@@ -44,11 +44,10 @@ No source was copied from any AGPL-licensed project.
 | `@peculiar/x509` | MIT | The tunnel's self-signed certificate (#179); desktop and server only |
 | `reflect-metadata` | Apache-2.0 | The polyfill `@peculiar/x509` requires; loaded with it |
 
-Verified against each package's published `LICENSE` file, except `jsqr`, which
-publishes no `LICENSE` file; its licence is the `license` field of its
-`package.json`. The aimatey packages are pinned to exact versions rather than
-ranges, per the PRD's treatment of them as an in-house dependency (§6), and
-`@johnhenry/oat-qr-fountain` is pinned the same way.
+Verified against each package's published `LICENSE` file. The aimatey packages
+are pinned to exact versions rather than ranges, per the PRD's treatment of
+them as an in-house dependency (§6), and `@johnhenry/oat-qr-fountain` is pinned
+the same way.
 
 `@johnhenry/oat-qr-fountain` brings `qrcode` (MIT) with it, which the desktop
 uses to draw a frame, and `qrcode` brings `pngjs` and `dijkstrajs` (MIT) and a
