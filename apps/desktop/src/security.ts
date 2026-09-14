@@ -127,9 +127,10 @@ const FONT_FILE_ORIGIN = 'https://fonts.gstatic.com';
  * 403 (it accepts loopback web origins and `app://`) until the user sets
  * `OLLAMA_ORIGINS`. Not to that exact origin, though: measured, an exact value
  * on this scheme stops Ollama 0.34.0 from starting, and where a `*` sits decides
- * what else it admits (`dev/probe-electron-csp-http/README.md`). Which value to
- * suggest is the owner's call on #284. That is the provider's CORS; nothing in
- * this policy moves it.
+ * what else it admits (`dev/probe-electron-csp-http/README.md`). Per the owner's
+ * ruling on #284, the Ollama note shows the value, derived from the page's origin
+ * by `ollamaOriginsSetting` (`src/ai/providers.ts`), and only where Ollama needs
+ * one. That is the provider's CORS; nothing in this policy moves it.
  *
  * NOT `ws:`. A plaintext loopback socket is #168's question, with its own
  * options and its own argument for naming origins narrowly. This ruling does not

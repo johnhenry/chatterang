@@ -15,12 +15,22 @@ import type { ApiKeyBackendAdapterConfig, BackendAdapter } from '@johnhenry/aima
 
 export type ProviderKind = 'cloud' | 'self-hosted' | 'aggregator';
 
+/** Part of a note: plain words, or a value to type exactly, shown as code. */
+export type NotePart = string | { readonly code: string };
+
 export interface ProviderDescriptor {
   readonly id: string;
   readonly label: string;
   readonly kind: ProviderKind;
   /** One honest line about what connecting this means. */
   readonly note: string;
+  /**
+   * The rest of the note, when it depends on the origin this page runs at. The
+   * panel passes `window.location.origin`, read when the note renders, because
+   * that origin differs by platform. Null when there is nothing to add for that
+   * origin. Only Ollama sets it (#284).
+   */
+  readonly originNote?: (origin: string) => readonly NotePart[] | null;
   /** Whether an API key is required to connect. */
   readonly needsKey: boolean;
   /** Whether the user supplies the endpoint (self-hosted servers). */
@@ -50,6 +60,24 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
     label: 'Ollama',
     kind: 'self-hosted',
     note: 'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.',
+    originNote(origin) {
+      const setting = ollamaOriginsSetting(origin);
+      if (setting.kind === 'none-needed') return null;
+      if (setting.kind === 'unknown') {
+        return [
+          'This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s ',
+          { code: 'OLLAMA_ORIGINS' },
+          ' setting needs.',
+        ];
+      }
+      return [
+        'Ollama refuses this app until its ',
+        { code: 'OLLAMA_ORIGINS' },
+        ' setting allows it. Add ',
+        { code: setting.value },
+        ' to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      ];
+    },
     needsKey: false,
     needsBaseUrl: true,
     defaultBaseUrl: 'http://localhost:11434',
@@ -226,6 +254,87 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
     },
   },
 ];
+
+/**
+ * What Ollama's `OLLAMA_ORIGINS` has to hold before it answers a page at `origin`.
+ *
+ * The owner's ruling on #284: the Ollama note shows the narrowest value that
+ * still lets Ollama start, and only where one is needed. Measured against a
+ * throwaway `ollama serve` 0.34.0, one process per value
+ * (`dev/probe-electron-csp-http/README.md`):
+ *
+ * - Ollama already answers its default origins with nothing set, so for those
+ *   the note asks for nothing.
+ * - A value starting `http://` or `https://` starts, and an exact one admits
+ *   that origin alone, so an http(s) origin is its own value.
+ * - An exact value on any other scheme (`chatterang-desktop://app`,
+ *   `capacitor://localhost`) makes Ollama panic before it listens. A value
+ *   with `*` starts, and the `*` must lead: `*chatterang-desktop://app` matches
+ *   origins ending in the app's own, so `chatterang-desktop://app-evil` is
+ *   refused. A trailing `*` matches a prefix and admits that origin.
+ * - Anything that is not exactly a serialized origin (opaque `null`, a path, a
+ *   comma, a `*`, a non-canonical form) gets no value. A comma would split into
+ *   two entries, and a `*` would widen the match, so printing a guess could
+ *   stop Ollama starting or admit more than this app. It fails closed.
+ */
+export type OllamaOriginsSetting =
+  | { readonly kind: 'none-needed' }
+  | { readonly kind: 'add'; readonly value: string }
+  | { readonly kind: 'unknown' };
+
+/**
+ * Ollama 0.34.0's defaults, as its `server config` log line lists them with
+ * `OLLAMA_ORIGINS` unset. A value the user sets is added ahead of these, not in
+ * place of them.
+ */
+const OLLAMA_DEFAULT_ORIGINS: readonly string[] = [
+  ...['localhost', '127.0.0.1', '0.0.0.0'].flatMap((host) => [
+    `http://${host}`,
+    `https://${host}`,
+    `http://${host}:*`,
+    `https://${host}:*`,
+  ]),
+  'app://*',
+  'file://*',
+  'tauri://*',
+  'vscode-webview://*',
+  'vscode-file://*',
+];
+
+/** Scheme, host (a name or a bracketed IPv6 address) and optional port; nothing else. */
+const SERIALIZED_ORIGIN = /^([a-z][a-z0-9+.-]*):\/\/(?:[a-z0-9.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?$/;
+
+/** How Ollama's CORS middleware matches one entry: exact, or around one `*`. */
+function ollamaEntryAdmits(entry: string, origin: string): boolean {
+  const star = entry.indexOf('*');
+  if (star === -1) return entry === origin;
+  const head = entry.slice(0, star);
+  const tail = entry.slice(star + 1);
+  return (
+    origin.length >= head.length + tail.length && origin.startsWith(head) && origin.endsWith(tail)
+  );
+}
+
+export function ollamaOriginsSetting(origin: string): OllamaOriginsSetting {
+  const shape = SERIALIZED_ORIGIN.exec(origin);
+  if (!shape) return { kind: 'unknown' };
+  // Canonical or nothing: `http://localhost:80` or `http://0x7f.1` is not what a
+  // browser sends, so an exact value built from it would match nothing.
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return { kind: 'unknown' };
+  }
+  if (`${url.protocol}//${url.host}` !== origin) return { kind: 'unknown' };
+
+  if (OLLAMA_DEFAULT_ORIGINS.some((entry) => ollamaEntryAdmits(entry, origin))) {
+    return { kind: 'none-needed' };
+  }
+  const scheme = shape[1];
+  if (scheme === 'http' || scheme === 'https') return { kind: 'add', value: origin };
+  return { kind: 'add', value: `*${origin}` };
+}
 
 export function getProvider(id: string): ProviderDescriptor | undefined {
   return PROVIDERS.find((provider) => provider.id === id);

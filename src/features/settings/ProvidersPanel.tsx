@@ -168,7 +168,9 @@ function ProviderGroup({
             >
               <div className="list__main">
                 <span className="list__title">{provider.label}</span>
-                <span className="list__sub">{provider.note}</span>
+                <span className="list__sub">
+                  <ProviderNote provider={provider} />
+                </span>
               </div>
               <Icon name="plus" size={16} />
             </button>
@@ -176,6 +178,27 @@ function ProviderGroup({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * A provider's note, plus any of it that depends on this page's own origin.
+ *
+ * The origin is read here, at render, not at import. It is the `Origin` this
+ * app sends, and it differs by platform: `chatterang-desktop://app` on desktop,
+ * `capacitor://localhost` on iOS, `https://localhost` on Android, and wherever
+ * the web build is served.
+ */
+function ProviderNote({ provider }: { provider: ProviderDescriptor }): ReactNode {
+  const more = provider.originNote?.(window.location.origin) ?? null;
+  return (
+    <>
+      {provider.note}
+      {more ? ' ' : null}
+      {more?.map((part, index) =>
+        typeof part === 'string' ? part : <code key={index}>{part.code}</code>,
+      )}
+    </>
   );
 }
 
@@ -233,7 +256,9 @@ function ConnectSheet({
           <Icon name="cloud" size={16} />
           <span className="card__title grow">What this means</span>
         </div>
-        <p style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>{provider.note}</p>
+        <p style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>
+          <ProviderNote provider={provider} />
+        </p>
       </div>
 
       <div className="field">

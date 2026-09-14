@@ -188,6 +188,73 @@ What the rows show:
   in place of them.
 
 That is the provider's CORS, not this policy, and nothing in the CSP can change
-it. It is recorded here, not worked around. Which value the app's own copy
-should name is the owner's call (#284). LM Studio's CORS setting was not
+it. It is recorded here, not worked around. LM Studio's CORS setting was not
 measured.
+
+## The value the Ollama note shows (#284)
+
+The owner ruled that the Ollama note names `OLLAMA_ORIGINS` and shows the
+narrowest value that starts Ollama. The value is derived at runtime from this
+app's origin, and shown only where Ollama needs one.
+`ollamaOriginsSetting` (`src/ai/providers.ts`) derives it, and the panel passes
+`window.location.origin` when the note renders:
+
+- an origin Ollama already allows by default gets no value, and the note asks
+  for nothing;
+- an `http://` or `https://` origin outside the defaults is its own value, exactly;
+- any other scheme gets `*` followed by the origin (the suffix form);
+- anything that is not exactly a canonical serialized origin (`null`, a path, a
+  comma, a `*`, a default port) gets no value, and the note says the app cannot
+  tell.
+
+A third run measured each value the function prints. It used the same isolation
+as the runs above, plus its own empty `HOME`, on ports 12501-12507. Each case
+was checked with `GET /api/version` and the preflight for `POST /api/chat`, and
+the two agreed in every cell (200 with 204, 403 with 403). The user's own
+`ollama serve` was the only Ollama process before and after.
+
+| page origin | platform | function prints | unset | under the printed value |
+|---|---|---|---|---|
+| `chatterang-desktop://app` | desktop | `*chatterang-desktop://app` | 403 | 200 |
+| `capacitor://localhost` | iOS | `*capacitor://localhost` | 403 | 200 |
+| `https://localhost` | Android | nothing | 200 | |
+| `http://localhost:5273` | web dev | nothing | 200 | |
+| `http://192.168.1.10:5273` | web, served on a LAN address | `http://192.168.1.10:5273` | 403 | 200 |
+| `http://[::1]:5273` | web, served on IPv6 loopback | `http://[::1]:5273` | 403 | 200 |
+| `null` | opaque | nothing (cannot tell) | 403 | |
+
+What else each printed value lets in:
+
+| `OLLAMA_ORIGINS` | also 200 | 403 |
+|---|---|---|
+| `*chatterang-desktop://app` | `xchatterang-desktop://app` | `chatterang-desktop://app-evil`, `chatterang-desktop://evil`, `capacitor://localhost`, `https://evil.example`, `http://192.168.1.10:5273` |
+| `*capacitor://localhost` | `xcapacitor://localhost` | `capacitor://localhost.evil`, `chatterang-desktop://app`, `https://evil.example` |
+| `http://192.168.1.10:5273` | nothing | `http://192.168.1.10:5274`, `http://192.168.1.10:52730`, `https://192.168.1.10:5273`, `http://192.168.1.10`, `http://192.168.1.100:5273`, `http://x192.168.1.10:5273`, `chatterang-desktop://app` |
+| `http://[::1]:5273` | nothing | `http://[::1]:5274` |
+| `http://192.168.1.10:5273,*chatterang-desktop://app` | both entries' origins, and `xchatterang-desktop://app` | the same refusals |
+
+- Under every value, the defaults still answered 200: `https://localhost`,
+  `http://localhost:5273`, `http://127.0.0.1`, `https://0.0.0.0:8443`, `app://-`,
+  `tauri://localhost`, `vscode-webview://abc` and the string `file://`. Each
+  `server config` line listed the value ahead of the unchanged defaults. That is
+  why the note says to add the value, with a comma, to anything already set.
+  The two-entry row shows a comma-joined value keeps both.
+- `chatterang-desktop://app`, set exactly, was run once more: it panicked with
+  the same message and exited 2 without listening.
+- `http://localhost.evil.example` and `https://evil.example` were 403 under
+  every value.
+- **The residual of the suffix form.** `*chatterang-desktop://app` also admits
+  any origin that merely ends with the app's own, such as
+  `xchatterang-desktop://app`. That needs another app on the machine to register
+  a look-alike scheme and send requests from it. The prefix form
+  (`chatterang-desktop://app*`) admits `chatterang-desktop://app-evil` on this
+  app's own scheme, and an exact value does not start, so the suffix form is
+  the narrowest one that starts.
+- A browser page at a `file:` URL sends `Origin: null`, whatever its
+  `location.origin` says, so the function gives no value for `file://` even
+  though that string matched a default.
+- Where the function says no value is needed, and where the note prints one,
+  was only measured for the origins above on Ollama 0.34.0. The default list is
+  copied from that version's `server config` line, and its literals are in the
+  bundled binary. Ollama's FAQ, read through Context7, names only `127.0.0.1`
+  and `0.0.0.0`. A different Ollama version could have different defaults.

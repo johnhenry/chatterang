@@ -1340,6 +1340,45 @@ describe('the provider panel hints', () => {
     }
   });
 
+  it('asks for an OLLAMA_ORIGINS value only where Ollama refuses this app', () => {
+    // The owner's ruling on #284: the Ollama note names the setting and the
+    // narrowest value that still starts Ollama, from this app's origin at
+    // runtime, and asks for nothing where Ollama already accepts that origin.
+    // The value is ADDED to whatever the user has set, and takes effect only on
+    // restart. `tests/ollama-origins.test.tsx` renders it and holds the measured
+    // values; this pins the sentences around them.
+    const words = (origin: string): string | null =>
+      getProvider('ollama')
+        ?.originNote?.(origin)
+        ?.map((part) => (typeof part === 'string' ? part : part.code))
+        .join('') ?? null;
+
+    expect(words('chatterang-desktop://app')).toBe(
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add *chatterang-desktop://app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+    );
+    expect(words('capacitor://localhost')).toBe(
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add *capacitor://localhost to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+    );
+    // Android and the web dev server: measured 200 with nothing set.
+    expect(words('https://localhost')).toBeNull();
+    expect(words('http://localhost:5273')).toBeNull();
+    // Opaque: no value, and says why.
+    expect(words('null')).toBe(
+      'This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.',
+    );
+    // The retraction still leads the note.
+    expect(getProvider('ollama')?.note).toContain(
+      'Requests go to the address you give. Nothing here checks that it is on your network.',
+    );
+    // And no other provider's copy mentions Ollama's setting.
+    for (const provider of PROVIDERS) {
+      if (provider.id === 'ollama') continue;
+      expect(provider.note, provider.id).not.toContain('OLLAMA_ORIGINS');
+      expect(provider.originNote, provider.id).toBeUndefined();
+    }
+    expect(PROVIDERS_PANEL).not.toContain('OLLAMA_ORIGINS');
+  });
+
   it('does not make allowing it the precondition for tool output leaving', () => {
     // "…and, if you allow it, what a tool read" read as a guarantee that
     // nothing goes without a grant. The flipped-back-variant path goes without
