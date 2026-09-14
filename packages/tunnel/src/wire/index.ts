@@ -99,6 +99,41 @@ export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
  */
 export const TUNNEL_CAP_CLOSE_CODE = 4503;
 
+/**
+ * The close code for a PAIRING-ONLY tunnel that tried to carry something other
+ * than the pairing exchange, or more of it than a pairing needs (#136). A
+ * pairing window that closed is {@link TUNNEL_PAIRING_CLOSED_CLOSE_CODE}.
+ *
+ * A phone with no device credential reaches the listener only while the
+ * desktop is showing a pairing code, and then only for the exchange. 4000 plus
+ * HTTP's 403: the connection was let in, and this is not something it may do.
+ * Here rather than in the host for the reason {@link TUNNEL_CAP_CLOSE_CODE} is.
+ */
+export const TUNNEL_PAIRING_ONLY_CLOSE_CODE = 4403;
+
+/**
+ * The close code for a PAIRING-ONLY tunnel whose pairing window has closed
+ * (#136): the code it was admitted under expired, was dismissed or replaced, or
+ * another connection completed the pairing — or this one did, and its time to
+ * receive the credential is over.
+ *
+ * Its own code, not {@link TUNNEL_PAIRING_ONLY_CLOSE_CODE}: a phone whose code
+ * ran out mid-exchange did nothing it may not do, and telling it otherwise
+ * sends its user looking for the wrong fault. 4000 plus HTTP's 410 Gone.
+ */
+export const TUNNEL_PAIRING_CLOSED_CLOSE_CODE = 4410;
+
+/**
+ * The request header a paired device presents its credential in (#135, #136).
+ *
+ * A HEADER, NEVER THE URL. #136's ruling: a credential in a query string lands
+ * in request-line logs, proxy logs and history, so the listener refuses a URL
+ * that carries one rather than ignoring it. The native socket plugin (#181)
+ * sets this header on the phone. Lower case because Node hands header names to
+ * the listener lower-cased, and one spelling is one spelling to grep for.
+ */
+export const TUNNEL_CREDENTIAL_HEADER = 'chatterang-device-credential';
+
 /** Frames that belong to one turn, and carry its id. */
 export type TurnFrame =
   /** A turn going up. `body` is the request; the codec decides what may cross. */
@@ -107,6 +142,18 @@ export type TurnFrame =
   | { readonly v: number; readonly kind: 'chunk'; readonly turn: TurnId; readonly body: unknown }
   /** Stop this turn. Mid-stream, which is why it needs the id. */
   | { readonly v: number; readonly kind: 'cancel'; readonly turn: TurnId };
+
+/**
+ * One message of the pairing exchange (#130, #136).
+ *
+ * THE ONLY FRAME A PAIRING-ONLY TUNNEL MAY CARRY, beside `hello` and `bye`. It
+ * exists so that rule has something to name: without a kind of its own, "the
+ * pairing exchange and nothing else" is a sentence the listener cannot enforce.
+ * `body` is the exchange's step — a CPace message, a confirmation tag, the
+ * credential handed over at the end — and, like `chunk`, the wire does not know
+ * what one IS. Its shape is the exchange's to define.
+ */
+export type PairFrame = { readonly v: number; readonly kind: 'pair'; readonly body: unknown };
 
 /** Frames about the connection rather than about a turn. */
 export type ControlFrame =
@@ -140,7 +187,7 @@ export type ControlFrame =
     };
 
 /** One frame on the tunnel. */
-export type TunnelFrame = TurnFrame | ControlFrame;
+export type TunnelFrame = TurnFrame | ControlFrame | PairFrame;
 
 /** Every `kind` this build knows, for validation and for exhaustive tests. */
 export const FRAME_KINDS = [
@@ -152,6 +199,7 @@ export const FRAME_KINDS = [
   'pong',
   'bye',
   'error',
+  'pair',
 ] as const;
 
 export type FrameKind = (typeof FRAME_KINDS)[number];
@@ -276,6 +324,13 @@ export function decodeFrame(bytes: Uint8Array): TunnelFrame {
     return typeof turn === 'string' && turn !== ''
       ? { v: TUNNEL_WIRE_VERSION, kind: 'error', turn, body: { code, message } }
       : { v: TUNNEL_WIRE_VERSION, kind: 'error', body: { code, message } };
+  }
+
+  if (k === 'pair') {
+    // Carried, not interpreted: see `PairFrame`. Required, because a pairing
+    // step with nothing in it is not a step.
+    if (!('body' in frame)) throw new TunnelWireError('pair frame has no body');
+    return { v: TUNNEL_WIRE_VERSION, kind: 'pair', body: frame.body };
   }
 
   if (k === 'bye') {

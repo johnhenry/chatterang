@@ -81,7 +81,17 @@ export type ClaimRefusal =
   | 'expired'
   | 'exhausted';
 
+declare const WINDOW_BRAND: unique symbol;
+
 export interface PairingWindow {
+  /**
+   * BRANDED, so a window cannot be written down as a literal that says
+   * `claimed`. The only way to hold one is {@link openWindow}, and
+   * {@link isOpenedWindow} asks the same question at runtime. A device
+   * credential is minted against a window (`host/credential.ts`), and a
+   * credential with no pairing behind it is the thing that mint refuses.
+   */
+  readonly [WINDOW_BRAND]: true;
   /** What the window is right now, evaluated against `now`. */
   state(now: number): WindowState;
   /**
@@ -99,6 +109,30 @@ export interface PairingWindow {
   remaining(): number;
   /** When the window closes, on the injected clock's scale. */
   readonly expiresAt: number;
+  /**
+   * Be told, once, when this window stops being `issued`, and why: `claimed`,
+   * `cancelled` (by `cancel()`, by a new code, or by an exhausted budget) or
+   * `expired`. Called synchronously, in the turn the state latches, after it
+   * has latched. A window that is already closed calls back at once.
+   *
+   * EXPIRY IS STILL EVALUATED, NEVER SCHEDULED (see `openWindow`): `expired` is
+   * reported when a `state()` or `claim()` call first observes it, so whoever
+   * needs to hear about expiry promptly asks `state()` when they need to know.
+   * The tunnel listener does, on a timer and at every upgrade, so a connection
+   * admitted to pair does not outlive the code it was admitted under (#136).
+   *
+   * A watcher that throws is not this window's problem: the state has already
+   * latched, and every other watcher still hears it. Returns the unsubscribe.
+   */
+  onClose(watcher: (state: Exclude<WindowState, 'issued'>) => void): () => void;
+}
+
+/** Windows {@link openWindow} made. Unforgeable, unlike a property. */
+const opened = new WeakSet<object>();
+
+/** Did {@link openWindow} make this? The runtime half of the brand. */
+export function isOpenedWindow(value: unknown): value is PairingWindow {
+  return typeof value === 'object' && value !== null && opened.has(value);
 }
 
 /**
@@ -123,7 +157,22 @@ export function openWindow(options: {
   const secret = options.secret;
   const expiresAt = options.now + (options.windowMs ?? DEFAULT_WINDOW_MS);
   let left = options.attemptBudget ?? DEFAULT_ATTEMPT_BUDGET;
-  let terminal: WindowState | null = null;
+  let terminal: Exclude<WindowState, 'issued'> | null = null;
+  const watchers = new Set<(state: Exclude<WindowState, 'issued'>) => void>();
+
+  /** Latch a terminal state, then tell every watcher. Only the first latch speaks. */
+  const close = (state: Exclude<WindowState, 'issued'>): void => {
+    if (terminal !== null) return;
+    terminal = state;
+    for (const watcher of [...watchers]) {
+      try {
+        watcher(state);
+      } catch {
+        // See `onClose`: the state has latched; the next watcher still hears it.
+      }
+    }
+    watchers.clear();
+  };
 
   const evaluate = (now: number): WindowState => {
     if (terminal !== null) return terminal;
@@ -142,20 +191,32 @@ export function openWindow(options: {
     // guaranteed is that a window observed closed stays closed, so a backwards
     // step after the fact buys nothing.
     if (now >= expiresAt) {
-      terminal = 'expired';
+      close('expired');
       return 'expired';
     }
     return 'issued';
   };
 
-  return {
+  // Checked against the interface minus its brand, which is a type-only symbol
+  // no value can hold; the cast below adds it, once, here.
+  const window = {
     expiresAt,
     remaining: () => (terminal === null ? left : 0),
     state: evaluate,
+    onClose(watcher: (state: Exclude<WindowState, 'issued'>) => void) {
+      if (terminal !== null) {
+        watcher(terminal);
+        return () => undefined;
+      }
+      watchers.add(watcher);
+      return () => {
+        watchers.delete(watcher);
+      };
+    },
     cancel() {
       // Only from a live state. `cancel()` after `claimed` must not rewrite
       // history into a cancellation that never happened.
-      if (terminal === null) terminal = 'cancelled';
+      if (terminal === null) close('cancelled');
     },
     claim(presented, now) {
       const before = evaluate(now);
@@ -169,17 +230,19 @@ export function openWindow(options: {
 
       const matched = equalCt(secret, presented);
       if (matched) {
-        terminal = 'claimed';
+        close('claimed');
         return { ok: true, state: 'claimed' };
       }
 
       if (left <= 0) {
-        terminal = 'cancelled';
+        close('cancelled');
         return { ok: false, reason: 'exhausted', state: 'cancelled', remaining: 0 };
       }
       return { ok: false, reason: 'mismatch', state: 'issued', remaining: left };
     },
-  };
+  } satisfies Omit<PairingWindow, typeof WINDOW_BRAND>;
+  opened.add(window);
+  return window as unknown as PairingWindow;
 }
 
 /**

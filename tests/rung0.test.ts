@@ -8,7 +8,14 @@ import { streamIntegrityWarning, streamedTextOf } from '@/ai/engine';
 import { createTunnelClient } from '@chatterang/tunnel/client';
 import { createTunnelHost } from '@chatterang/tunnel/host';
 import { isMessage } from '@chatterang/tunnel/stream';
-import { TUNNEL_WIRE_VERSION, encodeFrame, type TunnelFrame } from '@chatterang/tunnel/wire';
+import {
+  TUNNEL_CREDENTIAL_HEADER,
+  TUNNEL_WIRE_VERSION,
+  encodeFrame,
+  type TunnelFrame,
+} from '@chatterang/tunnel/wire';
+
+import { credentialHeaders, holdableStore, testGate } from './support/tunnel-gate';
 
 /**
  * RUNG 0 (#156): two halves of the tunnel on one machine, over loopback.
@@ -29,7 +36,24 @@ import { TUNNEL_WIRE_VERSION, encodeFrame, type TunnelFrame } from '@chatterang/
  * precedent: ephemeral ports so nothing collides, every server closed in
  * `afterEach` whether the test passed or threw, and no fixed timeouts that
  * turn a slow machine into a failure.
+ *
+ * THROUGH THE REAL GATE (#135). The host has no ungated door, so rung 0 gets
+ * in with a TEST CREDENTIAL, minted the way a desktop mints one — a pairing
+ * window opened, claimed and minted against — and the real client presents it
+ * in the header. Every raw peer below carries it too, so a peer dropped by a
+ * lifecycle test is dropped for the lifecycle and not for having no credential.
  */
+
+/** A rung-0 host on the real gate, and the credential its one device holds. */
+async function gatedHost(options: { greeting?: readonly TunnelFrame[]; port?: number } = {}) {
+  const gate = testGate();
+  const { credential } = await gate.mintDevice();
+  const host = await createTunnelHost({
+    binding: gate.binding(options.port),
+    ...(options.greeting ? { greeting: options.greeting } : {}),
+  });
+  return { host, credential };
+}
 
 const open: { close(): Promise<void> }[] = [];
 afterEach(async () => {
@@ -74,10 +98,10 @@ const assembledOf = (frame: TunnelFrame | undefined): string | undefined => {
 
 /** A host and a client, connected, both registered for teardown. */
 async function pair(greeting?: readonly TunnelFrame[]) {
-  const host = await createTunnelHost(greeting ? { greeting } : {});
+  const { host, credential } = await gatedHost(greeting ? { greeting } : {});
   open.push(host);
   const { port } = host.server.address() as AddressInfo;
-  const client = await createTunnelClient({ url: `ws://127.0.0.1:${port}` });
+  const client = await createTunnelClient({ url: `ws://127.0.0.1:${port}`, credential });
   open.push(client);
   return { host, client };
 }
@@ -434,12 +458,12 @@ describe('each half reports its OWN close', () => {
      * goes, and being unable to skip that is the property under test. So the
      * misbehaviour is written by hand, on this side too.
      */
-    const host = await createTunnelHost({});
+    const { host, credential } = await gatedHost();
     open.push(host);
     const { port } = host.server.address() as AddressInfo;
 
     const { WebSocket: RawSocket } = await import('ws');
-    const peer = new RawSocket(`ws://127.0.0.1:${port}`);
+    const peer = new RawSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(credential) });
     await new Promise<void>((resolve, reject) => {
       peer.on('open', () => resolve());
       peer.on('error', reject);
@@ -469,7 +493,7 @@ describe('the listener lifecycle', () => {
     open.push({ close: () => new Promise<void>((resolve) => occupant.close(() => resolve())) });
     const { port } = occupant.address() as AddressInfo;
 
-    const attempt = createTunnelHost({ port });
+    const attempt = createTunnelHost({ binding: testGate().binding(port) });
     // A regression that binds anyway must not leak a server into the next test.
     attempt.then((host) => open.push(host), () => undefined);
 
@@ -492,7 +516,7 @@ describe('the listener lifecycle', () => {
      * already resolved, where it vanishes — and a failed listener looks like a
      * healthy one.
      */
-    const host = await createTunnelHost({});
+    const { host } = await gatedHost();
     open.push(host);
     expect(() => host.server.emit('error', new Error('after listen'))).toThrow('after listen');
   });
@@ -517,14 +541,14 @@ describe('the listener lifecycle', () => {
      * port reported "on" while serving nothing. ECONNREFUSED is the honest
      * answer.
      */
-    const host = await createTunnelHost({});
+    const { host, credential } = await gatedHost();
     open.push(host);
     const { port } = host.server.address() as AddressInfo;
 
     const { WebSocket: RawSocket } = await import('ws');
     const connect = () =>
       new Promise<InstanceType<typeof RawSocket>>((resolve, reject) => {
-        const peer = new RawSocket(`ws://127.0.0.1:${port}`);
+        const peer = new RawSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(credential) });
         open.push({ close: async () => peer.terminate() });
         peer.on('open', () => resolve(peer));
         peer.on('error', reject);
@@ -548,12 +572,12 @@ describe('the listener lifecycle', () => {
      * That is #158's overwritten `peer`, back inside the wrapper. The test
      * above connects afresh after `closed`, which is why it could not see it.
      */
-    const host = await createTunnelHost({});
+    const { host, credential } = await gatedHost();
     open.push(host);
     const { port } = host.server.address() as AddressInfo;
 
     const { WebSocket: RawSocket } = await import('ws');
-    const first = new RawSocket(`ws://127.0.0.1:${port}`);
+    const first = new RawSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(credential) });
     open.push({ close: async () => first.terminate() });
     await new Promise<void>((resolve, reject) => {
       first.on('open', () => resolve());
@@ -593,12 +617,16 @@ describe('the listener lifecycle', () => {
         // RFC 6455's own sample nonce: any 16 bytes, base64.
         'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
         'Sec-WebSocket-Version: 13',
+        // A VALID credential, so the drop below is the lifecycle's and not the
+        // gate's: without it, this peer would be refused for having none, and
+        // the test would pass on a host that admits late peers.
+        `${TUNNEL_CREDENTIAL_HEADER}: ${credential}`,
         '',
         '',
       ].join('\r\n'),
     );
-    // Dropped with no answer at all: not a 101, and not a cap refusal that
-    // would say the host is full when it is over.
+    // Dropped with no answer at all: not a 101, not a 401, and not a cap
+    // refusal that would say the host is full when it is over.
     expect(await answer).toBe('');
     expect(host.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
   });
@@ -619,11 +647,74 @@ describe('the listener lifecycle', () => {
      * `receive()` must still end, or a caller that shuts down an unused host
      * waits forever for a peer that is never coming.
      */
-    const host = await createTunnelHost({});
+    const { host } = await gatedHost();
     open.push(host);
     await host.close('never used');
     await host.closed;
     expect(host.ended()).toEqual({ kind: 'clean', reason: 'never used' });
     expect(await drain(host.receive())).toEqual([]);
+  });
+});
+
+describe('the gate rung 0 runs through (#135)', () => {
+  it('the real client with no credential is refused before the upgrade, and the host has no tunnel', async () => {
+    /*
+     * THE PAIRED CONTROL FOR EVERY TEST ABOVE. Each of them gets in because
+     * `pair()` presents a minted credential; without this, they would pass just
+     * as well on a host that admitted anyone, and rung 0 would be proving the
+     * protocol over a door with no lock. No pairing window is open, so a peer
+     * with nothing to present has nowhere to go.
+     */
+    const { host } = await gatedHost();
+    open.push(host);
+    const { port } = host.server.address() as AddressInfo;
+
+    await expect(createTunnelClient({ url: `ws://127.0.0.1:${port}` })).rejects.toThrow(/cannot reach/);
+    expect(host.ended()).toBeNull();
+  });
+
+  it('a peer whose credential is still being checked when the tunnel ends is not admitted afterwards', async () => {
+    /*
+     * THE MID-REQUEST CASE ABOVE, ONE STEP LATER. That peer's upgrade arrived
+     * after the host stopped accepting and was dropped at the door. This one's
+     * arrived WHILE the host was accepting and is still inside the gate — its
+     * credential being read — when the one tunnel ends. The gate's answer
+     * lands on a host that is over, and must admit nobody: otherwise it
+     * becomes the host's tunnel and `ended()` goes from PEER_GONE back to null,
+     * which is #158's overwritten `peer` a third time.
+     */
+    const held = holdableStore();
+    const gate = testGate(held.store);
+    const first = await gate.mintDevice();
+    const second = await gate.mintDevice();
+    const host = await createTunnelHost({ binding: gate.binding() });
+    open.push(host);
+    const { port } = host.server.address() as AddressInfo;
+
+    const { WebSocket: RawSocket } = await import('ws');
+    const admitted = new RawSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(first.credential) });
+    open.push({ close: async () => admitted.terminate() });
+    await new Promise<void>((resolve, reject) => {
+      admitted.on('open', () => resolve());
+      admitted.on('error', reject);
+    });
+
+    held.holdReads();
+    const late = new RawSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(second.credential) });
+    open.push({ close: async () => late.terminate() });
+    const lateOutcome = new Promise<string>((resolve) => {
+      late.on('error', () => resolve('refused'));
+      late.once('unexpected-response', () => resolve('refused'));
+      late.once('open', () => resolve('open'));
+    });
+    await held.read;
+
+    admitted.terminate();
+    await host.closed;
+    expect(host.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
+
+    held.release();
+    expect(await lateOutcome).toBe('refused');
+    expect(host.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
   });
 });

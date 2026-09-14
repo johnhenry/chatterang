@@ -2425,7 +2425,8 @@ describe('a listening socket forces the privacy copy to change', () => {
     createTunnelHost: 'listens',
     createTunnelListener: 'listens',
     // The TLS identity (#179): a key, its pin, a certificate, and the
-    // owner-only file the key is kept in. `node:crypto` and `node:fs`, no socket.
+    // owner-only file the key is kept in. `node:crypto` and `node:fs`, and on
+    // macOS a `/bin/ls -lde` child process to read ACLs; no socket.
     TunnelIdentityError: 'binds nothing',
     generateTunnelKey: 'binds nothing',
     issueTunnelCertificate: 'binds nothing',
@@ -2434,6 +2435,20 @@ describe('a listening socket forces the privacy copy to change', () => {
     tunnelKeyFromPkcs8Pem: 'binds nothing',
     tunnelKeyPkcs8Pem: 'binds nothing',
     tunnelPinOf: 'binds nothing',
+    // The address literal and the TLS brand the server's binding shares with
+    // the tunnel's (#135): a string and a validating constructor.
+    LOOPBACK_HOST: 'binds nothing',
+    asTlsMaterial: 'binds nothing',
+    // The device-credential registry and its in-memory store (#135): hashing
+    // and a Map. Neither opens a socket; the listener that consults them does.
+    createDeviceCredentials: 'binds nothing',
+    createMemoryCredentialStore: 'binds nothing',
+    // The bounds on a connection that presented nothing (#136, #169): numbers
+    // the listener reads. None of them opens anything.
+    MAX_PAIRING_TUNNELS: 'binds nothing',
+    MAX_PAIRING_FRAME_BYTES: 'binds nothing',
+    MAX_PAIRING_BACKLOG: 'binds nothing',
+    PAIRING_HANDOVER_MS: 'binds nothing',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [

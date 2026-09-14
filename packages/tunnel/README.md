@@ -52,8 +52,7 @@ the drift the contracts guard exists to prevent.
 out a `Tunnel` per connection. Each tunnel owns its inbox, its sequence guard,
 its `ended` latch and its socket, so two peers' frames never interleave into
 one stream, and closing one tunnel leaves the others and the listener running.
-That per-tunnel close is the primitive #135's revocation needs; revocation
-itself is not here.
+That per-tunnel close is what revocation uses; see "Who gets in".
 
 `maxTunnels` is required and has no default, because how many tunnels an app
 holds is that app's decision rather than this package's. A connection past the
@@ -65,8 +64,9 @@ socket open still holds a connection.
 
 #169's items are recommendations, not rulings. Two are built here: several
 concurrent connections, and a cap enforced at accept time. The third, replacing
-a device's stale socket with its new one, is deferred because it needs device
-identity (#135), and none exists yet.
+a device's stale socket with its new one, is not built. It needed device
+identity, which now exists (a tunnel's `admission.deviceId`), so it is
+buildable; nobody has built it.
 
 `createTunnelHost` is rung 0's single tunnel on top of the listener: capped at
 one, and it stops accepting once that tunnel ends. A late peer is refused at
@@ -75,11 +75,113 @@ either handshaking onto a tunnel that is already over. The check is at the
 upgrade because `server.close()` alone lets a connection that is already inside
 a request finish upgrading.
 
+## Who gets in
+
+`createTunnelListener` and `createTunnelHost` take a `TunnelBinding` (#135,
+#158). It is its own union and **not** a third arm of `ServerBinding`: #135's
+ruling is explicit that a third arm puts an arm-dependent branch back into
+`checkToken`'s gate 1, and the operator token and the cookie helpers stay out
+of the tunnel. It has a loopback arm with no host field, and a TLS arm with any
+address and `TlsMaterial`, which the tunnel's own key and certificate make (see
+"The TLS identity"). The only things shared with
+`apps/server/src/binding.ts` are `LOOPBACK_HOST` and the `TlsMaterial` brand.
+They live in `src/host/tls.ts`, a file that imports nothing, and the server
+re-exports them: two copies of a `unique symbol` brand would be two
+incompatible types.
+
+**Both arms require a `TunnelGate`**, the loopback arm included. This is the
+fail-closed reading of the rulings. Tailscale Serve, which #154's re-scope
+recommends as the remote path (#124 records it, awaiting its own ruling),
+forwards an HTTPS name to a loopback port. And a stranger's process on this
+machine is not the operator; `apps/server/src/binding.ts` measured that.
+Rung 0 goes through the same gate; there is no ungated door.
+
+At the HTTP upgrade, before `ws` writes a byte:
+
+1. **The URL carries nothing.** Any request-target but `/` gets 400. That
+   includes a credential in the query, which is refused rather than ignored,
+   even beside a valid header (#136).
+2. **A `chatterang-device-credential` header is final** (`TUNNEL_CREDENTIAL_HEADER`).
+   Malformed, unknown, wrong or revoked credentials all get 401, with no reason
+   given, and none falls through to pairing. A registry that cannot be read
+   gets 503.
+3. **No credential:** the connection is admitted only while a pairing window is
+   `issued`, and only as a *pairing tunnel* (#136). It may carry `hello`,
+   `pair` and `bye` in either direction, and anything else closes it with
+   `TUNNEL_PAIRING_ONLY_CLOSE_CODE` (4403), which the client reports as
+   `PAIRING_ONLY`. A pairing tunnel is never promoted: a phone that finishes
+   pairing reconnects with its credential. With no window open, the connection
+   gets 401. `createTunnelHost` (rung 0) admits no pairing tunnel at all.
+
+What changed while the gate was deciding is asked again in the turn that
+admits. `listener.close()` destroys an upgrade the gate has not finished with.
+
+**A pairing tunnel ends with its code**, whether or not it is sending
+anything. It closes with `TUNNEL_PAIRING_CLOSED_CLOSE_CODE` (4410), which the
+client reports as `PAIRING_WINDOW_CLOSED`:
+
+- **The window closing ends it in that turn.** That covers a code dismissed or
+  replaced, a spent attempt budget, or a claim. The window tells the listener
+  through `PairingWindow.onClose`.
+- **Expiry is evaluated, not scheduled** (`pairing/window.ts`). The listener
+  asks on a timer at the deadline, at every upgrade, and whenever a frame
+  moves. A timer that fires late, on a machine that slept, closes late; the
+  latched window decides.
+- **A claim is attributed.** The caller claims through the tunnel,
+  `admission.claim(secret)`. That tunnel keeps its channel for
+  `PAIRING_HANDOVER_MS` (10 s) to receive its credential, and every other
+  pairing tunnel under the window ends at once. A window claimed directly,
+  with no tunnel to attribute it to, ends every pairing tunnel under it.
+
+What a pairing tunnel can hold is bounded, one named constant per limit
+(#169):
+
+- `MAX_PAIRING_TUNNELS` (2) is its own cap. Pairing tunnels never count
+  against `maxTunnels`, so a stranger on the LAN cannot keep a paired phone out
+  by holding slots.
+- `MAX_PAIRING_FRAME_BYTES` (16 KiB) is enforced by `ws` before it buffers a
+  message. A device's limit is the codec's `MAX_FRAME_BYTES`, where `ws`'s
+  default was 100 MiB.
+- `MAX_PAIRING_BACKLOG` (16) caps unread frames. Past it the tunnel closes
+  with 4403.
+
+**The credential** (#135) comes from `createDeviceCredentials(store)`:
+
+- `mint(window, now)` mints only for a `claimed` pairing window that
+  `openWindow` made (`PairingWindow` is branded, and `isOpenedWindow` checks
+  the same at runtime), once per window. The credential is
+  `<deviceId>.<secret>`, 16 and 32 random bytes, base64url, and it is returned
+  once.
+- The store keeps SHA-256 of it, keyed by device id. That is enough for a
+  256-bit random secret, where a password would need a slow KDF.
+- The comparison is `timingSafeEqual` over the two digests.
+- `revoke(deviceId)` refuses the device at once. In the same turn it drops
+  every frame each of the device's tunnels had queued and stops reading from
+  them. It then closes every one of those tunnels with `bye` reason `revoked`.
+  Finally it writes a zero-byte tombstone over the digest and deletes it. If
+  the delete fails, the rejection is rethrown and the device stays refused,
+  including by a registry opened over the same store after a restart.
+- `CredentialStore` is an interface. `createMemoryCredentialStore` forgets
+  everything on exit.
+
+Rung 0's test credential is minted exactly that way.
+`createTunnelClient({ url, credential })` sends it in the header, and only over
+`wss:` or `ws://127.0.0.1`. Node's WebSocket can send a header; a webview's
+cannot, and throws rather than connecting without it. The phone's transport is
+#181's plugin.
+
 ## The TLS identity (#179, #180)
 
 `src/host/identity.ts` makes the key a paired client pins and the certificates
 that carry it; `src/host/identity-store.ts` keeps the key on disk for both apps.
-Neither binds anything, and neither is called by an app yet.
+Neither binds anything. Each app has a loader over the store
+(`apps/desktop/src/tunnel-identity.ts`, `apps/server/src/tunnel-identity.ts`),
+and nothing calls either loader yet.
+
+What they make is what the TLS arm of `TunnelBinding` serves (see "Who gets
+in"): `asTlsMaterial(tunnelKeyPkcs8Pem(key), certificate.certPem)`. The
+material carries no pin of its own; the pin is `key.pin`, and a certificate
+re-issued from the same key serves the same one.
 
 - **The pin is the key, not the certificate.** `TunnelPin` is the SHA-256 of the
   DER SubjectPublicKeyInfo, as 32 bytes (`NegotiatedPeer.spki`) and as padded
@@ -116,16 +218,31 @@ Neither binds anything, and neither is called by an app yet.
 - **A production transport.** #181 chose a native socket plugin on both
   platforms, and that plugin is not built. What exists is rung 0 (#156):
   `createTunnelClient`, `createTunnelHost` and `createTunnelListener` speak the
-  real wire format over loopback `ws://`, with no TLS and no credential, and no
-  app starts a listener.
-- **`TunnelBinding`.** It belongs in `src/host/`, modelled on
-  `apps/server/src/binding.ts` — bind address and credentials as one union, so
-  the unsafe combination cannot be written down. There is one arm to write now;
-  writing it is #157/#158's job. It must be its own union and **not** a third
-  arm of `ServerBinding`: #135's ruling is explicit that a third arm puts an
-  arm-dependent branch back into `checkToken`'s gate 1, whose absence is that
-  file's documented strength.
-- **Frame kinds.** `TunnelFrame['kind']` became a union in #159.
+  real wire format over loopback `ws://`, through the credential gate. **No app
+  starts a listener** (#158). A listener that carries turns waits on #7, per
+  #169's ruling.
+- **Where the paired-device registry persists** (#133). `CredentialStore` is
+  the seam. The only implementation forgets every phone when the process ends.
+- **Handing the identity to a listener.** `identity.ts` makes the key and its
+  certificates, `identity-store.ts` keeps the key, and the TLS arm accepts what
+  they make. Both apps have a key loader (`apps/*/src/tunnel-identity.ts`) and
+  nothing calls either; no app issues a certificate or passes one to a
+  binding. Still open: key lifetime and rotation, how long a certificate lasts
+  (`validDays` has no default), and whether the phone checks names or only the
+  SPKI pin (#179, #180, #295).
+- **The pairing exchange itself.** The wire has a `pair` frame and the listener
+  confines a pairing tunnel to it. The steps it carries are not defined here:
+  the CPace messages, confirmation, and handing the minted credential to the
+  phone under the session key.
+- **The rest of what revocation owes.** A revoked tunnel's unread frames are
+  dropped, but purging a revoked device's queued *turns* (#196) needs the turn
+  queue, which waits on #7. On the headless server, revoking the operator
+  token must invalidate every credential minted under it (#135), and nothing
+  ties the two together yet.
+- **What a tunnelled turn may use and how its prompts reach the phone** (#170),
+  and the surface declaration asserted before binding.
+- **Frame kinds.** `TunnelFrame['kind']` became a union in #159. `pair` joined
+  it for #136's gate.
 
 ### Why plaintext `ws://` lost
 

@@ -39,6 +39,7 @@ const SAMPLES: Record<string, TunnelFrame> = {
     turn: 't1',
     body: { code: 'PEER_GONE', message: 'the desktop stopped responding' },
   },
+  pair: { v: TUNNEL_WIRE_VERSION, kind: 'pair', body: { step: 'message', bytes: 'AAEC' } },
 };
 
 describe('the tunnel envelope', () => {
@@ -104,6 +105,18 @@ describe('what the envelope refuses', () => {
     expect(() =>
       decodeFrame(raw({ v: TUNNEL_WIRE_VERSION, kind: 'error', body: { code: 'X' } })),
     ).toThrow(/code and message/);
+  });
+
+  it('refuses a pair frame with no body, and carries a body it does not interpret (#136)', () => {
+    // A pairing step with nothing in it is not a step, and a pairing tunnel
+    // may carry nothing but these — so an empty one is refused at the codec.
+    expect(() => decodeFrame(raw({ v: TUNNEL_WIRE_VERSION, kind: 'pair' }))).toThrow(/pair frame has no body/);
+    const opaque = { anything: [1, 'two', { three: null }] };
+    expect(decodeFrame(raw({ v: TUNNEL_WIRE_VERSION, kind: 'pair', body: opaque }))).toEqual({
+      v: TUNNEL_WIRE_VERSION,
+      kind: 'pair',
+      body: opaque,
+    });
   });
 
   it('refuses an oversized frame before parsing it', () => {

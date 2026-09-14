@@ -8,7 +8,9 @@ import {
   DEFAULT_ATTEMPT_BUDGET,
   DEFAULT_WINDOW_MS,
   createPairingWindows,
+  isOpenedWindow,
   openWindow,
+  type PairingWindow,
 } from '@chatterang/tunnel/pairing';
 
 /**
@@ -231,5 +233,97 @@ describe('the comparison', () => {
     expect(body).toContain('diff |=');
     expect(body).toContain('secret.length ^ presented.length');
     expect(body, 'equalCt returns early inside the loop').not.toMatch(/for\s*\([^)]*\)\s*\{[^}]*return/);
+  });
+});
+
+describe('a window says when it closes, so a connection admitted under it can end with it (#136)', () => {
+  it('tells every watcher once, with the state it latched, however it closed', () => {
+    const cases: readonly (readonly [
+      name: string,
+      make: () => PairingWindow,
+      close: (window: PairingWindow) => void,
+      expected: string,
+    ])[] = [
+      ['a claim', () => open(), (w) => w.claim(SECRET, T0), 'claimed'],
+      ['cancel', () => open(), (w) => w.cancel(), 'cancelled'],
+      ['a spent budget', () => open({ attemptBudget: 1 }), (w) => w.claim(WRONG, T0), 'cancelled'],
+      // Evaluated, never scheduled: expiry is reported when it is first observed.
+      ['expiry, when asked', () => open(), (w) => w.state(T0 + DEFAULT_WINDOW_MS), 'expired'],
+      ['expiry, observed by a claim', () => open(), (w) => w.claim(SECRET, T0 + DEFAULT_WINDOW_MS), 'expired'],
+    ];
+    for (const [name, make, close, expected] of cases) {
+      const w = make();
+      const heard: string[] = [];
+      w.onClose((state) => heard.push(state));
+      w.onClose((state) => heard.push(`second:${state}`));
+      close(w);
+      // A closed window does not speak again, whatever is done to it after.
+      w.cancel();
+      w.claim(SECRET, T0);
+      w.state(T0 + 10 * DEFAULT_WINDOW_MS);
+      expect(heard, name).toEqual([expected, `second:${expected}`]);
+    }
+  });
+
+  it('says nothing while it is still issued, a failed claim included', () => {
+    const w = open();
+    const heard: string[] = [];
+    w.onClose((state) => heard.push(state));
+    expect(w.claim(WRONG, T0)).toMatchObject({ ok: false, reason: 'mismatch' });
+    expect(w.state(T0 + DEFAULT_WINDOW_MS - 1)).toBe('issued');
+    expect(heard).toEqual([]);
+  });
+
+  it('a watcher added after the window closed is told at once', () => {
+    const w = open();
+    w.cancel();
+    const heard: string[] = [];
+    w.onClose((state) => heard.push(state));
+    expect(heard).toEqual(['cancelled']);
+  });
+
+  it('an unsubscribed watcher is not told, and one that throws does not silence the next', () => {
+    const w = open();
+    const heard: string[] = [];
+    const off = w.onClose(() => heard.push('unsubscribed'));
+    w.onClose(() => {
+      throw new Error('a watcher with a bug');
+    });
+    w.onClose((state) => heard.push(state));
+    off();
+    expect(w.claim(SECRET, T0)).toEqual({ ok: true, state: 'claimed' });
+    expect(heard).toEqual(['claimed']);
+    expect(w.state(T0)).toBe('claimed');
+  });
+
+  it("issuing a new code tells the old window's watchers it was cancelled", () => {
+    const windows = createPairingWindows();
+    const first = windows.issue({ secret: SECRET, now: T0 });
+    const heard: string[] = [];
+    first.onClose((state) => heard.push(state));
+    windows.issue({ secret: WRONG, now: T0 });
+    expect(heard).toEqual(['cancelled']);
+  });
+});
+
+describe('a window is branded (#135)', () => {
+  it('knows the windows openWindow made, and not a copy or a literal that answers the same', () => {
+    const real = open();
+    expect(real.claim(SECRET, T0).ok).toBe(true);
+    expect(isOpenedWindow(real)).toBe(true);
+    expect(isOpenedWindow(createPairingWindows().issue({ secret: SECRET, now: T0 }))).toBe(true);
+
+    expect(isOpenedWindow({ ...real })).toBe(false);
+    expect(
+      isOpenedWindow({
+        state: () => 'claimed',
+        claim: () => ({ ok: true, state: 'claimed' }),
+        cancel: () => undefined,
+        remaining: () => 0,
+        expiresAt: 0,
+        onClose: () => () => undefined,
+      }),
+    ).toBe(false);
+    for (const value of [null, undefined, 'claimed', 0]) expect(isOpenedWindow(value)).toBe(false);
   });
 });

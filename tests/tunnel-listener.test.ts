@@ -14,11 +14,14 @@ import {
 } from '@chatterang/tunnel/host';
 import {
   TUNNEL_CAP_CLOSE_CODE,
+  TUNNEL_CREDENTIAL_HEADER,
   TUNNEL_WIRE_VERSION,
   decodeFrame,
   encodeFrame,
   type TunnelFrame,
 } from '@chatterang/tunnel/wire';
+
+import { credentialHeaders, testGate } from './support/tunnel-gate';
 
 /**
  * ONE LISTENER, MANY TUNNELS (#158).
@@ -36,6 +39,10 @@ import {
  * Manners from `tests/rung0.test.ts`: ephemeral ports, everything closed in
  * `afterEach`, and no deadlines. `eventually` polls, and the test timeout is
  * the only bound on it.
+ *
+ * Every peer here presents a device credential minted through the real gate
+ * (#135), so what these tests measure is the listener's lifecycle and not its
+ * admission — `tests/tunnel-admission.test.ts` owns that.
  */
 
 const open: { close(): unknown }[] = [];
@@ -69,11 +76,13 @@ const chunk = (sequence: number, delta: string): TunnelFrame => ({
 const deltaOf = (frame: TunnelFrame): unknown =>
   'body' in frame ? (frame.body as Record<string, unknown> | undefined)?.['delta'] : undefined;
 
-async function listen(options: TunnelListenerOptions) {
-  const listener = await createTunnelListener(options);
+async function listen(options: Omit<TunnelListenerOptions, 'binding'>) {
+  const gate = testGate();
+  const { credential } = await gate.mintDevice();
+  const listener = await createTunnelListener({ ...options, binding: gate.binding() });
   open.push(listener);
   const { port } = listener.server.address() as AddressInfo;
-  return { listener, port, incoming: listener.tunnels()[Symbol.asyncIterator]() };
+  return { listener, port, credential, incoming: listener.tunnels()[Symbol.asyncIterator]() };
 }
 
 async function nextTunnel(incoming: AsyncIterator<Tunnel>): Promise<Tunnel> {
@@ -90,9 +99,9 @@ interface Peer {
   readonly closeCode: Promise<number>;
 }
 
-async function rawPeer(port: number): Promise<Peer> {
+async function rawPeer(port: number, credential: string): Promise<Peer> {
   const { WebSocket } = await import('ws');
-  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`, { headers: credentialHeaders(credential) });
   open.push({ close: () => socket.terminate() });
   const frames: TunnelFrame[] = [];
   socket.on('message', (data: Buffer) => frames.push(decodeFrame(new Uint8Array(data))));
@@ -123,10 +132,10 @@ async function drain(source: AsyncIterable<TunnelFrame>): Promise<TunnelFrame[]>
 
 describe('one listener, many tunnels', () => {
   it('two tunnels do not share frames', async () => {
-    const { port, incoming } = await listen({ maxTunnels: 2 });
-    const a = await rawPeer(port);
+    const { port, incoming, credential } = await listen({ maxTunnels: 2 });
+    const a = await rawPeer(port, credential);
     const tunnelA = await nextTunnel(incoming);
-    const b = await rawPeer(port);
+    const b = await rawPeer(port, credential);
     const tunnelB = await nextTunnel(incoming);
 
     // Each send reaches its own peer. The old host sent to whichever peer
@@ -157,13 +166,13 @@ describe('one listener, many tunnels', () => {
   });
 
   it('the cap is enforced at accept time, before any greeting', async () => {
-    const { listener, port, incoming } = await listen({ maxTunnels: 2, greeting: [HELLO] });
-    const a = await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 2, greeting: [HELLO] });
+    const a = await rawPeer(port, credential);
     const tunnelA = await nextTunnel(incoming);
-    const b = await rawPeer(port);
+    const b = await rawPeer(port, credential);
     const tunnelB = await nextTunnel(incoming);
 
-    const refused = await rawPeer(port);
+    const refused = await rawPeer(port, credential);
     expect(await refused.closeCode).toBe(TUNNEL_CAP_CLOSE_CODE);
     /*
      * WAIT FOR THE SERVER'S SIDE of the refusal, not only the client's. The
@@ -184,7 +193,7 @@ describe('one listener, many tunnels', () => {
     expect(a.frames).toEqual([HELLO]);
 
     // A refused socket frees no slot: the next one is refused too.
-    const fourth = await rawPeer(port);
+    const fourth = await rawPeer(port, credential);
     expect(await fourth.closeCode).toBe(TUNNEL_CAP_CLOSE_CODE);
   });
 
@@ -193,11 +202,11 @@ describe('one listener, many tunnels', () => {
      * #169 asks for a refusal the client can render. Classified as PEER_GONE,
      * a full listener is indistinguishable from a cable pulled mid-stream.
      */
-    const { port, incoming } = await listen({ maxTunnels: 1 });
-    await rawPeer(port);
+    const { port, incoming, credential } = await listen({ maxTunnels: 1 });
+    await rawPeer(port, credential);
     await nextTunnel(incoming);
 
-    const client = await createTunnelClient({ url: `ws://127.0.0.1:${port}` });
+    const client = await createTunnelClient({ url: `ws://127.0.0.1:${port}`, credential });
     open.push(client);
     await client.closed;
     expect(client.ended()).toMatchObject({ kind: 'abnormal', code: 'TUNNEL_FULL' });
@@ -206,15 +215,15 @@ describe('one listener, many tunnels', () => {
   it('a connection after one ends is a new tunnel', async () => {
     // Capped at ONE, so the second peer is admitted only if the first peer's
     // slot really came back.
-    const { port, incoming } = await listen({ maxTunnels: 1, greeting: [HELLO] });
-    const a = await rawPeer(port);
+    const { port, incoming, credential } = await listen({ maxTunnels: 1, greeting: [HELLO] });
+    const a = await rawPeer(port, credential);
     const tunnelA = await nextTunnel(incoming);
 
     a.socket.terminate();
     await tunnelA.closed;
     expect(tunnelA.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
 
-    const b = await rawPeer(port);
+    const b = await rawPeer(port, credential);
     const tunnelB = await Promise.race([
       nextTunnel(incoming),
       b.closeCode.then((code) => {
@@ -230,10 +239,10 @@ describe('one listener, many tunnels', () => {
   it('closing one tunnel leaves the others and the listener open', async () => {
     // The primitive #135's revocation needs: one device's socket closed,
     // nobody else's.
-    const { listener, port, incoming } = await listen({ maxTunnels: 2 });
-    const a = await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 2 });
+    const a = await rawPeer(port, credential);
     const tunnelA = await nextTunnel(incoming);
-    const b = await rawPeer(port);
+    const b = await rawPeer(port, credential);
     const tunnelB = await nextTunnel(incoming);
 
     await tunnelA.close('revoked');
@@ -249,7 +258,7 @@ describe('one listener, many tunnels', () => {
 
     // And the listener still accepts, into the slot the closed tunnel gave back.
     expect(listener.server.listening).toBe(true);
-    const c = await rawPeer(port);
+    const c = await rawPeer(port, credential);
     const tunnelC = await Promise.race([
       nextTunnel(incoming),
       c.closeCode.then((code) => {
@@ -260,10 +269,10 @@ describe('one listener, many tunnels', () => {
   });
 
   it('listener.close() with live tunnels resolves, and every peer hears bye', async () => {
-    const { listener, port, incoming } = await listen({ maxTunnels: 2 });
-    const a = await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 2 });
+    const a = await rawPeer(port, credential);
     const tunnelA = await nextTunnel(incoming);
-    const b = await rawPeer(port);
+    const b = await rawPeer(port, credential);
     const tunnelB = await nextTunnel(incoming);
 
     /*
@@ -305,8 +314,8 @@ describe('one listener, many tunnels', () => {
      * that turn, so the test holds one real upgrade back from the listener and
      * delivers it itself, in the same turn as `close()`.
      */
-    const { listener, port, incoming } = await listen({ maxTunnels: 2 });
-    await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 2 });
+    await rawPeer(port, credential);
     await nextTunnel(incoming);
 
     const handlers = listener.server.listeners('upgrade') as ((...args: unknown[]) => void)[];
@@ -322,7 +331,8 @@ describe('one listener, many tunnels', () => {
       late.once('data', (data: Buffer) => resolve(data.toString('latin1')));
       late.once('close', () => resolve(''));
     });
-    late.write(upgradeRequest(port));
+    // With a valid credential, so the drop is close()'s and not the gate's.
+    late.write(upgradeRequest(port, credential));
     const upgrade = await held;
     for (const handler of handlers) listener.server.on('upgrade', handler);
 
@@ -338,7 +348,7 @@ describe('one listener, many tunnels', () => {
     // No default and no clamping: a cap of 0 or NaN is a caller's mistake, and
     // a listener that quietly admitted everyone would hide it.
     for (const maxTunnels of [0, -1, 1.5, Number.NaN]) {
-      const attempt = createTunnelListener({ maxTunnels });
+      const attempt = createTunnelListener({ maxTunnels, binding: testGate().binding() });
       attempt.then((listener) => open.push(listener), () => undefined);
       await expect(attempt, String(maxTunnels)).rejects.toThrow(RangeError);
     }
@@ -351,14 +361,17 @@ describe('one listener, many tunnels', () => {
      * directive below is unused and the typecheck fails. The runtime line is
      * only there to give the test a body.
      */
+    // The binding is supplied, so the directive below is about maxTunnels alone
+    // and would go unused the day it gained a default.
+    const binding = testGate().binding();
     // @ts-expect-error maxTunnels is required
-    const options: TunnelListenerOptions = {};
-    expect(options).toEqual({});
+    const options: TunnelListenerOptions = { binding };
+    expect(options).toEqual({ binding });
   });
 });
 
 /** A complete WebSocket upgrade request, as the bytes a raw TCP peer writes. */
-const upgradeRequest = (port: number): string =>
+const upgradeRequest = (port: number, credential: string): string =>
   [
     'GET / HTTP/1.1',
     `Host: 127.0.0.1:${String(port)}`,
@@ -367,6 +380,7 @@ const upgradeRequest = (port: number): string =>
     // RFC 6455's own sample nonce: any 16 bytes, base64.
     'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
     'Sec-WebSocket-Version: 13',
+    `${TUNNEL_CREDENTIAL_HEADER}: ${credential}`,
     '',
     '',
   ].join('\r\n');
@@ -376,7 +390,7 @@ const upgradeRequest = (port: number): string =>
  * will do on request — so it is written by hand over raw TCP, for the reason
  * `faultyHost` in `tests/rung0.test.ts` is.
  */
-async function protocolBreaker(port: number) {
+async function protocolBreaker(port: number, credential: string) {
   const { connect } = await import('node:net');
   const tcp = connect(port, '127.0.0.1');
   open.push({ close: () => tcp.destroy() });
@@ -388,7 +402,7 @@ async function protocolBreaker(port: number) {
         ? resolve()
         : reject(new Error('the listener did not upgrade the connection')),
     );
-    tcp.write(upgradeRequest(port));
+    tcp.write(upgradeRequest(port, credential));
   });
   return {
     /** A text frame WITHOUT the mask RFC 6455 requires of every client frame. */
@@ -405,10 +419,10 @@ describe('a peer that breaks the WebSocket protocol', () => {
      * `ws` reports it as an `error` event and nothing listened. In a listener
      * holding several tunnels that is one peer taking down all of them.
      */
-    const { listener, port, incoming } = await listen({ maxTunnels: 2 });
-    const good = await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 2 });
+    const good = await rawPeer(port, credential);
     const tunnelGood = await nextTunnel(incoming);
-    const bad = await protocolBreaker(port);
+    const bad = await protocolBreaker(port, credential);
     const tunnelBad = await nextTunnel(incoming);
 
     bad.sendUnmasked();
@@ -430,11 +444,11 @@ describe('a peer that breaks the WebSocket protocol', () => {
      * without a listener for it, the failure is vitest's unhandled-error
      * report failing the run, which is the crash this pins.
      */
-    const { listener, port, incoming } = await listen({ maxTunnels: 1 });
-    const good = await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 1 });
+    const good = await rawPeer(port, credential);
     const tunnelGood = await nextTunnel(incoming);
 
-    const refused = await protocolBreaker(port);
+    const refused = await protocolBreaker(port, credential);
     refused.sendUnmasked();
     await refused.gone;
     await eventually(async () => (await connectionsOf(listener.server)) === 1);
@@ -456,13 +470,13 @@ describe('a peer that breaks the WebSocket protocol', () => {
      * these tests is a `ws` client, which answers a close by itself, so none of
      * them could see it. The test timeout is the bound.
      */
-    const { listener, port, incoming } = await listen({ maxTunnels: 1 });
-    await rawPeer(port);
+    const { listener, port, incoming, credential } = await listen({ maxTunnels: 1 });
+    await rawPeer(port, credential);
     await nextTunnel(incoming);
 
     // Upgraded and refused in the same turn on the server's side, and it never
     // writes another byte.
-    const silent = await protocolBreaker(port);
+    const silent = await protocolBreaker(port, credential);
 
     await listener.close();
     await silent.gone;
