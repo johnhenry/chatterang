@@ -98,8 +98,15 @@ export const useMcp = create<McpState>((set, get) => ({
       servers: get().servers.filter((s) => s.id !== id),
       states: Object.fromEntries(Object.entries(get().states).filter(([k]) => k !== id)),
     });
-    if (removed) await pruneMcpToolsFor(removed.name);
-    await get().reconnect();
+    // The reconnect is what unregisters the removed server's tools, so it runs
+    // even when the prune does not finish. A chat write refused half-way — a
+    // full disk — must not leave tools callable for a server the panel has
+    // just said is gone. The failure still reaches the caller.
+    try {
+      if (removed) await pruneMcpToolsFor(removed.name);
+    } finally {
+      await get().reconnect();
+    }
   },
 
   // Deliberately does NOT prune. Switching a server off and on again brings

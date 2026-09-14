@@ -157,6 +157,25 @@ describe('removing an MCP server', () => {
     await callNotesSearchIn('c1');
     expect(manager.callTool, 'a call reached a server the chat never enabled').not.toHaveBeenCalled();
   });
+
+  it('still unregisters its tools when a chat cannot be written', async () => {
+    useChats.setState({ chats: [chat('c1', ['mcp:notes.search'])] });
+    useMcp.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+    await useMcp.getState().reconnect();
+    await callNotesSearchIn('c1');
+    expect(manager.callTool, 'the paired control: the enable reaches the server').toHaveBeenCalledOnce();
+    manager.callTool.mockClear();
+
+    // The prune writes each chat. A refused write leaves this chat's enable in
+    // place, and the removal must not also leave the tool it points at.
+    tables.chats.put.mockRejectedValueOnce(new Error('QuotaExceededError'));
+    await expect(useMcp.getState().remove('mcp_a')).rejects.toThrow('QuotaExceededError');
+
+    expect(toolsOf('c1'), 'the write really failed').toEqual(['mcp:notes.search']);
+    expect(toolRegistry.get('mcp:notes.search')).toBeUndefined();
+    await callNotesSearchIn('c1');
+    expect(manager.callTool, 'a removed server was still called').not.toHaveBeenCalled();
+  });
 });
 
 describe('adding an MCP server', () => {
@@ -180,6 +199,34 @@ describe('adding an MCP server', () => {
     await callNotesSearchIn('c1');
     expect(manager.callTool).toHaveBeenCalledOnce();
     expect(manager.callTool).toHaveBeenCalledWith('notes', 'search', { q: 'bank details' }, undefined);
+  });
+
+  it('prunes the name the server is stored under, not the name as typed', async () => {
+    // The panel hands `add` its form field untrimmed, and the tool ids are
+    // built from the trimmed name. A prune of `mcp:  notes .` matches nothing.
+    useChats.setState({ chats: [chat('c1', ['mcp:notes.search', 'calculator'])] });
+
+    expect(await useMcp.getState().add({ name: '  notes ', url: 'https://b.example/mcp' })).toBeNull();
+
+    expect(useMcp.getState().servers.map((entry) => entry.name)).toEqual(['notes']);
+    expect(toolsOf('c1')).toEqual(['calculator']);
+    await callNotesSearchIn('c1');
+    expect(manager.callTool, 'an orphaned enable reached the new server').not.toHaveBeenCalled();
+  });
+
+  it('that is refused as a duplicate leaves every chat as it was', async () => {
+    // The live server keeps its name and its enables. Only an add that goes
+    // ahead is a new server that no chat can have turned on.
+    useChats.setState({ chats: [chat('c1', ['mcp:notes.search'])] });
+    useMcp.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+
+    expect(await useMcp.getState().add({ name: 'notes', url: 'https://b.example/mcp' })).toBe(
+      'There is already a server called “notes”.',
+    );
+
+    expect(toolsOf('c1')).toEqual(['mcp:notes.search']);
+    expect(tables.chats.put).not.toHaveBeenCalled();
+    expect(tables.mcpServers.put).not.toHaveBeenCalled();
   });
 
   it('prunes before its tools are listed, so no stale enable ever points at them', async () => {
@@ -219,5 +266,35 @@ describe('switching a server off', () => {
 
     expect(toolsOf('c1')).toEqual(['mcp:notes.search']);
     expect(tables.chats.put).not.toHaveBeenCalled();
+  });
+});
+
+describe('a surface that never loaded the chat store', () => {
+  /**
+   * The prune is installed by `state/chat` when it loads, and `state/mcp` does
+   * not import it. Every shipped entry point loads both today, but nothing
+   * makes a new one do so — and a prune that silently did nothing would reopen
+   * the bypass while the remove sheet said the tools had left every chat.
+   *
+   * Measured in a fresh module graph, so the chat store this file imported
+   * above is not the one that installed anything.
+   */
+  it('refuses to add or remove a server rather than skipping the prune', async () => {
+    vi.resetModules();
+    const alone = (await import('@/state/mcp')).useMcp;
+
+    await expect(alone.getState().add({ name: 'notes', url: 'https://b.example/mcp' })).rejects.toThrow(
+      'the chat store is not loaded',
+    );
+    expect(tables.mcpServers.put, 'the server was never stored').not.toHaveBeenCalled();
+    expect(alone.getState().servers).toEqual([]);
+
+    alone.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+    await expect(alone.getState().remove('mcp_a')).rejects.toThrow('the chat store is not loaded');
+
+    // The paired control: the same fresh graph, once the chat store has loaded.
+    await import('@/state/chat');
+    expect(await alone.getState().add({ name: 'notes', url: 'https://b.example/mcp' })).toBeNull();
+    expect(tables.mcpServers.put).toHaveBeenCalledOnce();
   });
 });
