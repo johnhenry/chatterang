@@ -1116,6 +1116,89 @@ describe('the desktop bridge stays platform-free', () => {
 });
 
 /**
+ * #7 BUILD SLICE S1: WHAT A HIDDEN WORKER'S CALL PATH WOULD DRAG ACROSS A LAYER.
+ *
+ * A MEASUREMENT, NOT A RULE. It changes no guard above; it asks two of them a
+ * question the design could not answer by reading: if the hidden worker window
+ * that runs a paired phone's turn (#7, ruling 1) speaks the existing host
+ * envelope over a `MessagePort`, what does that envelope import, and who can
+ * import it?
+ *
+ * The dynamic half — an unchanged `Supervisor` serving that envelope over a real
+ * `MessageChannel`, with loss seen as the port's own `close` — is in
+ * `tests/desktop-background-measurements.test.ts`. The results are written up
+ * in `docs/BACKGROUND-WORK-MEASUREMENTS.md`. If either assertion below changes,
+ * that note is stale.
+ */
+describe('the hidden worker’s call path, measured against the layers (#7 S1)', () => {
+  const DESKTOP = resolve(process.cwd(), 'apps/desktop/src');
+  /** The bridge guard's own banned set, asked of every specifier in the closure. */
+  const BRIDGE_BANNED = /^(electron$|electron\/|node:)/;
+
+  /**
+   * Every file a module reaches by relative import, and every package it names.
+   *
+   * Read as CODE, so a specifier quoted in a comment is not counted as an
+   * import. A relative target that does not exist is a failure rather than a
+   * silently shorter closure.
+   */
+  function importClosure(entry: string): { files: string[]; packages: string[]; missing: string[] } {
+    const files = new Set<string>();
+    const packages = new Set<string>();
+    const missing: string[] = [];
+    const visit = (file: string): void => {
+      if (files.has(file)) return;
+      if (!existsSync(file)) {
+        missing.push(relative(DESKTOP, file));
+        return;
+      }
+      files.add(file);
+      for (const match of codeOf(readFileSync(file, 'utf8')).matchAll(SPECIFIER)) {
+        const specifier = match[1] ?? '';
+        if (specifier.startsWith('.')) visit(resolve(file, '..', specifier).replace(/\.js$/, '.ts'));
+        else packages.add(specifier);
+      }
+    };
+    visit(entry);
+    return {
+      files: [...files].map((file) => relative(DESKTOP, file).replaceAll('\\', '/')).sort(),
+      packages: [...packages].sort(),
+      missing,
+    };
+  }
+
+  it('the host envelope needs no Electron, no Node builtin, nothing src/ is banned from, and no package but contracts', () => {
+    const closure = importClosure(resolve(DESKTOP, 'bridge/host-runtime.ts'));
+    expect(closure.missing).toEqual([]);
+    // Measured, and small: the runtime, its clone check, and the protocol.
+    expect(closure.files).toEqual(['bridge/clone.ts', 'bridge/host-runtime.ts', 'bridge/protocol.ts']);
+    expect(closure.packages).toEqual(['@chatterang/contracts']);
+    for (const specifier of closure.packages) {
+      expect(BRIDGE_BANNED.test(specifier), specifier).toBe(false);
+      expect(isNodeBuiltin(specifier), specifier).toBe(false);
+      expect(DESKTOP_LAYER_BAN.test(specifier), specifier).toBe(false);
+    }
+  });
+
+  it('nothing in src/ can reach it: the preload is the one file that already carries bridge code into a renderer', () => {
+    // src/ may not name `@chatterang/desktop` at all (the shell-app guard
+    // above), so a turn runner written in src/ cannot construct a HostRuntime
+    // itself. Measured here from the other side: what the preload imports.
+    const preload = codeOf(readFileSync(resolve(DESKTOP, 'preload.ts'), 'utf8'));
+    const specifiers = [...new Set([...preload.matchAll(SPECIFIER)].map((match) => match[1] ?? ''))].sort();
+    expect(specifiers).toEqual(['./bridge/capacitor-shim.js', './bridge/renderer.js', 'electron']);
+
+    // And no src/ file names the runtime by any spelling today.
+    const reaching = files.filter((file) =>
+      [...codeOf(readFileSync(file, 'utf8')).matchAll(SPECIFIER)].some((match) =>
+        /host-runtime/.test(match[1] ?? ''),
+      ),
+    );
+    expect(reaching.map(rel)).toEqual([]);
+  });
+});
+
+/**
  * The pairing building blocks have one way in, and it is the seam (#128, #130).
  *
  * `pairingController().available` is false, and whatever offers pairing is
