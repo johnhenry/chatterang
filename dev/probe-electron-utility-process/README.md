@@ -210,7 +210,8 @@ between main seeing `'error'` and seeing `'exit'`.
 |---|---|---|---|---|---|---|
 | WITH an error listener | 11 | 11 | 11 (SIGSEGV) | 0–1 ms | survived 11 | nothing |
 | NO error listener, probe records exceptions | 11 | 11 | 11 | 0–3 ms | survived 11 | `uncaughtException` `ERR_UNHANDLED_ERROR` "Unhandled error. ('FatalError')", 11 of 11 |
-| NO error listener, `--bare` (Electron's default handler, as `main.ts` on main) | 3 | - | - | - | **stalled 3 of 3**, sampled in `runModal` / `NSAlert`; its `'exit'` step never ran; SIGKILLed at 15–20 s | (to the error box) |
+| NO error listener, `--bare` (Electron's default handler, as `main.ts` on main) | 3 | - | - | - | **blocked 3 of 3** in the error box, sampled in `runModal` / `NSAlert`; its `'exit'` step had not run when the runner SIGKILLed it at 15–20 s, with the box still up | (to the error box) |
+| the same, rerun during review, with the box closed while main waited | 2 | - | - | 3562 ms in one run | blocked until the box closed (in the other run sampled in `runModal` / `NSAlert` at 2.5, 6 and 12 s, its `'exit'` step logged at 17774 ms into the run); then `'exit'` was delivered and main exited 0, 2 of 2 | (to the error box) |
 | WITH an error listener, `--bare` (control) | 3 | 3 | 11 | - | survived 3 | nothing |
 | post inside the error listener | 11 | 11 | 11 | 1–2 ms | survived 11; the post returned `undefined` | nothing |
 | `kill()` inside the error listener | 11 | 11 | 0 | 0–1 ms | survived 11; `kill()` returned `true` 11 of 11 | nothing |
@@ -229,11 +230,13 @@ as 0.
   `'error'`, and it threw `ERR_UNHANDLED_ERROR` into main's `uncaughtException`
   in every run. With no handler of the app's own, as in `main.ts`, Electron's
   default handler opened a modal error box, and main's JavaScript stopped
-  inside it. The `'exit'` that followed within milliseconds was not delivered
-  to JavaScript before the runner killed main, 15 to 20 seconds later. In the
-  app, the supervisor would not learn the host was gone, and every pending
-  call would wait on someone dismissing a box. What happens after the box is
-  dismissed was not measured.
+  inside it until the box was closed. In the three runs the runner killed, 15
+  to 20 seconds in, `'exit'` had still not been delivered. In the two runs
+  where the box was closed first, `'exit'` was delivered once it closed, and
+  main went on to exit 0. So the stall lasts as long as the box stays up, and
+  for that long the supervisor does not learn the host is gone and every
+  pending call waits on someone closing a box. What the app does after that
+  was not measured.
 - **The control shows the listener is the whole difference.** The same `--bare`
   run with an `'error'` listener survived 3 of 3.
 - **So `apps/desktop/src/utility-host.ts` listens for `'error'`.** It does so
@@ -248,6 +251,13 @@ as 0.
   gives up on, from inside that dispatch, and `kill()` inside the `'error'`
   listener survived 11 of 11. A process that reported a fatal error and never
   exited is terminated, not left running beside its replacement.
+- **The listener stays for the life of the process, `'exit'` included.** No
+  run saw `'error'` after `'exit'`, but Electron 44's source does not rule it
+  out: `OnV8FatalError` does not check whether the process has already
+  terminated, and `ForkUtilityProcess`'s `emit` still forwards `'error'` after
+  its `'exit'` branch has dropped the native handle. An `'error'` that found
+  the listener gone would throw into main. The adapter's tests include that
+  order.
 - **A post inside the `'error'` dispatch did not crash main (11 of 11)**, unlike
   one inside `'exit'`. The adapter refuses it anyway: the child is about to
   crash, and the post could go nowhere.
@@ -271,12 +281,21 @@ as 0.
   where it stopped. `main.cjs` writes with `fs.writeSync`.
 - **Every Electron without its own userData shares one directory**
   (`~/Library/Application Support/Electron`). The probe sets a temporary one.
+- **A probe cannot reliably clean up after itself.** A scenario the runner
+  SIGKILLs never reaches its clean-up, which left compiled `fatal-api.node`
+  copies, model roots and userData directories in the temp directory. Chromium
+  also writes into userData as it quits, after the clean-up has removed it, so
+  clean runs left an empty userData directory. `run.cjs` makes one temporary
+  root per launch, passes it as `--temp-root`, removes it once the process has
+  closed, killed or not, and removes it on SIGINT or SIGTERM too. `main.cjs`
+  writes everything under it. A direct `electron main.cjs` run makes its own
+  root and removes it on a clean exit only.
 - **`app.on('child-process-gone')` is not a substitute for `'exit'`** for this
   purpose. The probe records it, but the supervisor's contract is the
   `UtilityProcess` `'exit'`.
 - **A `--bare` run whose exception escapes puts an error box on screen.** It
   is Electron's default `uncaughtException` handler, and it blocks main until
-  the runner kills it. A release build's `sample` shows `runModal` and
+  someone closes it or the runner kills it. A release build's `sample` shows `runModal` and
   `NSAlert`, not `ShowErrorBox`, because that symbol is not exported.
 - **A heap-limit out-of-memory is not a `FatalError`.** Shrinking
   `--max-old-space-size` ends the child through Node's OOM handler, with exit

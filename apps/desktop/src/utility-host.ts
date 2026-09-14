@@ -53,9 +53,13 @@
  *     throws `ERR_UNHANDLED_ERROR` out of Electron's native callback into
  *     main's `uncaughtException`. `main.ts` installs no handler for that, so
  *     Electron's default one shows a modal error box, and main's JavaScript
- *     stalled inside it: the `'exit'` that followed was never seen, and so
- *     the supervisor would never have heard the host was gone.
- *   - `'exit'` followed `'error'` within 3 ms in every run.
+ *     is blocked inside it until the box is closed. While it is up the
+ *     `'exit'` is not delivered, so the supervisor does not hear the host is
+ *     gone: in three runs killed 15 to 20 s in, it never was; in two where
+ *     the box was closed, it was delivered afterwards.
+ *   - With main not blocked, `'exit'` followed `'error'` within 3 ms in every
+ *     run. No run saw the other order, but Electron's source does not rule it
+ *     out (see the listener below).
  *   - A post and a `kill()` made from inside the `'error'` dispatch both
  *     survived, 11 of 11 each. See the probe README.
  *
@@ -110,6 +114,10 @@ export function utilityHostHandle(child: UtilityProcessLike): HostHandle {
   let reaped = false;
   const fatalListeners: Array<(reason: string) => void> = [];
 
+  // Never removed, and not `once`. An `'error'` that finds no listener throws
+  // into main, and one can come after `'exit'` as well as before it: Electron
+  // 44's `OnV8FatalError` does not check whether the process has terminated,
+  // and `ForkUtilityProcess#emit` still forwards `'error'` after its `'exit'`.
   child.on('error', () => {
     exited = true;
     for (const tell of [...fatalListeners]) tell(FATAL_ERROR);

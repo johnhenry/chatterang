@@ -56,6 +56,7 @@ class FakeUtilityProcess extends EventEmitter {
   readonly posted: Post[] = [];
   kills = 0;
   #phase: Phase = 'alive';
+  #exitDispatched = false;
 
   /** Where in its life the process is, as a post arriving now would find it. */
   get phase(): Phase {
@@ -71,7 +72,7 @@ class FakeUtilityProcess extends EventEmitter {
     this.kills += 1;
     // Measured: true for a live child and from inside the 'error' dispatch,
     // false from inside the exit dispatch and after it.
-    return this.#phase !== 'inside the exit dispatch' && this.#phase !== 'after exit';
+    return !this.#exitDispatched;
   }
 
   /** The process is gone, but Electron has not dispatched `'exit'` yet. */
@@ -86,19 +87,21 @@ class FakeUtilityProcess extends EventEmitter {
    * calls `EmitWithoutEvent("error", "FatalError", location, report)`, and
    * `ForkUtilityProcess` forwards that to `EventEmitter#emit`. So this is a
    * real `'error'` emit, and with no listener it throws, as Electron's does.
-   * `'exit'` is a separate dispatch that follows; a test calls `exit` for it.
+   * `'exit'` is a separate dispatch, which a test calls `exit` for. Measured,
+   * it follows; Electron's source does not rule out the other order.
    */
   fatal(): void {
     this.#phase = 'inside the error dispatch';
     try {
       this.emit('error', 'FatalError', 'v8::ToLocalChecked Empty MaybeLocal', FATAL_REPORT);
     } finally {
-      this.#phase = 'fatal, exit not yet dispatched';
+      this.#phase = this.#exitDispatched ? 'after exit' : 'fatal, exit not yet dispatched';
     }
   }
 
   /** Electron dispatches `'exit'` to every listener, in registration order. */
   exit(code: number): void {
+    this.#exitDispatched = true;
     this.#phase = 'inside the exit dispatch';
     this.emit('exit', code);
     this.#phase = 'after exit';
@@ -476,6 +479,19 @@ describe("a V8 fatal error (UtilityProcess 'error') is a lost host, and nothing 
     },
     { name: "'error' alone", end: (child: FakeUtilityProcess) => child.fatal(), reason: 'fatal V8 error', kills: 1 },
     { name: "'exit' alone", end: (child: FakeUtilityProcess) => child.exit(0), reason: 'exit code 0', kills: 0 },
+    {
+      // Not measured, and not ruled out: Electron's `OnV8FatalError` emits
+      // without checking whether the process has already terminated, and its
+      // JavaScript wrapper forwards 'error' whatever came before. The listener
+      // must still be there, and the exit has already reported the loss.
+      name: "'exit' then 'error'",
+      end: (child: FakeUtilityProcess) => {
+        child.exit(0);
+        child.fatal();
+      },
+      reason: 'exit code 0',
+      kills: 0,
+    },
   ];
 
   it.each(endings)(
@@ -488,6 +504,8 @@ describe("a V8 fatal error (UtilityProcess 'error') is a lost host, and nothing 
       // left the calls "still pending" for 'error' alone, and let them be
       // settled by the exit, not the fatal error, for 'error' then 'exit'.
       // Removing the listener made the ending itself throw ERR_UNHANDLED_ERROR.
+      // Removing it once 'exit' had fired made 'exit' then 'error' throw it,
+      // and no other test noticed.
       const child = new FakeUtilityProcess();
       const { llama } = supervise(child);
       const capabilities = llama.getCapabilities();
@@ -590,20 +608,23 @@ describe('main.ts builds every inference host handle through it', () => {
     // Nothing between the fork and the handle may listen for exit or for a
     // fatal error first: the adapter's latch is only first if it is registered
     // first.
+    // Any quote style: nothing in the repo enforces one.
     expect(code.slice(fork, wrap)).not.toMatch(
-      /\.(on|once|addListener|prependListener)\(\s*'(exit|error)'/,
+      /\.(on|once|addListener|prependListener)\(\s*['"\x60](exit|error)['"\x60]/,
     );
   });
 
   it('never posts to, kills, or listens for the exit or fatal error of a utility process itself', () => {
     // FAULT INJECTED (see the commit): adding
     // `child.on('error', () => undefined);` after the fork failed this test and
-    // the one above. A listener there would swallow the FatalError before the
-    // adapter could latch on it, and the supervisor would never hear of it.
+    // the one above. So did the same listener in double quotes or backticks,
+    // and `child.once("exit", () => undefined);`. When these matched single
+    // quotes only, the double-quoted listener passed both. A listener there runs
+    // before the adapter's latch, so anything it posted would reach Electron.
     expect(code).not.toMatch(/\.postMessage\(/);
     expect(code).not.toMatch(/child\.kill\(/);
-    expect(code).not.toMatch(/'exit'/);
-    expect(code).not.toMatch(/'error'/);
+    expect(code).not.toMatch(/['"\x60]exit['"\x60]/);
+    expect(code).not.toMatch(/['"\x60]error['"\x60]/);
   });
 
   it('utility-host.ts imports no Electron, so this file drives the real handle', () => {

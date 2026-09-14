@@ -31,10 +31,18 @@ const { mkdtempSync, rmSync, writeSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 
+// Everything this probe writes goes under one temporary root. run.cjs passes
+// one as --temp-root and removes it once this process has closed, even when it
+// had to SIGKILL it: a killed process never reaches cleanUp, and Chromium
+// writes into userData as it quits, after cleanUp. Run directly, the probe
+// makes its own root and removes it on a clean exit.
+const GIVEN_ROOT = (process.argv.find((a) => a.startsWith('--temp-root=')) ?? '').slice('--temp-root='.length);
+const TEMP_ROOT = GIVEN_ROOT || mkdtempSync(join(tmpdir(), 'probe-utilproc-'));
+
 // A userData directory of its own. Every Electron started without one shares
 // ~/Library/Application Support/Electron, and other Electron runs on the same
 // machine were using it while this probe ran.
-const USER_DATA = mkdtempSync(join(tmpdir(), 'probe-utilproc-userdata-'));
+const USER_DATA = mkdtempSync(join(TEMP_ROOT, 'userdata-'));
 app.setPath('userData', USER_DATA);
 
 // Written SYNCHRONOUSLY. Node writes console.log to a pipe asynchronously on
@@ -86,15 +94,12 @@ let nextId = 1;
 const call = (method, extra) => ({ k: 'call', id: nextId++, plugin: 'LlamaCpp', method, args: [{ requestId: `probe-${nextId}`, handle: 'h', prompt: 'p', ...extra }] });
 const ping = () => ({ k: 'ping', id: nextId++ });
 
-// Temporary directories to remove when the run ends.
-const TEMP_DIRS = [];
 let addonPath;
 /** fatal-api.c, built once per run, only by a scenario that needs it. */
 function fatalApiAddon() {
   if (addonPath) return addonPath;
   if (process.platform === 'win32') throw new Error('fatal-api.c is built with a POSIX cc; not on win32');
-  const dir = mkdtempSync(join(tmpdir(), 'probe-utilproc-addon-'));
-  TEMP_DIRS.push(dir);
+  const dir = mkdtempSync(join(TEMP_ROOT, 'addon-'));
   const outFile = join(dir, 'fatal-api.node');
   const flags = process.platform === 'darwin' ? ['-bundle', '-undefined', 'dynamic_lookup'] : ['-shared', '-fPIC'];
   execFileSync('cc', [...flags, '-o', outFile, join(__dirname, 'fatal-api.c')], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -118,7 +123,7 @@ function reportKeys(report) {
  * 'kill' (calls child.kill() from inside it).
  */
 async function fork(name, { errorListener = false, execArgv } = {}) {
-  const modelRoot = mkdtempSync(join(tmpdir(), 'probe-utilproc-'));
+  const modelRoot = mkdtempSync(join(TEMP_ROOT, 'model-root-'));
   step(`${name}: forking`);
   const child = utilityProcess.fork(CHILD, [modelRoot, 'llama'], {
     serviceName: `chatterang-inference-probe-${name}`,
@@ -473,7 +478,7 @@ async function main() {
 app.whenReady().then(async () => {
   if (process.platform === 'darwin') app.dock?.hide();
   const cleanUp = () => {
-    for (const dir of [USER_DATA, ...TEMP_DIRS]) rmSync(dir, { recursive: true, force: true });
+    rmSync(TEMP_ROOT, { recursive: true, force: true });
   };
   if (LIST) {
     out('PROBE_LIST ' + JSON.stringify(Object.keys(scenarios)));

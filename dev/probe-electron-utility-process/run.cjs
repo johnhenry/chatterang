@@ -10,6 +10,8 @@
 // which is what node_modules/.bin/electron launches), so a signal is seen as a
 // signal rather than as the wrapper's exit code 1.
 const { spawn, spawnSync } = require('node:child_process');
+const { mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
 const { join, resolve } = require('node:path');
 
 const REPO = resolve(__dirname, '..', '..');
@@ -42,16 +44,38 @@ const MACOS_NO_RESTORE = process.platform === 'darwin' ? ['-ApplePersistenceIgno
 
 const line = (out, tag) => out.split('\n').find((l) => l.startsWith(tag));
 
+// Each running Electron and the temporary root it writes under. Interrupted,
+// the runner takes both with it.
+const live = new Map();
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    for (const [child, tempRoot] of live) {
+      child.kill('SIGKILL');
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
+
 /**
  * One Electron main, its pipes drained as it runs, SIGKILLed at the limit.
  *
  * The limit exists because launches stalled. Every stall sampled was the macOS
  * reopen-windows alert described above, not the API under test. A scenario
  * that still stalls is recorded as timed out instead of stalling the run.
+ *
+ * Everything the launch writes goes under a temporary root this runner makes,
+ * passes as --temp-root, and removes once the process has closed. main.cjs
+ * cannot be trusted to: a process SIGKILLed at the limit never reaches its
+ * clean-up, and Chromium writes into userData as it quits, after it.
  */
 function electron(args) {
   return new Promise((done) => {
-    const child = spawn(ELECTRON, [...args, ...MACOS_NO_RESTORE], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const tempRoot = mkdtempSync(join(tmpdir(), 'probe-utilproc-'));
+    const child = spawn(ELECTRON, [...args, `--temp-root=${tempRoot}`, ...MACOS_NO_RESTORE], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    live.set(child, tempRoot);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -75,6 +99,8 @@ function electron(args) {
     }, SCENARIO_LIMIT_MS);
     child.on('close', (status, signal) => {
       clearTimeout(limit);
+      live.delete(child);
+      rmSync(tempRoot, { recursive: true, force: true });
       done({ status, signal, stdout, stderr, timedOut, stallFrames });
     });
   });
