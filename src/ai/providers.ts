@@ -81,8 +81,10 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
         // value admits this app there alone. Only that exact origin says so.
         ...(origin === CAPACITOR_IOS_DEFAULT_ORIGIN ? [` ${OLLAMA_SHARED_ORIGIN_SENTENCE}`] : []),
         ' If it already has a value, put a comma between them, with no spaces.',
-        // Ruled on #284: a value holding `*` typed unquoted into zsh stops the
-        // command with "no matches found", so every shown value says to quote it.
+        // Ruled on #284: every shown value says to quote it. A value holding `*`,
+        // typed unquoted as a command argument in zsh (Ollama's FAQ sets its
+        // variables on macOS with `launchctl setenv`), stops the command with "no
+        // matches found". A zsh assignment, `export NAME=value` included, keeps it.
         ` ${OLLAMA_QUOTE_SENTENCE}`,
         ' Restart Ollama for the change to take effect.',
       ];
@@ -320,8 +322,10 @@ const OLLAMA_SHARED_ORIGIN_SENTENCE =
 
 /**
  * Said with every value shown (#284). Platform-neutral: the value contains `*`
- * wherever the origin is not http(s), and unquoted in zsh, macOS's default
- * shell, that fails with "no matches found".
+ * wherever the origin is not http(s). zsh, macOS's default shell, expands an
+ * unquoted `*` in a command argument, such as `launchctl setenv`, the form
+ * Ollama's FAQ gives for macOS, and fails with "no matches found". A zsh
+ * assignment, `export NAME=value` included, does not expand it.
  */
 const OLLAMA_QUOTE_SENTENCE = 'If you set it from a shell, put the value in quotes.';
 
