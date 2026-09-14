@@ -391,6 +391,17 @@ async function expectEachCallThatDidNotGoRecordedAsNotSent(): Promise<void> {
     ],
     { isGranted: () => true },
   );
+  // Refused because its server changed the other way: switched off while the
+  // model was still writing the call, so its tool had left the registry. The
+  // request declared it, and that is all it is named from.
+  const departed = toolOn('ledger', true, async () => true);
+  const leftTheRegistry = (
+    await runToolCalls(
+      new ToolRegistry([]),
+      [{ type: 'tool_use' as const, id: 'c0', name: departed.name, input: { text: SECRET } }],
+      { enabledIds: [departed.id], declared: [departed], destinations: { isGranted: () => true } },
+    )
+  ).executed;
 
   const expected = [
     { record: atSheet[0], host: 'notes.example', server: 'notes', why: 'not-allowed', says: 'it was not allowed' },
@@ -413,6 +424,13 @@ async function expectEachCallThatDidNotGoRecordedAsNotSent(): Promise<void> {
       record: serverChanged[0],
       host: 'notes.example',
       server: 'notes',
+      why: 'server-changed',
+      says: 'the server changed before it went',
+    },
+    {
+      record: leftTheRegistry[0],
+      host: 'ledger.example',
+      server: 'ledger',
       why: 'server-changed',
       says: 'the server changed before it went',
     },

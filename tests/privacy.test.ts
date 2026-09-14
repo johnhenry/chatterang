@@ -17,7 +17,7 @@ import type {
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
 import { holdsGrant, reachPaired, type EgressGrant } from '@/domain/chat';
-import { toolRegistry } from '@/ai/tools/registry';
+import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
 import { ENGINE_PHASE, isLocalEngine, type EngineId } from '@/domain/manifest';
@@ -1340,6 +1340,93 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(thenStopped.archive.call).not.toHaveBeenCalled();
     expect(thenStopped.tools.map((tool) => tool.name)).toEqual(['notes.note', 'archive.note']);
     expect(thenStopped.tools[1]!.receipt).toMatchObject(notSent);
+  });
+
+  it('records a call as not sent when its server leaves while the model is still writing it — under Stop too', async () => {
+    // Removing a server, switching one off or adding one runs `reconnect`,
+    // which takes every MCP tool out of the registry before it puts the enabled
+    // servers' back. A call the model was still writing reaches the dispatcher
+    // with nothing behind its name. It was a call to a server the request
+    // declared, and it did not go (#92, owner ruling that "not sent" covers
+    // every call that did not leave), so it is not answered as a name nothing
+    // stands behind, and Stop does not skip it silently.
+    const stopCall = '<tool_call>{"name":"x.y","arguments":{}}</tool_call>';
+    const leaving = async (leave: boolean, stop = false) => {
+      const probe = mcpProbe();
+      toolRegistry.register(probe.tool);
+      const controller = new AbortController();
+      // Runs on this device, first in the batch, and Stop lands while it runs.
+      const stopper: ChatterangTool = {
+        id: 'x.y',
+        name: 'x.y',
+        description: 'Stops the reply',
+        summary: 'Stops the reply',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => {
+          controller.abort();
+          return { output: 'stopped' };
+        },
+      };
+      if (stop) toolRegistry.register(stopper);
+      let turns = 0;
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register(
+        'scripted',
+        new FunctionBackendAdapter({
+          execute: async () => {
+            throw new Error('this backend only streams');
+          },
+          executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+            const first = turns++ === 0;
+            yield { type: 'start', sequence: 0, metadata: request.metadata };
+            yield { type: 'content', sequence: 1, delta: first ? (stop ? stopCall : '') + MCP_CALL : 'Done.' };
+            // What `reconnect` does first, while the call is still being written.
+            if (first && leave) toolRegistry.unregister(probe.tool.id);
+            yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          },
+        }),
+      );
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: stop ? [stopper.id, probe.tool.id] : [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+          signal: controller.signal,
+        }),
+      );
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, tools, turns };
+    };
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    const output = 'This call’s arguments were not sent to notes.example: the server changed before it went.';
+
+    // The control: the server stays, and the call goes.
+    const stayed = await leaving(false);
+    expect(stayed.probe.call).toHaveBeenCalledOnce();
+    expect(stayed.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent']);
+
+    const left = await leaving(true);
+    expect(left.probe.call, 'it was not sent').not.toHaveBeenCalled();
+    expect(left.tools.map((tool) => tool.output)).toEqual([output]);
+    expect(left.tools[0]!.receipt).toMatchObject(notSent);
+
+    // Stop lands while an earlier call runs: still recorded, still not sent,
+    // and the model is not run again.
+    const stopped = await leaving(true, true);
+    expect(stopped.probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(stopped.turns).toBe(1);
+    expect(stopped.tools.map((tool) => tool.name)).toEqual(['x.y', 'notes.note']);
+    expect(stopped.tools[1]!.output).toBe(output);
+    expect(stopped.tools[1]!.receipt).toMatchObject(notSent);
   });
 
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {

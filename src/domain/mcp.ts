@@ -147,7 +147,10 @@ export interface McpCallFields {
  *   a call the server does not call read-only changing data there.
  * - `server-changed`: nobody refused it. The server record it was prepared for
  *   was removed, switched off, renamed or pointed elsewhere while it waited, or
- *   no client was left to send it ({@link McpNotSent}).
+ *   no client was left to send it ({@link McpNotSent}); or the conversation's
+ *   grant for it was withdrawn while an earlier call ran; or its tool had left
+ *   the registry by the time it was dispatched, because a server was removed,
+ *   switched off or added while the model was still writing the call.
  * - `stopped`: the reply was stopped before the call went, and nothing else
  *   held it back. Nothing leaves after Stop, so this is every such call in the
  *   batch: one waiting on a person, at the send sheet or the data-change

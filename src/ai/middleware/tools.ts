@@ -272,7 +272,7 @@ export function enabledToolIds(request: IRChatRequest): readonly string[] {
  * enabled one — `getByName` returns whichever registered first.
  */
 function enabledTool(
-  registry: ToolRegistry,
+  registry: Pick<ToolRegistry, 'get'>,
   enabledIds: readonly string[],
   name: string,
 ): ChatterangTool | undefined {
@@ -300,6 +300,15 @@ export async function runToolCalls(
      * and a caller that forgot to pass it must not compile.
      */
     destinations: ToolDestinationPolicy;
+    /*
+     * The tools the request these calls answer declared to the model, as the
+     * registry held them when it was built. NEVER RUN: a call executes only
+     * from the live registry. Read only to name a call whose tool has left the
+     * registry since, so it is recorded as not sent to that server rather than
+     * answered as a name nothing stands behind (#92). Leaving it out sends
+     * nothing more, but loses that record, so both callers in this app pass it.
+     */
+    declared?: readonly ChatterangTool[];
     signal?: AbortSignal;
     onToolExecuted?: (tool: ExecutedTool) => void;
   },
@@ -311,6 +320,25 @@ export async function runToolCalls(
   // not exist. A distinct "not enabled" message would tell the model which
   // tools are installed that the user chose not to give it.
   const tools = calls.map((call) => enabledTool(registry, options.enabledIds, call.name));
+  /*
+   * A TOOL THAT LEFT THE REGISTRY MID-TURN (#92, owner ruling that "not sent"
+   * covers every call that did not leave). Removing a server, switching one off
+   * or adding one runs `reconnect` in `state/mcp.ts`, which takes every MCP
+   * tool out of the registry before it puts the enabled servers' back. A call
+   * the model was writing meanwhile reaches here with nothing behind its name.
+   * It was a call to a server this request declared, and it did not go, so it
+   * is named from `declared` — looked up by the same enabled ids — and
+   * recorded as not sent. Nothing is run from it.
+   */
+  const departed = calls.map((call, index) =>
+    tools[index] === undefined
+      ? enabledTool(
+          { get: (id) => options.declared?.find((tool) => tool.id === id) },
+          options.enabledIds,
+          call.name,
+        )
+      : undefined,
+  );
   // Asked BEFORE any call in the batch runs, so a sheet lists every call its
   // answer covers, and a destructive call's own confirm comes after it.
   const { refused, onHeldGrant } = await refusedDestinations(
@@ -343,6 +371,20 @@ export async function runToolCalls(
   };
 
   /*
+   * Its tool gone, no sheet was raised for it and nothing can run it. The record
+   * says the server changed, because taking a server's tools away is what a
+   * server change does, and like a withdrawn grant that outranks Stop.
+   */
+  const changed = (index: number): Refusal | undefined => {
+    const destination = departed[index]?.destination;
+    if (!destination) return undefined;
+    return {
+      output: `This call’s arguments were not sent to ${destination.host}: the server changed before it went.`,
+      why: 'server-changed',
+    };
+  };
+
+  /*
    * STOP HOLDS BACK EVERY CALL THAT HAS NOT GONE, and each is written down (#92,
    * owner ruling that "not sent" covers every call that did not leave). That is
    * a call allowed by a grant the conversation held, or by an answer given in
@@ -361,16 +403,19 @@ export async function runToolCalls(
   };
 
   for (const [index, call] of calls.entries()) {
-    const refusal = refused.get(index) ?? withdrawn(index) ?? stopped(index);
+    const refusal = refused.get(index) ?? withdrawn(index) ?? changed(index) ?? stopped(index);
     // Nothing runs once the turn is stopped. A refused call is still written
     // down below, whatever refused it: a refusal sends nothing, and a call the
     // person declined before Stop came is as much not sent as one Stop held
     // back (owner ruling OD7). What is skipped here without a record is only a
-    // call with no destination — a tool that runs on this device, or none by
-    // that name — which has no server it was not sent to.
+    // call with no destination — a tool that runs on this device, or a name
+    // the request did not declare — which has no server it was not sent to.
     if (options.signal?.aborted && !refusal) continue;
 
     const tool = tools[index];
+    // What a record names: the live tool, or the one the request declared when
+    // the live one has gone. Only `tool` is ever run.
+    const named = tool ?? departed[index];
     const started = performance.now();
 
     let output: string;
@@ -378,10 +423,7 @@ export async function runToolCalls(
     let display: ExecutedTool['display'];
     let receipt: ExecutedTool['receipt'];
 
-    if (!tool) {
-      output = `No tool named "${call.name}" is available.`;
-      isError = true;
-    } else if (refusal) {
+    if (refusal) {
       // Written by this app from the destination's host, which the person
       // typed; nothing in it came from the model or the server.
       output = refusal.output;
@@ -389,19 +431,22 @@ export async function runToolCalls(
       // RECORDED AS NOT SENT (#92, owner ruling OD7), so the thread and the
       // export can say what did not go. Only for a call with a destination:
       // an `mcp:` tool refused for declaring none has no host to name.
-      const destination = tool.destination;
-      if (destination) {
+      const destination = named?.destination;
+      if (named && destination) {
         receipt = {
           outcome: 'withheld',
           why: refusal.why,
           serverId: destination.serverId,
           serverName: destination.serverName,
           host: destination.host,
-          toolName: tool.name,
+          toolName: named.name,
           bytes: argumentBytes(call.input),
           at: Date.now(),
         };
       }
+    } else if (!tool) {
+      output = `No tool named "${call.name}" is available.`;
+      isError = true;
     } else {
       try {
         const result = await tool.execute(call.input, {
@@ -561,6 +606,11 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
     const enabled = context.request.tools ?? [];
     if (enabled.length === 0) return next();
 
+    // What this request declares, as it begins: see `declared` on `runToolCalls`.
+    const declared = enabledToolIds(context.request).flatMap((id) => {
+      const tool = options.registry.get(id);
+      return tool ? [tool] : [];
+    });
     let response = await next();
     const executed: ExecutedTool[] = [];
     let messages: IRMessage[] = [...context.request.messages];
@@ -575,6 +625,7 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
         // to hold a grant and no moment to raise a sheet in, so no call that
         // leaves the device is sent from it, granted or not (#6).
         destinations: NO_DESTINATIONS,
+        declared,
         signal: context.signal,
         onToolExecuted: options.onToolExecuted,
       });

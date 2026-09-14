@@ -49,7 +49,7 @@ import {
   taintedCharacters,
   type ClearedMessage,
 } from '@/ai/taint';
-import { toolRegistry } from '@/ai/tools/registry';
+import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { fallbackWarning, mergeWarnings, warningsOf, type TurnWarning } from '@/ai/warnings';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
 import type { EngineId } from '@/domain/manifest';
@@ -130,6 +130,21 @@ function withheldNote(characters: number): string {
  */
 function declaredToolNames(toolIds: readonly string[] | undefined): ReadonlySet<string> {
   return new Set((toolIds?.length ? toolRegistry.toIRTools(toolIds) : []).map((tool) => tool.name));
+}
+
+/**
+ * The tools a request declares, as the registry holds them when it is built —
+ * the same lookup `#toIR` makes to tell the model what it may call.
+ *
+ * Handed to the dispatcher only to name a call whose tool left the registry
+ * before the call was dispatched (`declared` on `runToolCalls`, #92). Nothing is
+ * ever run from it.
+ */
+function declaredTools(toolIds: readonly string[] | undefined): ChatterangTool[] {
+  return (toolIds ?? []).flatMap((id) => {
+    const tool = toolRegistry.get(id);
+    return tool ? [tool] : [];
+  });
 }
 
 interface TurnResult {
@@ -879,6 +894,8 @@ export class ChatterangEngine {
         };
       }
 
+      // Taken as the request is built, beside the tool list `#toIR` declares.
+      const offered = declaredTools(request.toolIds);
       const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
 
       let turn: TurnResult;
@@ -954,6 +971,7 @@ export class ChatterangEngine {
       const batch = await runToolCalls(toolRegistry, calls, {
         enabledIds: request.toolIds ?? [],
         destinations: this.#mcpDestinations(request.mcpEgress),
+        declared: offered,
         signal: request.signal,
       });
       tools.push(...batch.executed);
