@@ -95,23 +95,29 @@ export function Composer({
   }, [text]);
 
   const send = useCallback(() => {
+    // NOT WHILE A TURN IS RUNNING, and the text stays. Send is not on screen
+    // then — Stop is — but Enter in the field and the Send command still came
+    // here, handed the text over and cleared the field, and the store refuses a
+    // turn while one runs: what was typed was gone.
+    if (generating) return;
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
     onSend(trimmed, attachments);
     setText('');
     setAttachments([]);
-  }, [text, attachments, onSend]);
+  }, [generating, text, attachments, onSend]);
 
   useEffect(
     () =>
       registerCommand('chat.send', () => {
         // `false` hands the command back to the dispatcher rather than
-        // pretending a disabled composer sent something.
-        if (disabled) return false;
+        // pretending a disabled composer sent something — nor one that sends
+        // nothing while a turn runs.
+        if (disabled || generating) return false;
         send();
         return true;
       }),
-    [disabled, send],
+    [disabled, generating, send],
   );
 
   const addImages = useCallback(
