@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ChatterangEngine, targetFor } from '@/ai/engine';
+import { ChatterangEngine, targetFor, type ToolEgressRequest } from '@/ai/engine';
 import { createMcpTool } from '@/ai/mcp/tools';
 import { renderPrompt } from '@/ai/prompt';
 import { getProvider } from '@/ai/providers';
@@ -31,7 +31,7 @@ import {
   type ShellContext,
   type ShellStores,
 } from '@/shell/commands';
-import { toolOutputSheetBody } from '@/state/chat';
+import { buildMessages, toolOutputSheetBody } from '@/state/chat';
 
 import {
   CALL,
@@ -806,7 +806,7 @@ describe('the tool-output sheet', () => {
     expect(failed.receipt?.outcome).toBe('failed');
     expect(local.receipt).toBeUndefined();
 
-    const body = toolOutputSheetBody([sent, local], 'GPT-4o mini', 120);
+    const body = toolOutputSheetBody([sent, local], [], 'GPT-4o mini', 120);
     expect(body).toContain('notes.note returned this from notes.example');
     expect(body, 'the internal tool id is not what a person is shown').not.toContain('mcp:');
     expect(body).toContain('leaky read from this app’s own data');
@@ -814,9 +814,10 @@ describe('the tool-output sheet', () => {
       /notes\.note[^.;]*own data/,
     );
 
-    // A failed call was handed over, but what came back is this app's own
-    // error text. The server did not return it, and the sheet does not say so.
-    const failedBody = toolOutputSheetBody([failed], 'GPT-4o mini', 40);
+    // A failed call was handed over, and what came back is this app's framing
+    // around an error message the server may have written. The sheet says
+    // neither that the server returned it nor that it is this app's own.
+    const failedBody = toolOutputSheetBody([failed], [], 'GPT-4o mini', 40);
     expect(failedBody).toContain('notes.note did not complete on notes.example');
     expect(failedBody).not.toContain('mcp:');
     expect(failedBody).not.toContain('returned this from');
@@ -824,8 +825,132 @@ describe('the tool-output sheet', () => {
 
     // And the sheet the app raises is built by this function, not a copy of it.
     expect(shipped('state/chat.ts')).toContain(
-      'body: toolOutputSheetBody(tools, modelName, characters)',
+      'body: toolOutputSheetBody(tools, earlier, modelName, characters)',
     );
+  });
+
+  /*
+   * THE TURNS AFTER THE CALL. A reply written from a tool's output is marked
+   * tainted in the history, so every later turn raises the sheet again before
+   * any tool has run — and the engine hands over only THIS turn's tools, which
+   * is none. The body fell back to "A tool read from this app’s own data" over
+   * a reply written from what a server returned. Measured through the real
+   * history builder and the real engine gate; `variant-provenance.test.ts`
+   * measures that the store hands the policy these replies.
+   */
+  it('does not call earlier MCP output this app’s own on the turns after it', async () => {
+    const receipt = {
+      outcome: 'sent' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.search',
+      bytes: 22,
+      at: 1,
+    };
+    const chat: Parameters<typeof buildMessages>[0] = {
+      id: 'c1',
+      title: 'c1',
+      mode: 'chat',
+      personaId: null,
+      modelId: null,
+      sampler: null,
+      tools: ['mcp:notes.search'],
+      showThinking: false,
+      createdAt: 1,
+      updatedAt: 1,
+      messageCount: 3,
+      preview: '',
+    };
+    const rows: Parameters<typeof buildMessages>[1] = [
+      { id: 'm1', chatId: 'c1', role: 'user', content: 'what do my notes say?', createdAt: 1 },
+      {
+        id: 'm2',
+        chatId: 'c1',
+        role: 'assistant',
+        content: `Your notes say ${SECRET}.`,
+        createdAt: 2,
+        toolCalls: [{ id: 't1', name: 'notes.search', input: { q: 'notes' }, output: `my ${SECRET}`, receipt }],
+      },
+      { id: 'm3', chatId: 'c1', role: 'user', content: 'and then?', createdAt: 3 },
+    ];
+    const built = await buildMessages(chat, rows, 0, 'no-such-model');
+
+    const asked: ToolEgressRequest[] = [];
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('cloud', recordingBackend(['Sure.']).adapter);
+    await drainEvents(
+      engine.stream({
+        messages: built.messages,
+        target: cloudTarget,
+        egress: {
+          isGranted: () => false,
+          request: async (request) => {
+            asked.push(request);
+            return 'deny';
+          },
+        },
+      }),
+    );
+
+    expect(asked, 'the sheet is raised over the earlier reply').toHaveLength(1);
+    expect(asked[0]!.tools, 'no tool has run this turn').toEqual([]);
+
+    const body = toolOutputSheetBody(
+      asked[0]!.tools,
+      built.derivedReplies,
+      asked[0]!.modelName,
+      asked[0]!.characters,
+    );
+    expect(body).toContain(
+      'Earlier replies in this conversation drew on tool output, including what notes.search returned from notes.example.',
+    );
+    expect(body).not.toContain('own data');
+
+    // With a tool of this turn's beside it, each keeps its own origin.
+    const { executed } = await runToolCalls(
+      new ToolRegistry([leakyTool]),
+      [{ type: 'tool_use', id: 'c2', name: 'leaky', input: {} }],
+      { enabledIds: ['leaky'] },
+    );
+    const mixed = toolOutputSheetBody(executed, built.derivedReplies, 'GPT-4o mini', 200);
+    expect(mixed).toContain('leaky read from this app’s own data');
+    expect(mixed).toContain('what notes.search returned from notes.example');
+
+    // The paired control: the host is read off the receipt. The same reply with
+    // none — a local tool's, or one stored before receipts — names no origin,
+    // and is not called this app's own either.
+    const unreceipted = await buildMessages(
+      chat,
+      rows.map((row) =>
+        row.toolCalls ? { ...row, toolCalls: row.toolCalls.map(({ receipt: _none, ...call }) => call) } : row,
+      ),
+      0,
+      'no-such-model',
+    );
+    const plain = toolOutputSheetBody([], unreceipted.derivedReplies, 'GPT-4o mini', 40);
+    expect(plain).toContain('Earlier replies in this conversation drew on tool output. ');
+    expect(plain).not.toContain('notes.example');
+    expect(plain).not.toContain('own data');
+
+    // An earlier call that failed is named as one, not as a server's answer.
+    const failedEarlier = toolOutputSheetBody(
+      [],
+      [
+        {
+          toolCalls: [
+            { id: 't1', name: 'notes.search', input: {}, receipt: { ...receipt, outcome: 'failed' } },
+          ],
+        },
+      ],
+      'GPT-4o mini',
+      40,
+    );
+    expect(failedEarlier).toContain('notes.search, which did not complete on notes.example');
+    expect(failedEarlier).not.toContain('returned from');
+
+    // And with nothing to attribute at all, the floor names no origin.
+    expect(toolOutputSheetBody([], [], 'GPT-4o mini', 1)).not.toContain('own data');
   });
 });
 
