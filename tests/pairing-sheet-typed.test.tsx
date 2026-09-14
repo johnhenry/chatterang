@@ -326,7 +326,16 @@ describe('what the controller answers', () => {
   });
 
   it('refuses an answer that is not an outcome, and a refusal reason it has no words for', async () => {
-    for (const answer of [{ kind: 'bogus' }, { kind: 'refused', reason: 'made-up' }, undefined]) {
+    for (const answer of [
+      { kind: 'bogus' },
+      { kind: 'refused', reason: 'made-up' },
+      // Names every object inherits. A lookup that reads the prototype finds a
+      // function or an object there, not words, and React cannot render either.
+      { kind: 'refused', reason: 'constructor' },
+      { kind: 'refused', reason: '__proto__' },
+      { kind: 'refused', reason: 'toString' },
+      undefined,
+    ]) {
       const { controller } = fakeController(async () => answer as unknown as PairingOutcome);
       const { mount, onOutcome } = await open(controller);
       await fill({ host: '192.168.1.4:51234', code: '123456', kind: DESKTOP });
@@ -346,6 +355,32 @@ describe('what the controller answers', () => {
     expect(onOutcome).toHaveBeenCalledWith({ kind: 'paired', deviceName: 'Desk' });
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(dialog()).toBeNull();
+  });
+
+  it('closes before handing the pairing up, so nothing done with the news can leave the sheet up and busy', async () => {
+    const { controller } = fakeController(async () => ({ kind: 'paired', deviceName: 'Desk' }));
+    const { onOutcome, onClose } = await open(controller);
+    await fill({ host: '192.168.1.4:51234', code: '123456', kind: DESKTOP });
+    await submit();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOutcome).toHaveBeenCalledTimes(1);
+    expect(onClose.mock.invocationCallOrder[0]!).toBeLessThan(onOutcome.mock.invocationCallOrder[0]!);
+  });
+
+  it('reports a paired answer whose name is not text as paired, with no name', async () => {
+    // Treating it as a refusal would say "did not finish" about a pairing the
+    // controller says the host holds, which is the failure D9 exists to avoid.
+    for (const answer of [{ kind: 'paired' }, { kind: 'paired', deviceName: 42 }, { kind: 'paired', deviceName: null }]) {
+      const { controller } = fakeController(async () => answer as unknown as PairingOutcome);
+      const { mount, onOutcome, onClose } = await open(controller);
+      await fill({ host: '192.168.1.4:51234', code: '123456', kind: DESKTOP });
+      await submit();
+      expect(onOutcome, JSON.stringify(answer)).toHaveBeenCalledTimes(1);
+      expect(onOutcome, JSON.stringify(answer)).toHaveBeenCalledWith({ kind: 'paired', deviceName: '' });
+      expect(onClose, JSON.stringify(answer)).toHaveBeenCalledTimes(1);
+      expect(dialog(), JSON.stringify(answer)).toBeNull();
+      await mount.unmount();
+    }
   });
 
   it('does not send twice while a pairing is in flight', async () => {
@@ -530,6 +565,21 @@ describe('a name the host wrote', () => {
     for (const ch of ['\u0020', '\u00a0', '\u2029', '\u202f', '\u2065', '\u206a']) {
       expect(hasDisguisingCharacter(`a${ch}b`), `U+${ch.codePointAt(0)!.toString(16)}`).toBe(false);
     }
-    expect(pairedMessage('   ').startsWith('Paired.')).toBe(true);
+    expect(pairedMessage(`koob${String.fromCharCode(0x202e)}cam`)).toBe(
+      'Paired. The other machine’s name is not shown, because it contains characters that can disguise text.',
+    );
+    // A tab is blank AND a control character; the sentence about controls is the true one.
+    expect(pairedMessage(String.fromCharCode(9))).toBe(
+      'Paired. The other machine’s name is not shown, because it contains characters that can disguise text.',
+    );
+  });
+
+  it('says a blank name is blank, not that it hides something', () => {
+    // Nothing in '' or a run of spaces can disguise text, so the reason given
+    // for showing no name is that there is none.
+    for (const blank of ['', ' ', '   ', String.fromCharCode(0xa0)]) {
+      expect(hasDisguisingCharacter(blank), JSON.stringify(blank)).toBe(false);
+      expect(pairedMessage(blank), JSON.stringify(blank)).toBe('Paired. The other machine gave no name.');
+    }
   });
 });

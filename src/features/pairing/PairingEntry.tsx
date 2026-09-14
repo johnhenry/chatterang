@@ -17,9 +17,11 @@ import { pairedMessage } from '@/features/pairing/wording';
  * TWO COMPONENTS, so no hook ever follows the early return. The gate reads the
  * accessor and stops; the section below it holds state.
  *
- * The sheet is a lazy chunk, loaded when the button is pressed, so its words
- * and the typed-route parser stay off the startup path of everyone who never
- * pairs. No size is claimed for that: nothing here measures a build.
+ * The sheet component is imported lazily, when the button is pressed. That is
+ * all this claims. `wording.ts` is imported here too, for the toast, and
+ * `@/lib/pairing` for the gate, so neither is kept out of the chunk that loads
+ * Settings; what else the bundler keeps out is not measured, because nothing
+ * here runs a build.
  */
 
 const PairingSheet = lazy(() =>

@@ -115,6 +115,16 @@ describe('the pairing entry when a controller is available', () => {
     expect(byLabel('Six-digit code').value).toBe('');
   });
 
+  it('reports a pairing whose answer carries no name, and the sheet does not stick open', async () => {
+    // A controller that says "paired" and omits the name has still paired. The
+    // toast says so, in words that are true of a missing name.
+    fake.pair.mockResolvedValue({ kind: 'paired' } as unknown as PairingOutcome);
+    await openSheet();
+    await pairTyped();
+    expect(dialog()).toBeNull();
+    expect(toasts()).toEqual([{ message: 'Paired. The other machine gave no name.', tone: 'good' }]);
+  });
+
   it('withholds a name that can disguise itself, and still reports the pairing', async () => {
     fake.pair.mockResolvedValue({ kind: 'paired', deviceName: '\u202ekoobcam' } satisfies PairingOutcome);
     await openSheet();

@@ -131,16 +131,23 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
     if (inFlight.current === abort) inFlight.current = null;
 
     if (outcome?.kind === 'paired') {
-      // Surfaced whether or not the person already closed the sheet (D9).
-      onOutcome(outcome);
+      // Closed first, so nothing the parent does with the news can leave the
+      // sheet on screen and busy.
       if (!abort.signal.aborted) onClose();
+      // Surfaced whether or not the person already closed the sheet (D9). A
+      // name that is not text is handed up as no name: the controller says the
+      // host holds a pairing, and that is reported either way.
+      onOutcome({ kind: 'paired', deviceName: typeof outcome.deviceName === 'string' ? outcome.deviceName : '' });
       return;
     }
     // A refusal after the person closed answers a question they withdrew.
     if (abort.signal.aborted) return;
     setBusy(false);
     // A reason the controller invents gets the generic sentence, not silence.
-    setRefusal(outcome?.kind === 'refused' ? (REFUSAL_WORDING[outcome.reason] ?? GENERIC_REFUSAL) : GENERIC_REFUSAL);
+    // Own keys only: `constructor` or `__proto__` would otherwise find what
+    // every object inherits, which is not a sentence.
+    const reason = outcome?.kind === 'refused' ? outcome.reason : null;
+    setRefusal(reason !== null && Object.hasOwn(REFUSAL_WORDING, reason) ? REFUSAL_WORDING[reason] : GENERIC_REFUSAL);
   }
 
   const described = (hint: string, problem: unknown, error: string): string =>

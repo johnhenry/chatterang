@@ -88,10 +88,15 @@ export function hasDisguisingCharacter(name: string): boolean {
  * than stated as a fact about it. A name that could disguise itself is not
  * shown at all — the pairing still happened and is still reported, because a
  * completed pairing the phone stays silent about is the worse failure.
+ *
+ * Each withheld case gives the reason that is true of it. A blank name hides
+ * nothing, so it is not accused of hiding something; a name that is blank but
+ * holds a control character, such as a tab, gets the sentence about controls.
  */
 export function pairedMessage(deviceName: string): string {
-  if (hasDisguisingCharacter(deviceName) || deviceName.trim().length === 0) {
+  if (hasDisguisingCharacter(deviceName)) {
     return 'Paired. The other machine’s name is not shown, because it contains characters that can disguise text.';
   }
+  if (deviceName.trim().length === 0) return 'Paired. The other machine gave no name.';
   return `Paired with “${deviceName}”.`;
 }
