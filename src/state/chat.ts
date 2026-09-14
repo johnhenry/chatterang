@@ -235,17 +235,26 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
  * for a chat in here either. Deleting a chat stopped only its rows: the turn
  * running in it went on calling MCP servers under an answer given for the
  * conversation, measured through the real engine, and a turn asked for while
- * an earlier write held the delete's place started. So the running turn is
- * stopped as the delete is asked for (`liveTurn`), and `runGeneration` starts
- * none in a chat in here, nor hands one to the engine.
+ * an earlier write held the delete's place started. So every turn running in
+ * it is stopped as the delete is asked for (`liveTurns`), and `runGeneration`
+ * starts none in a chat in here, nor hands one to the engine.
  *
  * Taken out again if the delete fails — the chat is still there then, and so
  * should be what is written to it from then on.
  */
 const removedChats = new Set<string>();
 
-/** The chat the running generation belongs to, and what stops it. */
-let liveTurn: { readonly chatId: string; readonly controller: AbortController } | null = null;
+/**
+ * Every generation still running, with the chat it belongs to and what stops it.
+ *
+ * A SET, NOT ONE SLOT. More than one turn can be running: editing a user message
+ * starts a turn without asking whether one is already running, and the edit
+ * button is on screen while one is. One slot held the turn started last, and
+ * deleting the chat the earlier one ran in stopped nothing — its model went on
+ * calling an MCP server under the conversation's earlier yes, measured through
+ * the real engine.
+ */
+const liveTurns = new Set<{ readonly chatId: string; readonly controller: AbortController }>();
 
 /**
  * Write a message row, unless its chat's delete has been asked for. See
@@ -529,7 +538,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // turn. What that turn would send next is sent for a conversation the person
     // has just deleted.
     removedChats.add(chatId);
-    if (liveTurn?.chatId === chatId) liveTurn.controller.abort();
+    for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
     return writeInTurn(chatId, async () => {
       try {
         await deleteChat(chatId);
@@ -912,7 +921,8 @@ async function runGeneration(
   };
 
   set({ generating: true, controller, messages: [...get().messages, placeholder] });
-  liveTurn = { chatId: chat.id, controller };
+  const live = { chatId: chat.id, controller };
+  liveTurns.add(live);
   app.setActivity(runsOnThisDevice(target) ? 'loading' : 'remote');
 
   const started = performance.now();
@@ -1183,7 +1193,7 @@ async function runGeneration(
     app.toast(message, 'crit');
   } finally {
     if (livePlaceholderId === placeholder.id) livePlaceholderId = null;
-    if (liveTurn?.controller === controller) liveTurn = null;
+    liveTurns.delete(live);
     set({ generating: false, controller: null });
     app.setActivity('idle');
     app.setLiveRate(null);

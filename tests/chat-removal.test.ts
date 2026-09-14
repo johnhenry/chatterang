@@ -552,6 +552,72 @@ describe('a chat deleted while a turn is running in it', () => {
     expect(rowsFor('mcp_turn')).toEqual([]);
   });
 
+  it.each(['opens another chat and edits a message there', 'only opens another chat'] as const)(
+    'sends no further MCP call when, while the call is out, the person %s and then deletes it',
+    async (how) => {
+      // Editing a user message starts a turn without asking whether one is
+      // running, and the edit button is on screen while one is. So the edit
+      // starts a second turn, in the other chat, while the first is still
+      // running. The store remembered only the turn started last, and deleting
+      // the first chat stopped nothing: its model called the server again under
+      // the conversation's yes. The control only opens the other chat.
+      const edits = how === 'opens another chat and edits a message there';
+      const id = edits ? 'two_turns' : 'one_turn';
+      const other = `${id}_other`;
+      const probe = mcpProbe();
+      given({ ...chat(id, 1), tools: [probe.tool.id] }, chat(other, 2));
+      for (const row of [
+        { id: `${other}_user`, chatId: other, role: 'user', content: 'hello', createdAt: 1 },
+        { id: `${other}_reply`, chatId: other, role: 'assistant', content: 'Hi.', createdAt: 2 },
+      ] as Message[]) fake.messages.set(row.id, structuredClone(row));
+      useChats.setState({ activeChatId: id });
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+
+      const stoppedAtDelete: boolean[] = [];
+      let removing: Promise<void> = Promise.resolve();
+      probe.call.mockImplementationOnce(async (_server, _name, _args, signal) => {
+        await useChats.getState().openChat(other);
+        if (edits) await useChats.getState().editMessage(`${other}_user`, 'hello again');
+        removing = useChats.getState().removeChat(id);
+        stoppedAtDelete.push(signal?.aborted ?? false);
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+      const asked: string[] = [];
+      const original = useApp.getState().requestApproval;
+      // Requests in order: the first chat's, the edited chat's whole turn, then
+      // the first chat's next call and its last reply.
+      const backend = recordingBackend(edits ? [MCP_CALL, 'Edited reply.', MCP_CALL, 'Done.'] : [MCP_CALL, MCP_CALL, 'Done.']);
+
+      try {
+        toolRegistry.register(probe.tool);
+        engine.router.replace(QWEN.engine, backend.adapter);
+        useApp.setState({
+          engine: engine as never,
+          requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+            asked.push(action);
+            if (asked.length > 1) return false;
+            prompt?.onExtended?.();
+            return true;
+          },
+        });
+        await useChats.getState().send('file my bank details');
+        await removing;
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+        useApp.setState({ requestApproval: original });
+      }
+
+      expect(stoppedAtDelete, 'the first chat’s turn, as the delete is asked for').toEqual([true]);
+      expect(probe.call, 'the arguments reached the server once, before the delete').toHaveBeenCalledOnce();
+      expect(fake.chats.has(id)).toBe(false);
+      expect(rowsFor(id)).toEqual([]);
+      if (edits) {
+        // The other chat's turn is not the one deleted, and ran to its end.
+        expect((rowsFor(other) as Message[]).map((row) => row.content)).toEqual(['hello again', 'Edited reply.']);
+      }
+    },
+  );
+
   it.each(['deleted', 'only stopped'] as const)(
     'takes down the MCP send sheet its turn waits on when the chat is %s, and writes the not-sent record only for a chat still there',
     async (how) => {
