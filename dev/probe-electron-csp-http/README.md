@@ -128,7 +128,47 @@ with no `OLLAMA_ORIGINS` in its process environment or in `launchctl`),
 | `https://evil.example` | 403 |
 | none | 200 |
 
-So a stock Ollama refuses the desktop app's origin until the user starts it with
-something like `OLLAMA_ORIGINS=chatterang-desktop://app`. That is the provider's
-CORS, not this policy, and nothing in the CSP can change it. It is recorded here,
-not worked around. LM Studio's CORS setting was not measured.
+So a stock Ollama refuses the desktop app's origin until `OLLAMA_ORIGINS` admits
+it. This README used to suggest "something like
+`OLLAMA_ORIGINS=chatterang-desktop://app`". Measured, that value stops Ollama
+from starting at all.
+
+The measurement used a throwaway `ollama serve` (0.34.0, on its own loopback
+`OLLAMA_HOST` port with its own empty `OLLAMA_MODELS`, so the app's server was
+not touched), started once per value. In every row the preflight for
+`POST /api/chat` agreed with `GET /api/version` (403 with 403, 200 with 204):
+
+| `OLLAMA_ORIGINS` | server | `chatterang-desktop://app` | `chatterang-desktop://app-evil` | `capacitor://localhost` |
+|---|---|---|---|---|
+| unset | starts | 403 | not asked | 403 |
+| `chatterang-desktop://app` | **panics before listening** | | | |
+| `capacitor://localhost` | **panics before listening** | | | |
+| `http://localhost:5273` | starts | 403 | 403 | 403 |
+| `chatterang-desktop://app*` | starts | 200 | **200** | 403 |
+| `chatterang-desktop://*` | starts | 200 | 200 | 403 |
+| `capacitor://*` | starts | 403 | 403 | 200 |
+
+Both panics printed:
+
+    panic: bad origin: origins must contain '*' or include http://,https://,chrome-extension://,safari-extension://,moz-extension://,ms-browser-extension://
+
+What the rows show:
+
+- **An exact origin on a scheme outside that list is refused at startup.**
+  `chatterang-desktop://` (desktop) and `capacitor://` (iOS) are both outside
+  it. Only a value containing `*` starts. The FAQ's own example is in that form
+  (`chrome-extension://*,moz-extension://*,safari-web-extension://*`).
+- **`*` matches as a prefix.** `chatterang-desktop://app*` admits
+  `chatterang-desktop://app-evil` too.
+- **The web origins need no setting.** With it unset, `https://localhost` and
+  `http://localhost:5273` got 200. The startup log's `server config` line lists
+  the defaults: `http://` and `https://` for `localhost`, `127.0.0.1` and
+  `0.0.0.0`, each with and without `:*`, plus `app://*`, `file://*`, `tauri://*`,
+  `vscode-webview://*` and `vscode-file://*`, which is why `app://-` got 200
+  above. A value set in `OLLAMA_ORIGINS` was listed ahead of those defaults, not
+  in place of them.
+
+That is the provider's CORS, not this policy, and nothing in the CSP can change
+it. It is recorded here, not worked around. Which value the app's own copy
+should name is the owner's call (#284). LM Studio's CORS setting was not
+measured.
