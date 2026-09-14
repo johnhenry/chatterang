@@ -1347,6 +1347,73 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(thenStopped.tools[1]!.receipt).toMatchObject(notSent);
   });
 
+  it('does not send a destructive call once its server’s held grant is withdrawn while its data-change confirm is up', async () => {
+    // The dispatcher reads a held grant again just before a call runs, but a
+    // destructive call then waits on its data-change confirm inside the tool,
+    // and that sheet stays up for as long as nobody answers. Switching the
+    // server off and on meanwhile withdraws the grant and brings back the same
+    // record at the same address, so the live check in `state/mcp.ts` passes;
+    // and a yes to whether data may change never answers whether the arguments
+    // may leave (#6).
+    const confirming = async (withdraw: boolean, stop = false) => {
+      const probe = mcpProbe({ readOnly: false });
+      toolRegistry.register(probe.tool);
+      const held = new Set<string>([PROBE_SERVER.serverId]);
+      const controller = new AbortController();
+      probe.confirm.mockImplementation(async () => {
+        if (withdraw) held.delete(PROBE_SERVER.serverId);
+        if (stop) controller.abort();
+        return true;
+      });
+      const request = ask('conversation');
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: { isGranted: (destination) => held.has(destination.serverId), request },
+          signal: controller.signal,
+        }),
+      );
+      toolRegistry.unregister(probe.tool.id);
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, request, tools };
+    };
+
+    // The control: nothing withdrawn, the yes sends, nobody asked, recorded as sent.
+    const kept = await confirming(false);
+    expect(kept.probe.confirm).toHaveBeenCalledOnce();
+    expect(kept.probe.call).toHaveBeenCalledOnce();
+    expect(kept.request).not.toHaveBeenCalled();
+    expect(kept.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent']);
+
+    const withdrawn = await confirming(true);
+    expect(withdrawn.probe.confirm).toHaveBeenCalledOnce();
+    expect(withdrawn.probe.call).not.toHaveBeenCalled();
+    expect(withdrawn.request).not.toHaveBeenCalled();
+    expect(withdrawn.tools.map((tool) => tool.output)).toEqual([
+      'This call’s arguments were not sent to notes.example: this conversation’s permission for that server was withdrawn before it went.',
+    ]);
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    expect(withdrawn.tools[0]!.receipt).toMatchObject(notSent);
+
+    // Stop landing at the same confirm, after the withdrawal, leaves the same record.
+    const thenStopped = await confirming(true, true);
+    expect(thenStopped.probe.call).not.toHaveBeenCalled();
+    expect(thenStopped.tools[0]!.receipt).toMatchObject(notSent);
+  });
+
   it('records a call as not sent when its server leaves while the model is still writing it — under Stop too', async () => {
     // Removing a server, switching one off or adding one runs `reconnect`,
     // which takes every MCP tool out of the registry before it puts the enabled

@@ -210,6 +210,72 @@ describe('a call that could change data on its server', () => {
     expect(executed[0]?.output).toBe('The user declined that tool call.');
   });
 
+  it('reads a held grant again after the data-change confirm, and sends nothing once it is withdrawn', async () => {
+    // The confirm stays up for as long as nobody answers. Switching the server
+    // off and on meanwhile withdraws the grant but brings back the same record
+    // at the same address, and a yes to whether data may change never answers
+    // whether the arguments may leave (#6).
+    const dispatch = async (withdraw: boolean) => {
+      let held = true;
+      const order: string[] = [];
+      const confirm = vi.fn(async (_action: string) => {
+        if (withdraw) held = false;
+        order.push('changes');
+        return true;
+      });
+      const call = vi.fn(async () => {
+        order.push('sent');
+        return { content: [{ type: 'text', text: 'ok' }] };
+      });
+      const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+      const { executed } = await runToolCalls(new ToolRegistry([tool]), use(tool.name), {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => held },
+      });
+      return { tool, call, order, executed };
+    };
+
+    // The control: the grant stands, so the yes sends.
+    const kept = await dispatch(false);
+    expect(kept.order).toEqual(['changes', 'sent']);
+    expect(kept.executed[0]?.receipt).toMatchObject({ outcome: 'sent' });
+
+    const withdrawn = await dispatch(true);
+    expect(withdrawn.order).toEqual(['changes']);
+    expect(withdrawn.call).not.toHaveBeenCalled();
+    expect(withdrawn.executed[0]?.output).toBe(
+      'This call’s arguments were not sent to api.acme.com: this conversation’s permission for that server was withdrawn before it went.',
+    );
+    expect(withdrawn.executed[0]?.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_1',
+      host: 'api.acme.com',
+      toolName: withdrawn.tool.name,
+    });
+  });
+
+  it('reads the answer before the grant, and the grant before Stop, as the dispatcher does', async () => {
+    const call = vi.fn(async () => ({ content: [] }));
+    const make = (confirm: (action: string, signal?: AbortSignal) => Promise<boolean>) =>
+      mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+    const withdrawn = { ...context, stillGranted: () => false };
+
+    const declined = await make(async () => false).execute({ q: 'x' }, withdrawn);
+    expect(declined.receipt).toMatchObject({ outcome: 'withheld', why: 'declined' });
+
+    const stopping = new AbortController();
+    const stoppedThere = await make(async () => {
+      stopping.abort();
+      return true;
+    }).execute({ q: 'x' }, { ...withdrawn, signal: stopping.signal });
+    expect(stoppedThere.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
+
+    const standing = await make(async () => true).execute({ q: 'x' }, { ...context, stillGranted: () => true });
+    expect(standing.receipt).toMatchObject({ outcome: 'sent' });
+    expect(call).toHaveBeenCalledOnce();
+  });
+
   it('treats an answer it does not recognise as a refusal', async () => {
     // Fails closed: only the two affirmative answers send anything.
     const call = vi.fn(async () => ({ content: [] }));

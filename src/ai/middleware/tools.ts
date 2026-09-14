@@ -373,6 +373,10 @@ export async function runToolCalls(
      * removed or switched off" had become true. A grant is withdrawn only when
      * its server is removed or switched off, so the record says the server
      * changed (#92, owner ruling on a server changed while a call waited).
+     *
+     * And read once more inside the call, through `stillGranted`, by a tool that
+     * waits before its arguments leave: a destructive MCP call's data-change
+     * confirm is awaited inside `execute`, after this check has passed.
      */
     const withdrawn = (index: number): Refusal | undefined => {
       const destination = tools[index]?.destination;
@@ -465,9 +469,15 @@ export async function runToolCalls(
         isError = true;
       } else {
         try {
+          const destination = tool.destination;
           const result = await tool.execute(call.input, {
             signal: options.signal,
             now: () => new Date(),
+            // Only for a call a held grant let through, as `withdrawn` above. An
+            // answer given in this batch is not read again: not ruled.
+            ...(destination && onHeldGrant.has(index)
+              ? { stillGranted: () => options.destinations.isGranted(destination) }
+              : {}),
           });
           output = result.output;
           isError = Boolean(result.isError);

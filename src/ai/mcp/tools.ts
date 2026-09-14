@@ -139,18 +139,10 @@ export function createMcpTool(
         const approved = context.signal?.aborted
           ? undefined
           : await unlessStopped(options.confirm(action, context.signal), context.signal);
-        // STOPPED WHILE ASKING (#92). The owner's ruling is that nothing leaves
-        // after Stop; it names the send sheet, and this is the other sheet a
-        // call waits on, so it is held to the same. Read off the signal, not
-        // the answer: a yes that lands with or after Stop does not send.
-        if (context.signal?.aborted) {
-          return {
-            output: `${qualified} was not sent: the reply was stopped.`,
-            isError: true,
-            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'stopped' },
-          };
-        }
-        if (!approved) {
+        // Read once, off the signal and not the answer: a yes or a no that lands
+        // with or after Stop reaches nothing.
+        const stopped = context.signal?.aborted === true;
+        if (!stopped && !approved) {
           // RECORDED AS NOT SENT (#92, owner ruling OD7). Saying no to the
           // data-change question declines the call as surely as a no to the
           // send sheet does, and the record says which of the two it was.
@@ -158,6 +150,30 @@ export function createMcpTool(
             output: 'The user declined that tool call.',
             isError: true,
             receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'declined' },
+          };
+        }
+        // A HELD GRANT IS READ AGAIN AFTER THIS CONFIRM (#6). The dispatcher read
+        // it just before this ran, but the confirm stays up for as long as nobody
+        // answers it. Switching the server off and on meanwhile withdraws the
+        // grant and brings back the same record at the same address, so the live
+        // check in `state/mcp.ts` passes; and a yes here answers whether data may
+        // change, never whether the arguments may leave. Recorded as the
+        // dispatcher records a withdrawn grant (#92), and ahead of Stop, as there.
+        if (context.stillGranted !== undefined && !context.stillGranted()) {
+          return {
+            output: `This call’s arguments were not sent to ${host}: this conversation’s permission for that server was withdrawn before it went.`,
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'server-changed' },
+          };
+        }
+        // STOPPED WHILE ASKING (#92). The owner's ruling is that nothing leaves
+        // after Stop; it names the send sheet, and this is the other sheet a
+        // call waits on, so it is held to the same.
+        if (stopped) {
+          return {
+            output: `${qualified} was not sent: the reply was stopped.`,
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'stopped' },
           };
         }
       }
