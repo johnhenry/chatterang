@@ -1319,3 +1319,75 @@ describe('whoever waits is told, whenever their place changes', () => {
     expect(dPositions).toEqual([3, 2, 1]);
   });
 });
+
+describe('a window’s unit between two steps of its work keeps the slot, and its idle deadline stops meanwhile', () => {
+  /*
+   * OWNER RULING ON #7: a desktop turn holds the one slot from its first decode
+   * until the turn settles, its tool calls included. Rejected: a hold that
+   * yields after a long tool call. A tool call reports no progress, so without
+   * this the idle deadline would end a desktop turn 150 s into one.
+   */
+
+  it('between steps it outlives UNIT_IDLE_TIMEOUT_MS as often as it takes, and the next step’s progress restarts the deadline', async () => {
+    const r = rig();
+    const job = work();
+    const settled = watch(r.run(win(1), 'turn', job));
+    const behind = work();
+    r.run(device('p'), 'phone', behind);
+
+    r.broker.progress(win(1), 'turn');
+    r.broker.betweenSteps(win(1), 'turn');
+    for (let round = 0; round < 3; round += 1) await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+    expect(settled.done, 'a unit between two steps was ended by its idle deadline').toBe(false);
+    expect(r.broker.isRunning(win(1), 'turn')).toBe(true);
+    expect(behind.starts).toBe(0);
+
+    // The next step starts: its progress restarts the deadline from now.
+    r.broker.progress(win(1), 'turn');
+    await r.clock.advance(UNIT_IDLE_TIMEOUT_MS - 1);
+    expect(settled.done).toBe(false);
+    await r.clock.advance(1);
+    await flush();
+    expect(settled.end).toBe('DEADLINE');
+  });
+
+  it('not after its deadline has passed: a unit that says it is between steps too late ends, as late progress does', async () => {
+    const r = rig();
+    const settled = watch(r.run(win(1), 'turn', work()));
+    r.clock.jump(UNIT_IDLE_TIMEOUT_MS);
+    r.broker.betweenSteps(win(1), 'turn');
+    await flush();
+    expect(settled.end).toBe('DEADLINE');
+  });
+
+  it('a device’s unit cannot stop its deadline: a dropped socket does not end it, so nothing else would', async () => {
+    const r = rig();
+    const settled = watch(r.run(device('p'), 'turn', work()));
+    r.broker.betweenSteps(device('p'), 'turn');
+    await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+    await flush();
+    expect(settled.end).toBe('DEADLINE');
+  });
+
+  it('what bounds a window’s unit between steps still ends it: the window going away, a cancel, a suspend, a quit', async () => {
+    const paths: readonly (readonly [UnitEnd, (r: Rig) => void])[] = [
+      ['OWNER_LOST', (r) => r.broker.releaseWindow(1)],
+      // A running unit's cancel aborts its work, and the work's report ends it.
+      ['COMPLETED', (r) => r.broker.cancel(win(1), 'turn')],
+      ['HOST_SUSPENDED', (r) => r.broker.suspend()],
+      ['DESKTOP_QUITTING', (r) => r.broker.quit()],
+    ];
+    for (const [end, act] of paths) {
+      const r = rig();
+      const job = work();
+      const settled = r.run(win(1), 'turn', job);
+      r.broker.betweenSteps(win(1), 'turn');
+      act(r);
+      expect(job.signal?.aborted, end).toBe(true);
+      job.resolve('stopped');
+      expect((await settled).end).toBe(end);
+      await flush();
+      expect(r.broker.slotCount, end).toBe(0);
+    }
+  });
+});

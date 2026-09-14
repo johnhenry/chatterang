@@ -55,7 +55,8 @@
  *   2. WORKER LOSS: `workerLost(executor)`, for work whose executor died;
  *   3. OWNER LOSS: a window torn down (`releaseWindow`) or a device revoked
  *      (`revokeDevice`). A dropped socket is NOT owner loss (ruling 4);
- *   4. its DEADLINE: `UNIT_IDLE_TIMEOUT_MS` without progress.
+ *   4. its DEADLINE: `UNIT_IDLE_TIMEOUT_MS` without progress, not counted for
+ *      a window's unit between two steps of its work (`betweenSteps`).
  *
  * Plus the lifecycle ends that apply to everything at once (`suspend`,
  * `quit`) and a cancel from the owner while the unit is still waiting.
@@ -167,7 +168,10 @@ export const RETAIN_RESULT_COUNT = 8;
 
 /**
  * A running unit's INACTIVITY deadline. Progress resets it; a pending prompt
- * pauses it (a person reading is not a wedge).
+ * pauses it (a person reading is not a wedge); and it does not count for a
+ * window's unit between two steps of its work (`betweenSteps`), such as a
+ * desktop turn's tool call between two decodes, which the owner ruled holds
+ * the slot however long it takes.
  *
  * 150 s, deliberately LONGER than the Supervisor's `generateIdleTimeoutMs` and
  * `callTimeoutMs` (120 s each). For a desktop generation, or any other call the
@@ -364,6 +368,12 @@ interface Unit {
   /** The last position this unit's owner was told; 0 when never told. */
   told: number;
   deadlineAt: number;
+  /**
+   * A window's unit whose owner is between two steps of its work (a desktop
+   * turn running a tool call between two decodes). Its idle deadline does not
+   * count until `progress` is reported for it again.
+   */
+  betweenSteps: boolean;
   /** When a draining unit's work has had `UNIT_DRAIN_TIMEOUT_MS` to stop. */
   drainDeadlineAt: number;
   /** Its drain deadline has been acted on; it is acted on once. */
@@ -542,6 +552,7 @@ export class WorkBroker {
       returned: false,
       told: 0,
       deadlineAt: 0,
+      betweenSteps: false,
       drainDeadlineAt: 0,
       drainExpired: false,
       prompt: null,
@@ -589,7 +600,34 @@ export class WorkBroker {
     const now = this.#timers.now();
     this.#enforceDeadlines(unit, now);
     if (unit.state !== 'running' || unit.prompt !== null) return;
+    unit.betweenSteps = false;
     unit.deadlineAt = now + UNIT_IDLE_TIMEOUT_MS;
+  }
+
+  /**
+   * A window's unit is between two steps of its work that the broker cannot
+   * see: a desktop turn has finished one decode and is running a tool call, or
+   * waiting on a local approval sheet, before its next (#7, owner ruling that a
+   * desktop turn holds the slot for the whole turn). It keeps the slot, and its
+   * idle deadline stops until `progress` is next reported for it, which the
+   * next step's start does.
+   *
+   * THERE IS NO CONSTANT HERE. The ruling rejected a hold that yields after a
+   * long tool call. What bounds a unit between steps is what bounds its owner:
+   * the window going away (`releaseWindow`), a cancel, a suspend, a quit.
+   *
+   * WINDOWS ONLY. A device's unit is not ended by its socket dropping (ruling
+   * 4), so a device's unit between steps would have nothing to bound it; it is
+   * refused here, silently, and its deadline counts as before.
+   *
+   * Not after the deadline has passed: like late progress, it ends the unit.
+   */
+  betweenSteps(owner: Owner, unitId: string): void {
+    const unit = this.#owners.get(ownerKey(owner))?.get(unitId);
+    if (unit === undefined || unit.state !== 'running') return;
+    this.#enforceDeadlines(unit, this.#timers.now());
+    if (unit.state !== 'running' || unit.owner.kind !== 'window') return;
+    unit.betweenSteps = true;
   }
 
   /* ── Relayed prompts (#170) ─────────────────────────────────────────── */
@@ -902,7 +940,8 @@ export class WorkBroker {
   /**
    * A running unit's deadlines, checked against `now`: the prompt's if one is
    * pending (refused on expiry, which restarts the idle deadline), otherwise
-   * the idle deadline (the unit ends `DEADLINE`).
+   * the idle deadline (the unit ends `DEADLINE`), which does not count for a
+   * window's unit between two steps (`betweenSteps`).
    */
   #enforceDeadlines(unit: Unit, now: number): void {
     if (unit.state !== 'running') return;
@@ -910,6 +949,7 @@ export class WorkBroker {
       if (unit.prompt.deadlineAt <= now) this.#refusePrompt(unit, 'PROMPT_TIMEOUT');
       return;
     }
+    if (unit.betweenSteps) return;
     if (unit.deadlineAt <= now) this.#settle(unit, 'DEADLINE');
   }
 
