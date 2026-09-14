@@ -18,7 +18,21 @@
  * the supervisor sent, including a call addressed at an engine that does not
  * exist — which is exactly the confusion the plugin dimension was added to
  * make impossible.
+ *
+ * AND IT CAN BE SLOW TO START, on request: with
+ * `INFERENCE_HOST_DOUBLE_STARTUP_BLOCK_MS` set, it holds its event loop for
+ * that long before it can read a message. That is what a fork on a loaded
+ * machine looks like from main — the supervisor's ping clock starts at spawn,
+ * and a process that has not been scheduled yet answers nothing — and it is
+ * the only way to show that on demand rather than by hoping for load.
  */
+
+const startupBlockMs = Number(process.env.INFERENCE_HOST_DOUBLE_STARTUP_BLOCK_MS ?? 0);
+if (startupBlockMs > 0) {
+  // Synchronous, so the IPC channel is not read until it ends, and idle, so
+  // the double does not add the CPU load it is standing in for.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, startupBlockMs);
+}
 
 const PLUGINS = {
   LlamaCpp: ['getCapabilities', 'getThermalState', 'load', 'unload', 'listLoaded', 'generate', 'cancel', 'tokenize', 'countTokens', 'benchmark'],
