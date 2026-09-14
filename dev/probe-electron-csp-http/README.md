@@ -212,7 +212,9 @@ app's origin, and shown only where Ollama needs one.
 Wherever the note shows a value, it also says to put the value in quotes when it
 is set from a shell (the Shells residual below). At `capacitor://localhost`, and
 at no other origin, it also says the value is shared with other iOS apps (the
-iOS residual below). Both were ruled by the owner on #284.
+iOS residual below). At `https://localhost`, and at no other origin, it shows no
+value and says other Android apps reach Ollama the same way (the Android
+residual below). All three were ruled by the owner on #284.
 
 On desktop the whole note reads:
 
@@ -233,6 +235,17 @@ On iOS the whole note reads:
 > them reach Ollama if they can reach the machine it runs on. If it already has a
 > value, put a comma between them, with no spaces. If you set it from a shell,
 > put the value in quotes. Restart Ollama for the change to take effect.
+
+On Android the whole note reads:
+
+> A model server on your own machine or network. Requests go to the address you
+> give. Nothing here checks that it is on your network. Other Android apps built
+> on the same framework send the same origin as this app by default, and Ollama
+> already allows that origin, so they can reach Ollama the same way if they can
+> reach the machine it runs on.
+
+At Ollama's other default origins, such as `http://localhost:5273` (web dev) or
+`https://localhost:8443`, the note is its first three sentences alone.
 
 ### Third run: the values the first version printed
 
@@ -377,17 +390,24 @@ Residuals:
   shows the value on iOS and says so, at `capacitor://localhost` only. Only a
   distinct `iosScheme` or `hostname` would narrow it; that moves the app's
   stored data to a new origin, and it is not part of this change.
-- **Android, not ruled.** `capacitor.config.ts` sets no `server.androidScheme`
-  or `server.hostname`, and the pinned `@capacitor/android` 8.5.0 defaults them
-  to `https` and `localhost` (`CapConfig.java`), so the app's Android origin is
+- **Android.** `capacitor.config.ts` sets no `server.androidScheme` or
+  `server.hostname`, and the pinned `@capacitor/android` 8.5.0 defaults them to
+  `https` and `localhost` (`CapConfig.java`), so the app's Android origin is
   `https://localhost`. That origin is one of Ollama's defaults, so the note
   shows no value there (200 with nothing set, in the third run). The same
   default means every other default-configured Capacitor Android app, and any
   page served at `https://localhost`, reaches an Ollama it can reach with
-  nothing set at all. Ollama's defaults did that before this change. The note
-  says nothing about it on Android, because the ruling gave the shared-origin
-  sentence to `capacitor://localhost` alone. Whether the Android note should
-  say so is left to the owner.
+  nothing set at all. Ollama's defaults did that before this change, and no
+  `OLLAMA_ORIGINS` value can narrow it, because a value is added ahead of the
+  defaults, not in place of them. The owner ruled on #284 that the Android note
+  says so too: at exactly `https://localhost` it keeps asking for no setting,
+  shows no value and no quoting sentence, and adds that other Android apps built
+  on the same framework can reach Ollama the same way. Ollama's other default
+  origins, `https://localhost:8443` among them, get no such sentence. The note
+  keys on the origin alone, so a page at exactly `https://localhost` that is not
+  the Android app would show the Android sentence too: for example the headless
+  server with TLS on port 443, opened in a browser as `https://localhost`. That
+  case was not run and was not ruled on.
 - **Shells.** The value contains `*`. Typed unquoted as a command argument in
   zsh, macOS's default shell, it stops the command with "no matches found".
   Measured: `zsh -c 'print -r -- chatterang-desktop:*//app'` and the same with

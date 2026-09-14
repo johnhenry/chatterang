@@ -62,7 +62,15 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
     note: 'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.',
     originNote(origin) {
       const setting = ollamaOriginsSetting(origin);
-      if (setting.kind === 'none-needed') return null;
+      if (setting.kind === 'none-needed') {
+        // Ruled on #284: Android says its origin is shared too. Ollama already
+        // allows it, so there is no value and no quoting sentence, only the fact
+        // that other default-configured Capacitor Android apps get in the same
+        // way. Only that exact origin says so; other default origins say nothing.
+        return origin === CAPACITOR_ANDROID_DEFAULT_ORIGIN
+          ? [OLLAMA_ANDROID_SHARED_ORIGIN_SENTENCE]
+          : null;
+      }
       if (setting.kind === 'unknown') {
         return [
           'This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s ',
@@ -79,7 +87,7 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
         // Ruled on #284: iOS shows the value and says it is shared. Every
         // default-configured Capacitor iOS app sends this same origin, so no
         // value admits this app there alone. Only that exact origin says so.
-        ...(origin === CAPACITOR_IOS_DEFAULT_ORIGIN ? [` ${OLLAMA_SHARED_ORIGIN_SENTENCE}`] : []),
+        ...(origin === CAPACITOR_IOS_DEFAULT_ORIGIN ? [` ${OLLAMA_IOS_SHARED_ORIGIN_SENTENCE}`] : []),
         ' If it already has a value, put a comma between them, with no spaces.',
         // Ruled on #284: every shown value says to quote it. A value holding `*`,
         // typed unquoted as a command argument in zsh (Ollama's FAQ sets its
@@ -275,7 +283,8 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
  * (`dev/probe-electron-csp-http/README.md`):
  *
  * - Ollama already answers its default origins with nothing set, so for those
- *   the note asks for nothing.
+ *   the note asks for nothing. At Android's default origin alone it says that
+ *   origin is shared (a later ruling; see `CAPACITOR_ANDROID_DEFAULT_ORIGIN`).
  * - A value starting `http://` or `https://` starts, and an exact one admits
  *   that origin alone, so an http(s) origin is its own value.
  * - An exact value makes Ollama panic before it listens unless it starts with
@@ -317,8 +326,27 @@ export type OllamaOriginsSetting =
 const CAPACITOR_IOS_DEFAULT_ORIGIN = 'capacitor://localhost';
 
 /** Said beside the value only at `CAPACITOR_IOS_DEFAULT_ORIGIN` (#284). */
-const OLLAMA_SHARED_ORIGIN_SENTENCE =
+const OLLAMA_IOS_SHARED_ORIGIN_SENTENCE =
   'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+
+/**
+ * The origin every Capacitor Android app is served from unless it sets its own
+ * `server.androidScheme` or `server.hostname`: the pinned `@capacitor/android`
+ * 8.5.0 defaults them to `https` and `localhost` (`CapConfig.java`), and
+ * `capacitor.config.ts` sets neither. It is one of Ollama's defaults (measured
+ * 200 with `OLLAMA_ORIGINS` unset), so the note asks for no value here, and no
+ * value could narrow it: every default-configured Capacitor Android app, and
+ * any page served at exactly this origin, already gets in.
+ */
+const CAPACITOR_ANDROID_DEFAULT_ORIGIN = 'https://localhost';
+
+/**
+ * Said, with no value and no quoting sentence, only at
+ * `CAPACITOR_ANDROID_DEFAULT_ORIGIN` (#284). Not at Ollama's other default
+ * origins, which no default-configured Capacitor app sends.
+ */
+const OLLAMA_ANDROID_SHARED_ORIGIN_SENTENCE =
+  'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.';
 
 /**
  * Said with every value shown (#284). Platform-neutral: the value contains `*`

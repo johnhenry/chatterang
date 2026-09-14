@@ -1372,8 +1372,12 @@ describe('the provider panel hints', () => {
     // So the note may not invite either.
     expect(words('chatterang-desktop://app')).toContain('with no spaces');
     expect(words('chatterang-desktop://app')).not.toContain('anything already there');
-    // Android and the web dev server: measured 200 with nothing set.
-    expect(words('https://localhost')).toBeNull();
+    // Android and the web dev server: measured 200 with nothing set, so no
+    // setting. Android's origin is every default-configured Capacitor Android
+    // app's, and the owner ruled that its note says so; the dev server's says nothing.
+    expect(words('https://localhost')).toBe(
+      'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.',
+    );
     expect(words('http://localhost:5273')).toBeNull();
     // Opaque: no value, and says why.
     expect(words('null')).toBe(
@@ -1392,19 +1396,25 @@ describe('the provider panel hints', () => {
     expect(PROVIDERS_PANEL).not.toContain('OLLAMA_ORIGINS');
   });
 
-  it('says the iOS value is shared, and to quote a value, where the panel renders one', () => {
-    // Two owner rulings on #284, pinned against the real panel at the origin it
+  it('says the iOS and Android origins are shared, and to quote a value, where the panel renders one', () => {
+    // Three owner rulings on #284, pinned against the real panel at the origin it
     // reads when it renders, not against the catalog alone.
     //
     // iOS: every default-configured Capacitor iOS app sends `capacitor://localhost`,
     // so its value (the middle form, `capacitor:*//localhost`) cannot admit this
     // app alone. The note shows the value and says so; no other origin says it.
     //
+    // Android: every default-configured Capacitor Android app sends
+    // `https://localhost`, which Ollama allows by default. The note shows no value
+    // and says the others get in the same way; no other origin says it.
+    //
     // Quoting: the value is typed exactly, and `*` unquoted as a zsh command
     // argument fails with "no matches found". Shown with every value, and only
     // with a value.
     const shared =
       'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+    const androidShared =
+      'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.';
     const quote = 'If you set it from a shell, put the value in quotes.';
     const ollamaAt = (
       origin: string,
@@ -1442,11 +1452,13 @@ describe('the provider panel hints', () => {
     expect(ios.codes).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
     expect(ios.text).toContain(`Add capacitor:*//localhost to that setting. ${shared}`);
     expect(ios.text).toContain(quote);
+    expect(ios.text).not.toContain('Other Android apps');
 
     const desktop = ollamaAt('chatterang-desktop://app');
     expect(desktop.codes).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
     expect(desktop.text).not.toContain(shared);
     expect(desktop.text).not.toContain('Other iOS apps');
+    expect(desktop.text).not.toContain('Other Android apps');
     expect(desktop.text).toContain(quote);
 
     // A value with no `*` is still a value to type exactly.
@@ -1454,13 +1466,23 @@ describe('the provider panel hints', () => {
     expect(lan.codes).toEqual(['OLLAMA_ORIGINS', 'http://192.168.1.10:5273']);
     expect(lan.text).toContain(quote);
     expect(lan.text).not.toContain('Other iOS apps');
+    expect(lan.text).not.toContain('Other Android apps');
+
+    // Android: the shared sentence, with no value and nothing to quote.
+    const android = ollamaAt('https://localhost');
+    expect(android.codes).toEqual([]);
+    expect(android.text).toContain(`on your network. ${androidShared}`);
+    expect(android.text).not.toContain('OLLAMA_ORIGINS');
 
     // No value shown: Ollama already allows the origin, or the app cannot tell.
-    for (const origin of ['https://localhost', 'http://localhost:5273', 'null']) {
+    for (const origin of ['https://localhost', 'http://localhost:5273', 'https://localhost:8443', 'null']) {
       const page = ollamaAt(origin);
       expect(page.codes.length, origin).toBeLessThan(2);
       expect(page.text, origin).not.toContain('in quotes');
       expect(page.text, origin).not.toContain('Other iOS apps');
+      if (origin !== 'https://localhost') {
+        expect(page.text, origin).not.toContain('Other Android apps');
+      }
     }
 
     // Whole, as rendered. A sentence the panel appended around the catalog's
@@ -1474,7 +1496,7 @@ describe('the provider panel hints', () => {
       'capacitor://localhost': add('capacitor:*//localhost', ` ${shared}`),
       'chatterang-desktop://app': add('chatterang-desktop:*//app'),
       'http://192.168.1.10:5273': add('http://192.168.1.10:5273'),
-      'https://localhost': lead,
+      'https://localhost': `${lead} ${androidShared}`,
       'http://localhost:5273': lead,
       'null': `${lead} This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.`,
     };

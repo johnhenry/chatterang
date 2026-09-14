@@ -337,11 +337,16 @@ function sheetNoteAt(origin: string): { text: string; codes: string[] } {
  */
 const NOTE_LEAD =
   'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.';
+const IOS_SHARED =
+  'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+const ANDROID_SHARED =
+  'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.';
+const QUOTE = 'If you set it from a shell, put the value in quotes.';
 const WHOLE_NOTE: Readonly<Record<string, string>> = {
   'chatterang-desktop://app': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
   'capacitor://localhost': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
   'http://192.168.1.10:5273': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add http://192.168.1.10:5273 to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
-  'https://localhost': NOTE_LEAD,
+  'https://localhost': `${NOTE_LEAD} Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.`,
   'http://localhost:5273': NOTE_LEAD,
   'null': `${NOTE_LEAD} This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.`,
 };
@@ -386,6 +391,8 @@ describe('the Ollama note in the Providers panel', () => {
     // not get that sentence: its value admits that origin alone.
     const shared = 'Other iOS apps built on the same framework';
     expect(ollamaAt('capacitor://localhost').text).toContain(shared);
+    // And iOS never borrows Android's sentence.
+    expect(ollamaAt('capacitor://localhost').text).not.toContain('Android');
     for (const origin of [
       'chatterang-desktop://app',
       'http://192.168.1.10:5273',
@@ -439,6 +446,73 @@ describe('the Ollama note in the Providers panel', () => {
       expect(codes(page.body), origin).toEqual([]);
       page.unmount();
       vi.unstubAllGlobals();
+    }
+  });
+
+  it('says the Android origin is shared, with no value, only at the default Capacitor Android origin', () => {
+    // Ruled on #284. `https://localhost` is every default-configured Capacitor
+    // Android app's origin and one of Ollama's defaults (measured 200 unset), so
+    // the note asks for no setting there, and says the other apps get in the same
+    // way. With no value there is nothing to quote. Read on the list and on the
+    // add-connection sheet, each at the page's own origin.
+    const views = (origin: string): { where: string; text: string; codes: string[] }[] => {
+      const list = ollamaAt(origin);
+      const sheet = sheetNoteAt(origin);
+      return [
+        { where: `${origin} (list)`, text: list.note, codes: list.codes },
+        { where: `${origin} (sheet)`, text: sheet.text, codes: sheet.codes },
+      ];
+    };
+
+    for (const view of views('https://localhost')) {
+      expect(view.text, view.where).toBe(`${NOTE_LEAD} ${ANDROID_SHARED}`);
+      expect(view.codes, view.where).toEqual([]);
+      expect(view.text, view.where).not.toContain('OLLAMA_ORIGINS');
+      expect(view.text, view.where).not.toContain('Add ');
+      expect(view.text, view.where).not.toContain(QUOTE);
+      expect(view.text, view.where).not.toContain('quotes');
+      expect(view.text, view.where).not.toContain('iOS');
+    }
+
+    for (const view of views('capacitor://localhost')) {
+      expect(view.codes, view.where).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
+      expect(view.text, view.where).toContain(IOS_SHARED);
+      expect(view.text, view.where).toContain(QUOTE);
+      expect(view.text, view.where).not.toContain('Android');
+    }
+
+    // Ollama's other default origins, including a port on this very host: the
+    // note is the lead alone, with no shared sentence of either kind.
+    for (const origin of [
+      'http://localhost:5273',
+      'http://localhost',
+      'https://localhost:8443',
+      'http://127.0.0.1',
+      'https://127.0.0.1',
+      'https://0.0.0.0:8443',
+      'tauri://localhost',
+      'app://-',
+      'vscode-file://vscode-app',
+    ]) {
+      for (const view of views(origin)) {
+        expect(view.text, view.where).toBe(NOTE_LEAD);
+        expect(view.codes, view.where).toEqual([]);
+      }
+    }
+
+    // Look-alikes and origins that get a value or cannot tell: never Android.
+    for (const origin of [
+      'https://localhost.evil',
+      'https://x.localhost',
+      'https://evillocalhost',
+      'chatterang-desktop://app',
+      'http://192.168.1.10:5273',
+      'null',
+    ]) {
+      for (const view of views(origin)) {
+        expect(view.text, view.where).not.toContain('Android');
+        expect(view.text, view.where).not.toContain('Other ');
+      }
     }
   });
 
@@ -497,8 +571,12 @@ describe('the Ollama note in the Providers panel', () => {
     expect(desktop.text).toContain('If you set it from a shell, put the value in quotes.');
     expect(desktop.text).not.toContain('Other iOS apps');
 
+    expect(desktop.text).not.toContain('Other Android apps');
+    expect(ios.text).not.toContain('Other Android apps');
+
     const android = sheetNoteAt('https://localhost');
     expect(android.codes).toEqual([]);
+    expect(android.text).toContain(ANDROID_SHARED);
     expect(android.text).not.toContain('quotes');
     expect(android.text).not.toContain('Other iOS apps');
   });
