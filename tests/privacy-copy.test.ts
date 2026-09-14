@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ChatterangEngine, targetFor, type ToolEgressRequest } from '@/ai/engine';
 import { createMcpTool } from '@/ai/mcp/tools';
 import { renderPrompt } from '@/ai/prompt';
-import { getProvider } from '@/ai/providers';
+import { getProvider, PROVIDERS } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
 import { runToolCalls, type DestinationRequest } from '@/ai/middleware/tools';
 import { ToolRegistry, toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
@@ -1308,11 +1308,21 @@ describe('the provider panel hints', () => {
     // widened how false it was: the desktop renderer may now reach any
     // plain-http address as well as any https one, so a connection pointed off
     // the user's network really sends the conversation there.
-    const notes = shipped('ai/providers.ts');
-    expect(notes).not.toContain('stay inside your network');
+    //
+    // Pinned per provider, not by a count over the file: a count of two held
+    // while LM Studio's note said "Requests stay inside your LAN." and the
+    // sentence sat on the custom endpoint's note instead.
     const retraction =
       'Requests go to the address you give. Nothing here checks that it is on your network.';
-    expect(notes.split(retraction).length - 1).toBe(2);
+    for (const id of ['ollama', 'lmstudio']) {
+      expect(getProvider(id)?.note, id).toContain(retraction);
+    }
+    // And no note, self-hosted or not, makes the promise in other words.
+    const containment =
+      /\b(?:stays?|remains?|kept|keeps?)\s+(?:inside|on|within|in)\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b|\bnever\s+leaves?\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b/i;
+    for (const provider of PROVIDERS) {
+      expect(provider.note, provider.id).not.toMatch(containment);
+    }
   });
 
   it('does not make allowing it the precondition for tool output leaving', () => {
