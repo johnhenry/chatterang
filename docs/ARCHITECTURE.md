@@ -109,13 +109,21 @@ mid-stream, because its arguments are not complete until the turn ends. The
 loop is generate → find calls → run them → generate again, bounded at four
 round trips.
 
-**Device pressure is middleware too.** `src/ai/middleware/resilience.ts` checks
-thermal state and free memory before a local generation, and catches engine
-failures after. When it diverts, it rewrites the request for the new backend
-(the local model id means nothing to OpenAI), records the reason in response
-metadata, and the thread shows a labelled notice. It never diverts unless the
-user has nominated a fallback backend — sending a conversation off-device is a
-consent decision, not an error-handling detail.
+**Device pressure is middleware too, but only the streaming path diverts.**
+`src/ai/middleware/resilience.ts` checks thermal state and free memory before a
+local generation, and catches engine failures after. `ChatterangEngine.stream`
+runs the same pre-flight itself and, for a turn that runs on this device,
+diverts to the fallback: it rewrites the request for the new backend (the local
+model id means nothing to OpenAI), announces the divert before anything is
+sent, runs the egress gate again for the new destination, and the thread shows
+a labelled notice. The middleware form, which is what `complete()` runs, diverts
+only when its caller supplies `clearForFallback`, and then sends only the
+messages that hook cleared for the fallback, never the ones cleared for the
+original target. The engine never supplies it: `complete()` has nothing to
+announce a divert with and no sheet to raise, so a failure there is the error
+and a hot device serves the turn locally.
+Nothing diverts unless the user has nominated a fallback backend — sending a
+conversation off-device is a consent decision, not an error-handling detail.
 
 **The context window is budgeted before the request leaves.** `src/ai/context.ts`
 estimates the prompt and trims it to fit. This is not an optimisation — it is
