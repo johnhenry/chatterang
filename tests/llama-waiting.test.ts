@@ -18,15 +18,18 @@ interface Fake {
   readonly subscribed: string[];
   readonly removed: string[];
   generateCalled(): boolean;
+  /** Whether the adapter has asked for its `llamaWaiting` subscription. */
+  subscribingToWaiting(): boolean;
   emit(eventName: string, data: unknown): void;
   finish(): void;
 }
 
-function fakeLlama(options: { refuseWaiting?: boolean } = {}): Fake {
+function fakeLlama(options: { refuseWaiting?: boolean; holdWaiting?: Promise<void> } = {}): Fake {
   const listeners = new Map<string, (event: unknown) => void>();
   const subscribed: string[] = [];
   const removed: string[] = [];
   let called = false;
+  let subscribing = false;
   let finish: () => void = () => undefined;
   const plugin = {
     load: async () => ({
@@ -41,6 +44,12 @@ function fakeLlama(options: { refuseWaiting?: boolean } = {}): Fake {
     unload: async () => undefined,
     cancel: async () => undefined,
     addListener: async (eventName: string, listener: (event: unknown) => void) => {
+      if (eventName === 'llamaWaiting') {
+        subscribing = true;
+        // A subscription is an IPC round trip on the desktop: Stop can land
+        // while it is still being made.
+        await options.holdWaiting;
+      }
       if (eventName === 'llamaWaiting' && options.refuseWaiting === true) {
         // What PluginHost answers on a platform that registered the plain
         // llama definition, such as the headless server.
@@ -75,6 +84,7 @@ function fakeLlama(options: { refuseWaiting?: boolean } = {}): Fake {
     subscribed,
     removed,
     generateCalled: () => called,
+    subscribingToWaiting: () => subscribing,
     emit: (eventName, data) => listeners.get(eventName)?.(data),
     finish: () => finish(),
   };
@@ -166,6 +176,67 @@ describe('a streamed desktop generation hears that it is waiting (#7)', () => {
     fake.finish();
     await done;
     expect(seen).toEqual([{ requestId: 'turn-1', position: 1 }]);
+  });
+
+  it('a turn stopped while it is still subscribing never asks for a generation, and lets go of both subscriptions', async () => {
+    // #305: nothing is sent after Stop. Here, the generate a turn stopped
+    // mid-subscription still made would wait for the shared slot, and start on
+    // the host once the slot freed, long after Stop.
+    // FAULT INJECTED: removing the adapter's aborted check before `generate`
+    // sent the generation, and this test failed on `generateCalled()`.
+    let release: () => void = () => undefined;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fake = fakeLlama({ holdWaiting: hold });
+    vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
+    const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
+    const controller = new AbortController();
+    const adapter = new LlamaCppBackendAdapter({ resolver });
+
+    let settled = false;
+    const done = drain(adapter.executeStream(request, controller.signal)).finally(() => {
+      settled = true;
+    });
+    try {
+      await vi.waitFor(() => expect(fake.subscribingToWaiting()).toBe(true));
+      controller.abort();
+      release();
+      await vi.waitFor(() => expect(settled || fake.generateCalled()).toBe(true));
+
+      expect(fake.generateCalled(), 'a generation asked for after Stop').toBe(false);
+      const types = await done;
+      expect(types).not.toContain('content');
+      expect(types).not.toContain('done');
+      expect(fake.removed).toEqual(expect.arrayContaining(['llamaToken', 'llamaWaiting']));
+    } finally {
+      release();
+      fake.finish();
+      await done;
+    }
+  });
+
+  it('a place in line that arrives after Stop is not reported', async () => {
+    // The rail would say "Waiting" about a turn the person has already stopped.
+    // FAULT INJECTED: removing the aborted check from the `llamaWaiting`
+    // listener reported the second position.
+    const fake = fakeLlama();
+    vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
+    const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
+    const seen: unknown[] = [];
+    const controller = new AbortController();
+    const adapter = new LlamaCppBackendAdapter({ resolver, onWaiting: (event) => seen.push(event) });
+
+    const done = drain(adapter.executeStream(request, controller.signal));
+    await vi.waitFor(() => expect(fake.generateCalled()).toBe(true));
+    fake.emit('llamaWaiting', { requestId: 'turn-1', position: 2 });
+    controller.abort();
+    fake.emit('llamaWaiting', { requestId: 'turn-1', position: 1 });
+    fake.emit('llamaWaiting', { requestId: 'turn-1', position: 0 });
+    fake.finish();
+    await done;
+
+    expect(seen).toEqual([{ requestId: 'turn-1', position: 2 }]);
   });
 
   it('the app store turns a position into the rail’s state, and 0 into not waiting', () => {

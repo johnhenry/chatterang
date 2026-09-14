@@ -354,7 +354,9 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     const waiting = await Promise.resolve()
       .then(() =>
         (LlamaCpp as unknown as WaitingEvents).addListener('llamaWaiting', (event) => {
-          if (event.requestId !== requestId) return;
+          // Not after Stop (#305): a place in line for a stopped turn would
+          // put "Waiting" on the rail for a turn the person has ended.
+          if (event.requestId !== requestId || signal?.aborted === true) return;
           this.#config.onWaiting?.(event);
         }),
       )
@@ -362,6 +364,19 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
 
     const abort = (): void => void LlamaCpp.cancel({ requestId }).catch(() => undefined);
     signal?.addEventListener('abort', abort, { once: true });
+
+    // STOPPED WHILE SUBSCRIBING (#305, #7). Both subscriptions above are
+    // awaited, and an abort that happened during them fires no event, so the
+    // listener just added would never cancel what follows. On the desktop that
+    // generation waits for the slot it shares with a paired phone and starts on
+    // the host once the slot frees, long after Stop. Nothing is asked for; the
+    // engine reads the aborted signal and ends the turn as stopped.
+    if (signal?.aborted === true) {
+      signal.removeEventListener('abort', abort);
+      await listener.remove().catch(() => undefined);
+      await waiting?.remove().catch(() => undefined);
+      return;
+    }
 
     const generation = LlamaCpp.generate({
       handle: loaded.handle,
