@@ -226,8 +226,8 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
             label="How to pair"
             value={pane}
             options={[
-              { value: 'scan', label: 'Scan' },
               { value: 'type', label: 'Type' },
+              { value: 'scan', label: 'Scan' },
             ]}
             onChange={(next) => {
               setNotice(null);

@@ -241,6 +241,9 @@ describe('the camera is asked for only when the person presses Scan with camera 
 
     expect(mustButton('Type').getAttribute('aria-pressed')).toBe('true');
     expect(mustButton('Scan').getAttribute('aria-pressed')).toBe('false');
+    // Listed in the order it opens (#124): the selected route comes first.
+    const routes = dialog()?.querySelector('[role="group"][aria-label="How to pair"]');
+    expect([...(routes?.querySelectorAll('button') ?? [])].map((b) => b.textContent)).toEqual(['Type', 'Scan']);
     expect(byLabel('Computer address')).toBeInstanceOf(HTMLInputElement);
     // Seen, not merely present: textContent would count a hidden paragraph.
     expect(readsShown(dialog())).toContain(TYPED_ADMISSION);
