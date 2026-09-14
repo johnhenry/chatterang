@@ -408,6 +408,23 @@ Residuals:
   the Android app would show the Android sentence too: for example the headless
   server with TLS on port 443, opened in a browser as `https://localhost`. That
   case was not run and was not ruled on.
+  The sentence's "can reach Ollama the same way" rests on Ollama's CORS default
+  alone, not on a request from an Android WebView, and mixed content was not
+  measured there. `capacitor.config.ts` sets `android.allowMixedContent: false`,
+  which is also the `@capacitor/android` 8.5.0 default (`CapConfig.java`).
+  `Bridge.java` changes the WebView's mixed-content mode only when that setting
+  is true, and the app does not enable `CapacitorHttp`, so its Ollama requests
+  are WebView fetches from an `https://localhost` page. A default-configured app,
+  this one included, is therefore expected to reach a plain-http Ollama only on
+  loopback (an Ollama on the phone itself) or over https, and a request to an
+  `http://` LAN address is expected to be refused as mixed content, the way the
+  Electron probe's genuine `https:` control page was refused above. That control
+  page ran Electron's Chromium, not Android's WebView. Context7 returned nothing
+  on the WebView's default mixed-content mode, and no Android WebView was run
+  here, so both the refusal and the limit it puts on "can reach" are unmeasured.
+  An app at the same origin that sets `allowMixedContent: true`, or sends its
+  requests natively, would not be limited this way. The note's words were not
+  changed for this; that is for the owner.
 - **Shells.** The value contains `*`. Typed unquoted as a command argument in
   zsh, macOS's default shell, it stops the command with "no matches found".
   Measured: `zsh -c 'print -r -- chatterang-desktop:*//app'` and the same with
