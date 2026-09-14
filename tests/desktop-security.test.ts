@@ -504,6 +504,24 @@ describe('CSP_PRODUCTION', () => {
     // to make on purpose.
     expect(htmlOrigins.size).toBe(2);
   });
+
+  /**
+   * #284, AN OWNER RULING, PINNED EXACTLY SO NEITHER DIRECTION MOVES QUIETLY.
+   *
+   * `http:` is here because every self-hosted provider defaults to plain http
+   * and the adapters run in this renderer. Removing it refuses Ollama, LM Studio
+   * and the custom endpoint at their defaults again; the probe in
+   * `dev/probe-electron-csp-http/` measured that refusal as the CSP's.
+   *
+   * The exact list, rather than `toContain('http:')`, because the ruling was a
+   * scheme and nothing wider: `*` or `http://*` would also satisfy a contains
+   * check. And `ws:` is absent on purpose — a plaintext loopback socket is
+   * #168's question, not answered by this one, so it cannot ride in beside it.
+   */
+  it('[#284] admits plain http for self-hosted providers, and not ws:', () => {
+    expect(directives.get('connect-src')).toEqual(["'self'", 'https:', 'wss:', 'http:']);
+    expect(directives.get('connect-src')).not.toContain('ws:');
+  });
 });
 
 /* ── main.ts, checked the only way it can be ──────────────────────────── */

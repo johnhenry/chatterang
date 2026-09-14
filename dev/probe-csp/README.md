@@ -7,7 +7,11 @@ This settles the question that chose the QR decoder in #128, and it is here so
 the answer can be re-checked rather than believed.
 
 `/` serves a page under the **verbatim `SERVED_CSP`** from
-`apps/server/src/policy.ts`. `/mobile` serves the same page under the only
+`apps/server/src/policy.ts` as it stood when this was measured. It is kept as
+that copy on purpose. #284 has since added `http:` to `connect-src`. By the CSP
+spec, `connect-src` governs neither WebAssembly compilation nor worker creation,
+so the change should not affect what this table measures. The probe has not been
+rerun under the new policy. `/mobile` serves the same page under the only
 policy in force at `capacitor://localhost` — `index.html`'s `img-src`-only
 meta tag. The page tries two things a QR decoder might need and reports what
 happened.

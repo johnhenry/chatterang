@@ -64,12 +64,25 @@ import { BOOTSTRAP_PATH } from './wire.js';
  * reverse — fails, because two policies that drift apart silently is how one of
  * them ends up being the weak one nobody reads.
  *
- * `connect-src 'self' https: wss:` is kept, and it is worth saying why it is
- * not a hole: the served page is a full client, and a user who configures a
- * remote provider IN THEIR OWN BROWSER is making that request from their own
- * machine with their own key. The server never sees either. Narrowing this to
- * `'self'` would not make the deployment more private; it would break the
- * provider surface while leaving the server exactly as it is.
+ * `connect-src 'self' https: wss: http:` is kept, and it is worth saying why it
+ * is not a hole for the SERVER: the served page is a full client, and a user
+ * who configures a provider IN THEIR OWN BROWSER is making that request from
+ * their own machine with their own key. The server never sees either. Narrowing
+ * this to `'self'` would not make the deployment more private; it would break
+ * the provider surface while leaving the server exactly as it is.
+ *
+ * `http:` is an owner ruling (#284), carried here because the parity test above
+ * requires it, and its cost is written out beside `CSP_PRODUCTION`: any `https:`
+ * or `wss:` host was already reachable from the page, and now any plain-http
+ * host is too, LAN devices included, because CSP cannot express "private
+ * addresses only". Here that is the user's own browser reaching the user's own
+ * network, not the server making a request.
+ *
+ * On the TLS arm the browser's own mixed-content rule still refuses plain http
+ * to a non-loopback address from an `https:` page, whatever this says —
+ * measured in Chromium 152 by the control in `dev/probe-electron-csp-http/`,
+ * with Firefox and Safari not run — so there the widening reaches loopback
+ * providers only. `ws:` is in neither policy; that is #168's to decide.
  */
 export const SERVED_CSP = [
   "default-src 'self'",
@@ -77,7 +90,7 @@ export const SERVED_CSP = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' https: wss:",
+  "connect-src 'self' https: wss: http:",
   "object-src 'none'",
   "frame-src 'none'",
   "base-uri 'self'",
