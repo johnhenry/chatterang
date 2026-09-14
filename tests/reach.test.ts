@@ -453,6 +453,92 @@ describe('a conversation saved by yesterday’s build', () => {
   });
 });
 
+/* ── What a turn handed to a server, in the transcript (#92) ──────────── */
+
+describe('the receipts a turn kept, in the transcript', () => {
+  const call = (host: string) => ({
+    id: `call_${host}`,
+    name: 'x.search',
+    input: { q: 'q' },
+    receipt: {
+      outcome: 'sent' as const,
+      serverId: 'mcp_x',
+      serverName: 'x',
+      host,
+      toolName: 'x.search',
+      bytes: 12,
+      at: Date.UTC(2026, 8, 2),
+    },
+  });
+  const line = (host: string) =>
+    `- x.search sent 12 bytes of arguments to ${host} (x) at 2026-09-02 00:00:00 UTC`;
+
+  it('prints the displayed generation’s receipt once, though the row mirrors it', () => {
+    // `applyVariant` projects the displayed record onto the row, so its calls
+    // are on both. Reading both would print this call twice.
+    const displayed = { content: 'SECOND', provenance: ON_DEVICE, toolCalls: [call('a.example')] };
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          ...displayed,
+          variants: [{ content: 'FIRST', provenance: FROM_PROVIDER }, displayed],
+          variantIndex: 1,
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript.split('a.example').length - 1).toBe(1);
+    expect(transcript).toContain(`${line('a.example')}.\n`);
+    expect(transcript).not.toContain('not shown');
+  });
+
+  it('prints a failed regeneration’s own receipt beside the ones its list kept', () => {
+    // A regeneration that failed never appended its record, so its index is
+    // past the end and the row is the only place its call is written.
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: '',
+          error: 'The connection dropped.',
+          toolCalls: [call('b.example')],
+          variants: [{ content: 'FIRST', provenance: FROM_PROVIDER, toolCalls: [call('a.example')] }],
+          variantIndex: 1,
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      `${line('b.example')}.\n${line('a.example')} (from a version of this reply not shown).\n`,
+    );
+  });
+
+  it('still exports when a stored receipt’s time cannot be read', () => {
+    // `toISOString` throws on an invalid date. One bad row must cost its own
+    // timestamp, not the whole file and every `/chats/*.md` beside it.
+    const broken = call('c.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...broken, receipt: { ...broken.receipt, at: Number.NaN } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+    expect(transcript).toContain(
+      '- x.search sent 12 bytes of arguments to c.example (x) at an unrecorded time.',
+    );
+  });
+});
+
 /* ── 4. v7: one axis becomes two ─────────────────────────────────────── */
 
 describe('the two axes', () => {

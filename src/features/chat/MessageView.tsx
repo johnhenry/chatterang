@@ -6,6 +6,7 @@ import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
 import { currentVariant, ranOnDevice } from '@/domain/chat';
+import type { McpCallReceipt } from '@/domain/mcp';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
@@ -372,9 +373,39 @@ function Thinking({ text }: { text: string }): ReactNode {
   );
 }
 
+/**
+ * What the thread says about a call whose arguments were handed to an MCP
+ * server (#92).
+ *
+ * "Arguments", not bytes on the wire: the count is the UTF-8 length of what the
+ * model composed, and the request envelope and bearer header around it are not
+ * in it (`domain/mcp.ts`). A failed call is described as neither sent nor not
+ * sent — it may have failed before the server read it or after — because
+ * calling it not sent would be wrong in the flattering direction.
+ *
+ * An exhaustive switch, so an outcome added later cannot compile unrendered.
+ */
+function receiptSentence(receipt: McpCallReceipt): string {
+  const where = `${receipt.host} (${receipt.serverName})`;
+  const when = new Date(receipt.at).toLocaleString();
+  switch (receipt.outcome) {
+    case 'sent':
+      return `Sent ${receipt.bytes} bytes of arguments to ${where} at ${when}.`;
+    case 'failed':
+      return `Tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived.`;
+    default: {
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
+}
+
 function ToolCall({ tool }: { tool: ToolInvocation }): ReactNode {
   const [open, setOpen] = useState(false);
   const html = tool.name === 'render_html' ? String(tool.input.html ?? '') : '';
+  // Off the invocation `shown` handed down, never off the row: the record of
+  // what left moves with its generation, as the chips in the head do.
+  const receipt = tool.receipt;
 
   return (
     <div className="tool">
@@ -386,6 +417,12 @@ function ToolCall({ tool }: { tool: ToolInvocation }): ReactNode {
       >
         <Icon name="tool" size={13} />
         <span className="tool__name">{tool.name}</span>
+        {receipt ? (
+          <span className="chip chip--remote">
+            <Icon name="cloud" size={10} />
+            {receipt.host}
+          </span>
+        ) : null}
         <span className="grow truncate" style={{ opacity: 0.75 }}>
           {tool.isError ? 'failed' : (tool.output ?? '').slice(0, 60)}
         </span>
@@ -394,6 +431,11 @@ function ToolCall({ tool }: { tool: ToolInvocation }): ReactNode {
         ) : null}
         <Icon name={open ? 'chevron-down' : 'chevron-right'} size={13} />
       </button>
+
+      {/* Outside the collapsible body: #92 asks for this at the weight of the
+          chip that says which backend produced a reply, which is never
+          folded away. */}
+      {receipt ? <p className="tool__receipt">{receiptSentence(receipt)}</p> : null}
 
       {open ? (
         <div className="tool__body">
