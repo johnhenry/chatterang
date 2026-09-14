@@ -47,12 +47,23 @@
  * in `REFUSALS` — and every tunnel checks each frame against its turn's state
  * in both directions (`createProtocolGate` in `stream/`). A frame from the peer
  * that is outside that state is dropped unread and answered `FRAME_UNEXPECTED`;
- * one this end tries to send outside it throws. That is the wire's part of #7
- * and all of it. The wait list, the prompt timeout, held results, replacing a
- * device's stale socket, and settling turns on quit and on suspend belong to
- * the desktop's work broker, and none of those exists yet. Nothing here sends
- * a refusal of its own accord: which refusal a host sends, and when, is the
- * app's to decide, and no app has decided.
+ * a refusal of a turn that already had its terminal is dropped and not
+ * answered; one this end tries to send outside that state throws. A tunnel
+ * holds at most `MAX_OPEN_TURNS` open turns for each end that asks.
+ *
+ * WHICH REFUSALS THIS FILE SENDS BY ITSELF: two, and no others. A frame from
+ * the peer that is outside its turn's state is answered `FRAME_UNEXPECTED`.
+ * And once this end has refused every turn on a tunnel — an `error` naming no
+ * turn, with a code that ends turns — a `turn` or `attach` that crossed that
+ * refusal on the wire is answered with the same code, so both ends agree the
+ * turn never ran. Every other refusal, and when to send it, is the app's, and
+ * no app sends one yet. `HOST_DOES_NOT_RUN_TURNS` is defined for the headless
+ * server (#7's eighth ruling); nothing here sends it.
+ *
+ * That is the wire's part of #7 and all of it. The wait list, the prompt
+ * timeout, held results, replacing a device's stale socket, and settling turns
+ * on quit and on suspend belong to the desktop's work broker, and none of those
+ * exists yet.
  */
 
 import { createServer } from 'node:http';
@@ -615,6 +626,9 @@ function openTunnel(
       if (socket.readyState === socket.OPEN) socket.send(gate.send(verdict.reply));
       return;
     }
+    // A refusal of a turn that already had its terminal here: nothing reads it,
+    // and the peer is not answered. See `InboundVerdict`.
+    if (verdict.verdict === 'stale') return;
     // Contiguity, enforced. See the client's, which carries the argument.
     if (verdict.verdict === 'fault') {
       finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(verdict.fault) });

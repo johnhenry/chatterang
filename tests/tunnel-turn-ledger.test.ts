@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MAX_ENDED_TURNS_REMEMBERED,
+  MAX_OPEN_TURNS,
   TunnelProtocolError,
   createProtocolGate,
   createTurnLedger,
@@ -89,8 +90,8 @@ describe('a whole turn is allowed, from both ends', () => {
       ['hears', answer('p1', true)],
       ['says', content(0)],
       ['says', prompt('p2')],
-      ['hears', cancel()],
       ['hears', answer('p2', false)],
+      ['hears', cancel()],
       ['says', done(1)],
       ['hears', ack()],
     ];
@@ -113,16 +114,29 @@ describe('a whole turn is allowed, from both ends', () => {
 });
 
 describe('waiting', () => {
-  it('is said by the end running a turn that was asked for, before its first chunk', () => {
+  it('is said by the end running a turn that was asked for, before it has started', () => {
     const desktop = end();
     expect(desktop.says(waiting(1, 'never'))).toMatchObject({ kind: 'waiting', turn: 'never', reason: expect.stringMatching(/nobody asked/) });
     desktop.hears(turn());
     expect(desktop.hears(waiting())).toMatchObject({ reason: expect.stringMatching(/only the end running/) });
     expect(desktop.says(waiting())).toBeNull();
     desktop.says(content(0));
-    expect(desktop.says(waiting())).toMatchObject({ reason: expect.stringMatching(/already streaming/) });
+    expect(desktop.says(waiting())).toMatchObject({ reason: expect.stringMatching(/has started, so it is not waiting/) });
     desktop.says(done(1));
     expect(desktop.says(waiting())).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+  });
+
+  it('a prompt starts a turn too, so a position after one is refused at both ends', () => {
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(prompt('p1'));
+    desktop.hears(answer('p1'));
+    expect(desktop.says(waiting(5))).toMatchObject({ reason: expect.stringMatching(/has started/) });
+
+    const phone = end();
+    phone.says(turn());
+    phone.hears(prompt('p1'));
+    expect(phone.hears(waiting(5))).toMatchObject({ reason: expect.stringMatching(/has started/), replyCode: 'FRAME_UNEXPECTED' });
   });
 
   it('is never said about a stream nobody asked for', () => {
@@ -184,6 +198,71 @@ describe('prompt and answer', () => {
     desktop.says(prompt('p1'));
     desktop.says(done(0));
     expect(desktop.hears(answer('p1'))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+  });
+
+  it('FRAME_UNEXPECTED naming an open prompt does not close it, from either end', () => {
+    /*
+     * A report about one frame. It used to close the prompt it named, so a
+     * peer's refused frame under an open prompt's id — answered FRAME_UNEXPECTED
+     * naming that prompt — closed the prompt at the end that refused it, and the
+     * real answer was then refused.
+     */
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(prompt('p1'));
+    expect(desktop.hears(prompt('p1'))).toMatchObject({ prompt: 'p1', replyCode: 'FRAME_UNEXPECTED' });
+    expect(desktop.says(refusal('FRAME_UNEXPECTED', { turn: 't1', prompt: 'p1' }))).toBeNull();
+    expect(desktop.hears(refusal('FRAME_UNEXPECTED', { turn: 't1', prompt: 'p1' }))).toBeNull();
+    expect(desktop.hears(answer('p1'))).toBeNull();
+  });
+});
+
+describe('a cancelled turn takes no more questions or answers (#170)', () => {
+  it('an answer after the asker’s own cancel is refused, from both ends', () => {
+    const phone = end();
+    phone.says(turn());
+    phone.hears(prompt('p1'));
+    expect(phone.says(cancel())).toBeNull();
+    expect(phone.says(answer('p1'))).toMatchObject({ kind: 'answer', prompt: 'p1', reason: expect.stringMatching(/cancelled, so none of its prompts/) });
+
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(prompt('p1'));
+    expect(desktop.hears(cancel())).toBeNull();
+    expect(desktop.hears(answer('p1'))).toMatchObject({ reason: expect.stringMatching(/cancelled, so none of its prompts/), replyCode: 'FRAME_UNEXPECTED' });
+  });
+
+  it('the same answer with no cancel before it is taken — the control', () => {
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(prompt('p1'));
+    expect(desktop.hears(answer('p1'))).toBeNull();
+    expect(desktop.hears(cancel())).toBeNull();
+  });
+
+  it('nothing more is asked in it, it is cancelled once, and its runner still finishes it', () => {
+    const desktop = end();
+    const phone = end();
+    desktop.hears(turn());
+    phone.says(turn());
+    phone.says(cancel());
+    desktop.hears(cancel());
+    expect(desktop.hears(cancel())).toMatchObject({ reason: expect.stringMatching(/already cancelled/) });
+    expect(phone.says(cancel())).toMatchObject({ reason: expect.stringMatching(/already cancelled/) });
+
+    expect(desktop.says(prompt('p2'))).toMatchObject({ reason: expect.stringMatching(/cancelled, so nothing more is asked/) });
+    expect(desktop.says(waiting(1))).toMatchObject({ reason: expect.stringMatching(/cancelled, so nothing more is asked/) });
+    // What crossed the cancel on the wire is refused at the phone.
+    expect(phone.hears(prompt('p2'))).toMatchObject({ reason: expect.stringMatching(/cancelled/), replyCode: 'FRAME_UNEXPECTED' });
+    expect(phone.hears(waiting(1))).toMatchObject({ reason: expect.stringMatching(/cancelled/) });
+
+    // Its chunks and its terminal still cross, and its result is acknowledged.
+    for (const frame of [content(0), done(1)]) {
+      expect(desktop.says(frame)).toBeNull();
+      expect(phone.hears(frame)).toBeNull();
+    }
+    expect(phone.says(ack())).toBeNull();
+    expect(desktop.hears(ack())).toBeNull();
   });
 });
 
@@ -297,14 +376,18 @@ describe('turn, cancel and chunk', () => {
   });
 });
 
-describe('errors are always carried, and change state only from the end running the turn', () => {
+describe('errors change state only from the end running the turn', () => {
   it('a refusal that ends turns ends the turn it names', () => {
-    for (const code of ['WAIT_LIST_FULL', 'DESKTOP_QUITTING', 'HOST_SUSPENDED', 'HOST_DOES_NOT_RUN_TURNS', 'RESULT_UNKNOWN']) {
+    for (const code of ['WAIT_LIST_FULL', 'DESKTOP_QUITTING', 'HOST_SUSPENDED', 'HOST_DOES_NOT_RUN_TURNS']) {
       const phone = end();
       phone.says(turn());
       expect(phone.hears(refusal(code, { turn: 't1' })), code).toBeNull();
       expect(phone.hears(content(0)), code).toMatchObject({ reason: expect.stringMatching(/already ended/) });
     }
+    const phone = end();
+    phone.says(attach());
+    expect(phone.hears(refusal('RESULT_UNKNOWN', { turn: 't1' }))).toBeNull();
+    expect(phone.hears(done(0))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
   });
 
   it('a code this build does not know ends the turn, failing closed', () => {
@@ -323,15 +406,33 @@ describe('errors are always carried, and change state only from the end running 
     expect(phone.hears(content(0))).toBeNull();
   });
 
-  it('an error from the end that asked changes nothing', () => {
+  it('a refusal the table defines is refused from the end that asked, and changes nothing', () => {
     const desktop = end();
     desktop.hears(turn());
     desktop.says(prompt('p1'));
-    expect(desktop.hears(refusal('WAIT_LIST_FULL', { turn: 't1' }))).toBeNull();
-    expect(desktop.hears(refusal('PROMPT_EXPIRED', { turn: 't1', prompt: 'p1' }))).toBeNull();
+    for (const [code, where] of [
+      ['WAIT_LIST_FULL', { turn: 't1' }],
+      ['DESKTOP_QUITTING', { turn: 't1' }],
+      ['PROMPT_EXPIRED', { turn: 't1', prompt: 'p1' }],
+    ] as const) {
+      expect(desktop.hears(refusal(code, where)), code).toMatchObject({
+        reason: expect.stringMatching(/sent by the end running a turn/),
+        replyCode: 'FRAME_UNEXPECTED',
+      });
+    }
+    // A code this build does not know is carried from the asker: it cannot
+    // tell what that code means, so it reads nothing into it.
+    expect(desktop.hears(refusal('FROM_A_NEWER_BUILD', { turn: 't1' }))).toBeNull();
     // The turn is open and its prompt still takes an answer.
     expect(desktop.hears(answer('p1'))).toBeNull();
     expect(desktop.says(content(0))).toBeNull();
+
+    // And the end that asked cannot send one.
+    const phone = end();
+    phone.says(turn());
+    expect(phone.says(refusal('HOST_SUSPENDED', { turn: 't1' }))).toMatchObject({
+      reason: expect.stringMatching(/sent by the end running a turn/),
+    });
   });
 
   it('a refusal of the whole connection ends every turn its sender runs, and no other', () => {
@@ -351,10 +452,226 @@ describe('errors are always carried, and change state only from the end running 
     expect(untouched.hears(content(0))).toBeNull();
   });
 
-  it('an error for a turn nobody knows is carried and records nothing', () => {
+  it('a refusal of a turn nobody knows is dropped without a reply, and records nothing', () => {
     const phone = end();
-    expect(phone.hears(refusal('WAIT_LIST_FULL', { turn: 'unknown' }))).toBeNull();
+    expect(phone.hears(refusal('WAIT_LIST_FULL', { turn: 'unknown' }))).toMatchObject({
+      reason: expect.stringMatching(/no turn/),
+      replyCode: null,
+    });
     expect(phone.says(turn('unknown'))).toBeNull();
+  });
+});
+
+describe('a turn has one terminal', () => {
+  const ending = ['DESKTOP_QUITTING', 'HOST_SUSPENDED', 'WAIT_LIST_FULL', 'HOST_DOES_NOT_RUN_TURNS', 'FROM_A_NEWER_BUILD'];
+
+  it('the end running a turn may refuse it once, and not after it is over or for a turn it never had', () => {
+    for (const code of ending) {
+      const desktop = end();
+      desktop.hears(turn());
+      expect(desktop.says(refusal(code, { turn: 't1' })), code).toBeNull();
+      expect(desktop.says(refusal(code, { turn: 't1' })), code).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    }
+
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(done(0));
+    for (const code of [...ending, 'RESULT_UNKNOWN']) {
+      expect(desktop.says(refusal(code, { turn: 't1' })), code).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    }
+    expect(desktop.says(refusal('PROMPT_EXPIRED', { turn: 't1', prompt: 'p1' }))).toMatchObject({
+      reason: expect.stringMatching(/already ended/),
+    });
+    expect(desktop.says(refusal('DESKTOP_QUITTING', { turn: 'never' }))).toMatchObject({ reason: expect.stringMatching(/no turn/) });
+    // A report that a late frame for it went nowhere is still allowed.
+    expect(desktop.says(refusal('FRAME_UNEXPECTED', { turn: 't1' }))).toBeNull();
+  });
+
+  it('a refusal of a turn that already had its terminal is dropped by the end that asked, without a reply', () => {
+    for (const code of ending) {
+      const phone = end();
+      phone.says(turn());
+      phone.hears(done(0));
+      expect(phone.hears(refusal(code, { turn: 't1' })), code).toMatchObject({
+        reason: expect.stringMatching(/already ended/),
+        replyCode: null,
+      });
+    }
+    // A refusal is a terminal too.
+    const phone = end();
+    phone.says(turn());
+    expect(phone.hears(refusal('HOST_SUSPENDED', { turn: 't1' }))).toBeNull();
+    expect(phone.hears(refusal('DESKTOP_QUITTING', { turn: 't1' }))).toMatchObject({ replyCode: null });
+    // The control: a refusal of a turn still open is its terminal, and is read.
+    const open = end();
+    open.says(turn());
+    open.hears(content(0));
+    expect(open.hears(refusal('DESKTOP_QUITTING', { turn: 't1' }))).toBeNull();
+  });
+});
+
+describe('a refusal that says the turn had not started', () => {
+  for (const code of ['WAIT_LIST_FULL', 'HOST_DOES_NOT_RUN_TURNS']) {
+    it(`${code} is refused once the turn has started, at both ends`, () => {
+      for (const start of [content(0), prompt('p1')]) {
+        const desktop = end();
+        desktop.hears(turn());
+        desktop.says(start);
+        expect(desktop.says(refusal(code, { turn: 't1' })), start.kind).toMatchObject({
+          reason: expect.stringMatching(/had not started, and it has/),
+        });
+        const phone = end();
+        phone.says(turn());
+        phone.hears(start);
+        expect(phone.hears(refusal(code, { turn: 't1' })), start.kind).toMatchObject({
+          reason: expect.stringMatching(/had not started, and it has/),
+          replyCode: 'FRAME_UNEXPECTED',
+        });
+        // Refused, so the turn goes on to its real terminal.
+        expect(phone.hears(done(1)), start.kind).toBeNull();
+      }
+      // The control: before it started it is the turn's terminal, and a
+      // `waiting` does not start a turn.
+      const desktop = end();
+      desktop.hears(turn());
+      desktop.says(waiting(1));
+      expect(desktop.says(refusal(code, { turn: 't1' }))).toBeNull();
+    });
+  }
+
+  it('HOST_DOES_NOT_RUN_TURNS for the whole connection is refused while a turn its sender runs has started', () => {
+    const desktop = end();
+    desktop.hears(turn('started'));
+    desktop.hears(turn('queued'));
+    desktop.says(content(0, 'started'));
+    expect(desktop.says(refusal('HOST_DOES_NOT_RUN_TURNS'))).toMatchObject({
+      reason: expect.stringMatching(/one its sender runs has/),
+    });
+    // Refused, so nothing ended: the started turn finishes, and then it may.
+    expect(desktop.says(done(1, 'started'))).toBeNull();
+    expect(desktop.says(refusal('HOST_DOES_NOT_RUN_TURNS'))).toBeNull();
+    expect(desktop.says(waiting(1, 'queued'))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+  });
+
+  it('RESULT_UNKNOWN answers an attach, and nothing else', () => {
+    const desktop = end();
+    desktop.hears(turn());
+    expect(desktop.says(refusal('RESULT_UNKNOWN', { turn: 't1' }))).toMatchObject({
+      reason: expect.stringMatching(/did not come by attach/),
+    });
+    const phone = end();
+    phone.says(turn());
+    expect(phone.hears(refusal('RESULT_UNKNOWN', { turn: 't1' }))).toMatchObject({
+      reason: expect.stringMatching(/did not come by attach/),
+      replyCode: 'FRAME_UNEXPECTED',
+    });
+    // The control.
+    desktop.hears(attach('a1'));
+    expect(desktop.says(refusal('RESULT_UNKNOWN', { turn: 'a1' }))).toBeNull();
+  });
+});
+
+describe('a refusal of every turn is final for the tunnel', () => {
+  it('a turn that crossed it is refused with the same code at one end and is over at both', () => {
+    const phone = end();
+    const desktop = end();
+    // On the wire at once: the phone's turn going up, the desktop's refusal coming down.
+    expect(phone.says(turn())).toBeNull();
+    expect(desktop.says(refusal('HOST_SUSPENDED'))).toBeNull();
+    // The desktop reads the turn after its refusal: refused with that code, and never read.
+    expect(desktop.hears(turn())).toMatchObject({ kind: 'turn', turn: 't1', replyCode: 'HOST_SUSPENDED' });
+    // The phone reads the refusal after its turn: that turn is over.
+    expect(phone.hears(refusal('HOST_SUSPENDED'))).toBeNull();
+    // The desktop's repeat naming the turn is the one refusal it owes it, once…
+    expect(desktop.says(refusal('HOST_SUSPENDED', { turn: 't1' }))).toBeNull();
+    expect(desktop.says(refusal('HOST_SUSPENDED', { turn: 't1' }))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    // …and at the phone it is a second terminal, dropped without a reply.
+    expect(phone.hears(refusal('HOST_SUSPENDED', { turn: 't1' }))).toMatchObject({ replyCode: null });
+    // Neither end can run it.
+    expect(desktop.says(content(0))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    expect(desktop.says(prompt('p1'))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+  });
+
+  it('the end that received it asks for nothing more, and is streamed nothing new', () => {
+    const phone = end();
+    phone.says(turn());
+    phone.hears(refusal('DESKTOP_QUITTING'));
+    expect(phone.says(turn('t2'))).toMatchObject({
+      reason: expect.stringMatching(/the other end refused every turn on this tunnel \(DESKTOP_QUITTING\)/),
+      replyCode: 'FRAME_UNEXPECTED',
+    });
+    expect(phone.says(attach('t3'))).toMatchObject({ reason: expect.stringMatching(/the other end refused every turn/) });
+    expect(phone.hears(content(0, 'unasked'))).toMatchObject({ reason: expect.stringMatching(/the other end refused every turn/) });
+    // The other direction is untouched: the phone may still run a turn the desktop asks for.
+    expect(phone.hears(turn('for-the-phone'))).toBeNull();
+    expect(phone.says(content(0, 'for-the-phone'))).toBeNull();
+  });
+
+  it('the end that sent it starts nothing new, and owes a crossed turn exactly its own code', () => {
+    const desktop = end();
+    desktop.says(refusal('DESKTOP_QUITTING'));
+    expect(desktop.says(content(0, 'unasked'))).toMatchObject({ reason: expect.stringMatching(/this end refused every turn/) });
+    expect(desktop.hears(attach('a1'))).toMatchObject({ replyCode: 'DESKTOP_QUITTING' });
+    expect(desktop.says(waiting(1, 'a1'))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    expect(desktop.says(refusal('HOST_SUSPENDED', { turn: 'a1' }))).toMatchObject({ reason: expect.stringMatching(/already ended/) });
+    expect(desktop.says(refusal('DESKTOP_QUITTING', { turn: 'a1' }))).toBeNull();
+  });
+
+  it('a refusal of one turn is not final — the control', () => {
+    const phone = end();
+    phone.says(turn());
+    phone.hears(refusal('HOST_SUSPENDED', { turn: 't1' }));
+    expect(phone.says(turn('t2'))).toBeNull();
+
+    const desktop = end();
+    desktop.hears(turn());
+    desktop.says(refusal('HOST_SUSPENDED', { turn: 't1' }));
+    expect(desktop.hears(turn('t2'))).toBeNull();
+    expect(desktop.says(content(0, 't2'))).toBeNull();
+  });
+});
+
+describe(`at most ${MAX_OPEN_TURNS} open turns for each end that asks`, () => {
+  it('refuses the peer’s turn past the bound, without recording it, and takes one again once a turn ends', () => {
+    const desktop = end();
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) {
+      expect(desktop.hears(turn(`t${String(index)}`)), String(index)).toBeNull();
+    }
+    expect(desktop.hears(turn('over'))).toMatchObject({ reason: expect.stringMatching(/already open/), replyCode: 'FRAME_UNEXPECTED' });
+    expect(desktop.hears(attach('over'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+    desktop.says(refusal('WAIT_LIST_FULL', { turn: 't0' }));
+    expect(desktop.hears(turn('over'))).toBeNull();
+    expect(desktop.hears(turn('over-again'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+  });
+
+  it('refuses a stream nobody asked for past the bound — the kind only its sender can end', () => {
+    const phone = end();
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) {
+      expect(phone.hears(content(0, `u${String(index)}`)), String(index)).toBeNull();
+    }
+    expect(phone.hears(content(0, 'over'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+    phone.hears(done(1, 'u0'));
+    expect(phone.hears(content(0, 'over'))).toBeNull();
+
+    const desktop = end();
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) desktop.says(content(0, `u${String(index)}`));
+    expect(desktop.says(content(0, 'over'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+  });
+
+  it('holds this end’s own asks to it, so a peer that keeps to the bound never meets the other end’s', () => {
+    const phone = end();
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) phone.says(turn(`t${String(index)}`));
+    expect(phone.says(turn('over'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+    expect(phone.says(attach('over'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+  });
+
+  it('counts each asking end apart', () => {
+    const desktop = end();
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) desktop.hears(turn(`from-phone-${String(index)}`));
+    // Full for the phone's asks — and a stream the desktop starts unasked is
+    // one the phone would be asker of — while the desktop's own asks are not.
+    expect(desktop.says(content(0, 'unasked'))).toMatchObject({ reason: expect.stringMatching(/already open/) });
+    expect(desktop.says(turn('from-desktop'))).toBeNull();
   });
 });
 
@@ -385,6 +702,26 @@ describe(`the ledger remembers ${MAX_ENDED_TURNS_REMEMBERED} ended turns, and no
     expect(forgotten).not.toContain('open');
     expect(ledger.check(turn('open'), 'in')).toMatchObject({ reason: expect.stringMatching(/already in use/) });
     expect(ledger.check(done(0, 'open'), 'out')).toBeNull();
+  });
+
+  it('forgets a result still waiting for its ack last, so the ack is not refused', () => {
+    const phone = end();
+    phone.says(turn('held'));
+    phone.hears(done(0, 'held'));
+    for (let index = 0; index < MAX_ENDED_TURNS_REMEMBERED; index += 1) {
+      phone.says(turn(`t${String(index)}`));
+      phone.hears(refusal('WAIT_LIST_FULL', { turn: `t${String(index)}` }));
+    }
+    expect(phone.says(ack('held'))).toBeNull();
+
+    // Only when every remembered turn is waiting for an ack does the oldest go.
+    const forgotten: string[] = [];
+    const ledger = createTurnLedger({ onForget: (id) => forgotten.push(id) });
+    for (let index = 0; index <= MAX_ENDED_TURNS_REMEMBERED; index += 1) {
+      ledger.check(turn(`d${String(index)}`), 'out');
+      ledger.check(done(0, `d${String(index)}`), 'in');
+    }
+    expect(forgotten).toEqual(['d0']);
   });
 });
 
@@ -440,6 +777,32 @@ describe('the gate both halves run', () => {
     expect(() => desktop.send(content(0))).not.toThrow();
   });
 
+  it('drops a second terminal as stale, with no reply to send', () => {
+    const phone = createProtocolGate();
+    phone.send(turn());
+    expect(phone.receive(done(0))).toEqual({ verdict: 'accept' });
+    expect(phone.receive(refusal('DESKTOP_QUITTING', { turn: 't1' }))).toMatchObject({
+      verdict: 'stale',
+      violation: { kind: 'error', turn: 't1', replyCode: null },
+    });
+    expect(phone.receive(refusal('DESKTOP_QUITTING', { turn: 't1' }))).not.toHaveProperty('reply');
+  });
+
+  it('answers a turn that crossed a refusal of every turn with that code, sendable once through the gate', () => {
+    const desktop = createProtocolGate();
+    desktop.send(refusal('HOST_SUSPENDED'));
+    const verdict = desktop.receive(turn('crossed'));
+    if (verdict.verdict !== 'refuse') throw new Error(`expected a refusal, got ${verdict.verdict}`);
+    expect(verdict.reply).toEqual({
+      v: V,
+      kind: 'error',
+      turn: 'crossed',
+      body: { code: 'HOST_SUSPENDED', message: expect.stringMatching(/turn frame was not read: this end refused every turn/) },
+    });
+    expect(decodeFrame(desktop.send(verdict.reply))).toEqual(verdict.reply);
+    expect(() => desktop.send(verdict.reply)).toThrow(TunnelProtocolError);
+  });
+
   it('accepts a second turn numbering its reply from 0 on the same tunnel', () => {
     const phone = createProtocolGate();
     phone.send(turn('t1'));
@@ -480,6 +843,8 @@ describe('the gate both halves run', () => {
     const phone = createProtocolGate();
     expect(phone.receive(done(0, 'old'))).toEqual({ verdict: 'accept' });
     expect(phone.receive(done(1, 'old'))).toMatchObject({ verdict: 'refuse' });
+    // Acknowledged, so it is not kept back as a result waiting for its ack.
+    phone.send(ack('old'));
     for (let index = 0; index < MAX_ENDED_TURNS_REMEMBERED; index += 1) {
       const id = `t${String(index)}`;
       phone.send(turn(id));

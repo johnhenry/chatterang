@@ -364,12 +364,20 @@ export function isTurnScoped(kind: FrameKind): kind is TurnScopedKind {
  *
  * - `kind` is what an app renders: busy, quitting, suspended and refused are
  *   four different sentences, and "the connection closed" is none of them.
- * - `scope` is what the `error` frame must name: a `turn`, a turn AND a
- *   `prompt`, either a turn or nothing (a refusal of the whole connection), or
- *   anything. The decoder enforces it, so a refusal cannot arrive attached to
- *   the wrong thing.
+ * - `scope` is what the `error` frame must name: a `turn`; a turn that came by
+ *   `attach`; a turn AND a `prompt`; either a turn or nothing (a refusal of the
+ *   whole connection); or anything. The decoder enforces what a frame can show
+ *   by itself — that a turn, or a prompt, is named — so a refusal cannot arrive
+ *   attached to the wrong thing. Whether the turn came by `attach` is state,
+ *   and `createTurnLedger` in `stream/` holds it.
  * - `endsTurn` is whether the turn it names is over. A refusal that names no
- *   turn and ends turns ends every turn its sender was running on the tunnel.
+ *   turn and ends turns ends every turn its sender was running on the tunnel,
+ *   and is final for that tunnel (see `createTurnLedger`).
+ * - `beforeStart` is whether the code may only be sent before the turn it names
+ *   has started: before any prompt or chunk for it. `WAIT_LIST_FULL` and
+ *   `HOST_DOES_NOT_RUN_TURNS` say nothing in the turn ran, which is what makes
+ *   asking again safe, so the ledger refuses either once something could have;
+ *   `RESULT_UNKNOWN` says nothing of that turn is here to send.
  */
 export type RefusalKind =
   /** `WAIT_LIST_FULL`: nothing ran, and the host may take it later. */
@@ -389,12 +397,13 @@ export type RefusalKind =
   /** A code this build does not know. Read as a failure, never as success. */
   | 'unrecognised';
 
-export type RefusalScope = 'turn' | 'turn-or-connection' | 'prompt' | 'any';
+export type RefusalScope = 'turn' | 'attach' | 'turn-or-connection' | 'prompt' | 'any';
 
 export interface Refusal {
   readonly kind: RefusalKind;
   readonly scope: RefusalScope;
   readonly endsTurn: boolean;
+  readonly beforeStart: boolean;
 }
 
 /**
@@ -405,7 +414,11 @@ export interface Refusal {
  * `FRAME_UNEXPECTED` is what an end answers a frame with when that frame is
  * outside its turn's state — a `waiting` for a turn nobody asked for, an
  * `answer` to a prompt that already expired, a second `attach`. The frame is
- * dropped unread and the turn it names goes on; see `createTurnLedger`.
+ * dropped unread and the turn it names goes on; see `createTurnLedger`. It is a
+ * report about one frame, and it changes no turn and no prompt at either end.
+ * It is also one of only two refusals the tunnel halves send by themselves; the
+ * other is the repeat of a refusal of every turn, for a turn that crossed it
+ * (`createTurnLedger`). Every other code here is the app's to send.
  *
  * `RESULT_UNKNOWN` is ONE answer for four situations on purpose: nothing was
  * ever held, it expired, it was already acknowledged, or it belongs to another
@@ -414,17 +427,43 @@ export interface Refusal {
  * same as "not running" in `apps/desktop/src/bridge/supervisor.ts`.
  */
 export const REFUSALS = Object.freeze({
-  WAIT_LIST_FULL: Object.freeze({ kind: 'busy', scope: 'turn', endsTurn: true }),
-  DESKTOP_QUITTING: Object.freeze({ kind: 'quitting', scope: 'turn-or-connection', endsTurn: true }),
-  HOST_SUSPENDED: Object.freeze({ kind: 'suspended', scope: 'turn-or-connection', endsTurn: true }),
+  WAIT_LIST_FULL: Object.freeze({ kind: 'busy', scope: 'turn', endsTurn: true, beforeStart: true }),
+  DESKTOP_QUITTING: Object.freeze({
+    kind: 'quitting',
+    scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: false,
+  }),
+  HOST_SUSPENDED: Object.freeze({
+    kind: 'suspended',
+    scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: false,
+  }),
   HOST_DOES_NOT_RUN_TURNS: Object.freeze({
     kind: 'refused',
     scope: 'turn-or-connection',
     endsTurn: true,
+    beforeStart: true,
   }),
-  PROMPT_EXPIRED: Object.freeze({ kind: 'prompt-expired', scope: 'prompt', endsTurn: false }),
-  RESULT_UNKNOWN: Object.freeze({ kind: 'result-unknown', scope: 'turn', endsTurn: true }),
-  FRAME_UNEXPECTED: Object.freeze({ kind: 'unexpected', scope: 'any', endsTurn: false }),
+  PROMPT_EXPIRED: Object.freeze({
+    kind: 'prompt-expired',
+    scope: 'prompt',
+    endsTurn: false,
+    beforeStart: false,
+  }),
+  RESULT_UNKNOWN: Object.freeze({
+    kind: 'result-unknown',
+    scope: 'attach',
+    endsTurn: true,
+    beforeStart: true,
+  }),
+  FRAME_UNEXPECTED: Object.freeze({
+    kind: 'unexpected',
+    scope: 'any',
+    endsTurn: false,
+    beforeStart: false,
+  }),
 } as const satisfies Readonly<Record<string, Refusal>>);
 
 export type RefusalCode = keyof typeof REFUSALS;
@@ -434,12 +473,14 @@ export type RefusalCode = keyof typeof REFUSALS;
  *
  * FAILS CLOSED. A newer peer's refusal read as anything else would leave a
  * phone showing a turn as still running that the far side has already given
- * up on — or, worse, one rendered as finished.
+ * up on — or, worse, one rendered as finished. And it never claims the turn
+ * had not started, so nothing reads an unknown code as "nothing ran".
  */
 export const UNRECOGNISED_REFUSAL: Refusal = Object.freeze({
   kind: 'unrecognised',
   scope: 'any',
   endsTurn: true,
+  beforeStart: false,
 });
 
 /**
@@ -708,13 +749,13 @@ function readFrame(frame: Record<string, unknown>, reading: Reading): TunnelFram
     // carried as it came, and read as a failure (see UNRECOGNISED_REFUSAL).
     if (Object.hasOwn(REFUSALS, code)) {
       const { scope } = REFUSALS[code as RefusalCode];
-      if ((scope === 'turn' || scope === 'prompt') && turn === undefined) {
+      if ((scope === 'turn' || scope === 'attach' || scope === 'prompt') && turn === undefined) {
         throw new TunnelWireError(`${code} must name the turn it refuses`);
       }
       if (scope === 'prompt' && prompt === undefined) {
         throw new TunnelWireError(`${code} must name the prompt it refuses`);
       }
-      if ((scope === 'turn' || scope === 'turn-or-connection') && prompt !== undefined) {
+      if ((scope === 'turn' || scope === 'attach' || scope === 'turn-or-connection') && prompt !== undefined) {
         throw new TunnelWireError(`${code} refuses a turn, not a prompt`);
       }
     }

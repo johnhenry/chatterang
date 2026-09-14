@@ -150,8 +150,12 @@ export type TurnUpdate =
  * chunk is `completed` only for a `done` type, never for a type this build
  * does not know.
  *
- * Frames `createTunnelClient` refused for their turn's state never reach an
- * app, so this reads frames that were accepted; it does not re-check state.
+ * THIS DOES NOT CHECK STATE; `createProtocolGate` does, and `createTunnelClient`
+ * runs it on every frame before an app can read one. A frame outside its turn's
+ * state never reaches an app, and neither does a refusal of a turn that already
+ * had its terminal, so what an app classifies is one terminal per turn it asked
+ * for: `completed`, `failed`, or a refusal that ends it. A frame handed to this
+ * function from anywhere else has had none of those checks.
  */
 export function classifyFrame(frame: TunnelFrame): TurnUpdate {
   switch (frame.kind) {
@@ -319,6 +323,13 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
       if (socket.readyState === WebSocket.OPEN) socket.send(gate.send(verdict.reply));
       return;
     }
+    /*
+     * A SECOND TERMINAL NEVER REACHES THE APP. A refusal of a turn that already
+     * ended here — the desktop's named repeat of a refusal of every turn, or a
+     * desktop settling one turn twice — is dropped and not answered, so a phone
+     * never renders "completed" and then "quitting" for one reply.
+     */
+    if (verdict.verdict === 'stale') return;
     /*
      * CONTIGUITY, ENFORCED (#260). The IR calls `sequence` "the only
      * loss-detection primitive the IR has" once a stream crosses a wire and

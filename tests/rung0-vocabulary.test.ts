@@ -7,7 +7,7 @@ import type { WebSocket as RawSocket } from 'ws';
 
 import { classifyFrame, createTunnelClient } from '@chatterang/tunnel/client';
 import { createTunnelListener, type Tunnel } from '@chatterang/tunnel/host';
-import { TunnelProtocolError } from '@chatterang/tunnel/stream';
+import { MAX_OPEN_TURNS, TunnelProtocolError } from '@chatterang/tunnel/stream';
 import {
   TUNNEL_WIRE_VERSION,
   decodeFrame,
@@ -300,6 +300,52 @@ describe('prompt and answer (#170)', () => {
     await hears();
     await expect(client.send(answerFrame('t1', 'p1', true))).rejects.toThrow(TunnelProtocolError);
   });
+
+  it('the real phone refuses to answer a prompt after it cancelled the turn, and the desktop may only finish it', async () => {
+    const { port, nextTunnel } = await listen(1);
+    const { client, hears } = await phone(port);
+    const { tunnel, hears: desktopHears } = await nextTunnel();
+
+    await client.send(turnFrame('t1'));
+    await desktopHears();
+    await tunnel.send(promptFrame('t1', 'p1'));
+    expect(classifyFrame(await hears())).toMatchObject({ kind: 'prompt', prompt: 'p1' });
+
+    await client.send(cancel('t1'));
+    // #170: a prompt whose turn is cancelled is refused, and never sent later
+    // without a fresh answer — so there is no answer to send.
+    await expect(client.send(answerFrame('t1', 'p1', true))).rejects.toThrow(TunnelProtocolError);
+    expect(await desktopHears()).toEqual(cancel('t1'));
+
+    await expect(tunnel.send(promptFrame('t1', 'p2'))).rejects.toThrow(TunnelProtocolError);
+    await expect(tunnel.send(waiting('t1', 1))).rejects.toThrow(TunnelProtocolError);
+    await tunnel.send(done('t1', 0, 'stopped'));
+    expect(classifyFrame(await hears())).toEqual({ kind: 'completed', turn: 't1' });
+    expect(client.ended()).toBeNull();
+  });
+
+  it('an answer a raw phone sends after its own cancel is never read, and is answered FRAME_UNEXPECTED', async () => {
+    const { port, nextTunnel } = await listen(1);
+    const peer = await rawPhone(port);
+    const { tunnel, hears: desktopHears } = await nextTunnel();
+
+    peer.send(turnFrame('t1'));
+    await desktopHears();
+    await tunnel.send(promptFrame('t1', 'p1'));
+    await eventually(() => peer.frames.length === 1);
+
+    peer.send(cancel('t1'));
+    peer.send(answerFrame('t1', 'p1', true));
+    peer.send(ack('t1'));
+    // The cancel is read; the yes behind it never comes out of receive().
+    expect(await desktopHears()).toEqual(cancel('t1'));
+    await eventually(() => peer.frames.length === 3);
+    expect(peer.frames.slice(1).map(summary)).toEqual([
+      ['error', 't1', 'p1', 'FRAME_UNEXPECTED'],
+      ['error', 't1', undefined, 'FRAME_UNEXPECTED'],
+    ]);
+    expect(tunnel.ended()).toBeNull();
+  });
 });
 
 describe('refusals', () => {
@@ -360,6 +406,112 @@ describe('refusals', () => {
     expect(client.ended()).toEqual({ kind: 'clean', reason: 'the desktop is quitting' });
     // The refusal named no turn and ended the one the desktop was running.
     await expect(client.send(cancel('t1'))).rejects.toThrow(TunnelProtocolError);
+  });
+});
+
+describe('one terminal per turn', () => {
+  /** A desktop that writes whatever it is told to, for a phone that is the real client. */
+  async function rawDesktop() {
+    const server = createServer();
+    const { WebSocketServer } = await import('ws');
+    const sockets = new WebSocketServer({ server });
+    const heard: TunnelFrame[] = [];
+    const connected = new Promise<RawSocket>((resolve) => {
+      sockets.on('connection', (socket) => {
+        socket.on('message', (data: Buffer) => heard.push(decodeFrame(new Uint8Array(data))));
+        resolve(socket);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    open.push({
+      close: async () => {
+        sockets.clients.forEach((client) => client.terminate());
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => sockets.close(() => resolve()));
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    });
+    const { port } = server.address() as AddressInfo;
+    const { client, hears } = await phone(port);
+    return { client, hears, desktop: await connected, heard };
+  }
+
+  it('a refusal after a turn’s terminal never reaches the phone’s app, and is not answered', async () => {
+    const { client, hears, desktop, heard } = await rawDesktop();
+    await client.send(turnFrame('t1'));
+    await eventually(() => heard.length === 1);
+
+    desktop.send(encodeFrame(done('t1', 0, 'the answer')));
+    desktop.send(encodeFrame(refusal('DESKTOP_QUITTING', { turn: 't1' })));
+    desktop.send(encodeFrame(refusal('FROM_A_NEWER_BUILD', { turn: 't1' })));
+    desktop.send(encodeFrame({ v: V, kind: 'ping' }));
+
+    expect(classifyFrame(await hears())).toEqual({ kind: 'completed', turn: 't1' });
+    // The next thing the app reads is the ping: neither refusal got through.
+    expect(await hears()).toEqual({ v: V, kind: 'ping' });
+    // And the phone said nothing about them: the next frame the desktop hears is the ack.
+    await client.send(ack('t1'));
+    await eventually(() => heard.length === 2);
+    expect(heard.map(summary)).toEqual([
+      ['turn', 't1', undefined, undefined],
+      ['ack', 't1', undefined, undefined],
+    ]);
+    expect(client.ended()).toBeNull();
+  });
+
+  it('the desktop drops a refusal of a turn it has no record of, or one already over, and says nothing', async () => {
+    const { port, nextTunnel } = await listen(1);
+    const peer = await rawPhone(port);
+    const { tunnel, hears: desktopHears } = await nextTunnel();
+
+    peer.send(refusal('DESKTOP_QUITTING', { turn: 'never' }));
+    // A stream nobody asked for, so the desktop is its asker, then refused twice.
+    peer.send(done('unasked', 0, 'x'));
+    peer.send(refusal('FROM_A_NEWER_BUILD', { turn: 'unasked' }));
+    peer.send(turnFrame('marker'));
+
+    expect(await desktopHears()).toEqual(done('unasked', 0, 'x'));
+    expect(await desktopHears()).toEqual(turnFrame('marker'));
+    await tunnel.send(refusal('WAIT_LIST_FULL', { turn: 'marker' }));
+    await eventually(() => peer.frames.length === 1);
+    expect(peer.frames.map(summary)).toEqual([['error', 'marker', undefined, 'WAIT_LIST_FULL']]);
+    expect(tunnel.ended()).toBeNull();
+  });
+
+  it('a refusal of every turn that crosses a turn on the wire leaves both ends agreeing it never ran', async () => {
+    const { port, nextTunnel } = await listen(1);
+    const { client, hears } = await phone(port);
+    const { tunnel, hears: desktopHears } = await nextTunnel();
+
+    /*
+     * CROSSED ON PURPOSE. Neither send yields to the event loop, so neither end
+     * has read the other's frame when it writes its own: the desktop refuses
+     * every turn before it reads t1, and the phone asks for t1 before it reads
+     * that refusal. Uncrossed, the phone's own gate would refuse to send t1.
+     */
+    await tunnel.send(refusal('HOST_SUSPENDED', {}));
+    await client.send(turnFrame('t1'));
+
+    expect(classifyFrame(await hears())).toEqual({
+      kind: 'refused',
+      refusal: 'suspended',
+      endsTurn: true,
+      code: 'HOST_SUSPENDED',
+      message: 'refused: HOST_SUSPENDED',
+    });
+    // The desktop never read t1, and answered it HOST_SUSPENDED; the phone
+    // already had t1's terminal, so the next thing it reads is the pong.
+    await client.send({ v: V, kind: 'ping' });
+    expect(await desktopHears()).toEqual({ v: V, kind: 'ping' });
+    await tunnel.send({ v: V, kind: 'pong' });
+    expect(await hears()).toEqual({ v: V, kind: 'pong' });
+
+    // Neither end can run it, or start anything else on this tunnel.
+    await expect(tunnel.send(content('t1', 0, 'resumed'))).rejects.toThrow(TunnelProtocolError);
+    await expect(tunnel.send(content('t9', 0, 'unasked'))).rejects.toThrow(TunnelProtocolError);
+    await expect(client.send(turnFrame('t2'))).rejects.toThrow(TunnelProtocolError);
+    expect(client.ended()).toBeNull();
+    expect(tunnel.ended()).toBeNull();
   });
 });
 
@@ -491,6 +643,29 @@ describe('a frame outside its turn’s state', () => {
       ['error', 'a1', undefined, 'FRAME_UNEXPECTED'],
       ['error', 't1', 'p1', 'FRAME_UNEXPECTED'],
     ]);
+    expect(tunnel.ended()).toBeNull();
+  });
+
+  it(`a phone that opens more than ${MAX_OPEN_TURNS} turns has the extra one refused and not recorded, and the tunnel stays open`, async () => {
+    const { port, nextTunnel } = await listen(1);
+    const peer = await rawPhone(port);
+    const { tunnel, hears: desktopHears } = await nextTunnel();
+    const over = `t${String(MAX_OPEN_TURNS)}`;
+
+    for (let index = 0; index <= MAX_OPEN_TURNS; index += 1) peer.send(turnFrame(`t${String(index)}`));
+    peer.send({ v: V, kind: 'ping' });
+    for (let index = 0; index < MAX_OPEN_TURNS; index += 1) {
+      expect(await desktopHears()).toEqual(turnFrame(`t${String(index)}`));
+    }
+    // The one past the bound was never read: the next frame is the ping.
+    expect(await desktopHears()).toEqual({ v: V, kind: 'ping' });
+    await eventually(() => peer.frames.length === 1);
+    expect(summary(peer.frames[0]!)).toEqual(['error', over, undefined, 'FRAME_UNEXPECTED']);
+
+    // One turn ends, and the refused id — never recorded — is taken.
+    await tunnel.send(refusal('WAIT_LIST_FULL', { turn: 't0' }));
+    peer.send(turnFrame(over));
+    expect(await desktopHears()).toEqual(turnFrame(over));
     expect(tunnel.ended()).toBeNull();
   });
 

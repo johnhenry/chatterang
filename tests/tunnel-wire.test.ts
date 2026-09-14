@@ -313,6 +313,27 @@ describe('#7’s frames: each field checked on the way in and on the way out', (
     }
   });
 
+  it('waiting, prompt and answer refuse a field they do not have on the way out, at the top and in the body', () => {
+    /*
+     * Each `onlyKeys` on its own. Removing the one for the prompt frame's top
+     * level used to leave every test green: an extra top-level field was
+     * dropped at the send instead of refused.
+     */
+    const cases: [string, Record<string, unknown>][] = [
+      ['waiting frame', frame('waiting', { body: { position: 1 }, extra: 1 })],
+      ['waiting body', frame('waiting', { body: { position: 1, extra: 1 } })],
+      ['prompt frame', frame('prompt', { prompt: 'p1', body: { action: 'run bash' }, extra: 1 })],
+      ['prompt body', frame('prompt', { prompt: 'p1', body: { action: 'run bash', extra: 1 } })],
+      ['answer frame', frame('answer', { prompt: 'p1', body: { approved: true }, extra: 1 })],
+      ['answer body', frame('answer', { prompt: 'p1', body: { approved: true, extra: 1 } })],
+    ];
+    for (const [where, value] of cases) {
+      expect(() => encodeFrame(value as unknown as TunnelFrame), where).toThrow(new RegExp(`^${where} carries extra`));
+      // Coming in, the same field is dropped and the frame is read without it.
+      expect(JSON.stringify(decodeFrame(raw(value))), where).not.toContain('extra');
+    }
+  });
+
   it('writes the checked frame, so nothing the frame does not have reaches the socket', () => {
     const bytes = encodeFrame({ v: TUNNEL_WIRE_VERSION, kind: 'ping', secret: 'x' } as unknown as TunnelFrame);
     expect(new TextDecoder().decode(bytes)).toBe(`{"v":${String(TUNNEL_WIRE_VERSION)},"kind":"ping"}`);
@@ -329,13 +350,13 @@ describe('the error frame’s refusal vocabulary', () => {
 
   it('defines exactly these codes, as one frozen table', () => {
     expect(REFUSALS).toEqual({
-      WAIT_LIST_FULL: { kind: 'busy', scope: 'turn', endsTurn: true },
-      DESKTOP_QUITTING: { kind: 'quitting', scope: 'turn-or-connection', endsTurn: true },
-      HOST_SUSPENDED: { kind: 'suspended', scope: 'turn-or-connection', endsTurn: true },
-      HOST_DOES_NOT_RUN_TURNS: { kind: 'refused', scope: 'turn-or-connection', endsTurn: true },
-      PROMPT_EXPIRED: { kind: 'prompt-expired', scope: 'prompt', endsTurn: false },
-      RESULT_UNKNOWN: { kind: 'result-unknown', scope: 'turn', endsTurn: true },
-      FRAME_UNEXPECTED: { kind: 'unexpected', scope: 'any', endsTurn: false },
+      WAIT_LIST_FULL: { kind: 'busy', scope: 'turn', endsTurn: true, beforeStart: true },
+      DESKTOP_QUITTING: { kind: 'quitting', scope: 'turn-or-connection', endsTurn: true, beforeStart: false },
+      HOST_SUSPENDED: { kind: 'suspended', scope: 'turn-or-connection', endsTurn: true, beforeStart: false },
+      HOST_DOES_NOT_RUN_TURNS: { kind: 'refused', scope: 'turn-or-connection', endsTurn: true, beforeStart: true },
+      PROMPT_EXPIRED: { kind: 'prompt-expired', scope: 'prompt', endsTurn: false, beforeStart: false },
+      RESULT_UNKNOWN: { kind: 'result-unknown', scope: 'attach', endsTurn: true, beforeStart: true },
+      FRAME_UNEXPECTED: { kind: 'unexpected', scope: 'any', endsTurn: false, beforeStart: false },
     });
     expect(Object.isFrozen(REFUSALS)).toBe(true);
     for (const row of Object.values(REFUSALS)) expect(Object.isFrozen(row)).toBe(true);
@@ -343,7 +364,8 @@ describe('the error frame’s refusal vocabulary', () => {
 
   it('reads a code it does not know as a failure that ends the turn', () => {
     expect(refusalOf('FROM_A_NEWER_BUILD')).toBe(UNRECOGNISED_REFUSAL);
-    expect(UNRECOGNISED_REFUSAL).toEqual({ kind: 'unrecognised', scope: 'any', endsTurn: true });
+    // Failing closed: it ends the turn, and never says the turn had not started.
+    expect(UNRECOGNISED_REFUSAL).toEqual({ kind: 'unrecognised', scope: 'any', endsTurn: true, beforeStart: false });
     // Names every object inherits are not codes this build defines.
     for (const code of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
       expect(refusalOf(code), code).toBe(UNRECOGNISED_REFUSAL);
@@ -360,6 +382,11 @@ describe('the error frame’s refusal vocabulary', () => {
     expect(() => decodeFrame(raw(error({ turn: 't1', prompt: 'p1' }, 'WAIT_LIST_FULL')))).toThrow(
       /refuses a turn, not a prompt/,
     );
+    // RESULT_UNKNOWN's scope is `attach`: a turn and no prompt, as far as a
+    // frame can show. That the turn came by attach is the ledger's to check.
+    expect(() => decodeFrame(raw(error({ turn: 't1', prompt: 'p1' }, 'RESULT_UNKNOWN')))).toThrow(
+      /refuses a turn, not a prompt/,
+    );
     // And what each scope allows.
     for (const [fields, code] of [
       [{}, 'DESKTOP_QUITTING'],
@@ -367,6 +394,7 @@ describe('the error frame’s refusal vocabulary', () => {
       [{}, 'HOST_SUSPENDED'],
       [{}, 'HOST_DOES_NOT_RUN_TURNS'],
       [{ turn: 't1' }, 'HOST_DOES_NOT_RUN_TURNS'],
+      [{ turn: 't1' }, 'RESULT_UNKNOWN'],
       [{ turn: 't1', prompt: 'p1' }, 'PROMPT_EXPIRED'],
       [{}, 'FRAME_UNEXPECTED'],
       [{ turn: 't1', prompt: 'p1' }, 'FRAME_UNEXPECTED'],
