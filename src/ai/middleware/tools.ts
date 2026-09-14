@@ -342,12 +342,32 @@ export async function runToolCalls(
     };
   };
 
+  /*
+   * STOP HOLDS BACK EVERY CALL THAT HAS NOT GONE, and each is written down (#92,
+   * owner ruling that "not sent" covers every call that did not leave). That is
+   * a call allowed by a grant the conversation held, or by an answer given in
+   * this batch, when Stop came at another server's sheet or while an earlier
+   * call ran. It waited on nobody, and until this it did not run and had no
+   * record, so the thread and the export said nothing about it. Read at the
+   * call, so the time on the record is when it was held back.
+   */
+  const stopped = (index: number): Refusal | undefined => {
+    const destination = tools[index]?.destination;
+    if (!destination || !options.signal?.aborted) return undefined;
+    return {
+      output: `This call’s arguments were not sent to ${destination.host}: the reply was stopped.`,
+      why: 'stopped',
+    };
+  };
+
   for (const [index, call] of calls.entries()) {
-    const refusal = refused.get(index) ?? withdrawn(index);
+    const refusal = refused.get(index) ?? withdrawn(index) ?? stopped(index);
     // Nothing runs once the turn is stopped. A refused call is still written
     // down below, whatever refused it: a refusal sends nothing, and a call the
     // person declined before Stop came is as much not sent as one Stop held
-    // back (owner ruling OD7).
+    // back (owner ruling OD7). What is skipped here without a record is only a
+    // call with no destination — a tool that runs on this device, or none by
+    // that name — which has no server it was not sent to.
     if (options.signal?.aborted && !refusal) continue;
 
     const tool = tools[index];

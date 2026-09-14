@@ -974,13 +974,11 @@ describe('MCP arguments do not leave the device without a grant', () => {
     });
   });
 
-  it('holds back the whole batch at Stop: a server not yet asked about is recorded as stopped, and a granted call does not run', async () => {
-    // What this build does when Stop lands at one server's sheet, pinned so
-    // that changing it is a decision rather than a tidy-up. A call to another
-    // server that was not yet asked about is recorded as stopped. A call to a
-    // server the conversation already allowed does not run and has no record,
-    // because it waited on nobody; whether it should be recorded too is with
-    // the owner (#92).
+  it('holds back the whole batch at Stop, and records every call in it as stopped — a granted one too', async () => {
+    // Owner ruling on #92: "not sent" covers every call that did not leave. A
+    // call to another server that was not yet asked about is recorded as
+    // stopped, and so is a call to a server the conversation already allowed,
+    // though it waited on nobody. Until the ruling that one had no record.
     const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
     const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
     const { engine, probe } = setUp([MCP_CALL + archiveCall + mirrorCall, 'Done.']);
@@ -997,7 +995,10 @@ describe('MCP arguments do not leave the device without a grant', () => {
     toolRegistry.register(archive.tool);
     toolRegistry.register(mirror.tool);
     const controller = new AbortController();
+    let stoppedAt = 0;
     const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      stoppedAt = Date.now();
       controller.abort();
       return 'calls';
     });
@@ -1013,18 +1014,108 @@ describe('MCP arguments do not leave the device without a grant', () => {
         }),
       ),
     );
+    const finishedAt = Date.now();
 
     expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual([PROBE_SERVER.serverId]);
     expect(probe.call).not.toHaveBeenCalled();
     expect(archive.call).not.toHaveBeenCalled();
     expect(mirror.call, 'a granted call does not run after Stop').not.toHaveBeenCalled();
+    expect(mirror.confirm).not.toHaveBeenCalled();
     const records = events.flatMap((event) =>
       event.type === 'tool' ? [[event.tool.name, event.tool.receipt] as const] : [],
     );
     expect(records.map(([name, receipt]) => [name, receipt?.outcome === 'withheld' && receipt.why])).toEqual([
       ['notes.note', 'stopped'],
       ['archive.note', 'stopped'],
+      ['mirror.note', 'stopped'],
     ]);
+    // Recorded against its own server, sized as what would have gone.
+    const granted = records[2]![1];
+    expect(granted).toMatchObject({
+      serverId: 'mcp_mirror',
+      serverName: 'mirror',
+      host: 'mirror.example',
+      toolName: 'mirror.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: 'copy' })).length,
+    });
+    // Stamped when Stop held it back, which the export prints.
+    expect(granted?.at).toBeGreaterThanOrEqual(stoppedAt);
+    expect(granted?.at).toBeLessThanOrEqual(finishedAt);
+    const tool = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []))[2];
+    expect(tool?.output).toBe('This call’s arguments were not sent to mirror.example: the reply was stopped.');
+  });
+
+  it('records every allowed call that had not run when Stop came during an earlier one, and sends none of them', async () => {
+    // The same ruling, the other way Stop lands: while a call runs. Every call
+    // after it was allowed before the batch started — archive by a grant the
+    // conversation held, mirror by an answer given on screen in this batch —
+    // and none of them waited on anyone when Stop came.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://archive.example/mcp',
+    });
+    const mirror = mcpProbe({
+      serverName: 'mirror',
+      serverId: 'mcp_mirror',
+      serverUrl: 'https://mirror.example/mcp',
+      readOnly: false,
+    });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    const controller = new AbortController();
+    let stoppedAt = 0;
+    probe.call.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      stoppedAt = Date.now();
+      controller.abort();
+      return { content: [{ type: 'text', text: 'filed' }] };
+    });
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => 'calls');
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id],
+          mcpEgress: {
+            isGranted: (destination) => destination.serverId !== 'mcp_mirror',
+            request,
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+    const finishedAt = Date.now();
+    toolRegistry.unregister(archive.tool.id);
+    toolRegistry.unregister(mirror.tool.id);
+
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual(['mcp_mirror']);
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(archive.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(mirror.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(mirror.confirm, 'nothing is asked after Stop').not.toHaveBeenCalled();
+    const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+    expect(tools.map((tool) => [tool.name, tool.receipt?.outcome === 'withheld' ? tool.receipt.why : tool.receipt?.outcome])).toEqual([
+      ['notes.note', 'sent'],
+      ['archive.note', 'stopped'],
+      ['mirror.note', 'stopped'],
+    ]);
+    expect(tools[1]!.receipt).toMatchObject({
+      serverName: 'archive',
+      host: 'archive.example',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+    expect(tools[2]!.receipt).toMatchObject({ serverName: 'mirror', host: 'mirror.example' });
+    for (const tool of tools.slice(1)) {
+      expect(tool.receipt?.at).toBeGreaterThanOrEqual(stoppedAt);
+      expect(tool.receipt?.at).toBeLessThanOrEqual(finishedAt);
+      expect(tool.output).toBe(`This call’s arguments were not sent to ${tool.receipt?.host}: the reply was stopped.`);
+    }
   });
 
   it('sends nothing after Stop while a destructive call’s own confirm is open, even when it is answered yes after', async () => {
