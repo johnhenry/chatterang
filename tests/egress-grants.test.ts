@@ -41,6 +41,7 @@ vi.mock('@/ai/mcp/client', () => ({
 
 const { useChats } = await import('@/state/chat');
 const { useApp } = await import('@/state/app');
+const { writeSetting } = await import('@/db');
 const { useMcp } = await import('@/state/mcp');
 const { holdsGrant } = await import('@/domain/chat');
 type EgressGrant = import('@/domain/chat').EgressGrant;
@@ -813,6 +814,108 @@ describe('an answer the running turn holds about a connection', () => {
     expect(requests[2]).not.toContain(SECRET);
     expect(connectionsOf('c1')).toEqual([]);
     expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+  });
+});
+
+describe('an answer the running turn holds, while switching its connection off clears the fallback', () => {
+  /*
+   * `toggleConnection` and `removeConnection` disconnect, then — when the
+   * connection is the fallback — await the settings write, and only then
+   * withdraw the connection's grants. Until the withdrawal STARTS nothing says
+   * the answer the turn holds is stale. So the question is whether anything can
+   * reach the connection in that window.
+   *
+   * For a switch-off it can: switching it back on registers the same id, and
+   * the next request is built under the held answer. For a removal the id does
+   * not come back through the app (a new connection gets a new id), so the
+   * re-registration below stands in for nothing a person can do; it is measured
+   * anyway, because the two share the ordering.
+   */
+  beforeEach(() => {
+    seed();
+    chatsTable.put.mockClear();
+  });
+
+  it.each([
+    ['switched off', 'turn'],
+    ['switched off', 'conversation'],
+    ['removed', 'turn'],
+    ['removed', 'conversation'],
+  ] as const)('ends when the connection is %s, though it is back before the settings are written (“%s”)', async (how, first) => {
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, CALL, CALL, 'Done.']);
+    engine.router.register('conn_openai', cloud.adapter);
+
+    let releaseSettings = () => {};
+    const settingsHeld = new Promise<void>((resolve) => {
+      releaseSettings = resolve;
+    });
+    vi.mocked(writeSetting).mockImplementationOnce(() => settingsHeld);
+
+    let runs = 0;
+    let leaving: Promise<void> | null = null;
+    toolRegistry.register({
+      ...leakyTool,
+      execute: async () => {
+        runs += 1;
+        if (runs === 2) {
+          // Not awaited, as a click in Settings during a tool run is not.
+          leaving =
+            how === 'removed'
+              ? useApp.getState().removeConnection('conn_openai')
+              : useApp.getState().toggleConnection('conn_openai', false);
+          await vi.waitFor(() => expect(writeSetting).toHaveBeenCalled());
+          // Back on, under the same id, while the fallback setting is still
+          // being written.
+          engine.router.register('conn_openai', cloud.adapter);
+        }
+        if (runs === 3) {
+          releaseSettings();
+          await leaving;
+        }
+        return leakyTool.execute();
+      },
+    });
+
+    const asked: string[] = [];
+    const answers: ('turn' | 'conversation' | 'no')[] = [first, 'no'];
+    const original = useApp.getState().requestApproval;
+    const settings = useApp.getState().settings;
+    useApp.setState({
+      engine: engine as never,
+      connections: [{ ...OPENAI }],
+      settings: { ...settings, fallbackBackendId: 'conn_openai' },
+      requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+        asked.push(action);
+        const answer = answers.shift() ?? 'no';
+        if (answer === 'conversation') prompt?.onExtended?.();
+        return answer !== 'no';
+      },
+    });
+    useChats.setState({
+      loaded: true,
+      generating: false,
+      controller: null,
+      messages: [],
+      activeChatId: 'c1',
+      chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
+    });
+
+    try {
+      await useChats.getState().send('what is in my chats?');
+      await macrotask();
+    } finally {
+      releaseSettings();
+      toolRegistry.unregister('leaky');
+      useApp.setState({ engine: null, connections: [], requestApproval: original, settings });
+    }
+
+    const requests = sent(cloud.seen);
+    expect(requests.length).toBeGreaterThanOrEqual(3);
+    expect(requests[1], 'the answer, while it stood').toContain(SECRET);
+    expect(requests[2], 'built while the fallback setting was being written').not.toContain(SECRET);
+    expect(asked).toHaveLength(2);
+    expect(connectionsOf('c1')).toEqual([]);
   });
 });
 
