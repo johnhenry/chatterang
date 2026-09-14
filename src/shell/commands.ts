@@ -25,7 +25,8 @@ import {
   type Capability,
 } from '@/domain/manifest';
 import { deriveTitle, reachKind } from '@/domain/chat';
-import type { Reach } from '@/domain/chat';
+import type { Reach, ToolInvocation } from '@/domain/chat';
+import type { McpCallReceipt } from '@/domain/mcp';
 
 export interface ShellOutput {
   readonly stdout: string;
@@ -196,6 +197,8 @@ interface ChatRow {
 interface TranscriptGeneration {
   content: string;
   provenance?: { modelName: string; reach?: Reach };
+  /** Only their receipts are printed: see `receiptLines`. */
+  toolCalls?: readonly ToolInvocation[];
 }
 interface MessageRow extends TranscriptGeneration {
   role: string;
@@ -686,7 +689,9 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
                 '    of the consent. A call the server itself calls destructive',
                 '    does ask, but about changing data there, not about what',
                 '    leaves. The arguments are whatever the model wrote from the',
-                '    conversation.',
+                '    conversation. Each call handed to a server is recorded in the',
+                '    thread and in an exported transcript: the server, its host,',
+                '    when, and how many bytes of arguments.',
               ]
             : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
@@ -985,9 +990,87 @@ export function renderTranscript(
       escapeTranscriptBody(shown.content.trim()),
       '',
     );
+
+    // EGRESS IS A FACT ABOUT THE CONVERSATION, NOT ABOUT WHICH VERSION IS ON
+    // SCREEN (#92). The heading and the text describe the displayed generation;
+    // what a hidden one sent is printed too, marked as not the reply above. A
+    // transcript that dropped it would say less left than did.
+    const egress = receiptLines(message, shown === record);
+    if (egress.length > 0) lines.push(...egress.map((line) => escapeTranscriptBody(line)), '');
   }
 
   return lines.join('\n');
+}
+
+/**
+ * One line per call a turn handed to an MCP server, for every generation the
+ * turn kept.
+ *
+ * EVERY GENERATION ONCE. When the displayed generation is a record in
+ * `variants`, the row's own fields are its projection (`applyVariant`), so the
+ * list alone is every generation and reading the row as well would print the
+ * displayed calls twice. Otherwise the row is a generation the list does not
+ * hold — a turn never regenerated, or a regeneration that failed or was
+ * interrupted, whose index points past the end — and it is read beside the list.
+ *
+ * Escaped by the caller like any body text: a tool name is chosen by the server.
+ */
+function receiptLines(message: MessageRow, displayedIsListed: boolean): string[] {
+  const variants = message.variants ?? [];
+  const generations: { generation: TranscriptGeneration; displayed: boolean }[] = displayedIsListed
+    ? variants.map((generation, index) => ({ generation, displayed: index === message.variantIndex }))
+    : [
+        { generation: message, displayed: true },
+        ...variants.map((generation) => ({ generation, displayed: false })),
+      ];
+  const ordered = [
+    ...generations.filter((entry) => entry.displayed),
+    ...generations.filter((entry) => !entry.displayed),
+  ];
+
+  return ordered.flatMap(({ generation, displayed }) =>
+    // `?.` for the same reason `shown` checks `content`: through v3 a variant
+    // was a bare string, and it has no calls to print.
+    (generation?.toolCalls ?? []).flatMap((call) =>
+      call.receipt
+        ? [
+            `- ${receiptClause(call.receipt)}${displayed ? '' : ' (from a version of this reply not shown)'}.`,
+          ]
+        : [],
+    ),
+  );
+}
+
+/**
+ * A receipt as the transcript prints it. The thread's sentence, with the tool
+ * named, because the export prints no tool blocks for it to sit under.
+ */
+function receiptClause(receipt: McpCallReceipt): string {
+  const where = `${receipt.host} (${receipt.serverName})`;
+  const when = transcriptTime(receipt.at);
+  switch (receipt.outcome) {
+    case 'sent':
+      return `${receipt.toolName} sent ${receipt.bytes} bytes of arguments to ${where} at ${when}`;
+    case 'failed':
+      return `${receipt.toolName} tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived`;
+    default: {
+      // A new outcome has to say what it means here before this compiles.
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * UTC to the second: a file is read in whatever timezone it is opened in.
+ * `toISOString` throws on an invalid date, and one bad row must not take the
+ * whole export down with it.
+ */
+function transcriptTime(at: number): string {
+  const date = new Date(at);
+  return Number.isNaN(date.getTime())
+    ? 'an unrecorded time'
+    : `${date.toISOString().slice(0, 19).replace('T', ' ')} UTC`;
 }
 
 /**

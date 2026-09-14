@@ -116,8 +116,10 @@ What can leave the device, each only when you turn it on:
    the tool was running, all travel under the same grant.
 4. **The arguments of an MCP tool**, to the server that tool comes from, if you
    connect one. Nothing is asked before they go — enabling the tool for a chat
-   is the whole of the consent today. ([#6](https://github.com/johnhenry/chatterang/issues/6)
-   is changing that to a grant and a receipt.)
+   is the whole of the consent today. Each call handed to a server is recorded
+   in the thread and in an exported transcript.
+   ([#6](https://github.com/johnhenry/chatterang/issues/6) is changing the
+   consent to a grant.)
 5. **Benchmark runs you publish**, if you turn that on. It is off by default,
    each run is confirmed individually, and the consent sheet shows the literal
    JSON — which contains no install id, device serial, account, or

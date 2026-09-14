@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { act, createElement } from 'react';
+import { createRoot } from 'react-dom/client';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -47,10 +49,14 @@ import {
 import type { IRMessage } from '@johnhenry/aimatey-types';
 import {
   chatterangCommands,
+  renderTranscript,
   type ShellCommand,
   type ShellContext,
   type ShellStores,
 } from '@/shell/commands';
+import type { ToolInvocation } from '@/domain/chat';
+import { MessageView } from '@/features/chat/MessageView';
+import { useApp } from '@/state/app';
 import { buildMessages, toolOutputSheetBody } from '@/state/chat';
 
 import {
@@ -233,6 +239,58 @@ async function privacyOutput(
   const result = await command!.run([], contextFor(overrides, actor));
   return reads(result.stdout);
 }
+
+/** One call to a read-only MCP tool through the real dispatcher, as the thread stores it. */
+async function mcpRecord(call: () => Promise<unknown>) {
+  const tool = mustCreateMcpTool(
+    {
+      server: 'notes',
+      name: 'note',
+      description: 'File a note',
+      readOnly: true,
+      destructive: false,
+      inputSchema: { type: 'object', properties: {} },
+    },
+    { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => true, call },
+  );
+  const { executed } = await runToolCalls(
+    new ToolRegistry([tool]),
+    [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }],
+    { enabledIds: [tool.id] },
+  );
+  return executed[0]!;
+}
+
+/** What the thread shows for an assistant turn that made this one call. */
+async function threadText(tool: ToolInvocation): Promise<string> {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  // Markdown loads lazily; the plain branch keeps the render synchronous.
+  useApp.setState({ settings: { ...useApp.getState().settings, renderMarkdown: false } });
+  const host = document.createElement('div');
+  document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => {
+      root.render(
+        createElement(MessageView, {
+          message: { id: 'm1', chatId: 'c1', role: 'assistant', content: 'Filed.', createdAt: 1, toolCalls: [tool] },
+          showThinking: false,
+          onRegenerate: () => {},
+          onEdit: () => {},
+        }),
+      );
+    });
+    return host.textContent ?? '';
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+}
+
+/** A receipt's time as the exported transcript prints it. */
+const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
 
 /* ── `privacy`, the one place that must not shade the truth ──────────── */
 
@@ -484,6 +542,77 @@ describe('the privacy command', () => {
     expect(asked).not.toMatch(/leave|send|argument/i);
     // And the arguments went anyway, on the same call.
     expect(call).toHaveBeenCalledWith('notes', 'mutate', { text: SECRET }, undefined);
+  });
+
+  /*
+   * THE RECEIPT, SHOWN (#92). The consent is still the enable, and the two
+   * sentences above still say so; this is what a person can check after the
+   * fact. Measured on a real record out of the real dispatcher, rendered by the
+   * real thread and the real transcript, so the host and the byte count on
+   * screen are the ones the call carried.
+   */
+  it('says each call handed to a server is recorded in the thread and the export — and it is', async () => {
+    const output = await privacyOutput({
+      mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
+    });
+    expect(output).toContain(
+      'Each call handed to a server is recorded in the thread and in an exported transcript: the server, its host, when, and how many bytes of arguments.',
+    );
+    const MESSAGE_VIEW = shipped('features/chat/MessageView.tsx');
+    expect(MESSAGE_VIEW).toContain(
+      '`Sent ${receipt.bytes} bytes of arguments to ${where} at ${when}.`',
+    );
+
+    const record = await mcpRecord(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+    const bytes = new TextEncoder().encode(JSON.stringify({ text: SECRET })).length;
+    expect(record.receipt).toMatchObject({
+      outcome: 'sent',
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes,
+    });
+    const at = record.receipt!.at;
+
+    expect(await threadText(record)).toContain(
+      `Sent ${bytes} bytes of arguments to notes.example (notes) at ${new Date(at).toLocaleString()}.`,
+    );
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'Filed.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note sent ${bytes} bytes of arguments to notes.example (notes) at ${utc(at)}.`,
+    );
+    // A record of the size, not a second copy of the words.
+    expect(transcript).not.toContain(SECRET);
+  });
+
+  it('says a call that failed may or may not have arrived — never that it was sent', async () => {
+    expect(shipped('features/chat/MessageView.tsx')).toContain(
+      '`Tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived.`',
+    );
+
+    const record = await mcpRecord(async () => {
+      throw new Error('connection reset');
+    });
+    const bytes = new TextEncoder().encode(JSON.stringify({ text: SECRET })).length;
+    expect(record.receipt?.outcome).toBe('failed');
+    const at = record.receipt!.at;
+
+    const thread = await threadText(record);
+    expect(thread).toContain(
+      `Tried to send ${bytes} bytes of arguments to notes.example (notes) at ${new Date(at).toLocaleString()} — the call failed, so they may or may not have arrived.`,
+    );
+    expect(thread).not.toContain(`Sent ${bytes} bytes`);
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'Could not file it.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note tried to send ${bytes} bytes of arguments to notes.example (notes) at ${utc(at)} — the call failed, so they may or may not have arrived.`,
+    );
+    expect(transcript).not.toContain('notes.note sent');
   });
 
   /**
@@ -1279,6 +1408,11 @@ describe('README.md’s privacy list', () => {
     // pinned above; this is the same fact on the public surface.
     expect(section).toMatch(/MCP tool/i);
     expect(section).toMatch(/Nothing is asked before they go/i);
+    // Measured in `the privacy command` above: a real record, rendered by the
+    // real thread and the real transcript.
+    expect(reads(section)).toContain(
+      'Each call handed to a server is recorded in the thread and in an exported transcript.',
+    );
   });
 
   it('points at the command as the generated source of truth', () => {

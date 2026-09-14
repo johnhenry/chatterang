@@ -1329,6 +1329,17 @@
   color: var(--ink);
 }
 
+/* The record that a call's arguments went to a server (#92). Not inside the
+   collapsible body: it is read at the weight of the chip saying where a reply
+   ran, and that chip is never folded away. */
+.tool__receipt {
+  margin: 0;
+  padding: 0 var(--s-3) var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-2xs);
+  color: var(--ink-2);
+}
+
 .tool__body {
   padding: 0 var(--s-3) var(--s-3);
   font-family: var(--font-mono);
