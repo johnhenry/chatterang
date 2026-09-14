@@ -7,7 +7,8 @@
  *
  * One thing worth stating plainly: connecting to a server does NOT make its
  * tools usable in a chat. Every MCP tool is `sensitive`, so it still has to be
- * enabled per chat like the `bash` tool. Connecting only makes them offerable.
+ * enabled per chat like the `bash` tool, and each call still needs a grant for
+ * its server before its arguments go (#6). Connecting only makes them offerable.
  *
  * And the converse: adding or removing a server switches that NAME's tools off
  * in every chat. Tool ids are keyed on the server name, so without this an
@@ -35,6 +36,10 @@ import { toolRegistry } from '@/ai/tools/registry';
  */
 async function pruneMcpToolsFor(serverName: string): Promise<void> {
   await (await import('@/state/app')).pruneMcpToolsFor(serverName);
+}
+
+async function revokeMcpGrantsFor(serverId: string): Promise<void> {
+  await (await import('@/state/app')).revokeMcpGrantsFor(serverId);
 }
 
 interface McpState {
@@ -108,7 +113,10 @@ export const useMcp = create<McpState>((set, get) => ({
     // full disk — must not leave tools callable for a server the panel has
     // just said is gone. The failure still reaches the caller.
     try {
-      if (removed) await pruneMcpToolsFor(removed.name);
+      if (removed) {
+        await pruneMcpToolsFor(removed.name);
+        await revokeMcpGrantsFor(removed.id);
+      }
     } finally {
       await get().reconnect();
     }
@@ -117,10 +125,20 @@ export const useMcp = create<McpState>((set, get) => ({
   // Deliberately does NOT prune. Switching a server off and on again brings
   // back the same row at the same URL, so an enable given to it is still an
   // enable given to that server. Removal is what ends that.
+  //
+  // It DOES withdraw the grants to send to it, as switching a provider off
+  // does (`toggleConnection`): a permission that survived the switch would
+  // apply again the moment it went back on, without being asked for. The
+  // reconnect still runs if that write fails, because it is what unregisters
+  // the tools.
   async toggle(id, enabled) {
     await db.mcpServers.update(id, { enabled });
     set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
-    await get().reconnect();
+    try {
+      if (!enabled) await revokeMcpGrantsFor(id);
+    } finally {
+      await get().reconnect();
+    }
   },
 
   async reconnect() {

@@ -856,15 +856,16 @@ function ChatSettingsSheet({
             `toolRegistry.list()` below. Its replacement led with "Tools run on
             this device" and then "the app asks first", and both halves were
             measured false: an MCP tool executes on its server, and calling one
-            sends the model's arguments there with no sheet at all. So the
-            sentence is split by where the tool actually runs, and the MCP half
-            says what does not happen. */}
+            sent the model's arguments there with no sheet at all. So the
+            sentence is split by where the tool actually runs. The MCP half
+            said nothing was asked until #6 made a grant the thing a call waits
+            on; it now says what is asked, and in which order. */}
         <p className="section__hint">
-          A tool from an MCP server runs on that server: calling one sends its arguments there,
-          and nothing is asked first — a call the server calls destructive asks about changing
-          data there, not about what leaves. Every other tool runs on this device; what it reads
-          goes to the model, and off this device with it when the model is remote — that one the
-          app asks about, every turn until you answer for the whole conversation.
+          A tool from an MCP server runs on that server: calling one sends its arguments there
+          once you allow that server, and a call the server calls destructive also asks about
+          changing data there. Every other tool runs on this device; what it reads goes to the
+          model, and off this device with it when the model is remote — that one the app asks
+          about, every turn until you answer for the whole conversation.
         </p>
         <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
           {toolRegistry.list().map((tool) => {

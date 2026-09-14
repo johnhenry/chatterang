@@ -32,6 +32,8 @@ import type { InstalledModel } from '@/db';
 import type { Message, Provenance, ToolInvocation } from '@/domain/chat';
 import type { McpCallReceipt } from '@/domain/mcp';
 import type { ToolEgressPolicy } from '@/ai/engine';
+import type { DestinationRequest, ToolDestinationPolicy } from '@/ai/middleware/tools';
+import type { ApprovalPrompt } from '@/state/app';
 
 /* ── The database, stubbed at the table boundary ────────────────────── */
 
@@ -57,7 +59,7 @@ vi.mock('@/db', () => ({
 const { act } = await import('react');
 const { createRoot } = await import('react-dom/client');
 
-const { useChats, buildMessages } = await import('@/state/chat');
+const { useChats, buildMessages, mcpSendSheet } = await import('@/state/chat');
 const { useModels } = await import('@/state/models');
 const { useApp } = await import('@/state/app');
 const { catalogEntry } = await import('@/data/catalog');
@@ -144,10 +146,15 @@ interface Turn {
   readonly hang?: Promise<void>;
   /** Throw after the tool event instead of finishing — the store's `catch`. */
   readonly throwWith?: string;
+  /** Ask the MCP policy the store handed over, as the dispatcher does before a call. */
+  readonly asksMcp?: DestinationRequest;
 }
 
 /** Turns the fake engine hands back, in order. */
 let script: Turn[] = [];
+
+/** What each `asksMcp` turn got back, and whether the policy then held a grant. */
+let mcpAnswers: { decision?: string; granted?: boolean }[] = [];
 
 /**
  * The engine, replaced by a recorder.
@@ -158,9 +165,20 @@ let script: Turn[] = [];
  */
 function scriptedEngine(): unknown {
   return {
-    async *stream(request: { readonly egress?: ToolEgressPolicy }) {
+    async *stream(request: {
+      readonly egress?: ToolEgressPolicy;
+      readonly mcpEgress?: ToolDestinationPolicy;
+    }) {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
+      if (turn.asksMcp) {
+        // What `runToolCalls` does with the policy: ask, and hand a
+        // conversation answer back to be kept.
+        const policy = request.mcpEgress;
+        const decision = await policy?.request?.(turn.asksMcp);
+        if (decision === 'conversation') policy?.onGranted?.(turn.asksMcp.destination);
+        mcpAnswers.push({ decision, granted: policy?.isGranted(turn.asksMcp.destination) });
+      }
       if (turn.asksEgress) {
         await request.egress?.request?.({
           backendId: 'conn_openai',
@@ -1190,5 +1208,72 @@ describe('the tool-output sheet over an earlier reply', () => {
       false,
     );
     expect(trimmed.derivedReplies).toEqual([]);
+  });
+});
+
+/* ── The MCP send sheet, through the store (#6) ───────────────────────── */
+
+describe('the MCP send sheet, through the store’s own policy', () => {
+  const ASK: DestinationRequest = {
+    destination: {
+      kind: 'mcp',
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    },
+    calls: [{ toolName: 'notes.note', bytes: 30, preview: '{"text":"a note"}' }],
+  };
+
+  /** Send one turn whose engine asks the MCP policy, and answer the sheet as told. */
+  async function answering(answer: 'no' | 'yes' | 'conversation'): Promise<(ApprovalPrompt | undefined)[]> {
+    const prompts: (ApprovalPrompt | undefined)[] = [];
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      requestApproval: async (_action: string, prompt?: ApprovalPrompt) => {
+        prompts.push(prompt);
+        if (answer === 'conversation') prompt?.onExtended?.();
+        return answer !== 'no';
+      },
+    });
+    mcpAnswers = [];
+    try {
+      script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
+      await useChats.getState().send('file it');
+    } finally {
+      useApp.setState({ requestApproval: original });
+    }
+    return prompts;
+  }
+
+  const grants = () => useChats.getState().chats.find((chat) => chat.id === 'c1')?.egressGrants ?? [];
+
+  it('raises the sheet `mcpSendSheet` builds, and a no sends nothing and keeps nothing', async () => {
+    const prompts = await answering('no');
+
+    expect(prompts).toHaveLength(1);
+    const { action: _action, ...sheet } = mcpSendSheet(ASK);
+    expect(prompts[0]).toMatchObject(sheet);
+    expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
+    expect(grants()).toEqual([]);
+  });
+
+  it('keeps a conversation answer for this chat and this server, and honours it at once', async () => {
+    await answering('conversation');
+
+    // Held before the write lands, so a call made straight after is not asked again.
+    expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: true }]);
+    await vi.waitFor(() =>
+      expect(grants()).toEqual([
+        { kind: 'mcp', serverId: 'mcp_notes', url: 'https://notes.example/mcp', grantedAt: expect.any(Number) },
+      ]),
+    );
+  });
+
+  it('does not keep a plain yes: it covered the calls on the sheet', async () => {
+    await answering('yes');
+
+    expect(mcpAnswers).toEqual([{ decision: 'calls', granted: false }]);
+    expect(grants()).toEqual([]);
   });
 });

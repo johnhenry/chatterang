@@ -15,6 +15,7 @@ import {
   currentVariant,
   deriveTitle,
   displaysUnrecorded,
+  holdsGrant,
   newId,
   splitThinking,
   REACH_DEVICE,
@@ -42,8 +43,12 @@ import {
   type ToolEgressPolicy,
 } from '@/ai/engine';
 import { markTainted } from '@/ai/taint';
-import type { ExecutedTool } from '@/ai/middleware/tools';
-import type { McpCallReceipt } from '@/domain/mcp';
+import type {
+  DestinationRequest,
+  ExecutedTool,
+  ToolDestinationPolicy,
+} from '@/ai/middleware/tools';
+import type { McpCallReceipt, ToolDestination } from '@/domain/mcp';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -51,7 +56,12 @@ import {
   fitToContext,
   type FitResult,
 } from '@/ai/context';
-import { installEgressRevoker, installMcpToolPruner, useApp } from '@/state/app';
+import {
+  installEgressRevoker,
+  installMcpGrantRevoker,
+  installMcpToolPruner,
+  useApp,
+} from '@/state/app';
 import { useModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
 
@@ -119,6 +129,13 @@ interface ChatState {
    * next claimed that id.
    */
   revokeEgress: (connectionId: string, chatId?: string) => Promise<void>;
+  /**
+   * Let this conversation send MCP tool calls' arguments to one server, at one
+   * address, until revoked (#6).
+   */
+  grantMcpEgress: (chatId: string, server: { serverId: string; url: string }) => Promise<void>;
+  /** Drop grants for one MCP server, across every conversation, whatever address they named. */
+  revokeMcpEgress: (serverId: string, chatId?: string) => Promise<void>;
 
   refreshContext: () => void;
   send: (text: string, attachments?: Attachment[]) => Promise<void>;
@@ -274,7 +291,7 @@ export const useChats = create<ChatState>((set, get) => ({
   async grantEgress(chatId, connectionId) {
     const chat = get().chats.find((entry) => entry.id === chatId);
     if (!chat) return;
-    if (chat.egressGrants?.some((grant) => grant.connectionId === connectionId)) return;
+    if (holdsGrant(chat.egressGrants, { kind: 'provider', connectionId })) return;
     const egressGrants: EgressGrant[] = [
       ...(chat.egressGrants ?? []),
       { connectionId, grantedAt: Date.now() },
@@ -286,13 +303,41 @@ export const useChats = create<ChatState>((set, get) => ({
     const affected = get().chats.filter(
       (chat) =>
         (chatId === undefined || chat.id === chatId) &&
-        chat.egressGrants?.some((grant) => grant.connectionId === connectionId),
+        holdsGrant(chat.egressGrants, { kind: 'provider', connectionId }),
     );
     for (const chat of affected) {
       await get().updateChat(chat.id, {
         egressGrants: (chat.egressGrants ?? []).filter(
-          (grant) => grant.connectionId !== connectionId,
+          (grant) => grant.kind === 'mcp' || grant.connectionId !== connectionId,
         ),
+      });
+    }
+  },
+
+  async grantMcpEgress(chatId, { serverId, url }) {
+    const chat = get().chats.find((entry) => entry.id === chatId);
+    if (!chat) return;
+    if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return;
+    // A grant for this server at an address it no longer has is REPLACED, not
+    // kept beside the new one. It covers nothing now, and a list that kept it
+    // would read as permission to send wherever the server used to be.
+    const egressGrants: EgressGrant[] = [
+      ...(chat.egressGrants ?? []).filter(
+        (grant) => grant.kind !== 'mcp' || grant.serverId !== serverId,
+      ),
+      { kind: 'mcp', serverId, url, grantedAt: Date.now() },
+    ];
+    await get().updateChat(chatId, { egressGrants });
+  },
+
+  async revokeMcpEgress(serverId, chatId) {
+    const names = (grant: EgressGrant): boolean => grant.kind === 'mcp' && grant.serverId === serverId;
+    const affected = get().chats.filter(
+      (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
+    );
+    for (const chat of affected) {
+      await get().updateChat(chat.id, {
+        egressGrants: (chat.egressGrants ?? []).filter((grant) => !names(grant)),
       });
     }
   },
@@ -588,6 +633,7 @@ async function runGeneration(
       sampler: resolveSampler(chat, target.modelId),
       toolIds: chat.tools,
       egress: egressPolicy(chat.id, built.derivedReplies),
+      mcpEgress: mcpEgressPolicy(chat.id),
       signal: controller.signal,
     });
 
@@ -941,7 +987,7 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
 
   return {
-    isGranted: (backendId) => grantsFor().some((grant) => grant.connectionId === backendId),
+    isGranted: (backendId) => holdsGrant(grantsFor(), { kind: 'provider', connectionId: backendId }),
 
     onGranted: (backendId) => {
       void useChats.getState().grantEgress(chatId, backendId);
@@ -970,6 +1016,104 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
 
       if (!allowed) return 'deny';
       return extended ? 'conversation' : 'turn';
+    },
+  };
+}
+
+/** The MCP send sheet, as `requestApproval` takes it. */
+export interface McpSendSheet {
+  readonly action: string;
+  readonly title: string;
+  readonly body: string;
+  readonly detail: readonly string[];
+  readonly confirmLabel: string;
+  readonly extendedLabel: string;
+  readonly cancelLabel: string;
+}
+
+/**
+ * What a person is shown before an MCP call's arguments leave (#6).
+ *
+ * The tools, the server, its host and the bytes, and then each call's
+ * arguments as the model wrote them, cut short and labelled as the model's.
+ * The arguments are the one thing a person can actually judge, and a detail
+ * line is rendered as text, so what the model wrote cannot become markup;
+ * the label is there because it can still be persuasive.
+ *
+ * The plain yes covers exactly the calls listed and says so. The broader yes
+ * names the host, because it covers every call to that server from here on.
+ *
+ * Exported so the sheet is measured against a request the real dispatcher
+ * built, rather than a copy of these strings.
+ */
+export function mcpSendSheet({ destination, calls }: DestinationRequest): McpSendSheet {
+  const { host, serverName } = destination;
+  const names = [...new Set(calls.map((call) => call.toolName))].join(', ');
+  const bytes = calls.reduce((total, call) => total + call.bytes, 0);
+  const one = calls.length === 1;
+  const confirmLabel = one ? 'Send this call' : 'Send these calls';
+
+  return {
+    action: `send tool arguments to ${host}`,
+    title: `Send to ${host}?`,
+    body:
+      `${names} on ${serverName} would send ${bytes} bytes of arguments to ${host}` +
+      (one ? '. ' : `, in ${calls.length} calls. `) +
+      'The model wrote them from this conversation, and they do not leave this device unless you allow it. ' +
+      `“${confirmLabel}” covers only ${one ? 'the call' : 'the calls'} listed here; a later call asks again.`,
+    detail: calls.map(
+      (call) => `${call.toolName} · ${call.bytes} bytes · written by the model: ${call.preview}`,
+    ),
+    confirmLabel,
+    extendedLabel: `Send to ${host} for this conversation`,
+    cancelLabel: 'Don’t send',
+  };
+}
+
+/**
+ * The MCP half of the consent, in the app's own voice (#6).
+ *
+ * Read live from the store, as `egressPolicy` is. `answered` holds a
+ * conversation answer given during this turn until its write lands: the grant
+ * is persisted with `void`, and a model that calls the same server again at
+ * once must not be asked what the person has just answered for the whole
+ * conversation. It cannot outlive a revocation that matters: removing a server
+ * or switching it off makes its calls refuse at the live check in
+ * `state/mcp.ts`, and a changed address is a different key.
+ */
+function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
+  const grantsFor = (): readonly EgressGrant[] =>
+    useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
+  const answered = new Set<string>();
+  const keyOf = (destination: ToolDestination): string => `${destination.serverId} ${destination.url}`;
+
+  return {
+    isGranted: (destination) =>
+      answered.has(keyOf(destination)) ||
+      holdsGrant(grantsFor(), {
+        kind: 'mcp',
+        serverId: destination.serverId,
+        url: destination.url,
+      }),
+
+    onGranted: (destination) => {
+      answered.add(keyOf(destination));
+      void useChats
+        .getState()
+        .grantMcpEgress(chatId, { serverId: destination.serverId, url: destination.url });
+    },
+
+    async request(asked) {
+      const { action, ...prompt } = mcpSendSheet(asked);
+      let extended = false;
+      const allowed = await useApp.getState().requestApproval(action, {
+        ...prompt,
+        onExtended: () => {
+          extended = true;
+        },
+      });
+      if (!allowed) return 'deny';
+      return extended ? 'conversation' : 'calls';
     },
   };
 }
@@ -1266,6 +1410,11 @@ function sortChats(chats: Chat[]): Chat[] {
 // the grants that named it without this store having to be open.
 installEgressRevoker(async (connectionId) => {
   await useChats.getState().revokeEgress(connectionId);
+});
+
+// And for an MCP server removed or switched off, by the server record's id.
+installMcpGrantRevoker(async (serverId) => {
+  await useChats.getState().revokeMcpEgress(serverId);
 });
 
 // Registered at module load for the same reason. An MCP tool id is

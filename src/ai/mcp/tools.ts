@@ -12,8 +12,10 @@
  *    derived from the conversation — to a third party. Read-only describes
  *    what happens to the *server's* state, not to your data. In an app whose
  *    premise is that inference stays local, that distinction is the whole
- *    point, so `sensitive` is unconditional and the annotations only decide
- *    whether a call *additionally* needs per-call approval.
+ *    point, so `sensitive` is unconditional, every call waits on a grant for
+ *    its server before it is dispatched (`runToolCalls`, #6), and the
+ *    annotations only decide whether a call *additionally* asks about
+ *    changing data there.
  *
  * 2. **The destination host is in the description the model sees and in the
  *    summary the user sees.** A tool called `search` tells you nothing. A tool
@@ -30,6 +32,7 @@ import type { JSONSchema } from '@johnhenry/aimatey-types';
 
 import {
   McpNotSent,
+  argumentBytes,
   destinationHost,
   qualifiedToolName,
   type McpCallReceipt,
@@ -109,11 +112,13 @@ export function createMcpTool(
     parameters: descriptor.inputSchema as JSONSchema, // checked above, not asserted
 
     async execute(input, context): Promise<ToolResult> {
-      // Only destructive calls interrupt. A read-only remote call is still
-      // off-device, which is why the tool is sensitive and had to be enabled
-      // for this chat — that is the consent boundary. Prompting again per call
-      // would train the user to dismiss the sheet without reading it, which is
-      // worse than not prompting.
+      // TWO QUESTIONS, AND THIS IS THE SECOND. Whether these arguments may
+      // leave for this server was asked before this ran, at dispatch — that is
+      // where a grant can see the conversation (`runToolCalls`). What is asked
+      // here is whether a call the server does not declare read-only may
+      // change data there. They are different harms, so a grant for the whole
+      // conversation never answers this one (#6); a read-only call asks
+      // nothing more here.
       if (!descriptor.readOnly) {
         const approved = await options.confirm(
           `run “${descriptor.name}” on ${host}, which may change data there`,
@@ -127,7 +132,7 @@ export function createMcpTool(
       // none, and before the hand-off, so `at` is when the arguments left and a
       // call that then throws still has one. `now` is read once; the catch
       // below must not read it again.
-      const bytes = new TextEncoder().encode(JSON.stringify(input)).length;
+      const bytes = argumentBytes(input);
       const at = context.now().getTime();
       const receipt = (outcome: McpCallReceipt['outcome']): McpCallReceipt => ({
         outcome,

@@ -11,7 +11,7 @@ import { createMcpTool } from '@/ai/mcp/tools';
 import { renderPrompt } from '@/ai/prompt';
 import { getProvider } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
-import { runToolCalls } from '@/ai/middleware/tools';
+import { runToolCalls, type DestinationRequest } from '@/ai/middleware/tools';
 import { ToolRegistry, toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import {
   BACKUP_RULES_XML,
@@ -56,7 +56,7 @@ import {
 import type { ToolInvocation } from '@/domain/chat';
 import { MessageView } from '@/features/chat/MessageView';
 import { useApp } from '@/state/app';
-import { buildMessages, toolOutputSheetBody } from '@/state/chat';
+import { buildMessages, mcpSendSheet, toolOutputSheetBody } from '@/state/chat';
 
 import {
   CALL,
@@ -255,7 +255,8 @@ async function mcpRecord(call: () => Promise<unknown>) {
   const { executed } = await runToolCalls(
     new ToolRegistry([tool]),
     [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }],
-    { enabledIds: [tool.id] },
+    // Allowed: what these tests read is the record of a call that went.
+    { enabledIds: [tool.id], destinations: { isGranted: () => true } },
   );
   return executed[0]!;
 }
@@ -426,35 +427,68 @@ describe('the privacy command', () => {
     expect(output).not.toContain('archive');
   });
 
-  it('says nothing is asked before an MCP tool’s arguments go — and nothing is', async () => {
-    // The sentence.
+  /*
+   * THE SENTENCE THIS REPLACED WAS THE UNFLATTERING ONE: "nothing is asked
+   * before its arguments go — enabling the tool for a chat is the whole of the
+   * consent", pinned to a measurement that the arguments went unasked. The
+   * grant (#6) made it false, so it moved with the behaviour, and so did the
+   * measurement.
+   */
+  it('says an MCP tool’s arguments do not go until you allow that server — and they do not', async () => {
     const output = await privacyOutput({
       mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
     });
     expect(output).toContain(
-      'nothing is asked before its arguments go — enabling the tool for a chat is the whole of the consent',
+      'That tool runs there, not here. Its arguments do not go until you allow that server in this conversation — for the calls on screen, or for the whole conversation — and the sheet names the server, its host and how many bytes would be sent. A server on localhost is asked about the same way.',
     );
+    expect(output).not.toMatch(/nothing is asked/i);
 
-    // The measurement. A read-only tool, which is the quietest path an MCP
-    // server can ask for, and the arguments are the model's own words.
-    const confirm = vi.fn(async () => true);
-    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
-    const tool = mustCreateMcpTool(
-      {
-        server: 'notes',
-        name: 'note',
-        description: 'File a note',
-        readOnly: true,
-        destructive: false,
-        inputSchema: { type: 'object', properties: {} },
-      },
-      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm, call },
-    );
+    // The measurement, at the real dispatcher, on a read-only tool — the
+    // quietest path an MCP server can ask for — and on one at localhost, which
+    // is not exempt for being on this machine: a local process can forward
+    // anywhere.
+    for (const serverUrl of ['https://notes.example/mcp', 'http://localhost:3000/mcp']) {
+      const confirm = vi.fn(async () => true);
+      const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+      const tool = mustCreateMcpTool(
+        {
+          server: 'notes',
+          name: 'note',
+          description: 'File a note',
+          readOnly: true,
+          destructive: false,
+          inputSchema: { type: 'object', properties: {} },
+        },
+        { serverId: 'mcp_notes', serverUrl, confirm, call },
+      );
+      const registry = new ToolRegistry([tool]);
+      const use = [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }];
 
-    await tool.execute({ text: SECRET }, { signal: undefined, now: () => new Date(0) });
+      // Enabled for the chat, no grant, and the person says no.
+      const deny = vi.fn(async () => 'deny' as const);
+      await runToolCalls(registry, use, {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => false, request: deny },
+      });
+      expect(deny, serverUrl).toHaveBeenCalledOnce();
+      expect(call, `${serverUrl}: the arguments went unasked`).not.toHaveBeenCalled();
 
-    expect(confirm).not.toHaveBeenCalled();
-    expect(call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
+      // Nobody there to ask is a refusal, not a pass.
+      await runToolCalls(registry, use, {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => false },
+      });
+      expect(call, `${serverUrl}: the arguments went with nobody asked`).not.toHaveBeenCalled();
+
+      // The paired control: allowed, the same call goes, and a read-only tool
+      // asks nothing further.
+      await runToolCalls(registry, use, {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => false, request: async () => 'conversation' as const },
+      });
+      expect(call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
+      expect(confirm).not.toHaveBeenCalled();
+    }
   });
 
   it('says an MCP tool has to be enabled per chat — and one that is not cannot run', async () => {
@@ -471,7 +505,11 @@ describe('the privacy command', () => {
     const SETTINGS = SETTINGS_SCREEN;
     const PANEL = shipped('features/settings/McpPanel.tsx');
     expect(SETTINGS).toContain('every one has to be enabled per chat');
-    expect(PANEL).toContain('on per chat, and anything that can change data asks first');
+    // "no call’s arguments are sent until you allow that server" is measured
+    // in the test above, at the same dispatcher.
+    expect(PANEL).toContain(
+      'on per chat, no call’s arguments are sent until you allow that server, and anything that can change data asks first',
+    );
 
     // The measurement: a real MCP tool, registered, NOT enabled for the chat.
     const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
@@ -489,12 +527,14 @@ describe('the privacy command', () => {
     const registry = new ToolRegistry([mcp]);
     const use = [{ type: 'tool_use' as const, id: 'c1', name: mcp.name, input: { text: SECRET } }];
 
-    await runToolCalls(registry, use, { enabledIds: [] });
+    // Every destination allowed, so what is measured is the enable alone.
+    const allowed = { isGranted: () => true };
+    await runToolCalls(registry, use, { enabledIds: [], destinations: allowed });
     expect(call, 'an MCP tool the chat did not enable reached its server').not.toHaveBeenCalled();
 
     // The paired control: the same call, with the tool enabled, does reach it.
     // Without this the assertion above holds for a dispatcher that runs nothing.
-    await runToolCalls(registry, use, { enabledIds: [mcp.id] });
+    await runToolCalls(registry, use, { enabledIds: [mcp.id], destinations: allowed });
     expect(call).toHaveBeenCalledOnce();
   });
 
@@ -503,22 +543,44 @@ describe('the privacy command', () => {
     // real `useMcp` and chat store and needs `@/db` mocked to do it. It removes
     // a server and reads every chat's tool list back; and it re-adds a server
     // under the same name and shows the old enable no longer reaches it —
-    // which is what made "turned on per chat" false for the new server.
+    // which is what made "turned on per chat" false for the new server. The
+    // permission to send is measured in `tests/egress-grants.test.ts`, which
+    // removes a server and reads every chat's grants back.
     expect(shipped('features/settings/McpPanel.tsx')).toContain(
-      'and its tools will be removed from this device, and from every chat that had them on. Nothing on',
+      'and its tools will be removed from this device, and from every chat that had them on, along with any chat’s permission to send to it. Nothing on',
     );
   });
 
-  it('says a destructive call asks about the server’s data, not about what leaves', async () => {
+  it('says every grant to a server is dropped when the server is removed or switched off', async () => {
+    // Measured in `tests/egress-grants.test.ts`, through the real `useMcp` and
+    // chat store: removing or switching off a server drops exactly the grants
+    // that named it, switching it back on restores none, and no provider grant
+    // goes with them. Printed inside the MCP paragraph, which appears only when
+    // a server is connected — see "says nothing about MCP servers" above.
+    expect(
+      await privacyOutput({ mcp: [{ name: 'notes', host: 'notes.example', enabled: true }] }),
+    ).toContain('Every grant to a server is dropped when it is removed or switched off.');
+    expect(await privacyOutput({})).not.toContain('Every grant to a server');
+  });
+
+  it('says a destructive call is asked about twice, what leaves first', async () => {
     const output = await privacyOutput({
       mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
     });
     expect(output).toContain(
-      'A call the server itself calls destructive does ask, but about changing data there, not about what leaves',
+      'A call the server itself calls destructive is then asked about separately, about changing data there.',
     );
+    expect(output).not.toContain('not about what leaves');
 
-    const confirm = vi.fn(async () => true);
-    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'done' }] }));
+    const order: string[] = [];
+    const confirm = vi.fn(async (_action: string) => {
+      order.push('changes');
+      return true;
+    });
+    const call = vi.fn(async () => {
+      order.push('sent');
+      return { content: [{ type: 'text', text: 'done' }] };
+    });
     const tool = mustCreateMcpTool(
       {
         server: 'notes',
@@ -530,17 +592,34 @@ describe('the privacy command', () => {
       },
       { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm, call },
     );
+    const registry = new ToolRegistry([tool]);
+    const use = [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }];
 
-    await tool.execute({ text: SECRET }, { signal: undefined, now: () => new Date(0) });
+    await runToolCalls(registry, use, {
+      enabledIds: [tool.id],
+      destinations: {
+        isGranted: () => false,
+        request: async () => {
+          order.push('leaves');
+          return 'calls' as const;
+        },
+      },
+    });
+    expect(order).toEqual(['leaves', 'changes', 'sent']);
 
+    // The second question is about the server's state, and it does not repeat
+    // the arguments back.
     const asked = String(confirm.mock.calls.at(0)?.at(0) ?? '');
     expect(asked).toContain('may change data there');
-    // What the question does NOT mention is the whole finding: the user is
-    // asked about the server's state, never about their own words leaving.
     expect(asked).not.toContain(SECRET);
-    expect(asked).not.toMatch(/leave|send|argument/i);
-    // And the arguments went anyway, on the same call.
-    expect(call).toHaveBeenCalledWith('notes', 'mutate', { text: SECRET }, undefined);
+
+    // And a grant for the whole conversation does not answer it.
+    order.length = 0;
+    await runToolCalls(registry, use, {
+      enabledIds: [tool.id],
+      destinations: { isGranted: () => true },
+    });
+    expect(order).toEqual(['changes', 'sent']);
   });
 
   /*
@@ -865,16 +944,19 @@ describe('the tools hint in a chat', () => {
     expect(CHAT_SCREEN).not.toContain('Tools run on this device.');
   });
 
-  it('says an MCP tool runs on its server and its arguments go unasked', () => {
+  it('says an MCP tool runs on its server, and asks before its arguments go there', () => {
     expect(CHAT_SCREEN).toContain(
       reads(`A tool from an MCP server runs on that server: calling one sends its arguments
-        there, and nothing is asked first — a call the server calls destructive asks about
-        changing data there, not about what leaves.`),
+        there once you allow that server, and a call the server calls destructive also asks
+        about changing data there.`),
     );
+    expect(CHAT_SCREEN).not.toContain('nothing is asked first');
 
     // The measurement is in `the privacy command` above, against the same
-    // `createMcpTool`. What this half pins is that the sentence can be applied
-    // to the list the user is reading: an MCP tool is identifiable in it.
+    // `createMcpTool` and the real dispatcher: no grant, no call; allowed, the
+    // call goes; a destructive call asks what leaves, then what changes. What
+    // this half pins is that the sentence can be applied to the list the user
+    // is reading: an MCP tool is identifiable in it.
     const tool = mustCreateMcpTool(
       {
         server: 'notes',
@@ -943,6 +1025,7 @@ describe('the tool-output sheet', () => {
       const use = [{ type: 'tool_use' as const, id: 'c1', name: calledAs, input: { text: SECRET } }];
       const { executed } = await runToolCalls(new ToolRegistry([tool]), use, {
         enabledIds: [tool.id],
+        destinations: { isGranted: () => true },
       });
       return executed[0]!;
     };
@@ -1060,7 +1143,7 @@ describe('the tool-output sheet', () => {
     const { executed } = await runToolCalls(
       new ToolRegistry([leakyTool]),
       [{ type: 'tool_use', id: 'c2', name: 'leaky', input: {} }],
-      { enabledIds: ['leaky'] },
+      { enabledIds: ['leaky'], destinations: { isGranted: () => false } },
     );
     const mixed = toolOutputSheetBody(executed, built.derivedReplies, 'GPT-4o mini', 200);
     expect(mixed).toContain('leaky read from this app’s own data');
@@ -1103,6 +1186,83 @@ describe('the tool-output sheet', () => {
   });
 });
 
+/* ── The MCP send sheet (#6) ─────────────────────────────────────────── */
+
+describe('the MCP send sheet', () => {
+  /*
+   * The owner's ruling (OD5): the tools, the server, its host and the bytes,
+   * and a shortened preview of each call's arguments labelled as written by
+   * the model. Measured on the request the real dispatcher builds, so the
+   * byte count on the sheet is the one it computed from the real arguments.
+   */
+  it('names the server, its host and how much would be sent, and what the model wrote', async () => {
+    const call = vi.fn(async () => ({ content: [] }));
+    const tool = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: true,
+        destructive: false,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => true, call },
+    );
+    const long = 'x'.repeat(400);
+    const asked: DestinationRequest[] = [];
+
+    await runToolCalls(
+      new ToolRegistry([tool]),
+      [
+        // By id, which the dispatcher allows; the sheet names the tool as the list does.
+        { type: 'tool_use', id: 'c1', name: tool.id, input: { text: SECRET } },
+        { type: 'tool_use', id: 'c2', name: tool.name, input: { text: long } },
+      ],
+      {
+        enabledIds: [tool.id],
+        destinations: {
+          isGranted: () => false,
+          request: async (request) => {
+            asked.push(request);
+            return 'deny';
+          },
+        },
+      },
+    );
+
+    expect(asked, 'one sheet for both calls to one server').toHaveLength(1);
+    expect(call).not.toHaveBeenCalled();
+    const short = new TextEncoder().encode(JSON.stringify({ text: SECRET })).length;
+    const longBytes = new TextEncoder().encode(JSON.stringify({ text: long })).length;
+    const sheet = mcpSendSheet(asked[0]!);
+
+    expect(sheet.title).toBe('Send to notes.example?');
+    expect(sheet.body).toContain(
+      `notes.note on notes would send ${short + longBytes} bytes of arguments to notes.example, in 2 calls.`,
+    );
+    expect(sheet.body).toContain('“Send these calls” covers only the calls listed here; a later call asks again.');
+    expect(sheet.body, 'the internal tool id is not what a person is shown').not.toContain('mcp:');
+    expect(sheet.detail[0]).toBe(
+      `notes.note · ${short} bytes · written by the model: {"text":"${SECRET}"}`,
+    );
+    expect(sheet.detail[1]).toMatch(
+      new RegExp(`^notes\\.note · ${longBytes} bytes · written by the model: \\{"text":"x+…$`),
+    );
+    expect(sheet.detail[1]!.length, 'the preview is cut short').toBeLessThan(long.length);
+    expect(sheet.confirmLabel).toBe('Send these calls');
+    expect(sheet.extendedLabel).toBe('Send to notes.example for this conversation');
+    expect(sheet.cancelLabel).toBe('Don’t send');
+
+    // One call reads in the singular.
+    const single = mcpSendSheet({ ...asked[0]!, calls: asked[0]!.calls.slice(0, 1) });
+    expect(single.confirmLabel).toBe('Send this call');
+    expect(single.body).toContain('“Send this call” covers only the call listed here');
+
+    // And the sheet the app raises is this one.
+    expect(shipped('state/chat.ts')).toContain('const { action, ...prompt } = mcpSendSheet(asked);');
+  });
+});
+
 /* ── The provider panel ──────────────────────────────────────────────── */
 
 describe('the provider panel hints', () => {
@@ -1142,9 +1302,14 @@ describe('the settings privacy card', () => {
 
   it('names MCP arguments, and only when a connected server offers a tool', () => {
     expect(SETTINGS_SCREEN).toContain('{mcpToolCount > 0 ? (');
+    // Measured in `the privacy command` above, at the real dispatcher.
     expect(SETTINGS_SCREEN).toContain(
       reads(`The arguments of any MCP tool the model calls, to the server that tool comes from.
-        Nothing is asked before they go.`),
+        The app asks before they go, per server.`),
+    );
+    expect(SETTINGS_SCREEN).not.toContain('Nothing is asked before they go.');
+    expect(SETTINGS_SCREEN).toContain(
+      'their arguments leave this device once you allow that server, and every one has to be enabled per chat.',
     );
   });
 
@@ -1406,9 +1571,13 @@ describe('README.md’s privacy list', () => {
     // and says what the consent currently is. The command's own sentence is
     // pinned above; this is the same fact on the public surface.
     expect(section).toMatch(/MCP tool/i);
-    expect(section).toMatch(/Nothing is asked before they go/i);
-    // Measured in `the privacy command` above: a real record, rendered by the
-    // real thread and the real transcript.
+    // Measured in `the privacy command` above, at the real dispatcher.
+    expect(reads(section)).toContain(
+      'The app asks before they go — per server, for the calls on screen or for the whole conversation, and a server on localhost is asked about the same way.',
+    );
+    expect(section).not.toMatch(/Nothing is asked before they go/i);
+    // Measured there too: a real record, rendered by the real thread and the
+    // real transcript.
     expect(reads(section)).toContain(
       'Each call handed to a server is recorded in the thread and in an exported transcript.',
     );
@@ -2085,7 +2254,7 @@ describe('a paired device is named exactly where pairing is available', () => {
     {
       name: 'README.md, ## Privacy',
       ...body('README.md', README_TEXT, README_TEXT.indexOf('## Privacy'), README_TEXT.indexOf('## Licence')),
-      pinned: ['Nothing is asked before they go', 'generated from the code'],
+      pinned: ['The app asks before they go', 'generated from the code'],
     },
     {
       // The command object, to its closing brace — not the rest of the file.

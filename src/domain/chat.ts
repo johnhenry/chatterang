@@ -459,11 +459,54 @@ export interface Message {
 
 export type ChatMode = 'chat' | 'task';
 
-/** One conversation's permission to send tool output to one connection. */
-export interface EgressGrant {
+/**
+ * One conversation's permission to send something to one destination.
+ *
+ * TWO KINDS, AND NEITHER ANSWERS FOR THE OTHER. A provider grant lets tool
+ * output go to one connection; it has no `kind`, which is also every row stored
+ * before MCP grants existed, so those rows need no migration. An MCP grant lets
+ * tool-call arguments go to one server record AT ONE ADDRESS (#6): the name is
+ * what a same-name successor shares, and a record whose URL changed is
+ * somewhere else. Each kind carries only its own key, so a check written for
+ * one cannot compile against the other; read them through {@link holdsGrant}.
+ */
+export type EgressGrant = ProviderGrant | McpGrant;
+
+export interface ProviderGrant {
+  readonly kind?: undefined;
   /** Router/connection id, not the provider family — the key the engine gates on. */
   readonly connectionId: string;
   readonly grantedAt: number;
+}
+
+export interface McpGrant {
+  readonly kind: 'mcp';
+  /** `McpServerConfig.id` — never the server's name. */
+  readonly serverId: string;
+  readonly url: string;
+  readonly grantedAt: number;
+}
+
+/** What a grant check is about. */
+export type GrantSubject =
+  | { readonly kind: 'provider'; readonly connectionId: string }
+  | { readonly kind: 'mcp'; readonly serverId: string; readonly url: string };
+
+/**
+ * Does this conversation hold a grant for exactly this subject?
+ *
+ * The kind is checked as well as the key, so a row that somehow carries both
+ * kinds' fields still answers for one of them only.
+ */
+export function holdsGrant(
+  grants: readonly EgressGrant[] | undefined,
+  subject: GrantSubject,
+): boolean {
+  return (grants ?? []).some((grant) =>
+    subject.kind === 'mcp'
+      ? grant.kind === 'mcp' && grant.serverId === subject.serverId && grant.url === subject.url
+      : grant.kind !== 'mcp' && grant.connectionId === subject.connectionId,
+  );
 }
 
 export interface Chat {

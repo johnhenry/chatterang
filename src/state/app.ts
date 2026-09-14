@@ -208,6 +208,29 @@ export async function pruneMcpToolsFor(serverName: string): Promise<void> {
   await pruneMcpTools(serverName);
 }
 
+/**
+ * Drop every conversation's grant to send to one MCP server (#6).
+ *
+ * Registered for the reason the two hooks above are, and called when a server
+ * is removed or switched off, as `revokeEgressGrants` is for a connection: a
+ * permission that outlived its server being switched off would apply again the
+ * moment it came back on, without being asked for.
+ *
+ * The uninstalled default THROWS, as the pruner's does. A removal that silently
+ * kept every grant would leave the remove sheet's promise false.
+ */
+let revokeMcpGrants: (serverId: string) => Promise<void> = async () => {
+  throw new Error('MCP grants cannot be withdrawn: the chat store is not loaded.');
+};
+
+export function installMcpGrantRevoker(revoke: (serverId: string) => Promise<void>): void {
+  revokeMcpGrants = revoke;
+}
+
+export async function revokeMcpGrantsFor(serverId: string): Promise<void> {
+  await revokeMcpGrants(serverId);
+}
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   settings: DEFAULT_SETTINGS,
