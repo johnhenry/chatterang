@@ -219,6 +219,35 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
   return written;
 }
 
+/**
+ * Chats being deleted, or deleted, in this session, by id.
+ *
+ * `removeChat` waits its turn in `chatWrites` like any other write, so every
+ * write already asked for lands before the delete, and the delete takes it with
+ * the chat. What is asked for after is a no-op. A chat write sees that for
+ * itself — the chat is no longer in the store when it runs — but a message row
+ * names its chat and nothing more, and a turn still running in a deleted
+ * conversation, or the recovery of an interrupted row, wrote it straight back
+ * into the table: a conversation the person deleted, still on disk. So message
+ * rows go through `putMessage`, which asks this.
+ *
+ * Added when the delete starts, and taken out again if it fails — the chat is
+ * still there then, and so should be what is written to it.
+ */
+const removedChats = new Set<string>();
+
+/**
+ * Write a message row, unless its chat is being or has been deleted. See
+ * `removedChats`.
+ */
+async function putMessage(message: Message): Promise<void> {
+  // Asked in the same step the put is made. A delete that starts after this
+  // makes its own write after the put, and the table applies them in that
+  // order, so it takes the row with it; one that started before is seen here.
+  if (removedChats.has(message.chatId)) return;
+  await db.messages.put(message);
+}
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -296,8 +325,17 @@ export const useChats = create<ChatState>((set, get) => ({
   controller: null,
 
   async load() {
-    const chats = await db.chats.orderBy('updatedAt').reverse().toArray();
-    set({ loaded: true, chats: sortChats(chats) });
+    const stored = await db.chats.orderBy('updatedAt').reverse().toArray();
+    // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
+    // the engine is, before this read lands, and ⌘N there starts a chat. A read
+    // taken before that chat was written replaced the store without it, and the
+    // screen was left on a thread nothing could be sent to. What the store holds
+    // was written to the table before it was set, so it is never older than the
+    // read; a chat being deleted is left out, or the read would bring it back.
+    const held = get().chats;
+    const known = new Set(held.map((chat) => chat.id));
+    const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
+    set({ loaded: true, chats: sortChats([...held, ...unseen]) });
   },
 
   async openChat(chatId) {
@@ -310,12 +348,15 @@ export const useChats = create<ChatState>((set, get) => ({
       // receipts included — and becomes the failed turn it is.
       if (row.streaming && row.id !== livePlaceholderId) {
         const interrupted: Message = { ...row, streaming: false, error: INTERRUPTED };
-        await db.messages.put(interrupted);
+        await putMessage(interrupted);
         messages.push(interrupted);
       } else {
         messages.push(row);
       }
     }
+    // Deleted while its thread was being read: the thread read is from before,
+    // and opening it would put a deleted conversation back on screen.
+    if (removedChats.has(chatId)) return;
     set({ activeChatId: chatId, messages });
     get().refreshContext();
   },
@@ -393,19 +434,32 @@ export const useChats = create<ChatState>((set, get) => ({
         content: persona.firstMessage.replaceAll('{{char}}', persona.name).replaceAll('{{user}}', 'you'),
         createdAt: Date.now(),
       };
-      await db.messages.put(greeting);
+      await putMessage(greeting);
       set({ messages: [greeting] });
     }
 
     return chat.id;
   },
 
-  async removeChat(chatId) {
-    await deleteChat(chatId);
-    const chats = get().chats.filter((chat) => chat.id !== chatId);
-    set({
-      chats,
-      ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+  removeChat(chatId) {
+    // IN THE CHAT'S TURN, like every other write to it. Run straight away, the
+    // delete was under way while a write queued behind another one ran, found
+    // the chat still in the store, and put it back into the table after the
+    // delete had taken it out: the chat came back the next time the app loaded.
+    // Now what was asked for first lands first and goes with the chat, and what
+    // is asked for after finds it gone. See `removedChats`.
+    return writeInTurn(chatId, async () => {
+      removedChats.add(chatId);
+      try {
+        await deleteChat(chatId);
+      } catch (error) {
+        removedChats.delete(chatId);
+        throw error;
+      }
+      set({
+        chats: get().chats.filter((chat) => chat.id !== chatId),
+        ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+      });
     });
   },
 
@@ -538,7 +592,7 @@ export const useChats = create<ChatState>((set, get) => ({
       createdAt: Date.now(),
     };
 
-    await db.messages.put(userMessage);
+    await putMessage(userMessage);
     set({ messages: [...get().messages, userMessage] });
 
     if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
@@ -597,7 +651,7 @@ export const useChats = create<ChatState>((set, get) => ({
     if (!message) return;
 
     const updated = editedVariant(message, text);
-    await db.messages.put(updated);
+    await putMessage(updated);
 
     // Editing a user turn invalidates everything after it.
     const after = messages.slice(index + 1);
@@ -635,7 +689,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // One call, so text and provenance cannot part company here. This is the
     // line the defect was on.
     const updated = applyVariant(message, next);
-    await db.messages.put(updated);
+    await putMessage(updated);
     set({ messages: get().messages.map((entry) => (entry.id === messageId ? updated : entry)) });
   },
 }));
@@ -883,7 +937,7 @@ async function runGeneration(
           // keeps on screen, field for field.
           if (mayHaveLeft(event.tool.receipt)) {
             const split = splitThinking(raw);
-            await db.messages.put({
+            await putMessage({
               ...placeholder,
               content: split.content,
               thinking: split.thinking || undefined,
@@ -981,7 +1035,7 @@ async function runGeneration(
             variants,
             variantIndex: variants ? variants.length - 1 : undefined,
           };
-          await db.messages.put(finished);
+          await putMessage(finished);
           patch(() => finished);
           break;
         }
@@ -1010,7 +1064,7 @@ async function runGeneration(
             streaming: false,
             error: event.message,
           };
-          await db.messages.put(failed);
+          await putMessage(failed);
           patch(() => failed);
           app.toast(event.message, 'crit');
           break;
@@ -1028,7 +1082,7 @@ async function runGeneration(
       streaming: false,
       error: message,
     };
-    await db.messages.put(failed);
+    await putMessage(failed);
     patch(() => failed);
     app.toast(message, 'crit');
   } finally {
