@@ -21,6 +21,9 @@ import {
   createMemoryCredentialStore,
   createTunnelHost,
   createTunnelListener,
+  generateTunnelKey,
+  issueTunnelCertificate,
+  tunnelKeyPkcs8Pem,
   type CredentialStore,
   type DeviceCredentials,
   type Tunnel,
@@ -1326,6 +1329,64 @@ describe.runIf(!opensslAvailable())('the TLS arm, where openssl is missing', () 
     // `describe.runIf` above skips without a word. Locally that is a skip in
     // the summary; in CI it would be the TLS arm going untested, so it fails.
     expect(process.env['CI'], 'openssl is not installed, so the TLS arm test above did not run').toBeFalsy();
+  });
+});
+
+describe("the TLS arm, serving the tunnel's own identity (#179)", () => {
+  it("serves a certificate issued from the tunnel key, so a peer sees that key's pin, behind the same gate", async () => {
+    /*
+     * The two halves meet here: `identity.ts` makes the key and a certificate,
+     * and the TLS arm serves them as `TlsMaterial`. What a paired client holds
+     * is the key's pin (#180), so that is what is compared, computed from the
+     * DER the peer received rather than by `tunnelPinOf`. It needs no openssl,
+     * so unlike the test above it runs everywhere.
+     */
+    const key = generateTunnelKey();
+    const certificate = await issueTunnelCertificate(key, { validDays: 1 });
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const listener = await createTunnelListener({
+      maxTunnels: 2,
+      binding: {
+        kind: 'tls',
+        host: '127.0.0.1',
+        port: 0,
+        tls: asTlsMaterial(tunnelKeyPkcs8Pem(key), certificate.certPem),
+        gate: gate.gate,
+      },
+    });
+    open.push(listener);
+    const { port } = listener.server.address() as AddressInfo;
+    const incoming = listener.tunnels()[Symbol.asyncIterator]();
+
+    const { WebSocket } = await import('ws');
+    const pinServed = (response: { socket: unknown }) =>
+      createHash('sha256')
+        .update(
+          new X509Certificate((response.socket as TLSSocket).getPeerCertificate().raw).publicKey.export({
+            type: 'spki',
+            format: 'der',
+          }),
+        )
+        .digest('base64');
+    const attempt = (headers: Record<string, string>) =>
+      new Promise<{ outcome: number | 'open'; pin: string }>((resolveAttempt) => {
+        const socket = new WebSocket(`wss://127.0.0.1:${String(port)}`, { headers, rejectUnauthorized: false });
+        open.push({ close: () => socket.terminate() });
+        socket.on('error', () => undefined);
+        socket.once('unexpected-response', (request, response) => {
+          resolveAttempt({ outcome: response.statusCode ?? 0, pin: pinServed(response) });
+          request.destroy();
+        });
+        socket.once('upgrade', (response) => {
+          const pin = pinServed(response);
+          socket.once('open', () => resolveAttempt({ outcome: 'open', pin }));
+        });
+      });
+
+    expect(await attempt({})).toEqual({ outcome: 401, pin: key.pin.spkiSha256 });
+    expect(await attempt(credentialHeaders(a.credential))).toEqual({ outcome: 'open', pin: key.pin.spkiSha256 });
+    expect((await nextTunnel(incoming)).admission).toEqual({ kind: 'device', deviceId: a.deviceId });
   });
 });
 

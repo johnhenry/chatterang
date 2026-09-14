@@ -32,9 +32,10 @@
  * IT. What still has to exist before one may is AT LEAST this, and #158 holds
  * the whole gate: somewhere the paired-device registry persists (#133 — the
  * store here is an interface, and its one implementation forgets on exit),
- * certificate material the app actually makes (#179 — the TLS arm accepts it,
- * nothing here creates it), a declared surface (#170), and the inbound privacy
- * copy on every surface that makes the outbound promise, landing in the same
+ * the identity loaded and handed to a binding (#179 — `identity.ts` makes the
+ * key and its certificates and the TLS arm accepts them, but no app loads the
+ * key or issues a certificate), a declared surface (#170), and the inbound
+ * privacy copy on every surface that makes the outbound promise, landing in the same
  * change as the start path (#221, #158). A listener that carries turns also
  * waits on #7's background substrate, per #169's ruling.
  */
@@ -66,6 +67,42 @@ export { LOOPBACK_HOST, asTlsMaterial } from './tls.js';
 export type { TlsMaterial } from './tls.js';
 export { createDeviceCredentials, createMemoryCredentialStore } from './credential.js';
 export type { CredentialStore, DeviceCredentials, MintedCredential } from './credential.js';
+
+/*
+ * THE TUNNEL'S TLS IDENTITY (#179, #180): the key a paired client pins, the
+ * certificates made from it, and the owner-only store both apps keep it in.
+ * None of it binds anything — see `identity.ts` and `identity-store.ts` — and
+ * it is exported here because this is the one entry both apps import and the
+ * one entry `src/` may not.
+ */
+export {
+  TunnelIdentityError,
+  generateTunnelKey,
+  issueTunnelCertificate,
+  sameTunnelPin,
+  tunnelKeyFromPkcs8Pem,
+  tunnelKeyPkcs8Pem,
+  tunnelPinOf,
+} from './identity.js';
+export type {
+  TunnelCertificate,
+  TunnelCertificateOptions,
+  TunnelIdentityErrorReason,
+  TunnelKey,
+  TunnelPin,
+  TunnelSubjectAltName,
+} from './identity.js';
+export { loadOrCreateTunnelKey } from './identity-store.js';
+export type {
+  AccessControlListing,
+  KeyFileHandle,
+  KeyFileStat,
+  KeyFileSystem,
+  KeyProtection,
+  KeySealer,
+  StoredTunnelKey,
+  TunnelKeyStoreOptions,
+} from './identity-store.js';
 
 /*
  * WHAT A CONNECTION THAT PRESENTED NOTHING MAY HOLD (#136, #169).
@@ -156,42 +193,6 @@ export type TunnelAdmission =
        */
       claim(presented: Uint8Array): ClaimOutcome;
     };
-
-/*
- * THE TUNNEL'S TLS IDENTITY (#179, #180): the key a paired client pins, the
- * certificates made from it, and the owner-only store both apps keep it in.
- * None of it binds anything — see `identity.ts` and `identity-store.ts` — and
- * it is exported here because this is the one entry both apps import and the
- * one entry `src/` may not.
- */
-export {
-  TunnelIdentityError,
-  generateTunnelKey,
-  issueTunnelCertificate,
-  sameTunnelPin,
-  tunnelKeyFromPkcs8Pem,
-  tunnelKeyPkcs8Pem,
-  tunnelPinOf,
-} from './identity.js';
-export type {
-  TunnelCertificate,
-  TunnelCertificateOptions,
-  TunnelIdentityErrorReason,
-  TunnelKey,
-  TunnelPin,
-  TunnelSubjectAltName,
-} from './identity.js';
-export { loadOrCreateTunnelKey } from './identity-store.js';
-export type {
-  AccessControlListing,
-  KeyFileHandle,
-  KeyFileStat,
-  KeyFileSystem,
-  KeyProtection,
-  KeySealer,
-  StoredTunnelKey,
-  TunnelKeyStoreOptions,
-} from './identity-store.js';
 
 /**
  * One tunnel: one peer's connection, and everything that belongs to it alone.
