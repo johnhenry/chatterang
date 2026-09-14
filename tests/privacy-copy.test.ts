@@ -1301,6 +1301,20 @@ describe('the provider panel hints', () => {
     );
   });
 
+  it('and no provider note repeats the promise the hint retracted', () => {
+    // The hint was corrected; the Ollama and LM Studio notes in
+    // `src/ai/providers.ts` kept the same sentence, and the panel renders each
+    // note under its provider and again on the add-connection sheet. #284
+    // widened how false it was: the desktop renderer may now reach any
+    // plain-http address as well as any https one, so a connection pointed off
+    // the user's network really sends the conversation there.
+    const notes = shipped('ai/providers.ts');
+    expect(notes).not.toContain('stay inside your network');
+    const retraction =
+      'Requests go to the address you give. Nothing here checks that it is on your network.';
+    expect(notes.split(retraction).length - 1).toBe(2);
+  });
+
   it('does not make allowing it the precondition for tool output leaving', () => {
     // "…and, if you allow it, what a tool read" read as a guarantee that
     // nothing goes without a grant. The flipped-back-variant path goes without
@@ -1740,7 +1754,9 @@ describe('adding a way off the device forces the public list to change', () => {
  *   - any other directory: `src/` (the webview bundle, which cannot bind, and
  *     which `layering.test.ts` already holds to no `node:` builtin and no
  *     undeclared package such as `ws`), `scripts/`, `dev/` (whose probes do
- *     listen, on loopback, and do not ship) and generated `build/` output;
+ *     listen, only while a developer runs one, and do not ship — on loopback,
+ *     except `dev/probe-electron-csp-http`, which binds every interface so it
+ *     can measure a LAN address) and generated `build/` output;
  *   - a spelling none of the patterns match. It is a lexical scan, not a
  *     parse, and `server['lis' + 'ten']` walks straight past it.
  */
