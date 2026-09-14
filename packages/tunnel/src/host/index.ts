@@ -45,6 +45,42 @@ import {
   type TunnelFrame,
 } from '../wire/index.js';
 
+/*
+ * THE TUNNEL'S TLS IDENTITY (#179, #180): the key a paired client pins, the
+ * certificates made from it, and the owner-only store both apps keep it in.
+ * None of it binds anything — see `identity.ts` and `identity-store.ts` — and
+ * it is exported here because this is the one entry both apps import and the
+ * one entry `src/` may not.
+ */
+export {
+  TunnelIdentityError,
+  generateTunnelKey,
+  issueTunnelCertificate,
+  sameTunnelPin,
+  tunnelKeyFromPkcs8Pem,
+  tunnelKeyPkcs8Pem,
+  tunnelPinOf,
+} from './identity.js';
+export type {
+  TunnelCertificate,
+  TunnelCertificateOptions,
+  TunnelIdentityErrorReason,
+  TunnelKey,
+  TunnelPin,
+  TunnelSubjectAltName,
+} from './identity.js';
+export { loadOrCreateTunnelKey } from './identity-store.js';
+export type {
+  AccessControlListing,
+  KeyFileHandle,
+  KeyFileStat,
+  KeyFileSystem,
+  KeyProtection,
+  KeySealer,
+  StoredTunnelKey,
+  TunnelKeyStoreOptions,
+} from './identity-store.js';
+
 /**
  * One tunnel: one peer's connection, and everything that belongs to it alone.
  *
