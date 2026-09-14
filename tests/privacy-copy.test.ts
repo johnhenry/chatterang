@@ -10,7 +10,7 @@ import { renderPrompt } from '@/ai/prompt';
 import { getProvider } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
 import { runToolCalls } from '@/ai/middleware/tools';
-import { ToolRegistry, toolRegistry } from '@/ai/tools/registry';
+import { ToolRegistry, toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import {
   BACKUP_RULES_XML,
   CAMERA_USAGE_DESCRIPTION,
@@ -31,6 +31,7 @@ import {
   type ShellContext,
   type ShellStores,
 } from '@/shell/commands';
+import { toolOutputSheetBody } from '@/state/chat';
 
 import {
   CALL,
@@ -749,6 +750,82 @@ describe('the tools hint in a chat', () => {
     // Measured above, in "says which answer stops the asking, and only that
     // one does" — two sheets for two turn-scoped answers, one for a
     // conversation-scoped one.
+  });
+});
+
+/* ── The tool-output sheet ───────────────────────────────────────────── */
+
+describe('the tool-output sheet', () => {
+  /*
+   * NOTHING PINNED THIS SHEET, AND IT WAS FALSE FOR MCP OUTPUT. Its body said
+   * every tool "read from this app’s own data". An MCP tool's result is marked
+   * tainted like any other, so a remote model raises this sheet over output
+   * that came back from someone else's server — and the sheet called it ours.
+   *
+   * Measured on real records out of the real dispatcher, so the attribution is
+   * read off what each tool actually did rather than off a hand-built fixture.
+   */
+  it('says where tool output came from — this app, or which server', async () => {
+    const note = {
+      server: 'notes',
+      name: 'note',
+      description: 'File a note',
+      readOnly: true,
+      destructive: false,
+      inputSchema: { type: 'object', properties: {} },
+    };
+    const notes = {
+      serverId: 'mcp_notes',
+      serverUrl: 'https://notes.example/mcp',
+      confirm: async () => true,
+    };
+    const answers = mustCreateMcpTool(note, {
+      ...notes,
+      call: async () => ({ content: [{ type: 'text', text: 'filed' }] }),
+    });
+    const drops = mustCreateMcpTool(note, {
+      ...notes,
+      call: async () => {
+        throw new Error('connection reset');
+      },
+    });
+
+    const run = async (tool: ChatterangTool, calledAs = tool.name) => {
+      const use = [{ type: 'tool_use' as const, id: 'c1', name: calledAs, input: { text: SECRET } }];
+      const { executed } = await runToolCalls(new ToolRegistry([tool]), use, {
+        enabledIds: [tool.id],
+      });
+      return executed[0]!;
+    };
+    // Called by its id, which the dispatcher allows, so the record's own name is
+    // `mcp:notes.note`. The sheet names the tool the way the tool list does.
+    const sent = await run(answers, answers.id);
+    const failed = await run(drops, drops.id);
+    const local = await run(leakyTool);
+    expect(sent.receipt?.outcome).toBe('sent');
+    expect(failed.receipt?.outcome).toBe('failed');
+    expect(local.receipt).toBeUndefined();
+
+    const body = toolOutputSheetBody([sent, local], 'GPT-4o mini', 120);
+    expect(body).toContain('notes.note returned this from notes.example');
+    expect(body, 'the internal tool id is not what a person is shown').not.toContain('mcp:');
+    expect(body).toContain('leaky read from this app’s own data');
+    expect(body, 'the MCP output is not called this app’s own').not.toMatch(
+      /notes\.note[^.;]*own data/,
+    );
+
+    // A failed call was handed over, but what came back is this app's own
+    // error text. The server did not return it, and the sheet does not say so.
+    const failedBody = toolOutputSheetBody([failed], 'GPT-4o mini', 40);
+    expect(failedBody).toContain('notes.note did not complete on notes.example');
+    expect(failedBody).not.toContain('mcp:');
+    expect(failedBody).not.toContain('returned this from');
+    expect(failedBody).not.toContain('own data');
+
+    // And the sheet the app raises is built by this function, not a copy of it.
+    expect(shipped('state/chat.ts')).toContain(
+      'body: toolOutputSheetBody(tools, modelName, characters)',
+    );
   });
 });
 

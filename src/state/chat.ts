@@ -42,6 +42,7 @@ import {
   type ToolEgressPolicy,
 } from '@/ai/engine';
 import { markTainted } from '@/ai/taint';
+import type { ExecutedTool } from '@/ai/middleware/tools';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -813,6 +814,63 @@ async function runGeneration(
 /* ── Tool-output egress ──────────────────────────────────────────────── */
 
 /**
+ * The tool-output sheet's body: where each tool's output came from, then what
+ * sending it means.
+ *
+ * It used to say every tool "read from this app’s own data", which was true
+ * while every tool ran here. An MCP tool's output comes back from someone
+ * else's server and is marked tainted like any other (src/ai/engine.ts), so a
+ * remote model raises this sheet over it — and the sheet said it was ours.
+ *
+ * Attributed by the receipt's OUTCOME, not by whether there is one. A call that
+ * failed was handed to the server, but what came back into the thread is this
+ * app's own error text, and saying the server "returned this" would put words
+ * in its mouth. Exported so the attribution is measured against real tool
+ * records rather than a copy of the string.
+ */
+export function toolOutputSheetBody(
+  tools: readonly ExecutedTool[],
+  modelName: string,
+  characters: number,
+): string {
+  // Grouped by origin, so several local tools still read as one clause and
+  // each server gets its own.
+  const byOrigin = new Map<string, string[]>();
+  for (const tool of tools) {
+    const [name, origin] = originOf(tool);
+    const names = byOrigin.get(origin) ?? [];
+    if (!names.includes(name)) names.push(name);
+    byOrigin.set(origin, names);
+  }
+  const attributed =
+    [...byOrigin].map(([origin, names]) => `${names.join(', ')} ${origin}`).join('; ') ||
+    'A tool read from this app’s own data';
+
+  return (
+    `${attributed}. ` +
+    `To answer, ${modelName} has to see it. ` +
+    `${characters.toLocaleString()} characters — this is not a message you typed.`
+  );
+}
+
+/** A tool's name as the sheet prints it, and the clause saying where its output came from. */
+function originOf(tool: ExecutedTool): [name: string, origin: string] {
+  const receipt = tool.receipt;
+  if (receipt === undefined) return [tool.name, 'read from this app’s own data'];
+  switch (receipt.outcome) {
+    case 'sent':
+      return [receipt.toolName, `returned this from ${receipt.host}`];
+    case 'failed':
+      return [receipt.toolName, `did not complete on ${receipt.host}`];
+    default: {
+      // A new outcome has to say where its output came from before this compiles.
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
+}
+
+/**
  * The consent side of the engine's rule, in the app's own voice.
  *
  * Read live from the store rather than captured when the turn started: a grant
@@ -834,7 +892,6 @@ function egressPolicy(chatId: string): ToolEgressPolicy {
       const app = useApp.getState();
       const label =
         app.connections.find((connection) => connection.id === backendId)?.label ?? backendId;
-      const names = [...new Set(tools.map((tool) => tool.name))];
 
       // Named, counted, and attributed. "The request contains a tool message"
       // is not a thing anybody can decide about; "`bash` read 3 files from this
@@ -842,10 +899,7 @@ function egressPolicy(chatId: string): ToolEgressPolicy {
       let extended = false;
       const allowed = await app.requestApproval(`send tool output to ${label}`, {
         title: `Send tool output to ${label}?`,
-        body:
-          `${names.join(', ') || 'A tool'} read from this app’s own data. ` +
-          `To answer, ${modelName} has to see it. ` +
-          `${characters.toLocaleString()} characters — this is not a message you typed.`,
+        body: toolOutputSheetBody(tools, modelName, characters),
         detail: tools.slice(0, 4).map((tool) => `${tool.name} · ${tool.output.length} chars`),
         confirmLabel: 'Send this turn',
         extendedLabel: 'Send for this conversation',
