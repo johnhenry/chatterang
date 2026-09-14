@@ -450,3 +450,50 @@ describe('each half reports its OWN close', () => {
     expect(host.ended()).toMatchObject({ kind: 'abnormal', code: 'PEER_GONE' });
   });
 });
+
+describe('the listener lifecycle', () => {
+  it('a port already in use rejects rather than crashing', async () => {
+    /*
+     * EADDRINUSE USED TO BE AN UNCAUGHT EXCEPTION. `listen` had no error path,
+     * so the promise never settled — and `ws`, attached with `{ server }`,
+     * forwarded the server's `error` onto a WebSocketServer nobody listened
+     * to, which throws. A caller holding a busy port got a crashed process
+     * rather than a rejection it could report.
+     *
+     * The race is not a slow-machine timeout: a bind error comes back in
+     * microseconds. It only decides how a regression is REPORTED — as a
+     * named non-settlement here rather than a generic test timeout.
+     */
+    const occupant = createServer();
+    await new Promise<void>((resolve) => occupant.listen(0, '127.0.0.1', resolve));
+    open.push({ close: () => new Promise<void>((resolve) => occupant.close(() => resolve())) });
+    const { port } = occupant.address() as AddressInfo;
+
+    const attempt = createTunnelHost({ port });
+    // A regression that binds anyway must not leak a server into the next test.
+    attempt.then((host) => open.push(host), () => undefined);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsettled = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('createTunnelHost never settled')), 2000);
+    });
+    try {
+      await expect(Promise.race([attempt, unsettled])).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it('an error after listening is not swallowed by the listen promise', async () => {
+    /*
+     * THE OTHER HALF OF THAT ERROR PATH. The `once('error', reject)` that turns
+     * a busy port into a rejection comes off once the bind succeeds. Left on,
+     * it would take the next server error and hand it to a promise that has
+     * already resolved, where it vanishes — and a failed listener looks like a
+     * healthy one.
+     */
+    const host = await createTunnelHost({});
+    open.push(host);
+    expect(() => host.server.emit('error', new Error('after listen'))).toThrow('after listen');
+  });
+});
