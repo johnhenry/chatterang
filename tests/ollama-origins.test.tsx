@@ -287,17 +287,64 @@ function codes(element: Element): string[] {
   return [...element.querySelectorAll('code')].map((code) => code.textContent ?? '');
 }
 
-/** The Ollama list item's words and code values at one origin, rendered and torn down. */
-function ollamaAt(origin: string): { text: string; codes: string[] } {
+/**
+ * The Ollama list item at one origin, rendered and torn down: all its words, its
+ * note alone, and its code values.
+ */
+function ollamaAt(origin: string): { text: string; note: string; codes: string[] } {
   const page = renderPanelAt(origin);
   try {
     const ollama = providerItem(page.body, 'Ollama');
-    return { text: ollama.textContent ?? '', codes: codes(ollama) };
+    const note = ollama.querySelector('.list__sub');
+    if (!note) throw new Error(`no note under Ollama at ${origin}`);
+    return { text: ollama.textContent ?? '', note: note.textContent ?? '', codes: codes(ollama) };
   } finally {
     page.unmount();
     vi.unstubAllGlobals();
   }
 }
+
+/**
+ * The Ollama add-connection sheet at one origin: open it from the list, read the
+ * note in its "What this means" card, and tear it down. The address field's hint
+ * has its own <code>, so only the card's note is read.
+ */
+function sheetNoteAt(origin: string): { text: string; codes: string[] } {
+  const page = renderPanelAt(origin);
+  try {
+    act(() => {
+      providerItem(page.body, 'Ollama').click();
+    });
+    const dialogs = page.body.querySelectorAll('[role="dialog"]');
+    expect(dialogs, `one sheet at ${origin}`).toHaveLength(1);
+    expect(dialogs[0]?.textContent, origin).toContain('Connect Ollama');
+    const meaning = dialogs[0]?.querySelector('.card--remote');
+    expect(meaning?.textContent, origin).toContain('What this means');
+    const note = meaning?.querySelector('p');
+    if (!note) throw new Error(`no note on the sheet at ${origin}`);
+    return { text: note.textContent ?? '', codes: codes(note) };
+  } finally {
+    page.unmount();
+    vi.unstubAllGlobals();
+  }
+}
+
+/**
+ * The whole Ollama note, word for word, as rendered at each origin. Pinned whole
+ * because a sentence the panel itself appended (quoting advice on the
+ * cannot-tell note, or "Requests never leave your network.") passed every
+ * sentence-by-sentence check in review.
+ */
+const NOTE_LEAD =
+  'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.';
+const WHOLE_NOTE: Readonly<Record<string, string>> = {
+  'chatterang-desktop://app': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
+  'capacitor://localhost': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
+  'http://192.168.1.10:5273': `${NOTE_LEAD} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add http://192.168.1.10:5273 to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.`,
+  'https://localhost': NOTE_LEAD,
+  'http://localhost:5273': NOTE_LEAD,
+  'null': `${NOTE_LEAD} This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.`,
+};
 
 describe('the Ollama note in the Providers panel', () => {
   afterEach(() => {
@@ -345,6 +392,9 @@ describe('the Ollama note in the Providers panel', () => {
       'https://chat.example.com',
       'capacitor://evil',
       'capacitor://localhost:8080',
+      // Hosts that end in the letters "localhost" and are not it.
+      'capacitor://x.localhost',
+      'capacitor://evillocalhost',
       'xcapacitor://localhost',
       'ionic://localhost',
       'null',
@@ -357,7 +407,8 @@ describe('the Ollama note in the Providers panel', () => {
   });
 
   it('says to quote the value exactly when it shows one', () => {
-    // A value holding `*` unquoted in zsh fails with "no matches found".
+    // A value holding `*`, unquoted as a zsh command argument, fails with "no
+    // matches found".
     const quote = 'If you set it from a shell, put the value in quotes.';
     for (const origin of [
       'chatterang-desktop://app',
@@ -421,21 +472,34 @@ describe('the Ollama note in the Providers panel', () => {
     expect(getProvider('ollama')?.note).not.toContain('OLLAMA_ORIGINS');
   });
 
-  it('carries the value onto the add-connection sheet too', () => {
-    const page = renderPanelAt('capacitor://localhost');
-    act(() => {
-      providerItem(page.body, 'Ollama').click();
-    });
-    const sheet = page.body.querySelector('[role="dialog"]');
-    expect(sheet, 'the Connect Ollama sheet').not.toBeNull();
-    expect(sheet?.textContent).toContain('Connect Ollama');
-    // The "What this means" card; the address field's hint has its own <code>.
-    const meaning = sheet?.querySelector('.card--remote');
-    expect(meaning?.textContent).toContain('What this means');
-    expect(codes(meaning!)).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
-    // The sheet is where the connection is made, so it carries both rulings too.
-    expect(meaning?.textContent).toContain('Other iOS apps built on the same framework');
-    expect(meaning?.textContent).toContain('If you set it from a shell, put the value in quotes.');
-    page.unmount();
+  it('renders the whole note, and nothing more, at each origin', () => {
+    for (const [origin, note] of Object.entries(WHOLE_NOTE)) {
+      expect(ollamaAt(origin).note, origin).toBe(note);
+    }
+  });
+
+  it('carries the same note onto the add-connection sheet, at each origin', () => {
+    // The sheet is where the connection is made, so it carries both rulings, and
+    // it reads the page's origin as the list does rather than a fixed one.
+    for (const [origin, note] of Object.entries(WHOLE_NOTE)) {
+      const sheet = sheetNoteAt(origin);
+      expect(sheet.text, origin).toBe(note);
+      expect(sheet.codes, origin).toEqual(ollamaAt(origin).codes);
+    }
+
+    const ios = sheetNoteAt('capacitor://localhost');
+    expect(ios.codes).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
+    expect(ios.text).toContain('Other iOS apps built on the same framework');
+    expect(ios.text).toContain('If you set it from a shell, put the value in quotes.');
+
+    const desktop = sheetNoteAt('chatterang-desktop://app');
+    expect(desktop.codes).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
+    expect(desktop.text).toContain('If you set it from a shell, put the value in quotes.');
+    expect(desktop.text).not.toContain('Other iOS apps');
+
+    const android = sheetNoteAt('https://localhost');
+    expect(android.codes).toEqual([]);
+    expect(android.text).not.toContain('quotes');
+    expect(android.text).not.toContain('Other iOS apps');
   });
 });

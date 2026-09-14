@@ -1307,6 +1307,14 @@ describe('the MCP send sheet', () => {
 
 /* ── The provider panel ──────────────────────────────────────────────── */
 
+/**
+ * A promise that requests stay on, or never leave, the user's network, in any
+ * of the wordings review found passing a narrower pin. Checked against the
+ * catalog's notes and against every note as the panel renders it.
+ */
+const CONTAINMENT_PROMISE =
+  /\b(?:stays?|remains?|kept|keeps?)\s+(?:inside|on|within|in)\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b|\bnever\s+leaves?\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b/i;
+
 describe('the provider panel hints', () => {
   it('promises nothing about where a self-hosted address points', () => {
     // "Requests stay inside your network" was a promise about a URL the user
@@ -1334,10 +1342,8 @@ describe('the provider panel hints', () => {
       expect(getProvider(id)?.note, id).toContain(retraction);
     }
     // And no note, self-hosted or not, makes the promise in other words.
-    const containment =
-      /\b(?:stays?|remains?|kept|keeps?)\s+(?:inside|on|within|in)\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b|\bnever\s+leaves?\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b/i;
     for (const provider of PROVIDERS) {
-      expect(provider.note, provider.id).not.toMatch(containment);
+      expect(provider.note, provider.id).not.toMatch(CONTAINMENT_PROMISE);
     }
   });
 
@@ -1394,12 +1400,15 @@ describe('the provider panel hints', () => {
     // so its value (the middle form, `capacitor:*//localhost`) cannot admit this
     // app alone. The note shows the value and says so; no other origin says it.
     //
-    // Quoting: the value is typed exactly, and `*` unquoted in zsh fails with "no
-    // matches found". Shown with every value, and only with a value.
+    // Quoting: the value is typed exactly, and `*` unquoted as a zsh command
+    // argument fails with "no matches found". Shown with every value, and only
+    // with a value.
     const shared =
       'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
     const quote = 'If you set it from a shell, put the value in quotes.';
-    const ollamaAt = (origin: string): { text: string; codes: string[] } => {
+    const ollamaAt = (
+      origin: string,
+    ): { text: string; note: string; notes: string[]; codes: string[] } => {
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
       vi.stubGlobal('location', { origin, href: `${origin}/` });
       const host = document.createElement('div');
@@ -1415,6 +1424,11 @@ describe('the provider panel hints', () => {
         if (!item) throw new Error(`no Ollama item at ${origin}`);
         return {
           text: reads(item.textContent ?? ''),
+          note: reads(item.querySelector('.list__sub')?.textContent ?? ''),
+          // Every provider's note as the panel renders it here, not as the catalog holds it.
+          notes: [...host.querySelectorAll('button.list__item .list__sub')].map((sub) =>
+            reads(sub.textContent ?? ''),
+          ),
           codes: [...item.querySelectorAll('code')].map((code) => code.textContent ?? ''),
         };
       } finally {
@@ -1447,6 +1461,29 @@ describe('the provider panel hints', () => {
       expect(page.codes.length, origin).toBeLessThan(2);
       expect(page.text, origin).not.toContain('in quotes');
       expect(page.text, origin).not.toContain('Other iOS apps');
+    }
+
+    // Whole, as rendered. A sentence the panel appended around the catalog's
+    // words passed every check above: quoting advice on the cannot-tell note,
+    // and "Requests never leave your network." on Ollama's.
+    const lead =
+      'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.';
+    const add = (value: string, afterValue = ''): string =>
+      `${lead} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add ${value} to that setting.${afterValue} If it already has a value, put a comma between them, with no spaces. ${quote} Restart Ollama for the change to take effect.`;
+    const whole: Record<string, string> = {
+      'capacitor://localhost': add('capacitor:*//localhost', ` ${shared}`),
+      'chatterang-desktop://app': add('chatterang-desktop:*//app'),
+      'http://192.168.1.10:5273': add('http://192.168.1.10:5273'),
+      'https://localhost': lead,
+      'http://localhost:5273': lead,
+      'null': `${lead} This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.`,
+    };
+    for (const [origin, note] of Object.entries(whole)) {
+      const page = ollamaAt(origin);
+      expect(page.note, origin).toBe(note);
+      // And no provider's note, as rendered at this origin, promises containment.
+      expect(page.notes, origin).toHaveLength(PROVIDERS.length);
+      for (const rendered of page.notes) expect(rendered, origin).not.toMatch(CONTAINMENT_PROMISE);
     }
   });
 
