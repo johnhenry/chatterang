@@ -400,6 +400,93 @@ describe('tool enablement is enforced', () => {
     expect(allowed.execute).toHaveBeenCalledOnce();
   });
 
+  it('records a call whose server left while the model wrote it as not sent, and runs nothing', async () => {
+    // Removing a server, switching one off or adding one takes every MCP tool
+    // out of the registry while `reconnect` runs. This request declared the tool
+    // when it began, so the call is recorded as not sent to that server: named
+    // from what was declared, never run from it (#92).
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const dispatch = async (leave: boolean) => {
+      const spy = spyTool('mcp:notes.note', 'notes.note');
+      const tool: ChatterangTool = { ...spy.tool, destination };
+      const registry = new ToolRegistry([tool]);
+      const next = vi.fn(async () => {
+        // What `reconnect` does first, while the call is still being written.
+        if (leave) registry.unregister(tool.id);
+        return response('<tool_call>{"name":"notes.note","arguments":{"text":"x"}}</tool_call>');
+      });
+      const result = await createToolMiddleware({ registry })(
+        context({ request: enabled(['notes.note'], [tool.id]), backend: answer() }),
+        next,
+      );
+      const calls = (result.metadata.custom?.toolCalls as ExecutedTool[] | undefined) ?? [];
+      return { spy, calls };
+    };
+    const notSent = { outcome: 'withheld', serverId: 'mcp_notes', host: 'notes.example', toolName: 'notes.note' };
+
+    // The control: this path sends to no server, so a tool still registered is
+    // refused as not allowed. Only the reason differs once it has left.
+    const stayed = await dispatch(false);
+    expect(stayed.spy.execute).not.toHaveBeenCalled();
+    expect(stayed.calls.map((call) => call.receipt)).toMatchObject([{ ...notSent, why: 'not-allowed' }]);
+
+    const left = await dispatch(true);
+    expect(left.spy.execute).not.toHaveBeenCalled();
+    expect(left.calls.map((call) => call.receipt)).toMatchObject([{ ...notSent, why: 'server-changed' }]);
+    expect(left.calls[0]?.output).toBe(
+      'This call’s arguments were not sent to notes.example: the server changed before it went.',
+    );
+  });
+
+  it('hands the backend no follow-up once the turn is stopped, and keeps the not-sent record', async () => {
+    // Every refused call is recorded whatever the signal says (#92, owner ruling
+    // OD7), so a stopped batch still has results. The loop must end on the
+    // signal, not on an empty batch: nothing is asked of a model after Stop.
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const dispatch = async (stop: boolean) => {
+      const spy = spyTool('mcp:notes.note', 'notes.note');
+      const tool: ChatterangTool = { ...spy.tool, destination };
+      const registry = new ToolRegistry([tool]);
+      const controller = new AbortController();
+      const backend = answer();
+      const next = vi.fn(async () => {
+        // Stop lands while the model's reply comes back.
+        if (stop) controller.abort();
+        return response('<tool_call>{"name":"notes.note","arguments":{"text":"x"}}</tool_call>');
+      });
+      const result = await createToolMiddleware({ registry })(
+        context({ request: enabled(['notes.note'], [tool.id]), backend, signal: controller.signal }),
+        next,
+      );
+      const calls = (result.metadata.custom?.toolCalls as ExecutedTool[] | undefined) ?? [];
+      return { spy, calls, execute: backend.execute as ReturnType<typeof vi.fn> };
+    };
+    const notSent = { outcome: 'withheld', why: 'not-allowed', serverId: 'mcp_notes', host: 'notes.example' };
+
+    // The control: not stopped, the model reads the refusal once.
+    const running = await dispatch(false);
+    expect(running.spy.execute).not.toHaveBeenCalled();
+    expect(running.execute).toHaveBeenCalledOnce();
+    expect(running.calls.map((call) => call.receipt)).toMatchObject([notSent]);
+
+    const stopped = await dispatch(true);
+    expect(stopped.spy.execute).not.toHaveBeenCalled();
+    expect(stopped.execute, 'no request is handed to the backend after Stop').not.toHaveBeenCalled();
+    expect(stopped.calls.map((call) => call.receipt)).toMatchObject([notSent]);
+  });
+
   it('runs nothing when the request does not say which tools are enabled', async () => {
     // Fail closed. A request that declares a tool to the model but carries no
     // enabled ids is a caller that forgot, and forgetting must not re-open it.

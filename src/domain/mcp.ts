@@ -103,39 +103,131 @@ export interface ToolDestination {
 }
 
 /**
- * The record that a tool call's arguments were handed to an MCP server (#92).
+ * The record of what became of a tool call's arguments bound for an MCP server
+ * (#92).
  *
- * Taken when the call is handed over, not when it returns, so `at` is when the
- * arguments left and a call that then failed still has one. A call that never
- * left — declined at the confirm sheet, or refused with {@link McpNotSent} — has
- * none: a receipt says something left, and nothing did.
+ * `sent` and `failed` are taken when the call is handed over, not when it
+ * returns, so `at` is when the arguments left and a call that then failed still
+ * has one. `withheld` records what did NOT go, so the thread and the export can
+ * say so, and no reader may count it as egress — see {@link mayHaveLeft}. Owner
+ * ruling OD7 covers every way a call is held back, and `why` says which
+ * ({@link WithheldWhy}).
  *
  * `outcome` is a discriminant rather than optional flags so that every reader
- * has to say what it does with each value.
+ * has to say what it does with each value, and `why` exists only on the outcome
+ * it explains, for the same reason.
  *
  * `bytes` is the UTF-8 length of the arguments as JSON — the part the model
- * composed — not the size of the request envelope around them. There is no
- * hash: the arguments themselves are stored beside this, on the invocation.
+ * composed — not the size of the request envelope around them; for a withheld
+ * call, the size of what would have gone. There is no hash: the arguments
+ * themselves are stored beside this, on the invocation.
  */
-export interface McpCallReceipt {
-  readonly outcome: 'sent' | 'failed';
+export type McpCallReceipt =
+  | (McpCallFields & { readonly outcome: 'sent' | 'failed' })
+  | (McpCallFields & { readonly outcome: 'withheld'; readonly why: WithheldWhy });
+
+/** What every receipt records, whatever became of the call. */
+export interface McpCallFields {
   readonly serverId: string;
   readonly serverName: string;
   readonly host: string;
   /** Server-qualified (`notes.search`), whichever spelling the model called it by. */
   readonly toolName: string;
   readonly bytes: number;
-  /** Epoch milliseconds, taken as the arguments were handed to the server. */
+  /**
+   * Epoch milliseconds: when the arguments were handed to the server, or were
+   * withheld. For a call Stop held back, that is when Stop landed — or, stopped
+   * before its batch was dispatched, when the batch was.
+   */
   readonly at: number;
+}
+
+/**
+ * Why a call's arguments were withheld (#92, owner ruling OD7).
+ *
+ * - `not-allowed`: this conversation did not allow the server — the person said
+ *   no to the send sheet, or nobody could be asked (#6).
+ * - `declined`: the server was allowed, and the person said no when asked about
+ *   a call the server does not call read-only changing data there.
+ * - `server-changed`: nobody refused it. The server record it was prepared for
+ *   was removed, switched off, renamed or pointed elsewhere while it waited, or
+ *   no client was left to send it ({@link McpNotSent}); or the conversation's
+ *   grant for it was withdrawn while an earlier call ran; or its tool had left
+ *   the registry by the time it was dispatched, because a server was removed,
+ *   switched off or added while the model was still writing the call.
+ * - `stopped`: the reply was stopped before the call went, and nothing else
+ *   held it back. Nothing leaves after Stop, so this is every such call in the
+ *   batch: one waiting on a person, at the send sheet or the data-change
+ *   confirm, whatever was answered after; one whose own send sheet was never
+ *   raised, because Stop came at an earlier sheet or before the batch was
+ *   dispatched; and one already allowed — by a grant the conversation held or
+ *   an answer given in this batch — that had not yet run when Stop came, at
+ *   another server's sheet or while an earlier call ran.
+ *
+ * A call here is one read from a model turn that finished, under the turn's
+ * limit on tool rounds. A call in text the model was still writing when Stop
+ * came, or written in a turn past that limit, was never read as a call: it was
+ * not sent, and it has no record.
+ *
+ * Each reads differently in the thread and the export, because each is a
+ * different thing to have happened.
+ */
+export type WithheldWhy = 'not-allowed' | 'declined' | 'server-changed' | 'stopped';
+
+/**
+ * Could this call's arguments have reached the server?
+ *
+ * The question a record of egress is kept for. `failed` answers yes, because a
+ * call can fail after its arguments arrived; `withheld` answers no, whatever
+ * held the call back. An outcome this build has never heard of — a row written
+ * by a later one — falls to the `never` branch and answers true: kept as if
+ * something left, the direction it is safe to be wrong in.
+ */
+export function mayHaveLeft(receipt: McpCallReceipt | undefined): boolean {
+  if (receipt === undefined) return false;
+  switch (receipt.outcome) {
+    case 'sent':
+    case 'failed':
+      return true;
+    case 'withheld':
+      return false;
+    default:
+      unhandledOutcome(receipt);
+      return true;
+  }
+}
+
+/**
+ * The outcome of a receipt no branch of a reader handles: a row written by a
+ * later build.
+ *
+ * Called from a switch's `default`. Its parameter is `never`, so that switch
+ * stops compiling the moment an outcome is added and left unhandled; at
+ * runtime it hands back what was stored, for the reader to show. The receipt
+ * is passed rather than its `outcome`, because once every member of the union
+ * is handled the receipt itself is `never` and has no `outcome` to read.
+ */
+export function unhandledOutcome(receipt: never): string {
+  return String((receipt as { readonly outcome?: unknown }).outcome);
+}
+
+/**
+ * The same for a withheld receipt's `why`: a reason a later build added. The
+ * reader still knows the call was not sent, and shows the reason as stored
+ * rather than guessing what it meant.
+ */
+export function unhandledWhy(why: never): string {
+  return String(why);
 }
 
 /**
  * A refusal made BEFORE any byte left: there is no client, or the server a call
  * was prepared for is no longer the server its name points at.
  *
- * Distinct from every other failure because it is the one that must not leave a
- * receipt. Any other error may arrive after the arguments were delivered, and
- * recording such a call as not sent would be wrong in the flattering direction.
+ * Distinct from every other failure because it is the one recorded as not sent
+ * (`withheld`, why `server-changed`) rather than as an attempt. Any other error
+ * may arrive after the arguments were delivered, and recording such a call as
+ * not sent would be wrong in the flattering direction.
  */
 export class McpNotSent extends Error {
   constructor(message: string) {

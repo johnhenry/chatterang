@@ -48,7 +48,13 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import type { McpCallReceipt, ToolDestination } from '@/domain/mcp';
+import {
+  mayHaveLeft,
+  unhandledOutcome,
+  unhandledWhy,
+  type McpCallReceipt,
+  type ToolDestination,
+} from '@/domain/mcp';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -673,13 +679,16 @@ function editedVariant(message: Message, text: string): Message {
  * its own only generation. Empty text is dropped: a turn that failed before it
  * wrote anything is not a version anyone can flip back to.
  *
- * UNLESS IT HANDED SOMETHING TO A SERVER. A generation carrying an MCP receipt
- * is kept with no text, because the receipt is the only record that those
- * bytes left, and regenerating is not a reason to forget that. For the same
- * reason a regeneration that failed or was interrupted — a row whose index is
- * past the end of its list, showing a generation whose record was never
- * appended — is appended here when it carries one. Without a receipt it is
- * dropped, as it always was.
+ * UNLESS IT RECORDS AN MCP CALL. A generation carrying any MCP receipt — sent,
+ * failed or not sent — is kept with no text. A receipt that says bytes may have
+ * left is the only record that they did, and regenerating is not a reason to
+ * forget that. One that says a call was not sent is kept too, by owner ruling
+ * on #92: a stopped or refused turn's earlier version stays in the history with
+ * its not-sent records, and the export prints them as a version not shown. For
+ * the same reasons a regeneration that failed or was interrupted — a row whose
+ * index is past the end of its list, showing a generation whose record was
+ * never appended — is appended here when it carries one. Without a receipt it
+ * is dropped, as it always was.
  */
 function generationsSoFar(target: Message): MessageVariant[] {
   const listed = target.variants;
@@ -692,7 +701,15 @@ function generationsSoFar(target: Message): MessageVariant[] {
   return all.filter((variant) => variant.content.length > 0 || carriesReceipt(variant));
 }
 
-/** Did any tool call in this generation hand its arguments to an MCP server? */
+/**
+ * Does any tool call in this generation record what became of an MCP call?
+ *
+ * Any outcome counts, `withheld` included, and so does one a later build added
+ * (#92, owner ruling that not-sent records survive regeneration). This is not
+ * `mayHaveLeft`, which asks whether bytes may have left: that question still
+ * decides the mid-turn write in `runGeneration`, and this ruling does not widen
+ * it.
+ */
 function carriesReceipt(variant: MessageVariant): boolean {
   return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
 }
@@ -850,7 +867,8 @@ async function runGeneration(
           ];
           patch((message) => ({ ...message, toolCalls }));
 
-          // A receipt says bytes left the device, so it is written down NOW.
+          // A receipt that says bytes may have left the device is written down
+          // NOW. A withheld one waits for the turn to end like any other text.
           // Until this, nothing reached the database before the turn ended, and
           // a turn that errored, was stopped or was killed afterwards took the
           // record with it. The row goes in still marked streaming; `openChat`
@@ -863,7 +881,7 @@ async function runGeneration(
           // opens another chat mid-turn the running row is not in it — so the
           // lookup found nothing and nothing was written. It is the row `patch`
           // keeps on screen, field for field.
-          if (event.tool.receipt) {
+          if (mayHaveLeft(event.tool.receipt)) {
             const split = splitThinking(raw);
             await db.messages.put({
               ...placeholder,
@@ -1123,11 +1141,23 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
       return [receipt.toolName, `returned this from ${receipt.host}`];
     case 'failed':
       return [receipt.toolName, `did not complete on ${receipt.host}`];
-    default: {
+    case 'withheld':
+      // Nothing went, so nothing came back: the output is this app's refusal,
+      // whatever held the call back. A reason added later has to say whether
+      // that is still so before this compiles.
+      switch (receipt.why) {
+        case 'not-allowed':
+        case 'declined':
+        case 'server-changed':
+        case 'stopped':
+          return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
+        default:
+          // Not sent; whose words came back is not this build's to say.
+          return [receipt.toolName, `was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`];
+      }
+    default:
       // A new outcome has to say where its output came from before this compiles.
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      return [tool.name, unhandledOutcome(receipt)];
   }
 }
 
@@ -1138,10 +1168,18 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
       return `what ${names} returned from ${receipt.host}`;
     case 'failed':
       return `${names}, which did not complete on ${receipt.host}`;
-    default: {
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+    case 'withheld':
+      switch (receipt.why) {
+        case 'not-allowed':
+        case 'declined':
+        case 'server-changed':
+        case 'stopped':
+          return `${names}, which was not sent to ${receipt.host}`;
+        default:
+          return `${names}, which was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`;
+      }
+    default:
+      return unhandledOutcome(receipt);
   }
 }
 
@@ -1296,16 +1334,22 @@ function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
         .grantMcpEgress(chatId, { serverId: destination.serverId, url: destination.url });
     },
 
-    async request(asked) {
+    async request(asked, signal) {
       askedAt.set(keyOf(asked.destination), mcpWithdrawals.count(asked.destination.serverId));
       const { action, ...prompt } = mcpSendSheet(asked);
       let extended = false;
-      const allowed = await useApp.getState().requestApproval(action, {
-        ...prompt,
-        onExtended: () => {
-          extended = true;
+      // The turn's signal goes with the sheet, so Stop takes it down. The no
+      // that follows is read as stopped by the dispatcher, not as a refusal.
+      const allowed = await useApp.getState().requestApproval(
+        action,
+        {
+          ...prompt,
+          onExtended: () => {
+            extended = true;
+          },
         },
-      });
+        signal,
+      );
       if (!allowed) return 'deny';
       return extended ? 'conversation' : 'calls';
     },

@@ -16,6 +16,14 @@ export interface ToolContext {
   readonly signal?: AbortSignal;
   /** Current time, injected so tools stay testable. */
   readonly now: () => Date;
+  /**
+   * Whether the grant that let this call through still stands. Set by the
+   * dispatcher only for a call a grant the conversation already held let
+   * through; a tool that waits on anything before its arguments leave — the MCP
+   * data-change confirm — reads it again after the wait (#6). Absent means no
+   * held grant stands behind the call, and there is nothing more to read.
+   */
+  readonly stillGranted?: () => boolean;
 }
 
 export interface ToolResult {
@@ -24,7 +32,10 @@ export interface ToolResult {
   /** Optional payload the UI renders instead of raw text. */
   readonly display?: { readonly kind: 'html' | 'json' | 'text'; readonly value: string };
   readonly isError?: boolean;
-  /** Set by a tool that handed its arguments to an MCP server. See `McpCallReceipt`. */
+  /**
+   * Set by an MCP tool for what became of its call, including a call it did not
+   * send. Whether anything left is `mayHaveLeft`'s answer. See `McpCallReceipt`.
+   */
   readonly receipt?: McpCallReceipt;
 }
 

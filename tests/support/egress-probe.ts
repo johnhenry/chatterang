@@ -78,7 +78,7 @@ export function mcpProbe(
       content: [{ type: 'text', text: 'filed' }],
     }),
   );
-  const confirm = vi.fn(async (_action: string) => true);
+  const confirm = vi.fn(async (_action: string, _signal?: AbortSignal) => true);
   const tool = createMcpTool(
     {
       server: options.serverName ?? 'notes',

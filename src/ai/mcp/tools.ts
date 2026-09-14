@@ -35,10 +35,12 @@ import {
   argumentBytes,
   destinationHost,
   qualifiedToolName,
+  type McpCallFields,
   type McpCallReceipt,
   type ToolDestination,
 } from '@/domain/mcp';
 import { checkToolSchema } from '@/ai/mcp/schema';
+import { unlessStopped } from '@/ai/middleware/tools';
 import type { ChatterangTool, ToolResult } from '@/ai/tools/registry';
 import type { McpToolDescriptor } from '@/ai/mcp/client';
 
@@ -47,8 +49,11 @@ export interface McpToolOptions {
   readonly serverId: string;
   /** The server's URL, for showing where a call goes. */
   readonly serverUrl: string;
-  /** Shown to the user before a destructive call runs. */
-  confirm(action: string): Promise<boolean>;
+  /**
+   * Shown to the user before a destructive call runs. `signal` is the turn's:
+   * Stop takes the sheet down, and the call does not go.
+   */
+  confirm(action: string, signal?: AbortSignal): Promise<boolean>;
   call(
     server: string,
     name: string,
@@ -119,23 +124,8 @@ export function createMcpTool(
       // change data there. They are different harms, so a grant for the whole
       // conversation never answers this one (#6); a read-only call asks
       // nothing more here.
-      if (!descriptor.readOnly) {
-        const approved = await options.confirm(
-          `run “${descriptor.name}” on ${host}, which may change data there`,
-        );
-        if (!approved) {
-          return { output: 'The user declined that tool call.', isError: true };
-        }
-      }
-
-      // THE RECEIPT IS TAKEN HERE: after the confirm, so a declined call has
-      // none, and before the hand-off, so `at` is when the arguments left and a
-      // call that then throws still has one. `now` is read once; the catch
-      // below must not read it again.
       const bytes = argumentBytes(input);
-      const at = context.now().getTime();
-      const receipt = (outcome: McpCallReceipt['outcome']): McpCallReceipt => ({
-        outcome,
+      const fields = (at: number): McpCallFields => ({
         serverId: options.serverId,
         serverName: descriptor.server,
         host,
@@ -143,6 +133,57 @@ export function createMcpTool(
         bytes,
         at,
       });
+
+      if (!descriptor.readOnly) {
+        const action = `run “${descriptor.name}” on ${host}, which may change data there`;
+        const approved = context.signal?.aborted
+          ? undefined
+          : await unlessStopped(options.confirm(action, context.signal), context.signal);
+        // Read once, off the signal and not the answer: a yes or a no that lands
+        // with or after Stop reaches nothing.
+        const stopped = context.signal?.aborted === true;
+        if (!stopped && !approved) {
+          // RECORDED AS NOT SENT (#92, owner ruling OD7). Saying no to the
+          // data-change question declines the call as surely as a no to the
+          // send sheet does, and the record says which of the two it was.
+          return {
+            output: 'The user declined that tool call.',
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'declined' },
+          };
+        }
+        // A HELD GRANT IS READ AGAIN AFTER THIS CONFIRM (#6). The dispatcher read
+        // it just before this ran, but the confirm stays up for as long as nobody
+        // answers it. Switching the server off and on meanwhile withdraws the
+        // grant and brings back the same record at the same address, so the live
+        // check in `state/mcp.ts` passes; and a yes here answers whether data may
+        // change, never whether the arguments may leave. Recorded as the
+        // dispatcher records a withdrawn grant (#92), and ahead of Stop, as there.
+        if (context.stillGranted !== undefined && !context.stillGranted()) {
+          return {
+            output: `This call’s arguments were not sent to ${host}: this conversation’s permission for that server was withdrawn before it went.`,
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'server-changed' },
+          };
+        }
+        // STOPPED WHILE ASKING (#92). The owner's ruling is that nothing leaves
+        // after Stop; it names the send sheet, and this is the other sheet a
+        // call waits on, so it is held to the same.
+        if (stopped) {
+          return {
+            output: `${qualified} was not sent: the reply was stopped.`,
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'stopped' },
+          };
+        }
+      }
+
+      // THE SENT RECEIPT IS TAKEN HERE: after the confirm, so `at` is not when
+      // the question was first asked, and before the hand-off, so `at` is when
+      // the arguments left and a call that then throws still has one. `now` is
+      // read once; the catch below must not read it again.
+      const at = context.now().getTime();
+      const receipt = (outcome: 'sent' | 'failed'): McpCallReceipt => ({ ...fields(at), outcome });
 
       try {
         const result = await options.call(
@@ -153,9 +194,15 @@ export function createMcpTool(
         );
         return { ...renderResult(result), receipt: receipt('sent') };
       } catch (error) {
-        // Refused before anything left, so there is nothing to record.
+        // REFUSED BEFORE ANYTHING LEFT (#92, owner ruling OD7): the server this
+        // call was prepared for changed while it waited, or no client is left to
+        // send it. Recorded as not sent, and as nobody's refusal.
         if (error instanceof McpNotSent) {
-          return { output: `${qualified} was not sent: ${error.message}`, isError: true };
+          return {
+            output: `${qualified} was not sent: ${error.message}`,
+            isError: true,
+            receipt: { ...fields(at), outcome: 'withheld', why: 'server-changed' },
+          };
         }
         // Anything else may have failed after the arguments were delivered — a
         // server error, a connection dropped mid-response. It is recorded as an

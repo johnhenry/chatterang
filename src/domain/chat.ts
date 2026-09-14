@@ -48,8 +48,10 @@ export interface ToolInvocation {
   readonly isError?: boolean;
   readonly durationMs?: number;
   /**
-   * Present when this call's arguments were handed to an MCP server. It moves
-   * with its generation, as the rest of the invocation does.
+   * What became of this call, when it was an MCP call: sent, failed, or not
+   * sent and why. A call that did not leave has one too, so its presence is
+   * no test for egress; `mayHaveLeft` in domain/mcp is. It moves with its
+   * generation, as the rest of the invocation does.
    */
   readonly receipt?: McpCallReceipt;
 }

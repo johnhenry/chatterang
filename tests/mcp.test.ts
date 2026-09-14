@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { McpNotSent, destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/mcp';
+import {
+  McpNotSent,
+  destinationHost,
+  mayHaveLeft,
+  qualifiedToolName,
+  unhandledOutcome,
+  unhandledWhy,
+  validateServerUrl,
+  type McpCallReceipt,
+} from '@/domain/mcp';
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
 import { McpManager, type McpToolDescriptor } from '@/ai/mcp/client';
-import { runToolCalls, type DestinationDecision } from '@/ai/middleware/tools';
+import { runToolCalls, unlessStopped, type DestinationDecision } from '@/ai/middleware/tools';
 import { BUILT_IN_TOOLS, ToolRegistry } from '@/ai/tools/registry';
 
 /**
@@ -201,6 +210,72 @@ describe('a call that could change data on its server', () => {
     expect(executed[0]?.output).toBe('The user declined that tool call.');
   });
 
+  it('reads a held grant again after the data-change confirm, and sends nothing once it is withdrawn', async () => {
+    // The confirm stays up for as long as nobody answers. Switching the server
+    // off and on meanwhile withdraws the grant but brings back the same record
+    // at the same address, and a yes to whether data may change never answers
+    // whether the arguments may leave (#6).
+    const dispatch = async (withdraw: boolean) => {
+      let held = true;
+      const order: string[] = [];
+      const confirm = vi.fn(async (_action: string) => {
+        if (withdraw) held = false;
+        order.push('changes');
+        return true;
+      });
+      const call = vi.fn(async () => {
+        order.push('sent');
+        return { content: [{ type: 'text', text: 'ok' }] };
+      });
+      const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+      const { executed } = await runToolCalls(new ToolRegistry([tool]), use(tool.name), {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => held },
+      });
+      return { tool, call, order, executed };
+    };
+
+    // The control: the grant stands, so the yes sends.
+    const kept = await dispatch(false);
+    expect(kept.order).toEqual(['changes', 'sent']);
+    expect(kept.executed[0]?.receipt).toMatchObject({ outcome: 'sent' });
+
+    const withdrawn = await dispatch(true);
+    expect(withdrawn.order).toEqual(['changes']);
+    expect(withdrawn.call).not.toHaveBeenCalled();
+    expect(withdrawn.executed[0]?.output).toBe(
+      'This call’s arguments were not sent to api.acme.com: this conversation’s permission for that server was withdrawn before it went.',
+    );
+    expect(withdrawn.executed[0]?.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_1',
+      host: 'api.acme.com',
+      toolName: withdrawn.tool.name,
+    });
+  });
+
+  it('reads the answer before the grant, and the grant before Stop, as the dispatcher does', async () => {
+    const call = vi.fn(async () => ({ content: [] }));
+    const make = (confirm: (action: string, signal?: AbortSignal) => Promise<boolean>) =>
+      mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+    const withdrawn = { ...context, stillGranted: () => false };
+
+    const declined = await make(async () => false).execute({ q: 'x' }, withdrawn);
+    expect(declined.receipt).toMatchObject({ outcome: 'withheld', why: 'declined' });
+
+    const stopping = new AbortController();
+    const stoppedThere = await make(async () => {
+      stopping.abort();
+      return true;
+    }).execute({ q: 'x' }, { ...withdrawn, signal: stopping.signal });
+    expect(stoppedThere.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
+
+    const standing = await make(async () => true).execute({ q: 'x' }, { ...context, stillGranted: () => true });
+    expect(standing.receipt).toMatchObject({ outcome: 'sent' });
+    expect(call).toHaveBeenCalledOnce();
+  });
+
   it('treats an answer it does not recognise as a refusal', async () => {
     // Fails closed: only the two affirmative answers send anything.
     const call = vi.fn(async () => ({ content: [] }));
@@ -215,6 +290,55 @@ describe('a call that could change data on its server', () => {
     expect(executed[0]?.isError).toBe(true);
     expect(executed[0]?.output).toContain('did not allow');
   });
+});
+
+/**
+ * Stop, while a call waits on a person (#92, owner ruling OD7). The end-to-end
+ * measurements are in `privacy.test.ts`; these are the two halves under them.
+ */
+describe('a call waiting on a person when the turn is stopped', () => {
+  const acme = { serverId: 'mcp_1', serverUrl: 'https://api.acme.com/mcp' };
+  const stoppedSignal = () => {
+    const controller = new AbortController();
+    controller.abort();
+    return controller.signal;
+  };
+  const never = <T>() => new Promise<T>(() => {});
+
+  it('asks nothing once the turn is already stopped, at dispatch or at the confirm', async () => {
+    const call = vi.fn(async () => ({ content: [] }));
+    const confirm = vi.fn(async (_action: string, _signal?: AbortSignal) => true);
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+    const request = vi.fn(async () => 'calls' as const);
+
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use', id: 'c1', name: tool.name, input: { q: 'x' } }],
+      { enabledIds: [tool.id], destinations: { isGranted: () => false, request }, signal: stoppedSignal() },
+    );
+    expect(request, 'no sheet is raised for a stopped turn').not.toHaveBeenCalled();
+    expect(executed[0]?.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+
+    const direct = await tool.execute({ q: 'x' }, { signal: stoppedSignal(), now: () => new Date(0) });
+    expect(confirm, 'no confirm is raised for a stopped turn').not.toHaveBeenCalled();
+    expect(direct.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped', at: 0 });
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it('hands back the answer, or nothing once stopped, and never waits past Stop', async () => {
+    expect(await unlessStopped(Promise.resolve('yes'), undefined)).toBe('yes');
+    const live = new AbortController();
+    expect(await unlessStopped(Promise.resolve('yes'), live.signal)).toBe('yes');
+    await expect(unlessStopped(Promise.reject(new Error('boom')), live.signal)).rejects.toThrow('boom');
+
+    const stopping = new AbortController();
+    const waiting = unlessStopped(never<string>(), stopping.signal);
+    stopping.abort();
+    expect(await waiting).toBeUndefined();
+
+    // Stopped before it was asked: an abort that already happened fires no event.
+    expect(await unlessStopped(never<string>(), stoppedSignal())).toBeUndefined();
+  }, 2000);
 });
 
 describe('result rendering', () => {
@@ -289,16 +413,28 @@ describe('an MCP call receipt', () => {
     });
   });
 
-  it('is not taken for a destructive call the user declined, and is for one they allowed', async () => {
+  it('records a destructive call the user declined as not sent, and one they allowed as sent', async () => {
     const call = vi.fn(ok);
     const declined = mustCreateMcpTool(descriptor({ readOnly: false }), {
       ...acme,
       confirm: async () => false,
       call,
     });
-    const refused = await declined.execute({ q: 'x' }, { now: () => at });
+    const refused = await declined.execute({ q: 'héllo' }, { now: () => at });
     expect(call).not.toHaveBeenCalled();
-    expect(refused.receipt).toBeUndefined();
+    expect(refused.output).toBe('The user declined that tool call.');
+    // Declining the data-change question declines the call (#92, owner ruling
+    // OD7), and the record says it was that question and not the send sheet.
+    expect(refused.receipt).toEqual({
+      outcome: 'withheld',
+      why: 'declined',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 14,
+      at: at.getTime(),
+    });
 
     // The paired control, and the timing: the sheet takes a while to answer,
     // and the receipt says when the arguments LEFT — after the answer, not when
@@ -368,7 +504,7 @@ describe('an MCP call receipt', () => {
     expect(failed.receipt?.at).toBe(1_000);
   });
 
-  it('is not taken for a call refused before anything was sent', async () => {
+  it('records a call refused before anything was sent as not sent, because its server changed', async () => {
     const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
       ...acme,
       call: async () => {
@@ -380,13 +516,31 @@ describe('an MCP call receipt', () => {
 
     expect(result.isError).toBe(true);
     expect(result.output).toContain('acme.search was not sent: the server changed');
-    expect(result.receipt).toBeUndefined();
+    // Not an attempt, and nobody's refusal (#92, owner ruling OD7).
+    expect(result.receipt).toEqual({
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 9,
+      at: at.getTime(),
+    });
   });
 
-  it('is refused as not sent by a client that has no connection', async () => {
+  it('is refused as not sent by a client that has no connection, and recorded so', async () => {
     // Nothing is configured, so nothing can have left. Thrown as an ordinary
     // error this would be recorded as a failed attempt at a host never reached.
-    await expect(new McpManager().callTool('acme', 'search', {})).rejects.toBeInstanceOf(McpNotSent);
+    const client = new McpManager();
+    await expect(client.callTool('acme', 'search', {})).rejects.toBeInstanceOf(McpNotSent);
+
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
+      ...acme,
+      call: (server, name, args, signal) => client.callTool(server, name, args, signal),
+    });
+    const result = await tool.execute({ q: 'x' }, { now: () => at });
+    expect(result.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
   });
 
   it('reaches the dispatcher’s record, and a tool that runs here has none', async () => {
@@ -408,6 +562,28 @@ describe('an MCP call receipt', () => {
     expect(executed[0]?.receipt?.toolName).toBe('acme.search');
     expect(executed[1]?.isError).toBe(false);
     expect(executed[1]?.receipt).toBeUndefined();
+  });
+
+  it('keeps a record from a later build as if something left, and hands its outcome back to be shown', () => {
+    // An outcome this build has no branch for: a row a later build wrote. Every
+    // reader's `default` goes through `unhandledOutcome`, whose `never`
+    // parameter is the compile-time half; this is the runtime half.
+    const later = {
+      outcome: 'queued',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 1,
+      at: 0,
+    } as unknown as McpCallReceipt;
+    expect(mayHaveLeft(later)).toBe(true);
+    expect(unhandledOutcome(later as never)).toBe('queued');
+    expect(unhandledWhy('held-by-policy' as never)).toBe('held-by-policy');
+
+    // The paired controls: the outcomes this build knows.
+    expect(mayHaveLeft({ ...later, outcome: 'failed' } as McpCallReceipt)).toBe(true);
+    expect(mayHaveLeft({ ...later, outcome: 'withheld', why: 'declined' } as McpCallReceipt)).toBe(false);
   });
 });
 

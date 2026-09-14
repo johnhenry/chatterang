@@ -518,6 +518,104 @@ describe('the receipts a turn kept, in the transcript', () => {
     );
   });
 
+  it('prints a call that was not allowed as not sent, beside one that was sent', () => {
+    const withheld = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [call('a.example'), { ...withheld, receipt: { ...withheld.receipt, outcome: 'withheld', why: 'not-allowed' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      `${line('a.example')}.\n- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — it was not allowed.\n`,
+    );
+    expect(transcript).not.toContain('sent 12 bytes of arguments to b.example');
+  });
+
+  it('prints a destructive call that was declined as not sent, and says which question stopped it', () => {
+    const declined = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...declined, receipt: { ...declined.receipt, outcome: 'withheld', why: 'declined' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — it could change data there, and was declined.\n',
+    );
+    expect(transcript).not.toContain('it was not allowed');
+  });
+
+  it('prints a reason a later build added as not sent, with the reason as stored', () => {
+    const later = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...later, receipt: { ...later.receipt, outcome: 'withheld', why: 'held-by-policy' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — held-by-policy.\n',
+    );
+  });
+
+  it('prints a call whose server changed as not sent, and says that was why', () => {
+    const changed = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...changed, receipt: { ...changed.receipt, outcome: 'withheld', why: 'server-changed' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — the server changed before it went.\n',
+    );
+    expect(transcript).not.toMatch(/was not allowed|was declined/);
+  });
+
+  it('prints a call held back by Stop as not sent, and says the reply was stopped', () => {
+    const stopped = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...stopped, receipt: { ...stopped.receipt, outcome: 'withheld', why: 'stopped' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — the reply was stopped before it went.\n',
+    );
+  });
+
   it('still exports when a stored receipt’s time cannot be read', () => {
     // `toISOString` throws on an invalid date. One bad row must cost its own
     // timestamp, not the whole file and every `/chats/*.md` beside it.

@@ -170,14 +170,15 @@ function scriptedEngine(): unknown {
     async *stream(request: {
       readonly egress?: ToolEgressPolicy;
       readonly mcpEgress?: ToolDestinationPolicy;
+      readonly signal?: AbortSignal;
     }) {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
       if (turn.asksMcp) {
-        // What `runToolCalls` does with the policy: ask, and hand a
-        // conversation answer back to be kept.
+        // What `runToolCalls` does with the policy: ask, with the turn's
+        // signal, and hand a conversation answer back to be kept.
         const policy = request.mcpEgress;
-        const decision = await policy?.request?.(turn.asksMcp);
+        const decision = await policy?.request?.(turn.asksMcp, request.signal);
         if (decision === 'conversation') policy?.onGranted?.(turn.asksMcp.destination);
         mcpAnswers.push({ decision, granted: policy?.isGranted(turn.asksMcp.destination) });
         if (policy && turn.thenMcp) await turn.thenMcp(policy);
@@ -1042,16 +1043,139 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
   });
 
   it('is the receipt keeping it: the same empty turn without one is dropped, as before', async () => {
+    // Driven through `send`, as the not-sent cases below are. The store writes
+    // `receipt` onto every tool call it records, so a call to a tool that runs
+    // on this device carries the key with nothing in it: a check for the key
+    // rather than for a receipt would keep this version, and a row seeded
+    // without the key could not tell.
+    script = [
+      { text: '', provenance: ON_DEVICE, tool: TOOL },
+      { text: 'NEW ANSWER', provenance: ON_DEVICE },
+    ];
+    await useChats.getState().send('hello');
+    const first = assistantRow();
+    expect(first.content).toBe('');
+    expect(first.toolCalls?.map((call) => 'receipt' in call), 'the store wrote the key, empty').toEqual([true]);
+    expect(first.toolCalls?.[0]?.receipt).toBeUndefined();
+    await useChats.getState().regenerate(first.id);
+
+    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
+  });
+
+  it('is kept when a turn whose call failed after it was handed over is regenerated', async () => {
+    // A failed call may have delivered its arguments before it failed, so its
+    // record is kept for the same reason a sent one is.
+    const failed: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'failed' } };
     useChats.setState({
       messages: [
         USER,
-        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [TOOL], provenance: ON_DEVICE },
+        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [failed], provenance: ON_DEVICE },
       ],
     });
     script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
     await useChats.getState().regenerate('msg_a');
 
-    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['', 'NEW ANSWER']);
+    expect(row.variants?.[0]?.toolCalls?.[0]?.receipt?.outcome).toBe('failed');
+  });
+
+  /*
+   * NOT-SENT RECORDS SURVIVE REGENERATION (#92, owner ruling). The
+   * recommendation was to drop a version whose only records say "not sent"
+   * like any empty reply, since nothing left the device; the owner chose to
+   * keep it. The export prints its records as belonging to a version not
+   * shown — the treatment a version that did send already gets — and once.
+   */
+  it.each([
+    ['not-allowed', 'it was not allowed'],
+    ['declined', 'it could change data there, and was declined'],
+    ['server-changed', 'the server changed before it went'],
+    ['stopped', 'the reply was stopped before it went'],
+  ] as const)('is kept when a turn whose only record says a call was not sent (%s) is regenerated', async (why, reason) => {
+    const withheld: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'withheld', why } };
+    // A turn that wrote nothing but the record, as a stopped or refused one does.
+    script = [
+      { text: '', provenance: ON_DEVICE, tool: withheld },
+      { text: 'NEW ANSWER', provenance: ON_DEVICE },
+    ];
+    await useChats.getState().send('hello');
+    expect(assistantRow().content).toBe('');
+    await useChats.getState().regenerate(assistantRow().id);
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['', 'NEW ANSWER']);
+    expect(row.variantIndex).toBe(1);
+    expect(row.variants?.[0]?.toolCalls?.[0]?.receipt).toEqual(withheld.receipt);
+
+    const transcript = renderTranscript(useChats.getState().chats[0]!, useChats.getState().messages);
+    expect(transcript).toContain(
+      `\n- notes.search was not sent to notes.example (notes) at 2023-11-14 22:13:20 UTC — ${reason} (from a version of this reply not shown).\n`,
+    );
+    expect(transcript.split('notes.example').length - 1, 'printed once').toBe(1);
+  });
+
+  it('is kept when a failed regeneration whose only record says a call was not sent is regenerated again', async () => {
+    // The row shows a generation that was never appended to its list, as in
+    // "is kept when a regeneration that failed after sending is regenerated again".
+    const withheld: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'withheld', why: 'stopped' } };
+    useChats.setState({
+      messages: [
+        USER,
+        {
+          id: 'msg_a',
+          chatId: 'c1',
+          role: 'assistant',
+          content: '',
+          createdAt: 2,
+          toolCalls: [withheld],
+          error: 'This reply ended before it was complete.',
+          variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
+          variantIndex: 1,
+        },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['FIRST ANSWER', '', 'NEW ANSWER']);
+    expect(row.variants?.[1]?.toolCalls?.[0]?.receipt).toEqual(withheld.receipt);
+
+    const transcript = renderTranscript(useChats.getState().chats[0]!, useChats.getState().messages);
+    expect(transcript).toContain(
+      '\n- notes.search was not sent to notes.example (notes) at 2023-11-14 22:13:20 UTC — the reply was stopped before it went (from a version of this reply not shown).\n',
+    );
+    expect(transcript.split('notes.example').length - 1, 'printed once').toBe(1);
+  });
+
+  it('is not written down mid-turn when it records a call that was not sent', async () => {
+    // The paired control is "is written down while the turn is still running":
+    // the same held-open turn, with a receipt that says something left. The
+    // ruling that keeps a not-sent record through regeneration does not move it
+    // into this write: it is kept with the row the turn ends on.
+    const turn = heldOpen();
+    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
+    script = [{ text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, hang: turn.hang }];
+    const sending = useChats.getState().send('hello');
+    try {
+      // Polled off the store: the placeholder does not exist until `send` has
+      // written the user's turn.
+      await until(() =>
+        useChats
+          .getState()
+          .messages.some((row) => row.role === 'assistant' && (row.toolCalls?.length ?? 0) > 0),
+      );
+      for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
+      expect(storedRows().some((row) => row.streaming === true)).toBe(false);
+    } finally {
+      turn.release();
+      await sending;
+    }
+    // It is kept with the finished turn, like the rest of the generation.
+    const finished = storedRows().filter((row) => row.role === 'assistant' && !row.streaming).at(-1);
+    expect(finished?.toolCalls?.[0]?.receipt?.outcome).toBe('withheld');
   });
 
   it('is kept when a regeneration that failed after sending is regenerated again', async () => {
@@ -1091,7 +1215,8 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
           role: 'assistant',
           content: 'half a repl',
           createdAt: 2,
-          toolCalls: [TOOL],
+          // The key present and empty, as the store writes it for a local tool.
+          toolCalls: [{ ...TOOL, receipt: undefined }],
           error: 'This reply ended before it was complete.',
           variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
           variantIndex: 1,
@@ -1277,6 +1402,47 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       },
     };
   }
+
+  it('is taken down when the turn is stopped, and the turn ends', async () => {
+    // The real queue and the real policy: nothing here replaces `requestApproval`.
+    useApp.setState({ approvals: [] });
+    mcpAnswers = [];
+    script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
+    const sending = useChats.getState().send('file it');
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    expect(useApp.getState().approvals[0]?.title).toBe(mcpSendSheet(ASK).title);
+
+    useChats.getState().stop();
+
+    await vi.waitFor(() => expect(useApp.getState().approvals).toEqual([]));
+    await sending;
+    // Stop's no is the policy's answer; the dispatcher reads it off the signal.
+    expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
+    expect(grants()).toEqual([]);
+  });
+
+  it('dismisses only the stopped turn’s sheet, raises none once stopped, and lets an earlier answer stand', async () => {
+    useApp.setState({ approvals: [] });
+    const actions = () => useApp.getState().approvals.map((entry) => entry.action);
+    const other = new AbortController();
+    const stopping = new AbortController();
+    const theirs = useApp.getState().requestApproval('from another turn', undefined, other.signal);
+    const ours = useApp.getState().requestApproval('from this turn', undefined, stopping.signal);
+    expect(actions()).toEqual(['from another turn', 'from this turn']);
+
+    stopping.abort();
+    await expect(ours).resolves.toBe(false);
+    expect(actions(), 'another turn’s sheet stays').toEqual(['from another turn']);
+
+    const late = useApp.getState().requestApproval('after Stop', undefined, stopping.signal);
+    expect(actions(), 'a stopped turn raises nothing').toEqual(['from another turn']);
+    await expect(late).resolves.toBe(false);
+
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    await expect(theirs).resolves.toBe(true);
+    other.abort();
+    expect(useApp.getState().approvals).toEqual([]);
+  });
 
   it('raises the sheet `mcpSendSheet` builds, and a no sends nothing and keeps nothing', async () => {
     const prompts = await answering('no');

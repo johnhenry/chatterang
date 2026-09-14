@@ -17,7 +17,7 @@ import type {
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
 import { holdsGrant, reachPaired, type EgressGrant } from '@/domain/chat';
-import { toolRegistry } from '@/ai/tools/registry';
+import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
 import { ENGINE_PHASE, isLocalEngine, type EngineId } from '@/domain/manifest';
@@ -683,7 +683,16 @@ describe('MCP arguments do not leave the device without a grant', () => {
       expect(probe.call, target.backendId).not.toHaveBeenCalled();
       const tool = events.find((event) => event.type === 'tool');
       expect(tool?.type === 'tool' && tool.tool.output).toContain('were not sent to notes.example');
-      expect(tool?.type === 'tool' && tool.tool.receipt).toBeUndefined();
+      // Recorded as not sent, and sized as what would have gone (#92, OD7).
+      expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
+        outcome: 'withheld',
+        why: 'not-allowed',
+        serverId: PROBE_SERVER.serverId,
+        serverName: 'notes',
+        host: 'notes.example',
+        toolName: 'notes.note',
+        bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+      });
       toolRegistry.unregister(probe.tool.id);
     }
   });
@@ -693,11 +702,13 @@ describe('MCP arguments do not leave the device without a grant', () => {
     const { probe, run } = setUp();
     const request = ask('deny');
 
-    await run({ ...GRANTED_PROBE, request });
+    const events = await run({ ...GRANTED_PROBE, request });
 
     expect(probe.call).toHaveBeenCalledOnce();
     expect(probe.call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
     expect(request).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt?.outcome).toBe('sent');
   });
 
   it('is not answered by a grant for another server, or for the same server at another address', async () => {
@@ -728,9 +739,16 @@ describe('MCP arguments do not leave the device without a grant', () => {
 
   it('sends nothing when the person says no', async () => {
     const { probe, run } = setUp();
-    const request = ask('deny');
+    let answeredAt = 0;
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => {
+      // A sheet takes as long as the person does.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      answeredAt = Date.now();
+      return 'deny';
+    });
 
     const events = await run({ isGranted: () => false, request });
+    const finishedAt = Date.now();
 
     expect(request).toHaveBeenCalledOnce();
     expect(probe.call).not.toHaveBeenCalled();
@@ -738,6 +756,449 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(tool?.type === 'tool' && tool.tool.output).toBe(
       'The user did not allow sending this call’s arguments to notes.example.',
     );
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({ outcome: 'withheld', why: 'not-allowed' });
+    // The export prints this time as when the call was held back, so it is
+    // taken once the answer is in, not before the sheet opened.
+    const at = tool?.type === 'tool' ? tool.tool.receipt?.at : undefined;
+    expect(at).toBeGreaterThanOrEqual(answeredAt);
+    expect(at).toBeLessThanOrEqual(finishedAt);
+  });
+
+  it('sends nothing, and records it as not sent, when the person declines a destructive call its server was allowed', async () => {
+    // Owner ruling OD7 covers every way a person declines a call. The grant is
+    // held here, so what stops this one is the second question (OD1): whether
+    // a call the server does not call read-only may change data there.
+    const declines = async (answer: boolean) => {
+      const probe = mcpProbe({ readOnly: false });
+      probe.confirm.mockResolvedValue(answer);
+      toolRegistry.register(probe.tool);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+      toolRegistry.unregister(probe.tool.id);
+      const tool = events.find((event) => event.type === 'tool');
+      return { probe, receipt: tool?.type === 'tool' ? tool.tool.receipt : undefined };
+    };
+
+    const declined = await declines(false);
+    expect(declined.probe.confirm).toHaveBeenCalledOnce();
+    expect(declined.probe.call, 'it was not sent').not.toHaveBeenCalled();
+    expect(declined.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'declined',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+
+    // The paired control: allowed at the same confirm, it goes, and says so.
+    const allowed = await declines(true);
+    expect(allowed.probe.call).toHaveBeenCalledOnce();
+    expect(allowed.receipt?.outcome).toBe('sent');
+  });
+
+  /*
+   * STOP, WHILE A CALL WAITS ON A PERSON (#92, owner ruling OD7): nothing leaves
+   * after it, the sheet does not hold the turn open, and every call the sheet
+   * covered is recorded as not sent.
+   */
+
+  /** `running`, or a failure if it is still waiting on a sheet nobody will answer. */
+  function settled<T>(running: Promise<T>): Promise<T> {
+    return Promise.race([
+      running,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('the turn is still waiting on a sheet nobody answered')), 1000),
+      ),
+    ]);
+  }
+
+  it('sends nothing after Stop while the send sheet is open, and keeps nothing answered after', async () => {
+    const { engine, probe } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
+    const controller = new AbortController();
+    let answer: (decision: DestinationDecision) => void = () => {};
+    const request = vi.fn(
+      (_asked: DestinationRequest, _signal?: AbortSignal) =>
+        new Promise<DestinationDecision>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const onGranted = vi.fn();
+
+    const running = drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: { isGranted: () => false, request, onGranted },
+        signal: controller.signal,
+      }),
+    );
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    expect(request.mock.calls[0]![1], 'the sheet is handed the turn’s signal').toBe(controller.signal);
+
+    controller.abort();
+    // Nobody answered, and the turn still ends.
+    const events = await settled(running);
+    // An answer that arrives after Stop reaches nothing.
+    answer('conversation');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(onGranted, 'no grant is kept from a sheet answered after Stop').not.toHaveBeenCalled();
+    const receipts = events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt] : []));
+    // Both calls the sheet covered, each recorded, each sized as what would have gone.
+    expect(receipts.map((receipt) => receipt?.outcome === 'withheld' && receipt.why)).toEqual(['stopped', 'stopped']);
+    expect(receipts.map((receipt) => receipt?.bytes)).toEqual([
+      new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+      new TextEncoder().encode(JSON.stringify({ text: 'a shopping list' })).length,
+    ]);
+    expect(receipts[0]).toMatchObject({ host: 'notes.example', toolName: 'notes.note' });
+  });
+
+  it('sends nothing when the answer and Stop land in the same tick', async () => {
+    const { engine, probe } = setUp();
+    const controller = new AbortController();
+    let stoppedAt = 0;
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: {
+            isGranted: () => false,
+            request: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              stoppedAt = Date.now();
+              controller.abort();
+              return 'calls';
+            },
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+    const finishedAt = Date.now();
+
+    expect(probe.call).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+    expect(tool?.type === 'tool' && tool.tool.output).toBe(
+      'This call’s arguments were not sent to notes.example: the reply was stopped.',
+    );
+    // Stamped when Stop held it back, which the export prints.
+    const at = tool?.type === 'tool' ? tool.tool.receipt?.at : undefined;
+    expect(at).toBeGreaterThanOrEqual(stoppedAt);
+    expect(at).toBeLessThanOrEqual(finishedAt);
+  });
+
+  it('still records a call the person declined when Stop comes later in the batch', async () => {
+    // Every sheet in a batch is answered before any call runs, so a "Don’t
+    // send" is already a refusal when Stop lands — at the next server's sheet,
+    // or during a granted call queued before the declined one.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const declinedThenStopped = async (stopAt: 'sheet' | 'call') => {
+      const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+      const archive = mcpProbe({
+        serverName: 'archive',
+        serverId: 'mcp_archive',
+        serverUrl: 'https://archive.example/mcp',
+      });
+      toolRegistry.register(archive.tool);
+      const controller = new AbortController();
+      // At the sheet: notes is declined, and Stop comes while archive's is open.
+      // During the call: notes is granted and Stop comes while it runs; archive
+      // was declined before it started.
+      const request = vi.fn(async (asked: DestinationRequest): Promise<DestinationDecision> => {
+        if (stopAt === 'call') return 'deny';
+        if (asked.destination.serverId !== 'mcp_archive') return 'deny';
+        controller.abort();
+        return 'calls';
+      });
+      probe.call.mockImplementation(async () => {
+        controller.abort();
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+
+      const events = await settled(
+        drainEvents(
+          engine.stream({
+            messages: [{ role: 'user', content: 'file my note' }],
+            target: local(),
+            toolIds: [probe.tool.id, archive.tool.id],
+            mcpEgress: {
+              isGranted: (destination) => stopAt === 'call' && destination.serverId === PROBE_SERVER.serverId,
+              request,
+            },
+            signal: controller.signal,
+          }),
+        ),
+      );
+      toolRegistry.unregister(archive.tool.id);
+      const records = events.flatMap((event) =>
+        event.type === 'tool' ? [[event.tool.name, event.tool.receipt] as const] : [],
+      );
+      return { probe, archive, request, records };
+    };
+
+    const atSheet = await declinedThenStopped('sheet');
+    expect(atSheet.request).toHaveBeenCalledTimes(2);
+    expect(atSheet.probe.call).not.toHaveBeenCalled();
+    expect(atSheet.archive.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(atSheet.records.map(([name, receipt]) => [name, receipt?.outcome === 'withheld' && receipt.why])).toEqual([
+      ['notes.note', 'not-allowed'],
+      ['archive.note', 'stopped'],
+    ]);
+
+    const duringCall = await declinedThenStopped('call');
+    expect(duringCall.request).toHaveBeenCalledOnce();
+    expect(duringCall.probe.call).toHaveBeenCalledOnce();
+    expect(duringCall.archive.call).not.toHaveBeenCalled();
+    expect(duringCall.records.map(([name]) => name)).toEqual(['notes.note', 'archive.note']);
+    expect(duringCall.records[1]![1]).toMatchObject({
+      outcome: 'withheld',
+      why: 'not-allowed',
+      host: 'archive.example',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+  });
+
+  it('holds back the whole batch at Stop, and records every call in it as stopped — a granted one too', async () => {
+    // Owner ruling on #92: "not sent" covers every call that did not leave. A
+    // call to another server that was not yet asked about is recorded as
+    // stopped, and so is a call to a server the conversation already allowed,
+    // though it waited on nobody. Until the ruling that one had no record.
+    const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { engine, probe } = setUp([MCP_CALL + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://archive.example/mcp',
+    });
+    const mirror = mcpProbe({
+      serverName: 'mirror',
+      serverId: 'mcp_mirror',
+      serverUrl: 'https://mirror.example/mcp',
+    });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    const controller = new AbortController();
+    let stoppedAt = 0;
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      stoppedAt = Date.now();
+      controller.abort();
+      return 'calls';
+    });
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id],
+          mcpEgress: { isGranted: (destination) => destination.serverId === 'mcp_mirror', request },
+          signal: controller.signal,
+        }),
+      ),
+    );
+    const finishedAt = Date.now();
+
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual([PROBE_SERVER.serverId]);
+    expect(probe.call).not.toHaveBeenCalled();
+    expect(archive.call).not.toHaveBeenCalled();
+    expect(mirror.call, 'a granted call does not run after Stop').not.toHaveBeenCalled();
+    expect(mirror.confirm).not.toHaveBeenCalled();
+    const records = events.flatMap((event) =>
+      event.type === 'tool' ? [[event.tool.name, event.tool.receipt] as const] : [],
+    );
+    expect(records.map(([name, receipt]) => [name, receipt?.outcome === 'withheld' && receipt.why])).toEqual([
+      ['notes.note', 'stopped'],
+      ['archive.note', 'stopped'],
+      ['mirror.note', 'stopped'],
+    ]);
+    // Recorded against its own server, sized as what would have gone.
+    const granted = records[2]![1];
+    expect(granted).toMatchObject({
+      serverId: 'mcp_mirror',
+      serverName: 'mirror',
+      host: 'mirror.example',
+      toolName: 'mirror.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: 'copy' })).length,
+    });
+    // Stamped when Stop held it back, which the export prints.
+    expect(granted?.at).toBeGreaterThanOrEqual(stoppedAt);
+    expect(granted?.at).toBeLessThanOrEqual(finishedAt);
+    const tool = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []))[2];
+    expect(tool?.output).toBe('This call’s arguments were not sent to mirror.example: the reply was stopped.');
+  });
+
+  it('records every allowed call that had not run when Stop came during an earlier one, and sends none of them', async () => {
+    // The same ruling, the other way Stop lands: while a call runs. Every call
+    // after it was allowed before the batch started — archive by a grant the
+    // conversation held, mirror by an answer given on screen in this batch —
+    // and none of them waited on anyone when Stop came.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://archive.example/mcp',
+    });
+    const mirror = mcpProbe({
+      serverName: 'mirror',
+      serverId: 'mcp_mirror',
+      serverUrl: 'https://mirror.example/mcp',
+      readOnly: false,
+    });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    const controller = new AbortController();
+    let stoppedAt = 0;
+    let stoppedBy = 0;
+    probe.call.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      stoppedAt = Date.now();
+      controller.abort();
+      stoppedBy = Date.now();
+      // A server that does not stop when asked: the call runs on after Stop,
+      // and the records must still say when Stop landed, not when it ended.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { content: [{ type: 'text', text: 'filed' }] };
+    });
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => 'calls');
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id],
+          mcpEgress: {
+            isGranted: (destination) => destination.serverId !== 'mcp_mirror',
+            request,
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+    toolRegistry.unregister(archive.tool.id);
+    toolRegistry.unregister(mirror.tool.id);
+
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual(['mcp_mirror']);
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(archive.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(mirror.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(mirror.confirm, 'nothing is asked after Stop').not.toHaveBeenCalled();
+    const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+    expect(tools.map((tool) => [tool.name, tool.receipt?.outcome === 'withheld' ? tool.receipt.why : tool.receipt?.outcome])).toEqual([
+      ['notes.note', 'sent'],
+      ['archive.note', 'stopped'],
+      ['mirror.note', 'stopped'],
+    ]);
+    expect(tools[1]!.receipt).toMatchObject({
+      serverName: 'archive',
+      host: 'archive.example',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+    expect(tools[2]!.receipt).toMatchObject({ serverName: 'mirror', host: 'mirror.example' });
+    for (const tool of tools.slice(1)) {
+      // Stamped when Stop landed, which the export prints.
+      expect(tool.receipt?.at).toBeGreaterThanOrEqual(stoppedAt);
+      expect(tool.receipt?.at).toBeLessThanOrEqual(stoppedBy);
+      expect(tool.output).toBe(`This call’s arguments were not sent to ${tool.receipt?.host}: the reply was stopped.`);
+    }
+  });
+
+  it('sends nothing after Stop while a destructive call’s own confirm is open, even when it is answered yes after', async () => {
+    // The ruling names the send sheet; its stated effect is that nothing leaves
+    // after Stop, so the other sheet a call waits on is held to it too.
+    const probe = mcpProbe({ readOnly: false });
+    let yes: (approved: boolean) => void = () => {};
+    probe.confirm.mockImplementation(
+      (_action: string, _signal?: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          yes = resolve;
+        }),
+    );
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+    const controller = new AbortController();
+
+    const running = drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        signal: controller.signal,
+      }),
+    );
+    await vi.waitFor(() => expect(probe.confirm).toHaveBeenCalledOnce());
+    expect(probe.confirm.mock.calls[0]![1], 'the confirm is handed the turn’s signal').toBe(controller.signal);
+
+    controller.abort();
+    const events = await settled(running);
+    yes(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+      host: 'notes.example',
+    });
+    expect(tool?.type === 'tool' && tool.tool.output).toBe('notes.note was not sent: the reply was stopped.');
+  });
+
+  it('does not run the model again, or ask to send tool output, after Stop', async () => {
+    // A remote model reads the refusals only by being run again, which would
+    // first raise the tool-output sheet — after Stop.
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([MCP_CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+    const controller = new AbortController();
+    const egressRequest = vi.fn(async (_: ToolEgressRequest) => 'turn' as const);
+
+    await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: cloudTarget,
+          toolIds: [probe.tool.id],
+          egress: { isGranted: () => false, request: egressRequest },
+          mcpEgress: {
+            isGranted: () => false,
+            request: async () => {
+              controller.abort();
+              return 'calls';
+            },
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+
+    expect(probe.call).not.toHaveBeenCalled();
+    expect(egressRequest, 'no sheet is raised after Stop').not.toHaveBeenCalled();
+    expect(cloud.seen, 'the model is not run again over the refusal').toHaveLength(1);
   });
 
   it('asks once for every call to one server in a batch, and "these calls" sends exactly those', async () => {
@@ -818,8 +1279,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
     // off and on meanwhile withdraws the grant and brings back the same record
     // at the same address, so only reading the grant again at the call stops it.
     const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
-    const withdrawing = async (withdraw: boolean) => {
-      const { probe, run } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+    const withdrawing = async (withdraw: boolean, stop = false) => {
+      const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
       const archive = mcpProbe({
         serverName: 'archive',
         serverId: 'mcp_archive',
@@ -827,15 +1288,22 @@ describe('MCP arguments do not leave the device without a grant', () => {
       });
       toolRegistry.register(archive.tool);
       const held = new Set([PROBE_SERVER.serverId, 'mcp_archive']);
+      const controller = new AbortController();
       probe.call.mockImplementation(async () => {
         if (withdraw) held.delete('mcp_archive');
+        if (stop) controller.abort();
         return { content: [{ type: 'text', text: 'filed' }] };
       });
       const request = ask('conversation');
 
-      const events = await run(
-        { isGranted: (destination) => held.has(destination.serverId), request },
-        { toolIds: [probe.tool.id, archive.tool.id] },
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id],
+          mcpEgress: { isGranted: (destination) => held.has(destination.serverId), request },
+          signal: controller.signal,
+        }),
       );
       toolRegistry.unregister(archive.tool.id);
       toolRegistry.unregister(probe.tool.id);
@@ -843,10 +1311,11 @@ describe('MCP arguments do not leave the device without a grant', () => {
       return { probe, archive, request, tools };
     };
 
-    // The control: nothing withdrawn, both go, nobody asked.
+    // The control: nothing withdrawn, both go, nobody asked, both recorded as sent.
     const kept = await withdrawing(false);
     expect(kept.probe.call).toHaveBeenCalledOnce();
     expect(kept.archive.call).toHaveBeenCalledOnce();
+    expect(kept.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent', 'sent']);
 
     const withdrawn = await withdrawing(true);
     expect(withdrawn.probe.call).toHaveBeenCalledOnce();
@@ -858,6 +1327,178 @@ describe('MCP arguments do not leave the device without a grant', () => {
       'filed',
       'This call’s arguments were not sent to archive.example: this conversation’s permission for that server was withdrawn before it went.',
     ]);
+    // Recorded as not sent (#92): a grant is withdrawn only when its server is
+    // removed or switched off, so the record says the server changed.
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_archive',
+      serverName: 'archive',
+      host: 'archive.example',
+      toolName: 'archive.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    expect(withdrawn.tools[1]!.receipt).toMatchObject(notSent);
+
+    // Stop landing after the withdrawal still leaves the record behind.
+    const thenStopped = await withdrawing(true, true);
+    expect(thenStopped.archive.call).not.toHaveBeenCalled();
+    expect(thenStopped.tools.map((tool) => tool.name)).toEqual(['notes.note', 'archive.note']);
+    expect(thenStopped.tools[1]!.receipt).toMatchObject(notSent);
+  });
+
+  it('does not send a destructive call once its server’s held grant is withdrawn while its data-change confirm is up', async () => {
+    // The dispatcher reads a held grant again just before a call runs, but a
+    // destructive call then waits on its data-change confirm inside the tool,
+    // and that sheet stays up for as long as nobody answers. Switching the
+    // server off and on meanwhile withdraws the grant and brings back the same
+    // record at the same address, so the live check in `state/mcp.ts` passes;
+    // and a yes to whether data may change never answers whether the arguments
+    // may leave (#6).
+    const confirming = async (withdraw: boolean, stop = false) => {
+      const probe = mcpProbe({ readOnly: false });
+      toolRegistry.register(probe.tool);
+      const held = new Set<string>([PROBE_SERVER.serverId]);
+      const controller = new AbortController();
+      probe.confirm.mockImplementation(async () => {
+        if (withdraw) held.delete(PROBE_SERVER.serverId);
+        if (stop) controller.abort();
+        return true;
+      });
+      const request = ask('conversation');
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: { isGranted: (destination) => held.has(destination.serverId), request },
+          signal: controller.signal,
+        }),
+      );
+      toolRegistry.unregister(probe.tool.id);
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, request, tools };
+    };
+
+    // The control: nothing withdrawn, the yes sends, nobody asked, recorded as sent.
+    const kept = await confirming(false);
+    expect(kept.probe.confirm).toHaveBeenCalledOnce();
+    expect(kept.probe.call).toHaveBeenCalledOnce();
+    expect(kept.request).not.toHaveBeenCalled();
+    expect(kept.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent']);
+
+    const withdrawn = await confirming(true);
+    expect(withdrawn.probe.confirm).toHaveBeenCalledOnce();
+    expect(withdrawn.probe.call).not.toHaveBeenCalled();
+    expect(withdrawn.request).not.toHaveBeenCalled();
+    expect(withdrawn.tools.map((tool) => tool.output)).toEqual([
+      'This call’s arguments were not sent to notes.example: this conversation’s permission for that server was withdrawn before it went.',
+    ]);
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    expect(withdrawn.tools[0]!.receipt).toMatchObject(notSent);
+
+    // Stop landing at the same confirm, after the withdrawal, leaves the same record.
+    const thenStopped = await confirming(true, true);
+    expect(thenStopped.probe.call).not.toHaveBeenCalled();
+    expect(thenStopped.tools[0]!.receipt).toMatchObject(notSent);
+  });
+
+  it('records a call as not sent when its server leaves while the model is still writing it — under Stop too', async () => {
+    // Removing a server, switching one off or adding one runs `reconnect`,
+    // which takes every MCP tool out of the registry before it puts the enabled
+    // servers' back. A call the model was still writing reaches the dispatcher
+    // with nothing behind its name. It was a call to a server the request
+    // declared, and it did not go (#92, owner ruling that "not sent" covers
+    // every call that did not leave), so it is not answered as a name nothing
+    // stands behind, and Stop does not skip it silently.
+    const stopCall = '<tool_call>{"name":"x.y","arguments":{}}</tool_call>';
+    const leaving = async (leave: boolean, stop = false) => {
+      const probe = mcpProbe();
+      toolRegistry.register(probe.tool);
+      const controller = new AbortController();
+      // Runs on this device, first in the batch, and Stop lands while it runs.
+      const stopper: ChatterangTool = {
+        id: 'x.y',
+        name: 'x.y',
+        description: 'Stops the reply',
+        summary: 'Stops the reply',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => {
+          controller.abort();
+          return { output: 'stopped' };
+        },
+      };
+      if (stop) toolRegistry.register(stopper);
+      let turns = 0;
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register(
+        'scripted',
+        new FunctionBackendAdapter({
+          execute: async () => {
+            throw new Error('this backend only streams');
+          },
+          executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+            const first = turns++ === 0;
+            yield { type: 'start', sequence: 0, metadata: request.metadata };
+            yield { type: 'content', sequence: 1, delta: first ? (stop ? stopCall : '') + MCP_CALL : 'Done.' };
+            // What `reconnect` does first, while the call is still being written.
+            if (first && leave) toolRegistry.unregister(probe.tool.id);
+            yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          },
+        }),
+      );
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: stop ? [stopper.id, probe.tool.id] : [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+          signal: controller.signal,
+        }),
+      );
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, tools, turns };
+    };
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    const output = 'This call’s arguments were not sent to notes.example: the server changed before it went.';
+
+    // The control: the server stays, and the call goes.
+    const stayed = await leaving(false);
+    expect(stayed.probe.call).toHaveBeenCalledOnce();
+    expect(stayed.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent']);
+
+    const left = await leaving(true);
+    expect(left.probe.call, 'it was not sent').not.toHaveBeenCalled();
+    expect(left.tools.map((tool) => tool.output)).toEqual([output]);
+    expect(left.tools[0]!.receipt).toMatchObject(notSent);
+
+    // Stop lands while an earlier call runs: still recorded, still not sent,
+    // and the model is not run again.
+    const stopped = await leaving(true, true);
+    expect(stopped.probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(stopped.turns).toBe(1);
+    expect(stopped.tools.map((tool) => tool.name)).toEqual(['x.y', 'notes.note']);
+    expect(stopped.tools[1]!.output).toBe(output);
+    expect(stopped.tools[1]!.receipt).toMatchObject(notSent);
   });
 
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {
@@ -923,6 +1564,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(execute).not.toHaveBeenCalled();
     const tool = events.find((event) => event.type === 'tool');
     expect(tool?.type === 'tool' && tool.tool.output).toContain('does not say where its arguments would go');
+    // No destination, so no host to record a not-sent call against.
+    expect(tool?.type === 'tool' && tool.tool.receipt).toBeUndefined();
 
     // The control: the same tool under an id that does not claim to be MCP runs.
     toolRegistry.unregister('mcp:x.y');

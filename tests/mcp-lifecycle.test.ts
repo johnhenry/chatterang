@@ -75,6 +75,7 @@ const { useChats } = await import('@/state/chat');
 const { useMcp } = await import('@/state/mcp');
 const { toolRegistry } = await import('@/ai/tools/registry');
 const { runToolCalls } = await import('@/ai/middleware/tools');
+const { useApp } = await import('@/state/app');
 
 function chat(id: string, tools: string[]): Chat {
   return {
@@ -296,7 +297,13 @@ describe('a call prepared for one server', () => {
 
     const after = await held.execute({ q: 'x' }, at);
     expect(manager.callTool, 'a call built for a.example went to its successor').not.toHaveBeenCalled();
-    expect(after.receipt).toBeUndefined();
+    // Recorded as not sent, against the host it was built for (#92, OD7).
+    expect(after.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+      host: 'a.example',
+      serverId: 'mcp_a',
+    });
     expect(after.output).toContain('was not sent');
   });
 
@@ -307,7 +314,7 @@ describe('a call prepared for one server', () => {
 
     const result = await held.execute({ q: 'x' }, at);
     expect(manager.callTool).not.toHaveBeenCalled();
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({ outcome: 'withheld', why: 'server-changed' });
   });
 
   it('is not sent once the record it was built for names another address or name', async () => {
@@ -318,15 +325,108 @@ describe('a call prepared for one server', () => {
     manager.callTool.mockClear();
 
     useMcp.setState({ servers: [{ ...A, url: 'https://elsewhere.example/mcp' }] });
-    expect((await held.execute({ q: 'x' }, at)).receipt).toBeUndefined();
+    expect((await held.execute({ q: 'x' }, at)).receipt).toMatchObject({ why: 'server-changed' });
     useMcp.setState({ servers: [{ ...A, name: 'renamed' }] });
-    expect((await held.execute({ q: 'x' }, at)).receipt).toBeUndefined();
+    expect((await held.execute({ q: 'x' }, at)).receipt).toMatchObject({ why: 'server-changed' });
     expect(manager.callTool).not.toHaveBeenCalled();
 
     // The control: the record as the tool was built for it, and the call goes.
     useMcp.setState({ servers: [A] });
     expect((await held.execute({ q: 'x' }, at)).receipt?.outcome).toBe('sent');
     expect(manager.callTool).toHaveBeenCalledOnce();
+  });
+
+  it('goes nowhere, and is recorded as not sent, when its server changes while the send sheet is open', async () => {
+    // The dispatcher resolves the tool, then asks. The person answers yes —
+    // but by then the server behind the sheet has been removed and another
+    // added under its name. Through the real dispatcher and the real live check.
+    const dispatch = (change: () => Promise<void>) =>
+      runToolCalls(
+        toolRegistry,
+        [{ type: 'tool_use', id: 'call_1', name: 'notes.search', input: { q: 'bank details' } }],
+        {
+          enabledIds: ['mcp:notes.search'],
+          destinations: {
+            isGranted: () => false,
+            request: async () => {
+              await change();
+              return 'calls';
+            },
+          },
+        },
+      );
+
+    // The paired control: nothing changes while it is open, and the call goes.
+    await heldTool();
+    manager.callTool.mockClear();
+    const unchanged = await dispatch(async () => {});
+    expect(manager.callTool).toHaveBeenCalledOnce();
+    expect(unchanged.executed[0]?.receipt?.outcome).toBe('sent');
+
+    manager.callTool.mockClear();
+    const { executed } = await dispatch(async () => {
+      await useMcp.getState().remove('mcp_a');
+      await useMcp.getState().add({ name: 'notes', url: 'https://b.example/mcp' });
+    });
+    expect(manager.callTool, 'a call allowed for a.example went to its successor').not.toHaveBeenCalled();
+    expect(executed[0]?.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+      host: 'a.example',
+      serverId: 'mcp_a',
+    });
+  });
+});
+
+describe('a destructive call’s confirm when the turn is stopped', () => {
+  /**
+   * `state/mcp.ts` raises the confirm through the app's own queue, so whether
+   * Stop takes it down depends on that wiring handing the turn's signal over.
+   * Through the real registry, dispatcher and queue.
+   */
+  async function destructiveNotes() {
+    manager.listTools.mockImplementationOnce(async () =>
+      manager.state.configured.map((config) => ({
+        server: config.name,
+        name: 'search',
+        description: 'Search notes',
+        inputSchema: { type: 'object', properties: {} },
+        readOnly: false,
+        destructive: true,
+      })),
+    );
+    useMcp.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+    await useMcp.getState().reconnect();
+    useApp.setState({ approvals: [] });
+  }
+
+  const dispatch = (signal: AbortSignal) =>
+    runToolCalls(
+      toolRegistry,
+      [{ type: 'tool_use', id: 'call_1', name: 'notes.search', input: { q: 'bank details' } }],
+      { enabledIds: ['mcp:notes.search'], destinations: { isGranted: () => true }, signal },
+    );
+
+  it('is taken down by Stop, and the call goes nowhere', async () => {
+    // The paired control: the same confirm answered yes, and the call goes.
+    await destructiveNotes();
+    const answered = dispatch(new AbortController().signal);
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    expect((await answered).executed[0]?.receipt?.outcome).toBe('sent');
+    expect(manager.callTool).toHaveBeenCalledOnce();
+
+    manager.callTool.mockClear();
+    await destructiveNotes();
+    const controller = new AbortController();
+    const stopping = dispatch(controller.signal);
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    controller.abort();
+    const { executed } = await stopping;
+
+    expect(useApp.getState().approvals, 'the confirm is not left on screen').toEqual([]);
+    expect(manager.callTool).not.toHaveBeenCalled();
+    expect(executed[0]?.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped', host: 'a.example' });
   });
 });
 

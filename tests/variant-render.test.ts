@@ -518,6 +518,7 @@ describe('the record of what left follows the generation that sent it', () => {
       expect(bodyText()).toBe('REMOTE ANSWER');
       expect(receipts()).toEqual([SENT]);
       expect(toolChips(), 'and the host is in the block’s head').toEqual(['notes.example']);
+      expect(document.querySelector('.tool__head .chip')?.className).toBe('chip chip--remote');
 
       await act(async () => {
         byLabel('Next version').click();
@@ -550,6 +551,137 @@ describe('the record of what left follows the generation that sent it', () => {
           `Tried to send 30 bytes of arguments to notes.example (notes) at ${new Date(RECEIPT.at).toLocaleString()} — the call failed, so they may or may not have arrived.`,
         ]);
         expect(document.body.textContent).not.toContain('Sent 30 bytes');
+      },
+    );
+  });
+
+  it('says a call that was not allowed was not sent, and does not style it as leaving', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I could not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'The user did not allow sending this call’s arguments to notes.example.',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — it was not allowed.']);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send/);
+        expect(toolChips()).toEqual(['notes.example']);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+        const headline = document.querySelector('.tool__head')?.textContent ?? '';
+        expect(headline).toContain('not sent');
+        expect(headline, 'a call that was never sent did not fail').not.toContain('failed');
+      },
+    );
+  });
+
+  it('says a destructive call that was declined was not sent, and which question stopped it', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I did not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'The user declined that tool call.',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'declined' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual([
+          'Not sent to notes.example (notes) — it could change data there, and was declined.',
+        ]);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send|was not allowed/);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+        expect(document.querySelector('.tool__head')?.textContent ?? '').toContain('not sent');
+      },
+    );
+  });
+
+  it('says a call held back for a reason a later build added was not sent, with that reason', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I did not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'not sent',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'held-by-policy' } as unknown as McpCallReceipt,
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — held-by-policy.']);
+      },
+    );
+  });
+
+  it('says a call whose server changed while it waited was not sent, and that nobody refused it', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I could not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'notes.note was not sent: the server changed since this call was prepared',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'server-changed' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the server changed before it went.']);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send|was not allowed|was declined/);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+      },
+    );
+  });
+
+  it('says a call held back by Stop was not sent, and that the reply was stopped', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'Stopped.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'This call’s arguments were not sent to notes.example: the reply was stopped.',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'stopped' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the reply was stopped before it went.']);
+        expect(document.body.textContent).not.toMatch(
+          /Sent 30 bytes|Tried to send|was not allowed|was declined|server changed/,
+        );
       },
     );
   });

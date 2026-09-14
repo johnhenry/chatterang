@@ -26,7 +26,7 @@ import {
 } from '@/domain/manifest';
 import { deriveTitle, reachKind } from '@/domain/chat';
 import type { Reach, ToolInvocation } from '@/domain/chat';
-import type { McpCallReceipt } from '@/domain/mcp';
+import { unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 
 export interface ShellOutput {
   readonly stdout: string;
@@ -694,7 +694,9 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
                 '    changing data there. The arguments are whatever the model wrote',
                 '    from the conversation. Each call handed to a server is recorded',
                 '    in the thread and in an exported transcript: the server, its',
-                '    host, when, and how many bytes of arguments.',
+                '    host, when, and how many bytes of arguments. A call that did',
+                '    not go — declined, stopped, or refused because its server',
+                '    changed — is recorded there as not sent.',
               ]
             : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
@@ -1006,8 +1008,8 @@ export function renderTranscript(
 }
 
 /**
- * One line per call a turn handed to an MCP server, for every generation the
- * turn kept.
+ * One line per MCP call a turn recorded — handed to a server, or withheld from
+ * one — for every generation the turn kept.
  *
  * EVERY GENERATION ONCE. When the displayed generation is a record in
  * `variants`, the row's own fields are its projection (`applyVariant`), so the
@@ -1056,11 +1058,23 @@ function receiptClause(receipt: McpCallReceipt): string {
       return `${receipt.toolName} sent ${receipt.bytes} bytes of arguments to ${where} at ${when}`;
     case 'failed':
       return `${receipt.toolName} tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived`;
-    default: {
+    case 'withheld':
+      // What held it back, as the thread says it.
+      switch (receipt.why) {
+        case 'not-allowed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
+        case 'declined':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — it could change data there, and was declined`;
+        case 'server-changed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the server changed before it went`;
+        case 'stopped':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the reply was stopped before it went`;
+        default:
+          return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
+      }
+    default:
       // A new outcome has to say what it means here before this compiles.
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      return unhandledOutcome(receipt);
   }
 }
 
