@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ChatterangEngine, targetFor, type ToolEgressRequest } from '@/ai/engine';
 import { createMcpTool } from '@/ai/mcp/tools';
 import { renderPrompt } from '@/ai/prompt';
-import { getProvider } from '@/ai/providers';
+import { getProvider, PROVIDERS } from '@/ai/providers';
 import { clearForDestination, markTainted } from '@/ai/taint';
 import { runToolCalls, type DestinationRequest } from '@/ai/middleware/tools';
 import { ToolRegistry, toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
@@ -38,7 +38,9 @@ import {
   parseTypedEndpoint,
 } from '@chatterang/tunnel/pairing';
 import { isLocalEngine } from '@/domain/manifest';
+import { validateServerUrl } from '@/domain/mcp';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
+import { ProvidersPanel } from '@/features/settings/ProvidersPanel';
 import { capabilities } from '@/lib/platform';
 import {
   pairingController,
@@ -567,6 +569,20 @@ describe('the privacy command', () => {
       await privacyOutput({ mcp: [{ name: 'notes', host: 'notes.example', enabled: true }] }),
     ).toContain('Every grant to a server is dropped when it is removed or switched off.');
     expect(await privacyOutput({})).not.toContain('Every grant to a server');
+  });
+
+  it('says which server addresses it takes, localhost http included', () => {
+    // The URL hint said "https only." `validateServerUrl` has always taken plain
+    // http on localhost and 127.0.0.1, and the packaged desktop's CSP used to
+    // refuse those fetches anyway. #284 put `http:` in connect-src, so such a
+    // server now connects there too. The hint names the exception, and the
+    // validator is measured beside it so neither moves alone.
+    const PANEL = shipped('features/settings/McpPanel.tsx');
+    expect(PANEL).not.toContain('https only.');
+    expect(PANEL).toContain('Streamable HTTP endpoint. https, or localhost for development.');
+    expect(validateServerUrl('http://localhost:3000/mcp').ok).toBe(true);
+    expect(validateServerUrl('http://127.0.0.1:3000/mcp').ok).toBe(true);
+    expect(validateServerUrl('http://api.example.com/mcp').ok).toBe(false);
   });
 
   it('says a destructive call is asked about twice, what leaves first', async () => {
@@ -1291,6 +1307,14 @@ describe('the MCP send sheet', () => {
 
 /* ── The provider panel ──────────────────────────────────────────────── */
 
+/**
+ * A promise that requests stay on, or never leave, the user's network, in any
+ * of the wordings review found passing a narrower pin. Checked against the
+ * catalog's notes and against every note as the panel renders it.
+ */
+const CONTAINMENT_PROMISE =
+  /\b(?:stays?|remains?|kept|keeps?)\s+(?:inside|on|within|in)\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b|\bnever\s+leaves?\s+your\s+(?:own\s+)?(?:local\s+)?(?:network|LAN)\b/i;
+
 describe('the provider panel hints', () => {
   it('promises nothing about where a self-hosted address points', () => {
     // "Requests stay inside your network" was a promise about a URL the user
@@ -1299,6 +1323,190 @@ describe('the provider panel hints', () => {
     expect(PROVIDERS_PANEL).toContain(
       'Requests go to the address you give. Nothing here checks that it is on your network.',
     );
+  });
+
+  it('and no provider note repeats the promise the hint retracted', () => {
+    // The hint was corrected; the Ollama and LM Studio notes in
+    // `src/ai/providers.ts` kept the same sentence, and the panel renders each
+    // note under its provider and again on the add-connection sheet. #284
+    // widened how false it was: the desktop renderer may now reach any
+    // plain-http address as well as any https one, so a connection pointed off
+    // the user's network really sends the conversation there.
+    //
+    // Pinned per provider, not by a count over the file: a count of two held
+    // while LM Studio's note said "Requests stay inside your LAN." and the
+    // sentence sat on the custom endpoint's note instead.
+    const retraction =
+      'Requests go to the address you give. Nothing here checks that it is on your network.';
+    for (const id of ['ollama', 'lmstudio']) {
+      expect(getProvider(id)?.note, id).toContain(retraction);
+    }
+    // And no note, self-hosted or not, makes the promise in other words.
+    for (const provider of PROVIDERS) {
+      expect(provider.note, provider.id).not.toMatch(CONTAINMENT_PROMISE);
+    }
+  });
+
+  it('asks for an OLLAMA_ORIGINS value only where Ollama refuses this app', () => {
+    // The owner's ruling on #284: the Ollama note names the setting and the
+    // narrowest value that still starts Ollama, from this app's origin at
+    // runtime, and asks for nothing where Ollama already accepts that origin.
+    // The value is ADDED to whatever the user has set, and takes effect only on
+    // restart. `tests/ollama-origins.test.tsx` renders it and holds the measured
+    // values; this pins the sentences around them.
+    const words = (origin: string): string | null =>
+      getProvider('ollama')
+        ?.originNote?.(origin)
+        ?.map((part) => (typeof part === 'string' ? part : part.code))
+        .join('') ?? null;
+
+    expect(words('chatterang-desktop://app')).toBe(
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
+    );
+    expect(words('capacitor://localhost')).toBe(
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
+    );
+    // Ollama splits the setting on commas and keeps spaces. Measured: a space
+    // after the comma left the entry unmatched (403), and a space before
+    // `http://`, or a comma with nothing on one side, stopped Ollama starting.
+    // So the note may not invite either.
+    expect(words('chatterang-desktop://app')).toContain('with no spaces');
+    expect(words('chatterang-desktop://app')).not.toContain('anything already there');
+    // Android and the web dev server: measured 200 with nothing set, so no
+    // setting. Android's origin is every default-configured Capacitor Android
+    // app's, and the owner ruled that its note says so; the dev server's says nothing.
+    expect(words('https://localhost')).toBe(
+      'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.',
+    );
+    expect(words('http://localhost:5273')).toBeNull();
+    // Opaque: no value, and says why.
+    expect(words('null')).toBe(
+      'This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.',
+    );
+    // The retraction still leads the note.
+    expect(getProvider('ollama')?.note).toContain(
+      'Requests go to the address you give. Nothing here checks that it is on your network.',
+    );
+    // And no other provider's copy mentions Ollama's setting.
+    for (const provider of PROVIDERS) {
+      if (provider.id === 'ollama') continue;
+      expect(provider.note, provider.id).not.toContain('OLLAMA_ORIGINS');
+      expect(provider.originNote, provider.id).toBeUndefined();
+    }
+    expect(PROVIDERS_PANEL).not.toContain('OLLAMA_ORIGINS');
+  });
+
+  it('says the iOS and Android origins are shared, and to quote a value, where the panel renders one', () => {
+    // Three owner rulings on #284, pinned against the real panel at the origin it
+    // reads when it renders, not against the catalog alone.
+    //
+    // iOS: every default-configured Capacitor iOS app sends `capacitor://localhost`,
+    // so its value (the middle form, `capacitor:*//localhost`) cannot admit this
+    // app alone. The note shows the value and says so; no other origin says it.
+    //
+    // Android: every default-configured Capacitor Android app sends
+    // `https://localhost`, which Ollama allows by default. The note shows no value
+    // and says the others get in the same way; no other origin says it.
+    //
+    // Quoting: the value is typed exactly, and `*` unquoted as a zsh command
+    // argument fails with "no matches found". Shown with every value, and only
+    // with a value.
+    const shared =
+      'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+    const androidShared =
+      'Other Android apps built on the same framework send the same origin as this app by default, and Ollama already allows that origin, so they can reach Ollama the same way if they can reach the machine it runs on.';
+    const quote = 'If you set it from a shell, put the value in quotes.';
+    const ollamaAt = (
+      origin: string,
+    ): { text: string; note: string; notes: string[]; codes: string[] } => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      vi.stubGlobal('location', { origin, href: `${origin}/` });
+      const host = document.createElement('div');
+      document.body.append(host);
+      const root = createRoot(host);
+      try {
+        act(() => {
+          root.render(createElement(ProvidersPanel));
+        });
+        const item = [...host.querySelectorAll<HTMLElement>('button.list__item')].find(
+          (button) => button.querySelector('.list__title')?.textContent === 'Ollama',
+        );
+        if (!item) throw new Error(`no Ollama item at ${origin}`);
+        return {
+          text: reads(item.textContent ?? ''),
+          note: reads(item.querySelector('.list__sub')?.textContent ?? ''),
+          // Every provider's note as the panel renders it here, not as the catalog holds it.
+          notes: [...host.querySelectorAll('button.list__item .list__sub')].map((sub) =>
+            reads(sub.textContent ?? ''),
+          ),
+          codes: [...item.querySelectorAll('code')].map((code) => code.textContent ?? ''),
+        };
+      } finally {
+        act(() => root.unmount());
+        host.remove();
+        vi.unstubAllGlobals();
+      }
+    };
+
+    const ios = ollamaAt('capacitor://localhost');
+    expect(ios.codes).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
+    expect(ios.text).toContain(`Add capacitor:*//localhost to that setting. ${shared}`);
+    expect(ios.text).toContain(quote);
+    expect(ios.text).not.toContain('Other Android apps');
+
+    const desktop = ollamaAt('chatterang-desktop://app');
+    expect(desktop.codes).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
+    expect(desktop.text).not.toContain(shared);
+    expect(desktop.text).not.toContain('Other iOS apps');
+    expect(desktop.text).not.toContain('Other Android apps');
+    expect(desktop.text).toContain(quote);
+
+    // A value with no `*` is still a value to type exactly.
+    const lan = ollamaAt('http://192.168.1.10:5273');
+    expect(lan.codes).toEqual(['OLLAMA_ORIGINS', 'http://192.168.1.10:5273']);
+    expect(lan.text).toContain(quote);
+    expect(lan.text).not.toContain('Other iOS apps');
+    expect(lan.text).not.toContain('Other Android apps');
+
+    // Android: the shared sentence, with no value and nothing to quote.
+    const android = ollamaAt('https://localhost');
+    expect(android.codes).toEqual([]);
+    expect(android.text).toContain(`on your network. ${androidShared}`);
+    expect(android.text).not.toContain('OLLAMA_ORIGINS');
+
+    // No value shown: Ollama already allows the origin, or the app cannot tell.
+    for (const origin of ['https://localhost', 'http://localhost:5273', 'https://localhost:8443', 'null']) {
+      const page = ollamaAt(origin);
+      expect(page.codes.length, origin).toBeLessThan(2);
+      expect(page.text, origin).not.toContain('in quotes');
+      expect(page.text, origin).not.toContain('Other iOS apps');
+      if (origin !== 'https://localhost') {
+        expect(page.text, origin).not.toContain('Other Android apps');
+      }
+    }
+
+    // Whole, as rendered. A sentence the panel appended around the catalog's
+    // words passed every check above: quoting advice on the cannot-tell note,
+    // and "Requests never leave your network." on Ollama's.
+    const lead =
+      'A model server on your own machine or network. Requests go to the address you give. Nothing here checks that it is on your network.';
+    const add = (value: string, afterValue = ''): string =>
+      `${lead} Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add ${value} to that setting.${afterValue} If it already has a value, put a comma between them, with no spaces. ${quote} Restart Ollama for the change to take effect.`;
+    const whole: Record<string, string> = {
+      'capacitor://localhost': add('capacitor:*//localhost', ` ${shared}`),
+      'chatterang-desktop://app': add('chatterang-desktop:*//app'),
+      'http://192.168.1.10:5273': add('http://192.168.1.10:5273'),
+      'https://localhost': `${lead} ${androidShared}`,
+      'http://localhost:5273': lead,
+      'null': `${lead} This app cannot tell which origin it sends, so it cannot say what, if anything, Ollama’s OLLAMA_ORIGINS setting needs.`,
+    };
+    for (const [origin, note] of Object.entries(whole)) {
+      const page = ollamaAt(origin);
+      expect(page.note, origin).toBe(note);
+      // And no provider's note, as rendered at this origin, promises containment.
+      expect(page.notes, origin).toHaveLength(PROVIDERS.length);
+      for (const rendered of page.notes) expect(rendered, origin).not.toMatch(CONTAINMENT_PROMISE);
+    }
   });
 
   it('does not make allowing it the precondition for tool output leaving', () => {
@@ -1740,7 +1948,9 @@ describe('adding a way off the device forces the public list to change', () => {
  *   - any other directory: `src/` (the webview bundle, which cannot bind, and
  *     which `layering.test.ts` already holds to no `node:` builtin and no
  *     undeclared package such as `ws`), `scripts/`, `dev/` (whose probes do
- *     listen, on loopback, and do not ship) and generated `build/` output;
+ *     listen, only while a developer runs one, and do not ship — on loopback,
+ *     except `dev/probe-electron-csp-http`, which binds every interface so it
+ *     can measure a LAN address) and generated `build/` output;
  *   - a spelling none of the patterns match. It is a lexical scan, not a
  *     parse, and `server['lis' + 'ten']` walks straight past it.
  */

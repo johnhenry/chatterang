@@ -1,5 +1,9 @@
 import { createServer } from 'node:http';
-// The VERBATIM policy from apps/server/src/policy.ts (SERVED_CSP).
+// The policy from apps/server/src/policy.ts (SERVED_CSP), VERBATIM AS MEASURED on
+// 2026-09-13. Kept as that historical copy on purpose: the README's table is a
+// measurement of exactly this string. SERVED_CSP has since added `http:` to
+// connect-src (#284); connect-src governs neither WebAssembly compilation nor
+// worker creation, which is all this probe measures.
 const CSP = [
   "default-src 'self'", "script-src 'self'", "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:", "font-src 'self' data:",

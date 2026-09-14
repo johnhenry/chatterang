@@ -128,7 +128,7 @@ export function McpPanel(): ReactNode {
             autoCorrect="off"
             onChange={(e) => setForm({ ...form, url: e.target.value })}
           />
-          <span className="field__hint">Streamable HTTP endpoint. https only.</span>
+          <span className="field__hint">Streamable HTTP endpoint. https, or localhost for development.</span>
         </label>
 
         <label className="field">

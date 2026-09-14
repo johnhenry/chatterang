@@ -31,13 +31,22 @@ import type { InvokeResult, MainRouter } from '@chatterang/desktop/bridge';
 
 const INDEX = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
 
-/** `default-src 'self'` -> `['default-src', "'self'"]`, per directive. */
+/**
+ * `default-src 'self'` -> `['default-src', "'self'"]`, per directive.
+ *
+ * A repeated name throws rather than overwriting. A Map keeps the last clause; a
+ * browser keeps one and ignores the others. With overwriting, `"connect-src *"`
+ * written above the real clause in both policies passed the parity test, which
+ * compared the clauses after it.
+ */
 function directives(policy: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const clause of policy.split(';')) {
     const parts = clause.trim().split(/\s+/);
     const name = parts.shift();
-    if (name !== undefined && name !== '') out.set(name, parts);
+    if (name === undefined || name === '') continue;
+    if (out.has(name)) throw new Error(`${name} appears more than once in the policy`);
+    out.set(name, parts);
   }
   return out;
 }
@@ -72,8 +81,13 @@ describe('the served content-security-policy', () => {
   });
 
   it('keeps the img-src that closed the markdown-image exfiltration', () => {
-    expect(SERVED_CSP).toContain("img-src 'self' data: blob:");
-    expect(INDEX).toContain("img-src 'self' data: blob:");
+    // By parsed value, not by substring: `img-src 'self' data: blob: http:`
+    // still contains the old substring, and would reopen the channel over plain
+    // http. Nothing failed when `http:` was appended in both policies.
+    expect(directives(SERVED_CSP).get('img-src')).toEqual(["'self'", 'data:', 'blob:']);
+    const meta = /<meta http-equiv="Content-Security-Policy" content="([^"]*)"/.exec(INDEX);
+    expect(meta, 'index.html carries its meta policy').not.toBeNull();
+    expect(directives(meta?.[1] ?? '').get('img-src')).toEqual(["'self'", 'data:', 'blob:']);
   });
 
   it('sends the other four headers a served origin needs', () => {

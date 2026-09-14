@@ -83,9 +83,70 @@ const FONT_FILE_ORIGIN = 'https://fonts.gstatic.com';
  * injects style elements at runtime. Scripts have no such escape hatch, which
  * is the half that matters.
  *
- * The two font origins are the ONLY external hosts in the whole policy, and
- * they are named individually rather than as `https:` — see above for why they
- * are here at all and what removing them takes.
+ * The two font origins are the ONLY external hosts the policy names, and they
+ * are named individually rather than as `https:` — see above for why they are
+ * here at all and what removing them takes.
+ *
+ * `connect-src` IS THE OPPOSITE: IT ADMITS SCHEMES, NOT HOSTS, AND `http:` IS AN
+ * OWNER RULING (#284). The provider adapters (`src/ai/providers.ts`) run in this
+ * renderer with no main-process proxy, so this one directive decides which model
+ * servers the desktop can reach. Ollama (`http://localhost:11434`), LM Studio
+ * (`http://localhost:1234/v1`) and the custom OpenAI-compatible endpoint
+ * (`http://localhost:5001/v1`) all default to plain http, and without `http:`
+ * the packaged app refused every one of them at its default address.
+ *
+ * Asked to choose between naming the loopback origins (`http://localhost:*`,
+ * `http://127.0.0.1:*`, `http://[::1]:*`) and admitting the scheme, the owner
+ * chose the scheme, so a provider on another machine on the network is
+ * reachable too. THE COST, STATED SO IT IS NOT LOST: `https:` and `wss:` already
+ * let a compromised renderer reach any host on the internet (#168 calls that
+ * wider than the rest of the policy), and `http:` adds any plain-http host as
+ * well — every device on the user's LAN included, routers and printers and admin
+ * pages alike. CSP cannot express "private addresses only", which is why the
+ * choice was binary. It was the owner's decision, not something derived here.
+ *
+ * MEASURED, not inferred — `dev/probe-electron-csp-http/`, Electron 44.0.0 /
+ * Chrome 152, pages on the real `chatterang-desktop://app` scheme under the
+ * shipped permission handler, fetching a permissive-CORS server on this machine:
+ *
+ *                            before #284      this policy    no CSP
+ *     127.0.0.1              refused by CSP   works          works
+ *     localhost              refused by CSP   works          works
+ *     LAN, 192.168/16        refused by CSP   works          works
+ *     CGNAT, 100.64/10       refused by CSP   works          works
+ *
+ * So the refusal was the policy's alone, and the ruling reaches the network
+ * hosts it was made for: the scheme is `secure: true`, yet Chromium's
+ * mixed-content block did not fire from it. The same fetches from a genuinely
+ * `https:` page WERE refused as mixed content for both non-loopback addresses —
+ * the control showing the probe would have seen that block. One Chromium
+ * version's behaviour, not a documented guarantee; rerun the probe on upgrade.
+ *
+ * WHAT STILL REFUSES, AND IS NOT OURS: every request carries
+ * `Origin: chatterang-desktop://app`, and a stock Ollama 0.34.0 answers it with
+ * 403 (it accepts loopback web origins and `app://`) until the user sets
+ * `OLLAMA_ORIGINS`. Not to that exact origin, though: measured, an exact value
+ * on this scheme stops Ollama 0.34.0 from starting, and where a `*` sits decides
+ * what else it admits (`dev/probe-electron-csp-http/README.md`). Per the owner's
+ * ruling on #284, the Ollama note shows the value, derived from the page's origin
+ * by `ollamaOriginsSetting` (`src/ai/providers.ts`), and only where Ollama needs
+ * one. That is the provider's CORS; nothing in this policy moves it.
+ *
+ * NOT `ws:`. A plaintext loopback socket is #168's question, with its own
+ * options and its own argument for naming origins narrowly. This ruling does not
+ * answer it, and `tests/desktop-security.test.ts` fails if `ws:` appears here.
+ *
+ * This moves what the page is PERMITTED to reach, not what the app sends: a
+ * provider request still goes only to a connection the user added, at the
+ * address that connection holds.
+ *
+ * IT REACHES MCP TOO. The MCP transport also fetches from the renderer, and
+ * `validateServerUrl` (`src/domain/mcp.ts`) has always taken plain http on
+ * `localhost` and `127.0.0.1`. The old policy refused those servers in a
+ * packaged build; `http:` lets them connect, so the McpPanel hint that said
+ * "https only." now names the localhost exception. The owner ruled on #284 to
+ * keep it: those servers work here, behind the same per-server MCP grant as a
+ * remote server (refs #6), and MCP tools stay sensitive.
  */
 export const CSP_PRODUCTION = [
   "default-src 'self'",
@@ -93,7 +154,7 @@ export const CSP_PRODUCTION = [
   `style-src 'self' 'unsafe-inline' ${FONT_STYLE_ORIGIN}`,
   "img-src 'self' data: blob:",
   `font-src 'self' data: ${FONT_FILE_ORIGIN}`,
-  "connect-src 'self' https: wss:",
+  "connect-src 'self' https: wss: http:",
   "object-src 'none'",
   "frame-src 'none'",
   "base-uri 'self'",
