@@ -39,7 +39,7 @@
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
-import type { PairingWindow } from '../pairing/index.js';
+import { isOpenedWindow, type PairingWindow } from '../pairing/index.js';
 
 /** 16 bytes of device id: an identifier, not a secret, and never reused. */
 const DEVICE_ID_BYTES = 16;
@@ -59,6 +59,12 @@ const CREDENTIAL_SHAPE = /^([A-Za-z0-9_-]{22})\.[A-Za-z0-9_-]{43}$/;
  */
 const UNKNOWN_DEVICE = randomBytes(DIGEST_BYTES);
 
+/**
+ * What `revoke` writes over a digest before deleting it: zero bytes, which no
+ * digest is, so `verify` refuses it on width alone.
+ */
+const TOMBSTONE = new Uint8Array(0);
+
 declare const CREDENTIALS_BRAND: unique symbol;
 
 /**
@@ -71,7 +77,14 @@ declare const CREDENTIALS_BRAND: unique symbol;
 export interface CredentialStore {
   /** The digest stored for a device, or undefined if there is none. */
   get(deviceId: string): Promise<Uint8Array | undefined>;
-  /** Store a device's digest. Never called with the credential itself. */
+  /**
+   * Store a device's digest. Never called with the credential itself.
+   *
+   * ALSO CALLED WITH AN EMPTY ARRAY, by `revoke`, before it deletes: a
+   * TOMBSTONE, which `verify` refuses because it is not a digest's width. A
+   * store must keep what it is given, the empty array included, so a revocation
+   * whose delete fails is still a revocation after a restart.
+   */
   set(deviceId: string, digest: Uint8Array): Promise<void>;
   /** Forget a device. Resolves true if there was a digest to forget. */
   delete(deviceId: string): Promise<boolean>;
@@ -129,6 +142,13 @@ export interface DeviceCredentials {
    * refusal, and a store whose delete fails still leaves the device refused for
    * the life of the process — the rejection is rethrown, the device is not let
    * back in.
+   *
+   * AND IT OUTLIVES THE PROCESS. Before the delete, the digest is overwritten
+   * with a tombstone (see {@link CredentialStore.set}), so a delete that fails
+   * leaves a row no registry over the same store will accept — not the digest a
+   * restarted registry, with an empty `revoked` set, would let back in. The
+   * delete's failure is still rethrown, since the store is not in the state
+   * the caller asked for.
    */
   revoke(deviceId: string): Promise<boolean>;
   /**
@@ -169,6 +189,11 @@ export function createDeviceCredentials(store: CredentialStore): DeviceCredentia
 
   return {
     async mint(window, now) {
+      // A window `openWindow` made, not an object that answers `claimed`: the
+      // brand is a type, and this is the same question asked at runtime.
+      if (!isOpenedWindow(window)) {
+        throw new Error('tunnel: a device credential is minted only against a pairing window.');
+      }
       if (window.state(now) !== 'claimed') {
         throw new Error('tunnel: a device credential is minted only for a pairing that completed.');
       }
@@ -207,6 +232,10 @@ export function createDeviceCredentials(store: CredentialStore): DeviceCredentia
       revoked.add(deviceId);
       const closing = Promise.allSettled([...watchers].map((watcher) => watcher(deviceId)));
       try {
+        // The tombstone first, so the delete below failing is not the digest
+        // surviving. Its own failure is not fatal: the delete that follows is
+        // what removes the digest, and a delete that fails too is rethrown.
+        await store.set(deviceId, TOMBSTONE).catch(() => undefined);
         return await store.delete(deviceId);
       } finally {
         await closing;

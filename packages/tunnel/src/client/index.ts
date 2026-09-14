@@ -40,6 +40,7 @@ import { assertSendable, createSequenceGuard, faultMessage } from '../stream/ind
 import {
   TUNNEL_CAP_CLOSE_CODE,
   TUNNEL_CREDENTIAL_HEADER,
+  TUNNEL_PAIRING_CLOSED_CLOSE_CODE,
   TUNNEL_PAIRING_ONLY_CLOSE_CODE,
   TUNNEL_WIRE_VERSION,
   decodeFrame,
@@ -250,6 +251,16 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
         kind: 'abnormal',
         code: 'PAIRING_ONLY',
         message: 'the other device accepted this connection only to pair',
+      });
+      return;
+    }
+    // And the window, which is a different fault: the code this connection was
+    // let in under is no longer shown. Pairing again needs a new code.
+    if (event.code === TUNNEL_PAIRING_CLOSED_CLOSE_CODE) {
+      finish({
+        kind: 'abnormal',
+        code: 'PAIRING_WINDOW_CLOSED',
+        message: 'the pairing code this connection was let in under is no longer shown',
       });
       return;
     }

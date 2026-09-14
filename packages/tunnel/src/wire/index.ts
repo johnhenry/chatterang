@@ -101,7 +101,8 @@ export const TUNNEL_CAP_CLOSE_CODE = 4503;
 
 /**
  * The close code for a PAIRING-ONLY tunnel that tried to carry something other
- * than the pairing exchange, or whose pairing window has closed (#136).
+ * than the pairing exchange, or more of it than a pairing needs (#136). A
+ * pairing window that closed is {@link TUNNEL_PAIRING_CLOSED_CLOSE_CODE}.
  *
  * A phone with no device credential reaches the listener only while the
  * desktop is showing a pairing code, and then only for the exchange. 4000 plus
@@ -109,6 +110,18 @@ export const TUNNEL_CAP_CLOSE_CODE = 4503;
  * Here rather than in the host for the reason {@link TUNNEL_CAP_CLOSE_CODE} is.
  */
 export const TUNNEL_PAIRING_ONLY_CLOSE_CODE = 4403;
+
+/**
+ * The close code for a PAIRING-ONLY tunnel whose pairing window has closed
+ * (#136): the code it was admitted under expired, was dismissed or replaced, or
+ * another connection completed the pairing — or this one did, and its time to
+ * receive the credential is over.
+ *
+ * Its own code, not {@link TUNNEL_PAIRING_ONLY_CLOSE_CODE}: a phone whose code
+ * ran out mid-exchange did nothing it may not do, and telling it otherwise
+ * sends its user looking for the wrong fault. 4000 plus HTTP's 410 Gone.
+ */
+export const TUNNEL_PAIRING_CLOSED_CLOSE_CODE = 4410;
 
 /**
  * The request header a paired device presents its credential in (#135, #136).

@@ -27,7 +27,8 @@
  * {@link TunnelBinding} that cannot be written without a credential gate on
  * either arm, a per-device credential checked at the HTTP upgrade before `ws`
  * writes a byte, and a pairing-only admission that exists only while a pairing
- * window is open. Rung 0 (#156) runs on top of it, on loopback. NO APP STARTS
+ * window is open and ends when that window closes, whether or not it is sending
+ * anything. Rung 0 (#156) runs on top of it, on loopback. NO APP STARTS
  * IT. What still has to exist before one may is AT LEAST this, and #158 holds
  * the whole gate: somewhere the paired-device registry persists (#133 — the
  * store here is an interface, and its one implementation forgets on exit),
@@ -42,12 +43,15 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, Server } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
 import type { Duplex } from 'node:stream';
+import { clearTimeout, setTimeout } from 'node:timers';
 
-import type { PairingWindow, PairingWindows } from '../pairing/index.js';
+import type { ClaimOutcome, PairingWindow, PairingWindows } from '../pairing/index.js';
 import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
 import {
+  MAX_FRAME_BYTES,
   TUNNEL_CAP_CLOSE_CODE,
   TUNNEL_CREDENTIAL_HEADER,
+  TUNNEL_PAIRING_CLOSED_CLOSE_CODE,
   TUNNEL_PAIRING_ONLY_CLOSE_CODE,
   TUNNEL_WIRE_VERSION,
   decodeFrame,
@@ -63,6 +67,61 @@ export type { TlsMaterial } from './tls.js';
 export { createDeviceCredentials, createMemoryCredentialStore } from './credential.js';
 export type { CredentialStore, DeviceCredentials, MintedCredential } from './credential.js';
 
+/*
+ * WHAT A CONNECTION THAT PRESENTED NOTHING MAY HOLD (#136, #169).
+ *
+ * A pairing tunnel is the one kind of connection nobody has authenticated, so
+ * everything it can take is bounded here, one named constant per limit, as
+ * #169's recommendation asks. They are the listener's and not the caller's,
+ * unlike `maxTunnels`: one code is on screen at a time and one phone pairs
+ * against it, whichever app is listening.
+ */
+
+/**
+ * Pairing tunnels held at once, across the listener.
+ *
+ * SEPARATE FROM `maxTunnels`, and the separation is the point. When the two
+ * shared one cap, a stranger who opened every slot while a code was on screen
+ * and then sent nothing kept every paired phone out — measured in review, with
+ * the phone's valid credential closed with `TUNNEL_CAP_CLOSE_CODE`. Two, so a
+ * phone whose first socket died mid-exchange can reconnect while the dead one
+ * is still being closed.
+ */
+export const MAX_PAIRING_TUNNELS = 2;
+
+/**
+ * The largest message a pairing tunnel may send, in bytes, enforced by `ws`
+ * before it buffers the message. A CPace step and its confirmation are well
+ * under a kilobyte. `MAX_FRAME_BYTES` is 8 MiB, and allowing that to a peer
+ * nobody has authenticated is letting it put 8 MiB per message into the
+ * process that holds every paired device's tunnel.
+ *
+ * 16 KiB, written as a literal: esbuild keeps an unused `16 * 1024` in the
+ * server's bundle (an operator is not provably free of side effects) and drops
+ * an unused literal. See `tls.ts`'s header.
+ */
+export const MAX_PAIRING_FRAME_BYTES = 16_384;
+
+/**
+ * Frames a pairing tunnel may have waiting unread. A pairing is a handful of
+ * messages taken in turn, so a peer that queues more than this is not pairing,
+ * and is closed with `TUNNEL_PAIRING_ONLY_CLOSE_CODE` rather than buffered.
+ * Before this bound, 64 MiB of `pair` frames sent to a pairing tunnel nobody
+ * was reading were all accepted and the tunnel stayed open.
+ */
+export const MAX_PAIRING_BACKLOG = 16;
+
+/**
+ * How long the tunnel that claimed a window keeps its pairing channel after
+ * the claim, in milliseconds on the gate's clock: the time to mint the
+ * credential and hand it over (#135).
+ *
+ * A BOUND, NOT A GRACE. #136 closes the window on a completed pairing, so the
+ * claim ends every OTHER pairing tunnel under the window in that turn, and
+ * this one when the handover time runs out, whether or not either is sending.
+ */
+export const PAIRING_HANDOVER_MS = 10_000;
+
 /**
  * Why a tunnel was let in, which decides what it may carry (#135, #136).
  *
@@ -70,7 +129,11 @@ export type { CredentialStore, DeviceCredentials, MintedCredential } from './cre
  *     device from here on. Revoking the device closes it.
  *   - `pairing`: it presented nothing, while a pairing code was on screen. It
  *     may carry the pairing exchange — `hello`, `pair` and `bye` — and nothing
- *     else, and only while `window` is still live or has been claimed. It is
+ *     else, and only while its PAIRING CHANNEL is open: while `window` is
+ *     `issued`, and once it is `claimed`, only for the tunnel that claimed it
+ *     through `claim`, for {@link PAIRING_HANDOVER_MS}. When the channel
+ *     closes the listener ends the tunnel at once with
+ *     `TUNNEL_PAIRING_CLOSED_CLOSE_CODE`, without waiting for a frame. It is
  *     never promoted: a phone that finishes pairing reconnects with the
  *     credential it was given.
  */
@@ -78,8 +141,20 @@ export type TunnelAdmission =
   | { readonly kind: 'device'; readonly deviceId: string }
   | {
       readonly kind: 'pairing';
-      /** The window this tunnel was admitted under, so the caller claims THAT one. */
+      /** The window this tunnel was admitted under. */
       readonly window: PairingWindow;
+      /**
+       * Claim `window` FOR THIS TUNNEL, on the gate's clock.
+       *
+       * This is how the listener knows which connection completed the
+       * pairing, and so which one may stay to receive its credential. A claim
+       * that succeeds ends every other pairing tunnel under the window in the
+       * same turn. A window claimed any other way — `window.claim(...)`
+       * called directly — has nobody to attribute it to, and every pairing
+       * tunnel under it ends: a completed pairing nobody can place fails
+       * closed. Throws on a tunnel that has already ended.
+       */
+      claim(presented: Uint8Array): ClaimOutcome;
     };
 
 /*
@@ -135,12 +210,20 @@ export interface Tunnel {
   /**
    * Send one frame to this tunnel's peer.
    *
-   * On a PAIRING tunnel a frame outside the exchange, or any frame once the
-   * window it was admitted under has expired or been cancelled, is not sent:
-   * the tunnel ends as PAIRING_ONLY or PAIRING_WINDOW_CLOSED and this rejects.
+   * On a PAIRING tunnel a frame outside the exchange is not sent: the tunnel
+   * ends as PAIRING_ONLY and this rejects. Nor is any frame once the tunnel's
+   * pairing channel has closed (see {@link TunnelAdmission}): the tunnel ends
+   * as PAIRING_WINDOW_CLOSED, if the listener has not ended it already, and
+   * this rejects.
    */
   send(frame: TunnelFrame): Promise<void>;
-  /** Frames from this peer, in arrival order, until the tunnel closes. */
+  /**
+   * Frames from this peer, in arrival order, until the tunnel closes.
+   *
+   * A frame that arrives after the tunnel has ended, or after this side began
+   * closing it, is not delivered. A tunnel whose DEVICE WAS REVOKED delivers
+   * nothing more at all, including frames that were already queued (#135).
+   */
   receive(): AsyncIterable<TunnelFrame>;
   /**
    * Say `bye` to this peer and drop its connection. Every other tunnel, and
@@ -287,6 +370,10 @@ export interface TunnelHostOptions {
    * loopback is the protocol's fault and nothing else's. The gate is not one of
    * the variables it removes — rung 0 runs through the real one, with a test
    * credential minted by a real pairing window.
+   *
+   * DEVICES ONLY. A connection with no credential is refused with 401 even
+   * while a pairing code is shown: rung 0's host is its one tunnel, and a
+   * pairing tunnel is not a tunnel that host can be.
    */
   readonly binding: LoopbackTunnelBinding;
   /**
@@ -303,7 +390,8 @@ export interface TunnelListenerOptions {
   /** As {@link TunnelHostOptions.greeting}: device tunnels only. */
   readonly greeting?: readonly TunnelFrame[];
   /**
-   * The most tunnels this listener holds at once. REQUIRED, WITH NO DEFAULT.
+   * The most DEVICE tunnels this listener holds at once. REQUIRED, WITH NO
+   * DEFAULT.
    *
    * How many phones an app serves at once is that app's decision, and a number
    * picked here would be a decision made in the one place that cannot see the
@@ -313,8 +401,11 @@ export interface TunnelListenerOptions {
    * A connection past the cap is closed with `TUNNEL_CAP_CLOSE_CODE` before
    * anything is sent to it or read from it. A slot frees when a socket closes,
    * not when its tunnel is classified — a peer that said `bye` and kept its
-   * socket open is still holding a connection. Pairing tunnels count against
-   * it like any other.
+   * socket open is still holding a connection.
+   *
+   * PAIRING TUNNELS DO NOT COUNT AGAINST IT. They have their own cap,
+   * {@link MAX_PAIRING_TUNNELS}, enforced the same way, so a connection that
+   * presented nothing can never hold a paired phone's slot.
    *
    * WHAT IS NOT HERE: replacing a device's stale socket with its new one, the
    * #169 recommendation this does not build. Device identity exists now
@@ -329,6 +420,37 @@ type Socket = import('ws').WebSocket;
 /** What a pairing tunnel may carry: the exchange, its opening, and its end. */
 const PAIRING_KINDS: ReadonlySet<TunnelFrame['kind']> = new Set(['hello', 'pair', 'bye']);
 
+/** Why a tunnel is refused, in the host's words and in the wire's. */
+interface Refusal {
+  readonly code: string;
+  readonly message: string;
+  readonly closeCode: number;
+}
+
+const PAIRING_CHANNEL_CLOSED: Refusal = {
+  code: 'PAIRING_WINDOW_CLOSED',
+  message: 'the pairing code this tunnel was admitted under is no longer shown',
+  closeCode: TUNNEL_PAIRING_CLOSED_CLOSE_CODE,
+};
+
+/** A tunnel, with the two ways the listener ends one that `Tunnel` does not offer. */
+interface OpenedTunnel {
+  readonly tunnel: Tunnel;
+  /** End it as refused, with the refusal's close code. Safe to repeat. */
+  refuse(refused: Refusal): void;
+  /**
+   * End it because its device was revoked (#135). In THIS turn: no frame
+   * already queued is handed out again, `receive()` yields nothing more, and
+   * nothing still arriving is read. Then it closes with `bye` reason `revoked`.
+   *
+   * `close()` alone leaves queued frames readable — right for a tunnel that is
+   * merely ending, and wrong for one whose device is no longer trusted. #135's
+   * ruling asks revocation to purge the queue; this inbox is the queue there is
+   * today.
+   */
+  revoke(): Promise<void>;
+}
+
 /**
  * One connection's tunnel, over a socket that has already been admitted.
  *
@@ -340,11 +462,16 @@ function openTunnel(
   socket: Socket,
   admission: TunnelAdmission,
   greeting: readonly TunnelFrame[],
-  now: () => number,
-): Tunnel {
+  /** For a pairing tunnel, whether its pairing channel has closed. Null for a device. */
+  channelClosed: (() => Refusal | null) | null,
+): OpenedTunnel {
   const inbox: TunnelFrame[] = [];
   let wake: (() => void) | null = null;
   let ended: TunnelClose | null = null;
+  /** Set in the turn `close()` is first called, before its `bye` has flushed. */
+  let closingStarted = false;
+  /** Set in the turn this tunnel's device is revoked. */
+  let revoked = false;
   const guard = createSequenceGuard();
 
   let settle!: () => void;
@@ -373,40 +500,32 @@ function openTunnel(
 
   /**
    * THE PAIRING TUNNEL'S RULE, IN BOTH DIRECTIONS (#136): the exchange and
-   * nothing else, and only while the window that let it in is still live or
-   * has been claimed. A `claimed` window is allowed on purpose — the credential
-   * is handed over after the claim, on this tunnel. `expired` and `cancelled`
-   * are the code no longer being shown, and "reachable only while the desktop
-   * shows a code" covers a tunnel already open as much as one arriving.
+   * nothing else, and only while its pairing channel is open. When that is,
+   * see {@link TunnelAdmission}; the answer is the listener's `channelClosed`.
    *
-   * Evaluated when a frame moves, never scheduled, for the reason `window.ts`
-   * gives: a timer does not fire on a sleeping machine. A pairing tunnel that
-   * sends nothing holds its slot until the caller closes it or the listener
-   * does.
+   * Asked when a frame moves, and not only then. The listener also ends a
+   * pairing tunnel the moment its window closes, on a timer at the window's
+   * deadline, and at every upgrade — so a pairing tunnel that sends nothing
+   * does not outlive its code. It is still asked here because a timer does not
+   * fire on a sleeping machine, for the reason `window.ts` gives.
    */
-  const refusal = (frame: TunnelFrame): { code: string; message: string } | null => {
-    if (admission.kind !== 'pairing') return null;
+  const refusal = (frame: TunnelFrame): Refusal | null => {
+    if (channelClosed === null) return null;
     if (!PAIRING_KINDS.has(frame.kind)) {
       return {
         code: 'PAIRING_ONLY',
         message: `a tunnel admitted to pair may carry only the pairing exchange, not a ${frame.kind} frame`,
+        closeCode: TUNNEL_PAIRING_ONLY_CLOSE_CODE,
       };
     }
-    const state = admission.window.state(now());
-    if (state === 'expired' || state === 'cancelled') {
-      return {
-        code: 'PAIRING_WINDOW_CLOSED',
-        message: 'the pairing code this tunnel was admitted under is no longer shown',
-      };
-    }
-    return null;
+    return channelClosed();
   };
 
-  const refuse = (refused: { code: string; message: string }): void => {
-    finish({ kind: 'abnormal', ...refused });
+  const refuse = (refused: Refusal): void => {
+    finish({ kind: 'abnormal', code: refused.code, message: refused.message });
     // `close`, not `terminate`: the code is the phone's only way to tell a
-    // refusal from a cut. See `TUNNEL_PAIRING_ONLY_CLOSE_CODE`.
-    socket.close(TUNNEL_PAIRING_ONLY_CLOSE_CODE, 'pairing only');
+    // refusal from a cut. See the two pairing close codes in `wire/`.
+    socket.close(refused.closeCode, refused.closeCode === TUNNEL_PAIRING_CLOSED_CLOSE_CODE ? 'pairing closed' : 'pairing only');
   };
 
   if (admission.kind === 'device') {
@@ -417,6 +536,15 @@ function openTunnel(
   }
 
   socket.on('message', (data: Buffer) => {
+    /*
+     * NOTHING MORE IS READ FROM A TUNNEL THAT IS OVER. Once it has ended, or
+     * this side has begun closing it, a frame still arriving is dropped rather
+     * than queued: the host has already decided about this peer. Measured in
+     * review before this line existed: fifty `turn` frames a phone sent in the
+     * same turn its device was revoked all reached `receive()`, while the
+     * revocation's `bye` was still flushing.
+     */
+    if (ended !== null || closingStarted) return;
     let frame: TunnelFrame;
     try {
       frame = decodeFrame(new Uint8Array(data));
@@ -440,6 +568,15 @@ function openTunnel(
     const refused = refusal(frame);
     if (refused) {
       refuse(refused);
+      return;
+    }
+    // A pairing tunnel's unread frames are bounded. See `MAX_PAIRING_BACKLOG`.
+    if (channelClosed !== null && inbox.length >= MAX_PAIRING_BACKLOG) {
+      refuse({
+        code: 'PAIRING_BACKLOG',
+        message: `a tunnel admitted to pair queued more than ${String(MAX_PAIRING_BACKLOG)} unread frames`,
+        closeCode: TUNNEL_PAIRING_ONLY_CLOSE_CODE,
+      });
       return;
     }
     // Contiguity, enforced. See the client's, which carries the argument.
@@ -497,7 +634,7 @@ function openTunnel(
 
   let closing: Promise<void> | null = null;
 
-  return {
+  const tunnel = {
     admission,
     async send(frame) {
       assertSendable(frame);
@@ -510,7 +647,9 @@ function openTunnel(
     },
     async *receive() {
       for (;;) {
-        while (inbox.length > 0) yield inbox.shift()!;
+        // A revoked device's frames are not handed out, not even the ones
+        // already queued when it was revoked. See `revoke` below.
+        while (inbox.length > 0 && !revoked) yield inbox.shift()!;
         if (ended) return;
         await new Promise<void>((resolve) => {
           wake = () => {
@@ -523,6 +662,9 @@ function openTunnel(
     ended: () => ended,
     closed,
     close(reason) {
+      // In the turn `close` is called, before the `bye` below has flushed:
+      // from here on nothing this peer sends is read. See the message handler.
+      closingStarted = true;
       closing ??= (async () => {
         // The obligation, from this side: say `bye` before going (#260).
         if (socket.readyState === socket.OPEN) {
@@ -552,6 +694,17 @@ function openTunnel(
       return closing;
     },
   } satisfies Tunnel;
+
+  return {
+    tunnel,
+    refuse,
+    revoke() {
+      // One latch, read by `receive`. Nothing more is read into the inbox
+      // either: `close` below sets `closingStarted` in this same turn.
+      revoked = true;
+      return tunnel.close('revoked');
+    },
+  };
 }
 
 /**
@@ -563,8 +716,11 @@ function openTunnel(
  * guessing.
  */
 type Decision =
-  | { readonly admit: TunnelAdmission }
+  | { readonly admit: { readonly kind: 'device'; readonly deviceId: string } }
+  | { readonly admit: { readonly kind: 'pairing'; readonly window: PairingWindow } }
   | { readonly refuse: 400 | 401 | 503 };
+
+type Admit = Extract<Decision, { readonly admit: unknown }>['admit'];
 
 /**
  * THE GATE, AT THE UPGRADE (#135, #136). In this order, each step final:
@@ -581,10 +737,11 @@ type Decision =
  *    wrong — it is verified, and a failure is 401. It never falls through to
  *    pairing: a phone whose credential was revoked is not quietly offered the
  *    pairing exchange instead.
- * 3. NO CREDENTIAL: admitted ONLY while a pairing window is `issued` — asked in
- *    the turn that admits — and then only to pair. Otherwise 401.
+ * 3. NO CREDENTIAL: admitted ONLY by a listener that holds pairing tunnels at
+ *    all (rung 0's host does not), ONLY while a pairing window is `issued` —
+ *    asked in the turn that admits — and then only to pair. Otherwise 401.
  */
-async function decide(request: IncomingMessage, gate: TunnelGate): Promise<Decision> {
+async function decide(request: IncomingMessage, gate: TunnelGate, pairs: boolean): Promise<Decision> {
   if (request.url !== '/') return { refuse: 400 };
 
   const presented = request.headers[TUNNEL_CREDENTIAL_HEADER];
@@ -598,6 +755,7 @@ async function decide(request: IncomingMessage, gate: TunnelGate): Promise<Decis
     return deviceId === null ? { refuse: 401 } : { admit: { kind: 'device', deviceId } };
   }
 
+  if (!pairs) return { refuse: 401 };
   // No window at all is a refusal here. Whether a window is still `issued` is
   // asked ONCE, in the turn that admits (see `settle`), because deciding takes
   // turns of the event loop and the answer can change in them — and a second
@@ -683,6 +841,24 @@ interface Bound {
 }
 
 /**
+ * What the listener knows about a pairing window that the window does not
+ * (#136): which tunnels it let in, which of them claimed it, and when.
+ */
+interface PairingRecord {
+  readonly window: PairingWindow;
+  /** The pairing tunnels admitted under it whose sockets have not closed. */
+  readonly tunnels: Set<OpenedTunnel>;
+  /** The tunnel inside its admission's `claim` right now, so a claim can be placed. */
+  attempting: OpenedTunnel | null;
+  /** The tunnel whose `claim` succeeded. Null under a claimed window means nobody's. */
+  claimant: OpenedTunnel | null;
+  /** When the claim landed, on the gate's clock. */
+  claimedAt: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+  unsubscribe: () => void;
+}
+
+/**
  * Bind, and hand each admitted connection's tunnel to `admit` SYNCHRONOUSLY.
  *
  * Synchronous because {@link createTunnelHost} needs to know about its one
@@ -690,7 +866,12 @@ interface Bound {
  * in the same turn that tunnel ends. A queue in between would leave a gap in
  * which a second peer could be admitted to a host that is already over.
  */
-async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) => void): Promise<Bound> {
+async function listen(
+  options: TunnelListenerOptions,
+  admit: (tunnel: Tunnel) => void,
+  /** {@link MAX_PAIRING_TUNNELS} for a listener; 0 for rung 0's host, which admits devices only. */
+  maxPairingTunnels: number,
+): Promise<Bound> {
   const { maxTunnels, binding } = options;
   // Fails closed. A cap of 0, NaN or 1.5 is a caller's mistake, and clamping it
   // to something would hide the mistake behind a number nobody chose.
@@ -711,9 +892,18 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
    * `once('error')` added afterwards could run. With `noServer` the server's
    * events are this file's alone. This is the `ws` README's own pattern, and
    * so is authenticating in the `upgrade` handler before `handleUpgrade`.
+   *
+   * TWO OF THEM, ONE PER KIND OF ADMISSION, for one setting: `maxPayload`, the
+   * largest message `ws` will buffer before handing it over, is per server. A
+   * device gets the codec's own limit, `MAX_FRAME_BYTES`, rather than `ws`'s
+   * 100 MiB default, and a connection that presented nothing gets
+   * `MAX_PAIRING_FRAME_BYTES`. Past either, `ws` refuses the message itself
+   * (close 1009) and the tunnel ends as FRAME_INVALID.
    */
-  const sockets = new WebSocketServer({ noServer: true });
-  const live = new Set<Tunnel>();
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
+  const pairingSockets = new WebSocketServer({ noServer: true, maxPayload: MAX_PAIRING_FRAME_BYTES });
+  const live = new Set<OpenedTunnel>();
+  const windows = new Map<PairingWindow, PairingRecord>();
   /**
    * Upgrades the gate has not finished with: a credential still being
    * verified, or a refusal still being written. `listener.close()` destroys
@@ -724,17 +914,186 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
   const pending = new Set<Duplex>();
   let accepting = true;
 
+  /**
+   * IS THIS PAIRING TUNNEL'S CHANNEL CLOSED? The one answer, asked when a frame
+   * moves, when its window closes, when its timer fires and at every upgrade.
+   *
+   *   - `issued`: open, for every tunnel admitted under the window.
+   *   - `claimed`: open ONLY for the tunnel that claimed it through its
+   *     admission's `claim`, and only for PAIRING_HANDOVER_MS after the claim.
+   *     This used to be open for every tunnel under a claimed window, with no
+   *     end: in review, a stranger who connected beside the real phone still
+   *     sent and received `pair` frames an hour after the phone had paired.
+   *   - `expired` or `cancelled`: closed.
+   *
+   * `state()` is asked on the gate's clock, and that call is also what latches
+   * an expiry and so tells the window's watchers, this listener among them.
+   */
+  const channelClosed = (record: PairingRecord, opened: OpenedTunnel): Refusal | null => {
+    const now = gate.now();
+    const state = record.window.state(now);
+    if (state === 'issued') return null;
+    if (
+      state === 'claimed' &&
+      record.claimant === opened &&
+      record.claimedAt !== null &&
+      now < record.claimedAt + PAIRING_HANDOVER_MS
+    ) {
+      return null;
+    }
+    return PAIRING_CHANNEL_CLOSED;
+  };
+
+  /**
+   * A TIMER AT THE NEXT DEADLINE: the window's expiry while it is `issued`,
+   * the claimant's handover while it is `claimed`. It only ever ENDS tunnels,
+   * and only by asking {@link channelClosed} when it fires, so a timer that
+   * fires late — a machine that slept — ends them late, and one that fires
+   * before the gate's clock reaches the deadline sets itself again. The
+   * latched window decides; the timer makes sure somebody asks.
+   */
+  const schedule = (record: PairingRecord): void => {
+    if (record.timer !== null) clearTimeout(record.timer);
+    record.timer = null;
+    if (!accepting || record.tunnels.size === 0) return;
+    const now = gate.now();
+    const state = record.window.state(now);
+    const deadline =
+      state === 'issued'
+        ? record.window.expiresAt
+        : state === 'claimed' && record.claimant !== null && record.claimedAt !== null
+          ? record.claimedAt + PAIRING_HANDOVER_MS
+          : null;
+    if (deadline === null || deadline <= now) return;
+    const timer = setTimeout(() => {
+      record.timer = null;
+      sweep(record);
+    }, deadline - now);
+    // The listener's server keeps the process alive; a pairing deadline must not.
+    timer.unref();
+    record.timer = timer;
+  };
+
+  /** End every tunnel under `record` whose pairing channel has closed, then set its next timer. */
+  const sweep = (record: PairingRecord): void => {
+    for (const opened of [...record.tunnels]) {
+      const refused = channelClosed(record, opened);
+      if (refused) opened.refuse(refused);
+    }
+    schedule(record);
+  };
+
+  /** A pairing tunnel's socket closed: forget it, and its window once nothing is left under it. */
+  const forget = (record: PairingRecord, opened: OpenedTunnel): void => {
+    record.tunnels.delete(opened);
+    if (record.tunnels.size > 0) return;
+    if (record.timer !== null) clearTimeout(record.timer);
+    record.timer = null;
+    record.unsubscribe();
+    windows.delete(record.window);
+  };
+
   /*
    * REVOCATION CLOSES LIVE TUNNELS, NOT ONLY THE NEXT CONNECT (#135, #169).
-   * Each of the device's tunnels says `bye` with the reason and goes through
-   * its own close, which leaves every other tunnel and the listener running.
+   * Each of the device's tunnels — every one, not the first — is revoked:
+   * its queue dropped and its reading stopped in this turn, then `bye` with
+   * the reason through its own close, which leaves every other tunnel and the
+   * listener running.
    */
   const unwatch = gate.credentials.watchRevocations(async (deviceId) => {
     const revoked = [...live].filter(
-      (tunnel) => tunnel.admission.kind === 'device' && tunnel.admission.deviceId === deviceId,
+      ({ tunnel }) => tunnel.admission.kind === 'device' && tunnel.admission.deviceId === deviceId,
     );
-    await Promise.all(revoked.map((tunnel) => tunnel.close('revoked')));
+    await Promise.all(revoked.map((opened) => opened.revoke()));
   });
+
+  /**
+   * An upgraded socket, admitted. Called in the turn `handleUpgrade` completes.
+   */
+  const connect = (socket: Socket, decided: Admit): void => {
+    /*
+     * THE CAP, AT ACCEPT TIME, AND FIRST (#169). Before the greeting and before
+     * anything that reads from the socket, so a refused peer is told the code
+     * and nothing else, and no frame it sends is ever read into anything.
+     *
+     * ONE CAP PER KIND: devices against `maxTunnels`, pairing tunnels against
+     * `maxPairingTunnels`, so neither kind can take the other's slots.
+     */
+    const held = [...live].filter(({ tunnel }) => tunnel.admission.kind === decided.kind).length;
+    if (held >= (decided.kind === 'device' ? maxTunnels : maxPairingTunnels)) {
+      // A refused socket belongs to no tunnel, and its protocol errors must not
+      // throw either. See `openTunnel`'s `error` handler for why they would.
+      socket.on('error', () => undefined);
+      socket.close(TUNNEL_CAP_CLOSE_CODE, 'tunnel limit reached');
+      return;
+    }
+
+    if (decided.kind === 'device') {
+      const opened = openTunnel(socket, decided, options.greeting ?? [], null);
+      live.add(opened);
+      // The SOCKET closing frees the slot, not the tunnel being classified; see
+      // `maxTunnels`.
+      socket.on('close', () => live.delete(opened));
+      admit(opened.tunnel);
+      return;
+    }
+
+    const { window } = decided;
+    const existing = windows.get(window);
+    const record: PairingRecord = existing ?? {
+      window,
+      tunnels: new Set(),
+      attempting: null,
+      claimant: null,
+      claimedAt: null,
+      timer: null,
+      unsubscribe: () => undefined,
+    };
+    let opened!: OpenedTunnel;
+    const admission: TunnelAdmission = {
+      kind: 'pairing',
+      window,
+      claim(presented) {
+        if (opened.tunnel.ended() !== null) {
+          throw new Error('tunnel: this pairing tunnel has ended, and cannot claim a pairing window.');
+        }
+        // Attributed for the length of the call: a successful claim tells the
+        // window's watchers in the same turn, and they read `attempting`.
+        record.attempting = opened;
+        try {
+          return window.claim(presented, gate.now());
+        } finally {
+          record.attempting = null;
+        }
+      },
+    };
+    opened = openTunnel(socket, admission, [], () => channelClosed(record, opened));
+    live.add(opened);
+    record.tunnels.add(opened);
+    socket.on('close', () => {
+      live.delete(opened);
+      forget(record, opened);
+    });
+    if (existing === undefined) {
+      windows.set(window, record);
+      /*
+       * THE WINDOW CLOSING ENDS ITS TUNNELS, IN THAT TURN (#136). A code
+       * dismissed or replaced, a budget spent, or a claim: each latches the
+       * window, which calls this. Before it, a pairing tunnel that sent nothing
+       * outlived its code until the listener restarted — and, sharing the
+       * device cap, locked paired phones out for as long.
+       */
+      record.unsubscribe = window.onClose((state) => {
+        if (state === 'claimed') {
+          record.claimant = record.attempting;
+          record.claimedAt = gate.now();
+        }
+        sweep(record);
+      });
+    }
+    schedule(record);
+    admit(opened.tunnel);
+  };
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     /*
@@ -752,6 +1111,11 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
       socket.destroy();
       return;
     }
+    // Every pairing window asked on the gate's clock before anything else is
+    // decided, so one that ran out while its timer had not fired yet — or
+    // could not, on a machine that slept — ends its tunnels now.
+    for (const record of [...windows.values()]) sweep(record);
+
     socket.on('error', ignoreSocketError);
     pending.add(socket);
     socket.once('close', () => pending.delete(socket));
@@ -767,7 +1131,7 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
         refuseUpgrade(socket, decision.refuse);
         return;
       }
-      const { admit: admission } = decision;
+      const { admit: decided } = decision;
       /*
        * THE LAST WORD, IN THE TURN THAT ADMITS. Deciding took turns of the
        * event loop; handing the socket to `ws` below does not. So the two
@@ -787,9 +1151,9 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
        * test fails.
        */
       const stale =
-        admission.kind === 'device'
-          ? gate.credentials.isRevoked(admission.deviceId)
-          : admission.window.state(gate.now()) !== 'issued';
+        decided.kind === 'device'
+          ? gate.credentials.isRevoked(decided.deviceId)
+          : decided.window.state(gate.now()) !== 'issued';
       if (stale) {
         refuseUpgrade(socket, 401);
         return;
@@ -799,38 +1163,18 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
       /*
        * With no `verifyClient`, `handleUpgrade` reaches its callback
        * synchronously (`completeUpgrade` in `ws/lib/websocket-server.js`), so
-       * `connection` — and the tunnel joining `live`, where revocation can find
-       * it — runs in this same turn.
+       * `connect` — and the tunnel joining `live`, where revocation and the
+       * window's watcher can find it — runs in this same turn.
        */
-      sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit('connection', ws, request, admission));
+      (decided.kind === 'device' ? sockets : pairingSockets).handleUpgrade(request, socket, head, (ws) =>
+        connect(ws, decided),
+      );
     };
 
     // A gate that throws — a store that cannot be read — admits nobody. 503,
     // not 401: a paired phone told "unauthorized" would conclude it was
     // revoked, and it was not.
-    decide(request, gate).then(settle, () => settle({ refuse: 503 }));
-  });
-
-  sockets.on('connection', (socket: Socket, _request: IncomingMessage, admission: TunnelAdmission) => {
-    /*
-     * THE CAP, AT ACCEPT TIME, AND FIRST (#169). Before the greeting and before
-     * anything that reads from the socket, so a refused peer is told the code
-     * and nothing else, and no frame it sends is ever read into anything.
-     */
-    if (live.size >= maxTunnels) {
-      // A refused socket belongs to no tunnel, and its protocol errors must not
-      // throw either. See `openTunnel`'s `error` handler for why they would.
-      socket.on('error', () => undefined);
-      socket.close(TUNNEL_CAP_CLOSE_CODE, 'tunnel limit reached');
-      return;
-    }
-
-    const tunnel = openTunnel(socket, admission, options.greeting ?? [], gate.now);
-    live.add(tunnel);
-    // The SOCKET closing frees the slot, not the tunnel being classified; see
-    // `maxTunnels`.
-    socket.on('close', () => live.delete(tunnel));
-    admit(tunnel);
+    decide(request, gate, maxPairingTunnels > 0).then(settle, () => settle({ refuse: 503 }));
   });
 
   // A busy port rejects rather than hanging, as `apps/server/src/index.ts`'s
@@ -868,8 +1212,15 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
         for (const socket of pending) socket.destroy();
         pending.clear();
         unwatch();
+        // No pairing deadline outlives the listener, and no window it watched
+        // keeps calling into it.
+        for (const record of windows.values()) {
+          if (record.timer !== null) clearTimeout(record.timer);
+          record.timer = null;
+          record.unsubscribe();
+        }
         // Every open tunnel says `bye` and goes, each through its own close.
-        await Promise.all([...live].map((tunnel) => tunnel.close(reason)));
+        await Promise.all([...live].map(({ tunnel }) => tunnel.close(reason)));
 
         /*
          * `closeAllConnections()` BEFORE `server.close()`, and this is the bug
@@ -889,8 +1240,10 @@ async function listen(options: TunnelListenerOptions, admit: (tunnel: Tunnel) =>
          * never asked to upgrade.
          */
         sockets.clients.forEach((client) => client.terminate());
+        pairingSockets.clients.forEach((client) => client.terminate());
         server.closeAllConnections();
         await new Promise<void>((resolve) => sockets.close(() => resolve()));
+        await new Promise<void>((resolve) => pairingSockets.close(() => resolve()));
         await new Promise<void>((resolve) => server.close(() => resolve()));
       })();
       return closing;
@@ -920,10 +1273,14 @@ export async function createTunnelListener(options: TunnelListenerOptions): Prom
     for (const wake of waiters.splice(0)) wake();
   };
 
-  const bound = await listen(options, (tunnel) => {
-    queue.push(tunnel);
-    wakeAll();
-  });
+  const bound = await listen(
+    options,
+    (tunnel) => {
+      queue.push(tunnel);
+      wakeAll();
+    },
+    MAX_PAIRING_TUNNELS,
+  );
 
   return {
     server: bound.server,
@@ -956,7 +1313,9 @@ export async function createTunnelListener(options: TunnelListenerOptions): Prom
  * THROUGH THE SAME GATE, and rung 0 gets in with a TEST CREDENTIAL: its tests
  * open a pairing window, claim it and mint a device credential exactly as a
  * desktop would, and its client presents that credential in the header. There
- * is no ungated door for a test to use and a caller to find later.
+ * is no ungated door for a test to use and a caller to find later. It admits
+ * no pairing tunnel: its one tunnel is the host, and a pairing tunnel is not
+ * one.
  */
 export async function createTunnelHost(options: TunnelHostOptions): Promise<TunnelHost> {
   let tunnel: Tunnel | null = null;
@@ -972,18 +1331,22 @@ export async function createTunnelHost(options: TunnelHostOptions): Promise<Tunn
     settle = resolve;
   });
 
-  const bound = await listen({ ...options, maxTunnels: 1 }, (admitted) => {
-    tunnel = admitted;
-    arrive();
-    void admitted.closed.then(() => {
-      // Stop admitting in the turn the tunnel ends, before the next connection
-      // or upgrade can be read, so a caller that awaits `closed` never races
-      // the listener: a new connection is refused, and one already mid-request
-      // is dropped at its upgrade. See `Bound.stopAccepting`.
-      bound.stopAccepting();
-      settle();
-    });
-  });
+  const bound = await listen(
+    { ...options, maxTunnels: 1 },
+    (admitted) => {
+      tunnel = admitted;
+      arrive();
+      void admitted.closed.then(() => {
+        // Stop admitting in the turn the tunnel ends, before the next connection
+        // or upgrade can be read, so a caller that awaits `closed` never races
+        // the listener: a new connection is refused, and one already mid-request
+        // is dropped at its upgrade. See `Bound.stopAccepting`.
+        bound.stopAccepting();
+        settle();
+      });
+    },
+    0,
+  );
 
   return {
     server: bound.server,

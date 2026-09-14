@@ -107,26 +107,60 @@ At the HTTP upgrade, before `ws` writes a byte:
    gets 503.
 3. **No credential:** the connection is admitted only while a pairing window is
    `issued`, and only as a *pairing tunnel* (#136). It may carry `hello`,
-   `pair` and `bye` in either direction, and only while its window is live or
-   claimed. Anything else closes it with `TUNNEL_PAIRING_ONLY_CLOSE_CODE`
-   (4403), which the client reports as `PAIRING_ONLY`. A pairing tunnel is
-   never promoted: a phone that finishes pairing reconnects with its
-   credential. With no window open, the connection gets 401.
+   `pair` and `bye` in either direction, and anything else closes it with
+   `TUNNEL_PAIRING_ONLY_CLOSE_CODE` (4403), which the client reports as
+   `PAIRING_ONLY`. A pairing tunnel is never promoted: a phone that finishes
+   pairing reconnects with its credential. With no window open, the connection
+   gets 401. `createTunnelHost` (rung 0) admits no pairing tunnel at all.
 
 What changed while the gate was deciding is asked again in the turn that
 admits. `listener.close()` destroys an upgrade the gate has not finished with.
 
+**A pairing tunnel ends with its code**, whether or not it is sending
+anything. It closes with `TUNNEL_PAIRING_CLOSED_CLOSE_CODE` (4410), which the
+client reports as `PAIRING_WINDOW_CLOSED`:
+
+- **The window closing ends it in that turn.** That covers a code dismissed or
+  replaced, a spent attempt budget, or a claim. The window tells the listener
+  through `PairingWindow.onClose`.
+- **Expiry is evaluated, not scheduled** (`pairing/window.ts`). The listener
+  asks on a timer at the deadline, at every upgrade, and whenever a frame
+  moves. A timer that fires late, on a machine that slept, closes late; the
+  latched window decides.
+- **A claim is attributed.** The caller claims through the tunnel,
+  `admission.claim(secret)`. That tunnel keeps its channel for
+  `PAIRING_HANDOVER_MS` (10 s) to receive its credential, and every other
+  pairing tunnel under the window ends at once. A window claimed directly,
+  with no tunnel to attribute it to, ends every pairing tunnel under it.
+
+What a pairing tunnel can hold is bounded, one named constant per limit
+(#169):
+
+- `MAX_PAIRING_TUNNELS` (2) is its own cap. Pairing tunnels never count
+  against `maxTunnels`, so a stranger on the LAN cannot keep a paired phone out
+  by holding slots.
+- `MAX_PAIRING_FRAME_BYTES` (16 KiB) is enforced by `ws` before it buffers a
+  message. A device's limit is the codec's `MAX_FRAME_BYTES`, where `ws`'s
+  default was 100 MiB.
+- `MAX_PAIRING_BACKLOG` (16) caps unread frames. Past it the tunnel closes
+  with 4403.
+
 **The credential** (#135) comes from `createDeviceCredentials(store)`:
 
-- `mint(window, now)` mints only for a `claimed` pairing window, once per
-  window. The credential is `<deviceId>.<secret>`, 16 and 32 random bytes,
-  base64url, and it is returned once.
+- `mint(window, now)` mints only for a `claimed` pairing window that
+  `openWindow` made (`PairingWindow` is branded, and `isOpenedWindow` checks
+  the same at runtime), once per window. The credential is
+  `<deviceId>.<secret>`, 16 and 32 random bytes, base64url, and it is returned
+  once.
 - The store keeps SHA-256 of it, keyed by device id. That is enough for a
   256-bit random secret, where a password would need a slow KDF.
 - The comparison is `timingSafeEqual` over the two digests.
-- `revoke(deviceId)` refuses the device at once, even if the store's delete
-  then fails. It closes the device's live tunnels with `bye` reason `revoked`
-  and deletes the digest.
+- `revoke(deviceId)` refuses the device at once. In the same turn it drops
+  every frame each of the device's tunnels had queued and stops reading from
+  them. It then closes every one of those tunnels with `bye` reason `revoked`.
+  Finally it writes a zero-byte tombstone over the digest and deletes it. If
+  the delete fails, the rejection is rethrown and the device stays refused,
+  including by a registry opened over the same store after a restart.
 - `CredentialStore` is an interface. `createMemoryCredentialStore` forgets
   everything on exit.
 
@@ -197,13 +231,11 @@ re-issued from the same key serves the same one.
   confines a pairing tunnel to it. The steps it carries are not defined here:
   the CPace messages, confirmation, and handing the minted credential to the
   phone under the session key.
-- **The rest of what revocation owes.** Purging a revoked device's queued turns
-  (#196) needs the queue, which waits on #7. On the headless server, revoking
-  the operator token must invalidate every credential minted under it (#135),
-  and nothing ties the two together yet.
-- **A bound on a silent pairing tunnel.** Its window is checked whenever a
-  frame moves, never on a timer. A pairing tunnel that sends nothing holds its
-  slot after the code is gone, until the caller or the listener closes it.
+- **The rest of what revocation owes.** A revoked tunnel's unread frames are
+  dropped, but purging a revoked device's queued *turns* (#196) needs the turn
+  queue, which waits on #7. On the headless server, revoking the operator
+  token must invalidate every credential minted under it (#135), and nothing
+  ties the two together yet.
 - **What a tunnelled turn may use and how its prompts reach the phone** (#170),
   and the surface declaration asserted before binding.
 - **Frame kinds.** `TunnelFrame['kind']` became a union in #159. `pair` joined

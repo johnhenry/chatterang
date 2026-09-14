@@ -2443,6 +2443,12 @@ describe('a listening socket forces the privacy copy to change', () => {
     // and a Map. Neither opens a socket; the listener that consults them does.
     createDeviceCredentials: 'binds nothing',
     createMemoryCredentialStore: 'binds nothing',
+    // The bounds on a connection that presented nothing (#136, #169): numbers
+    // the listener reads. None of them opens anything.
+    MAX_PAIRING_TUNNELS: 'binds nothing',
+    MAX_PAIRING_FRAME_BYTES: 'binds nothing',
+    MAX_PAIRING_BACKLOG: 'binds nothing',
+    PAIRING_HANDOVER_MS: 'binds nothing',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [

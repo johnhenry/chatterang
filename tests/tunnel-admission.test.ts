@@ -1,29 +1,40 @@
 // @vitest-environment node
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { X509Certificate, createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import type { TLSSocket } from 'node:tls';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WebSocket as RawSocket } from 'ws';
 
 import { createTunnelClient } from '@chatterang/tunnel/client';
 import {
+  MAX_PAIRING_BACKLOG,
+  MAX_PAIRING_FRAME_BYTES,
+  MAX_PAIRING_TUNNELS,
+  PAIRING_HANDOVER_MS,
   asTlsMaterial,
   createDeviceCredentials,
   createMemoryCredentialStore,
+  createTunnelHost,
   createTunnelListener,
   type CredentialStore,
+  type DeviceCredentials,
   type Tunnel,
   type TunnelBinding,
   type TunnelGate,
+  type TunnelListener,
   type TunnelListenerOptions,
 } from '@chatterang/tunnel/host';
-import { openWindow } from '@chatterang/tunnel/pairing';
+import { openWindow, type PairingWindow } from '@chatterang/tunnel/pairing';
 import {
+  MAX_FRAME_BYTES,
+  TUNNEL_CAP_CLOSE_CODE,
   TUNNEL_CREDENTIAL_HEADER,
+  TUNNEL_PAIRING_CLOSED_CLOSE_CODE,
   TUNNEL_PAIRING_ONLY_CLOSE_CODE,
   TUNNEL_WIRE_VERSION,
   decodeFrame,
@@ -146,6 +157,30 @@ async function connect(
 function peerOf(outcome: Outcome): Peer {
   if (!('peer' in outcome)) throw new Error(`expected an upgrade, got ${JSON.stringify(outcome)}`);
   return outcome.peer;
+}
+
+/**
+ * The listener's end of the NEXT TCP connection, so a test can wait until the
+ * listener has read bytes a peer sent without reading the frames itself.
+ * Register before connecting.
+ */
+function nextServerSocket(listener: TunnelListener): Promise<Socket> {
+  return new Promise<Socket>((resolveSocket) => listener.server.once('connection', resolveSocket));
+}
+
+/**
+ * Bytes a client frame of this encoding occupies on the wire: a 2-byte header
+ * and a 4-byte mask, for a payload under 126 bytes, which every frame this is
+ * used for is.
+ */
+function wireBytes(frames: readonly Uint8Array[]): number {
+  for (const frame of frames) expect(frame.byteLength).toBeLessThan(126);
+  return frames.reduce((total, frame) => total + frame.byteLength + 6, 0);
+}
+
+function pairingAdmission(tunnel: Tunnel): Extract<Tunnel['admission'], { kind: 'pairing' }> {
+  if (tunnel.admission.kind !== 'pairing') throw new Error('expected a pairing tunnel');
+  return tunnel.admission;
 }
 
 /**
@@ -455,37 +490,265 @@ describe('pairing, only while a code is shown (#136)', () => {
     expect(await connect(port)).toEqual({ status: 401 });
   });
 
-  it('a live pairing tunnel whose code is dismissed or expires ends at its next frame; a claimed one does not', async () => {
+  it('a pairing tunnel ends the moment its code is dismissed or replaced, while it sends nothing', async () => {
+    /*
+     * #136: reachable only while the desktop shows a code. A silent pairing
+     * tunnel used to be checked only when a frame moved, so in review it
+     * outlived a dismissed code for as long as the listener ran.
+     */
     const gate = testGate();
     const { port, incoming } = await listen(gate);
 
-    // Claimed: the credential is handed over after the claim, on this tunnel.
-    const claimed = gate.showCode();
-    const claimedPeer = peerOf(await connect(port));
-    const claimedTunnel = await nextTunnel(incoming);
-    claimed.window.claim(claimed.secret, gate.clock.now);
-    claimedPeer.socket.send(encodeFrame(PAIR));
-    expect((await claimedTunnel.receive()[Symbol.asyncIterator]().next()).value).toEqual(PAIR);
-    await claimedTunnel.send(PAIR);
-    expect(claimedTunnel.ended()).toBeNull();
-
-    // Dismissed.
     gate.showCode();
     const dismissedPeer = peerOf(await connect(port));
     const dismissed = await nextTunnel(incoming);
     gate.pairing.cancel();
-    dismissedPeer.socket.send(encodeFrame(PAIR));
-    expect(await dismissedPeer.closeCode).toBe(TUNNEL_PAIRING_ONLY_CLOSE_CODE);
+    // In the turn the code is dismissed: no await between the two.
     expect(dismissed.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+    expect(await dismissedPeer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
 
-    // Expired, and the desktop's own send is refused the same way.
-    const expiring = gate.showCode(1_000);
-    const expiredPeer = peerOf(await connect(port));
-    const expired = await nextTunnel(incoming);
-    gate.clock.now = expiring.window.expiresAt;
-    await expect(expired.send(PAIR)).rejects.toThrow(/no longer shown/);
-    expect(await expiredPeer.closeCode).toBe(TUNNEL_PAIRING_ONLY_CLOSE_CODE);
-    expect(expiredPeer.frames).toEqual([]);
+    gate.showCode();
+    const replacedPeer = peerOf(await connect(port));
+    const replaced = await nextTunnel(incoming);
+    gate.showCode();
+    expect(replaced.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+    expect(await replacedPeer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect([...dismissedPeer.frames, ...replacedPeer.frames]).toEqual([]);
+  });
+
+  it('a silent pairing tunnel ends when its code expires, on a timer, with nothing else happening', async () => {
+    /*
+     * A 20 ms window on the test's clock, so the listener's timer is due in
+     * 20 ms of real time. If it fires before the clock is moved it asks, finds
+     * the window still issued, and sets itself again — so this waits on the
+     * close it means, not on a race with the timer.
+     */
+    const gate = testGate();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode(20);
+    const peer = peerOf(await connect(port));
+    const tunnel = await nextTunnel(incoming);
+    gate.clock.now = code.window.expiresAt;
+    expect(await peer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect(tunnel.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+  });
+
+  it('and at the next upgrade of anyone, if its timer has not fired', async () => {
+    /*
+     * The default window, so the timer is two minutes away and cannot be what
+     * ends it. A DEVICE connects — the gate never asks a device about the
+     * window — so the only thing left that asks is the sweep at the upgrade.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode();
+    const peer = peerOf(await connect(port));
+    const tunnel = await nextTunnel(incoming);
+    gate.clock.now = code.window.expiresAt;
+    expect(tunnel.ended()).toBeNull();
+
+    peerOf(await connect(port, { credential: a.credential }));
+    expect(await peer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect(tunnel.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+  });
+
+  it('and at its next frame, the desktop sending included', async () => {
+    const gate = testGate();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode();
+    const peer = peerOf(await connect(port));
+    const tunnel = await nextTunnel(incoming);
+    gate.clock.now = code.window.expiresAt;
+    await expect(tunnel.send(PAIR)).rejects.toThrow(/no longer shown/);
+    expect(await peer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect(peer.frames).toEqual([]);
+  });
+
+  it('the tunnel that claims keeps its channel for the handover, and every other pairing tunnel under the window ends at once', async () => {
+    /*
+     * Measured in review before this: a stranger connected beside the real
+     * phone, the phone's pairing claimed the window, and an hour later the
+     * stranger's tunnel still carried `pair` frames both ways. A claim is now
+     * made THROUGH the tunnel, so the listener knows whose it was.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode();
+    const phonePeer = peerOf(await connect(port));
+    const phone = await nextTunnel(incoming);
+    const strangerPeer = peerOf(await connect(port));
+    const stranger = await nextTunnel(incoming);
+
+    expect(pairingAdmission(phone).claim(code.secret)).toEqual({ ok: true, state: 'claimed' });
+    // The stranger, silent, ends in the claim's own turn.
+    expect(stranger.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+    expect(await strangerPeer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+
+    // The claimant still carries the exchange both ways: its credential goes back on it.
+    phonePeer.socket.send(encodeFrame(PAIR));
+    expect((await phone.receive()[Symbol.asyncIterator]().next()).value).toEqual(PAIR);
+    gate.clock.now += PAIRING_HANDOVER_MS - 1;
+    await phone.send(PAIR);
+    await eventually(() => phonePeer.frames.length === 1);
+    expect(phone.ended()).toBeNull();
+
+    // Until the handover is spent on the gate's clock — asked here by the next upgrade.
+    gate.clock.now += 1;
+    peerOf(await connect(port, { credential: a.credential }));
+    expect(await phonePeer.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect(phone.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+  });
+
+  it('a window claimed directly, with no tunnel to attribute it to, ends every pairing tunnel under it', async () => {
+    const gate = testGate();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode();
+    const first = peerOf(await connect(port));
+    await nextTunnel(incoming);
+    const second = peerOf(await connect(port));
+    await nextTunnel(incoming);
+
+    expect(code.window.claim(code.secret, gate.clock.now).ok).toBe(true);
+    expect(await first.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+    expect(await second.closeCode).toBe(TUNNEL_PAIRING_CLOSED_CLOSE_CODE);
+  });
+
+  it('a pairing tunnel that has ended cannot claim, and the window stays open for one that can', async () => {
+    const gate = testGate();
+    const { port, incoming } = await listen(gate);
+    const code = gate.showCode();
+    const peer = peerOf(await connect(port));
+    const tunnel = await nextTunnel(incoming);
+    peer.socket.terminate();
+    await tunnel.closed;
+
+    expect(() => pairingAdmission(tunnel).claim(code.secret)).toThrow(/has ended/);
+    expect(code.window.state(gate.clock.now)).toBe('issued');
+  });
+
+  it("pairing tunnels have their own cap, and never hold a paired phone's slot", async () => {
+    /*
+     * Measured in review before this: with `maxTunnels: 2`, two silent peers
+     * that connected while a code was shown kept a paired phone out — its valid
+     * credential was admitted and then closed with the cap code — until the
+     * listener restarted.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate, { maxTunnels: 1 });
+    gate.showCode();
+
+    for (let i = 0; i < MAX_PAIRING_TUNNELS; i += 1) {
+      peerOf(await connect(port));
+      expect((await nextTunnel(incoming)).admission.kind).toBe('pairing');
+    }
+    const over = peerOf(await connect(port));
+    expect(await over.closeCode).toBe(TUNNEL_CAP_CLOSE_CODE);
+
+    // Every pairing slot is taken, and the one device slot is still the phone's.
+    const phone = peerOf(await connect(port, { credential: a.credential }));
+    expect((await nextTunnel(incoming)).admission).toEqual({ kind: 'device', deviceId: a.deviceId });
+    phone.socket.send(encodeFrame(chunk(0, 'still mine')));
+    expect(phone.socket.readyState).toBe(phone.socket.OPEN);
+  });
+
+  it('a pairing tunnel may not send a message past MAX_PAIRING_FRAME_BYTES; a device may', async () => {
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const filler = 'A'.repeat(MAX_PAIRING_FRAME_BYTES);
+
+    // The control: a device's message of the same size is read.
+    const device = peerOf(await connect(port, { credential: a.credential }));
+    const deviceTunnel = await nextTunnel(incoming);
+    expect(encodeFrame(chunk(0, filler)).byteLength).toBeGreaterThan(MAX_PAIRING_FRAME_BYTES);
+    device.socket.send(encodeFrame(chunk(0, filler)));
+    expect((await deviceTunnel.receive()[Symbol.asyncIterator]().next()).value).toEqual(chunk(0, filler));
+
+    gate.showCode();
+    const stranger = peerOf(await connect(port));
+    const pairing = await nextTunnel(incoming);
+    const big: TunnelFrame = { v: TUNNEL_WIRE_VERSION, kind: 'pair', body: filler };
+    stranger.socket.send(encodeFrame(big));
+    // 1009, Message Too Big: `ws` refused it, before buffering it into a frame.
+    expect(await stranger.closeCode).toBe(1009);
+    await pairing.closed;
+    expect(pairing.ended()).toMatchObject({ kind: 'abnormal', code: 'FRAME_INVALID' });
+  });
+
+  it("a device's message past MAX_FRAME_BYTES is refused by ws, not buffered and handed to the codec", async () => {
+    /*
+     * The codec refuses it too, but only after `ws` has buffered it — up to
+     * `ws`'s own 100 MiB default. The codec's refusal closes with no code
+     * (1005); `ws`'s, with 1009. So the code says which one stopped it.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const device = peerOf(await connect(port, { credential: a.credential }));
+    const tunnel = await nextTunnel(incoming);
+    device.socket.send(new Uint8Array(MAX_FRAME_BYTES + 1));
+    expect(await device.closeCode).toBe(1009);
+    await tunnel.closed;
+    expect(tunnel.ended()).toMatchObject({ kind: 'abnormal', code: 'FRAME_INVALID' });
+  });
+
+  it('a pairing tunnel that queues more than MAX_PAIRING_BACKLOG unread frames is closed, not buffered', async () => {
+    /*
+     * Measured in review before this: sixteen 4 MiB `pair` frames, nobody
+     * reading, all accepted and the tunnel still open. The listener's socket's
+     * `bytesRead` says when every frame has been read off the wire, so the
+     * control half waits on that rather than on a clock.
+     */
+    const gate = testGate();
+    const { listener, port, incoming } = await listen(gate);
+    gate.showCode();
+    const serverSide = nextServerSocket(listener);
+    const stranger = peerOf(await connect(port));
+    const tunnel = await nextTunnel(incoming);
+    const socket = await serverSide;
+    const base = socket.bytesRead;
+    const frame = encodeFrame(PAIR);
+
+    // Exactly the backlog, read in full, and the tunnel is still open.
+    const backlog = Array.from({ length: MAX_PAIRING_BACKLOG }, () => frame);
+    for (const each of backlog) stranger.socket.send(each);
+    await eventually(() => socket.bytesRead - base >= wireBytes(backlog));
+    expect(tunnel.ended()).toBeNull();
+
+    // One more.
+    stranger.socket.send(frame);
+    expect(await stranger.closeCode).toBe(TUNNEL_PAIRING_ONLY_CLOSE_CODE);
+    expect(tunnel.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_BACKLOG' });
+    const received: TunnelFrame[] = [];
+    for await (const got of tunnel.receive()) received.push(got);
+    expect(received).toHaveLength(MAX_PAIRING_BACKLOG);
+  });
+
+  it("rung 0's host admits devices only: no credential is refused even while a code is shown", async () => {
+    const gate = testGate();
+    const host = await createTunnelHost({ binding: gate.binding() });
+    open.push(host);
+    const { port } = host.server.address() as AddressInfo;
+    gate.showCode();
+    expect(await connect(port)).toEqual({ status: 401 });
+    expect(host.ended()).toBeNull();
+  });
+
+  it('the real client hears PAIRING_WINDOW_CLOSED when the code goes, which is not PAIRING_ONLY', async () => {
+    const gate = testGate();
+    const { port, incoming } = await listen(gate);
+    gate.showCode();
+
+    const client = await createTunnelClient({ url: `ws://127.0.0.1:${port}` });
+    open.push(client);
+    await nextTunnel(incoming);
+    gate.pairing.cancel();
+    await client.closed;
+    expect(client.ended()).toMatchObject({ kind: 'abnormal', code: 'PAIRING_WINDOW_CLOSED' });
+    expect(TUNNEL_PAIRING_CLOSED_CLOSE_CODE).not.toBe(TUNNEL_PAIRING_ONLY_CLOSE_CODE);
   });
 
   it('the real client hears PAIRING_ONLY, not PEER_GONE', async () => {
@@ -534,6 +797,141 @@ describe('revocation (#135)', () => {
     expect((await nextTunnel(incoming)).admission).toEqual({ kind: 'device', deviceId: b.deviceId });
   });
 
+  it('closes EVERY tunnel the device holds, and they have ended by the time revoke resolves', async () => {
+    /*
+     * Two sockets for one device is the ordinary case until #169's stale-socket
+     * replacement is built. Asserted in the turn `revoke` resolves, before
+     * either peer's close is awaited: `revoke` waits for the listener to close
+     * them, and a test that awaited the peers first could not see that.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const first = peerOf(await connect(port, { credential: a.credential }));
+    const firstTunnel = await nextTunnel(incoming);
+    const second = peerOf(await connect(port, { credential: a.credential }));
+    const secondTunnel = await nextTunnel(incoming);
+
+    await gate.credentials.revoke(a.deviceId);
+    expect(firstTunnel.ended()).toEqual({ kind: 'clean', reason: 'revoked' });
+    expect(secondTunnel.ended()).toEqual({ kind: 'clean', reason: 'revoked' });
+    for (const peer of [first, second]) {
+      await peer.closeCode;
+      expect(peer.frames.at(-1)).toEqual({ v: TUNNEL_WIRE_VERSION, kind: 'bye', body: { reason: 'revoked' } });
+    }
+  });
+
+  it('drops the frames a revoked device had queued, where a plain close leaves them readable', async () => {
+    /*
+     * #135: revocation purges the queue. Measured in review before this: a
+     * `turn` the desktop had not read yet was still yielded by `receive()`
+     * after `revoke()` resolved. The listener's socket's `bytesRead` says when
+     * the frames have been read off the wire, without reading them.
+     */
+    const turn = (id: string): TunnelFrame => ({ v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: id, body: { messages: [] } });
+    const frames = ['t1', 't2', 't3'].map((id) => encodeFrame(turn(id)));
+    const gate = testGate();
+    const revokedDevice = await gate.mintDevice();
+    const closedDevice = await gate.mintDevice();
+    const { listener, port, incoming } = await listen(gate);
+
+    const queue = async (credential: string) => {
+      const serverSide = nextServerSocket(listener);
+      const peer = peerOf(await connect(port, { credential }));
+      const tunnel = await nextTunnel(incoming);
+      const socket = await serverSide;
+      const base = socket.bytesRead;
+      for (const frame of frames) peer.socket.send(frame);
+      await eventually(() => socket.bytesRead - base >= wireBytes(frames));
+      return tunnel;
+    };
+    const drain = async (tunnel: Tunnel) => {
+      const received: TunnelFrame[] = [];
+      for await (const got of tunnel.receive()) received.push(got);
+      return received;
+    };
+
+    // The control: queued, then closed deliberately, and all three still read.
+    const closed = await queue(closedDevice.credential);
+    await closed.close('done');
+    expect(await drain(closed)).toEqual([turn('t1'), turn('t2'), turn('t3')]);
+
+    const revoked = await queue(revokedDevice.credential);
+    await gate.credentials.revoke(revokedDevice.deviceId);
+    expect(await drain(revoked)).toEqual([]);
+  });
+
+  it('reads nothing a peer sends after this side has begun closing', async () => {
+    /*
+     * The frames are written in the same turn `close()` is called, so the
+     * listener can only read them afterwards, while its `bye` is flushing.
+     * Measured in review before this: fifty frames sent in the turn a device
+     * was revoked all reached `receive()`.
+     */
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const peer = peerOf(await connect(port, { credential: a.credential }));
+    const tunnel = await nextTunnel(incoming);
+
+    await new Promise<void>((resolveSent) => {
+      setTimeout(() => {
+        void tunnel.close('going');
+        for (let i = 0; i < 50; i += 1) peer.socket.send(encodeFrame(chunk(i, 'after')));
+        resolveSent();
+      }, 0);
+    });
+    const received: TunnelFrame[] = [];
+    for await (const got of tunnel.receive()) received.push(got);
+    expect(received).toEqual([]);
+    expect(tunnel.ended()).toEqual({ kind: 'clean', reason: 'going' });
+  });
+
+  it('delivers nothing a peer sends after its own bye', async () => {
+    // One write, so the listener reads both in order: the `bye` ends the
+    // tunnel, and the chunk behind it is not read into anything.
+    const gate = testGate();
+    const a = await gate.mintDevice();
+    const { port, incoming } = await listen(gate);
+    const peer = peerOf(await connect(port, { credential: a.credential }));
+    const tunnel = await nextTunnel(incoming);
+    const bye = encodeFrame({ v: TUNNEL_WIRE_VERSION, kind: 'bye', body: { reason: 'leaving' } });
+    const late = encodeFrame(chunk(0, 'after my bye'));
+    peer.socket.send(bye);
+    peer.socket.send(late);
+
+    const received: TunnelFrame[] = [];
+    for await (const got of tunnel.receive()) received.push(got);
+    expect(tunnel.ended()).toEqual({ kind: 'clean', reason: 'leaving' });
+    expect(received).toEqual([]);
+  });
+
+  it('a closed listener stops listening for revocations', async () => {
+    // #158's toggle stops and starts a listener over one registry. A stopped
+    // listener that stayed subscribed would be called on every revocation after.
+    const gate = testGate();
+    let watching = 0;
+    const counted = {
+      ...gate.credentials,
+      watchRevocations(onRevoke: (deviceId: string) => Promise<void>) {
+        watching += 1;
+        const off = gate.credentials.watchRevocations(onRevoke);
+        return () => {
+          watching -= 1;
+          off();
+        };
+      },
+    } as DeviceCredentials;
+    const listener = await createTunnelListener({
+      maxTunnels: 1,
+      binding: { kind: 'loopback', port: 0, gate: { ...gate.gate, credentials: counted } },
+    });
+    open.push(listener);
+    expect(watching).toBe(1);
+    await listener.close();
+    expect(watching).toBe(0);
+  });
+
   it('forgets the digest', async () => {
     const store = createMemoryCredentialStore();
     const gate = testGate(store);
@@ -576,11 +974,34 @@ describe('revocation (#135)', () => {
     await expect(gate.credentials.revoke(a.deviceId)).rejects.toThrow(/read-only/);
     await peer.closeCode;
     expect(tunnel.ended()).toEqual({ kind: 'clean', reason: 'revoked' });
-    // The digest is still in the store, and the device is refused anyway — by
+    // The row is still in the store, and the device is refused anyway — by
     // the registry itself, not only by the listener asking `isRevoked`.
-    expect(await inner.get(a.deviceId)).toBeDefined();
     expect(await gate.credentials.verify(a.credential)).toBeNull();
     expect(await connect(port, { credential: a.credential })).toEqual({ status: 401 });
+
+    // AND AFTER A RESTART. The row left behind is a zero-byte tombstone, not
+    // the digest, so a registry opened over the same store — with no memory of
+    // the revocation — refuses the device too. Measured in review before this:
+    // it admitted it.
+    expect(await inner.get(a.deviceId)).toEqual(new Uint8Array(0));
+    expect(await createDeviceCredentials(stuck).verify(a.credential)).toBeNull();
+  });
+
+  it('a tombstone that cannot be written does not stop the delete', async () => {
+    const inner = createMemoryCredentialStore();
+    const noTombstones: CredentialStore = {
+      get: (deviceId) => inner.get(deviceId),
+      set: async (deviceId, digest) => {
+        if (digest.byteLength === 0) throw new Error('refuses empty rows');
+        await inner.set(deviceId, digest);
+      },
+      delete: (deviceId) => inner.delete(deviceId),
+    };
+    const gate = testGate(noTombstones);
+    const a = await gate.mintDevice();
+    expect(await gate.credentials.revoke(a.deviceId)).toBe(true);
+    expect(await inner.get(a.deviceId)).toBeUndefined();
+    expect(await createDeviceCredentials(noTombstones).verify(a.credential)).toBeNull();
   });
 });
 
@@ -669,6 +1090,22 @@ describe('the credential itself', () => {
     const expired = openWindow({ secret, now: 0, windowMs: 10 });
     await expect(credentials.mint(expired, 10)).rejects.toThrow(/completed/);
 
+    // Something that only SAYS it is a claimed window. Measured in review
+    // before the brand: a literal like this minted a credential `verify` took.
+    const literal = {
+      state: () => 'claimed',
+      claim: () => ({ ok: true, state: 'claimed' }),
+      cancel: () => undefined,
+      remaining: () => 0,
+      expiresAt: 0,
+      onClose: () => () => undefined,
+    } as unknown as PairingWindow;
+    await expect(credentials.mint(literal, 0)).rejects.toThrow(/against a pairing window/);
+    const real = openWindow({ secret, now: 0 });
+    expect(real.claim(secret, 0).ok).toBe(true);
+    // Nor a copy of a real, claimed one.
+    await expect(credentials.mint({ ...real }, 0)).rejects.toThrow(/against a pairing window/);
+
     const claimed = openWindow({ secret, now: 0 });
     expect(claimed.claim(secret, 0).ok).toBe(true);
     const minted = await credentials.mint(claimed, 0);
@@ -741,9 +1178,28 @@ describe('the tunnel binding (#135, #158)', () => {
       },
     };
 
+    // @ts-expect-error a pairing window is branded: a literal that answers `claimed` is not one.
+    const literalWindow: PairingWindow = {
+      state: () => 'claimed',
+      claim: () => ({ ok: true, state: 'claimed' }),
+      cancel: () => undefined,
+      remaining: () => 0,
+      expiresAt: 0,
+      onClose: () => () => undefined,
+    };
+
     expect(
-      [loopbackNoGate, tlsNoGate, tlsNoMaterial, literalMaterial, serverArm, loopbackWithHost, literalCredentials],
-    ).toHaveLength(7);
+      [
+        loopbackNoGate,
+        tlsNoGate,
+        tlsNoMaterial,
+        literalMaterial,
+        serverArm,
+        loopbackWithHost,
+        literalCredentials,
+        literalWindow,
+      ],
+    ).toHaveLength(8);
   });
 
   it('the loopback arm binds 127.0.0.1, whatever else an object carries', async () => {
@@ -831,25 +1287,45 @@ describe.runIf(opensslAvailable())('the TLS arm', () => {
     expect(address).toBe('127.0.0.1');
     const incoming = listener.tunnels()[Symbol.asyncIterator]();
 
+    /*
+     * THE CERTIFICATE SERVED IS THE ONE HANDED OVER, compared by fingerprint.
+     * `rejectUnauthorized: false` means the handshake would succeed with any
+     * certificate at all — measured in review: a listener serving a freshly
+     * made `CN=IMPOSTOR` passed this test before the comparison was added.
+     */
+    const expected = new X509Certificate(pem.cert).fingerprint256;
     const { WebSocket } = await import('ws');
     const attempt = (headers: Record<string, string>) =>
-      new Promise<number | 'open'>((resolveAttempt) => {
+      new Promise<{ outcome: number | 'open'; fingerprint: string }>((resolveAttempt) => {
         const socket = new WebSocket(`wss://127.0.0.1:${String(port)}`, { headers, rejectUnauthorized: false });
         open.push({ close: () => socket.terminate() });
         socket.on('error', () => undefined);
+        const served = (response: { socket: unknown }) =>
+          (response.socket as TLSSocket).getPeerCertificate().fingerprint256;
         socket.once('unexpected-response', (request, response) => {
-          resolveAttempt(response.statusCode ?? 0);
+          resolveAttempt({ outcome: response.statusCode ?? 0, fingerprint: served(response) });
           request.destroy();
         });
-        socket.once('open', () => resolveAttempt('open'));
+        socket.once('upgrade', (response) => {
+          const fingerprint = served(response);
+          socket.once('open', () => resolveAttempt({ outcome: 'open', fingerprint }));
+        });
       });
 
-    expect(await attempt({})).toBe(401);
-    expect(await attempt(credentialHeaders(a.credential))).toBe('open');
+    expect(await attempt({})).toEqual({ outcome: 401, fingerprint: expected });
+    expect(await attempt(credentialHeaders(a.credential))).toEqual({ outcome: 'open', fingerprint: expected });
     expect((await nextTunnel(incoming)).admission).toEqual({ kind: 'device', deviceId: a.deviceId });
 
     // And it is not also answering plaintext on the same port.
     expect(await connect(port, { credential: a.credential })).not.toHaveProperty('peer');
+  });
+});
+
+describe.runIf(!opensslAvailable())('the TLS arm, where openssl is missing', () => {
+  it('is not skipped quietly in CI', () => {
+    // `describe.runIf` above skips without a word. Locally that is a skip in
+    // the summary; in CI it would be the TLS arm going untested, so it fails.
+    expect(process.env['CI'], 'openssl is not installed, so the TLS arm test above did not run').toBeFalsy();
   });
 });
 
