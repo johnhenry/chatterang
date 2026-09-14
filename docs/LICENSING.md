@@ -38,13 +38,23 @@ No source was copied from any AGPL-licensed project.
 | `zustand` | MIT | State |
 | `dexie` | Apache-2.0 | IndexedDB |
 | `react-markdown`, `remark-gfm`, `rehype-highlight` | MIT | Reply rendering |
+| `@johnhenry/oat-qr-fountain` | MIT | Pairing code frames: fountain coding over QR (#127) |
+| `jsqr` | Apache-2.0 | Reading a pairing code from a camera frame (#128) |
 | `vite`, `vitest`, `typescript` | MIT / Apache-2.0 | Build and test |
 | `@peculiar/x509` | MIT | The tunnel's self-signed certificate (#179); desktop and server only |
 | `reflect-metadata` | Apache-2.0 | The polyfill `@peculiar/x509` requires; loaded with it |
 
 Verified against each package's published `LICENSE` file. The aimatey packages
 are pinned to exact versions rather than ranges, per the PRD's treatment of
-them as an in-house dependency (§6).
+them as an in-house dependency (§6), and `@johnhenry/oat-qr-fountain` is pinned
+the same way.
+
+`@johnhenry/oat-qr-fountain` brings `qrcode` (MIT) with it, which the desktop
+uses to draw a frame, and `qrcode` brings `pngjs` and `dijkstrajs` (MIT) and a
+command-line argument parser, `yargs@15`, with its own dependencies (MIT and
+ISC). `yargs@15` sits beside the `yargs@17` already installed rather than
+replacing it, and none of it is imported by anything the app bundles: it
+serves `qrcode`'s command-line tool.
 
 ### One dependency note worth recording
 

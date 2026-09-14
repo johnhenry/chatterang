@@ -3,25 +3,43 @@ import { resolve } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { decodeFrame, hasNativeDetector, type QrFrame } from '@/lib/qr-decode';
+import { decodePacketFromImageData, encodePacket } from '@johnhenry/oat-qr-fountain';
+import { decodePairingUri } from '@chatterang/tunnel/pairing';
+import { generatePackets, prepareSource, type OatPacket } from '@/lib/oat-fountain';
+import { OAT_HEADER_BYTES, decodeFrame, type FrameRead, type QrFrame } from '@/lib/qr-decode';
+import { openFountainSession, pairingUriFromBytes } from '@/lib/qr-scan';
 
 /**
- * #128's decoder seam, tested against REAL QR codes.
+ * #128's decoder seam, tested against REAL QR codes — and, since #127's ruling,
+ * against a real OAT pairing frame.
  *
- * The fixture in `tests/fixtures/qr-codes.json` was produced by an independent
+ * The fixtures in `tests/fixtures/qr-codes.json` were produced by an independent
  * encoder (`qrcode@1.5.4`), not by the decoder under test and not by hand. That
  * independence is the point: a round trip through one library proves the
  * library is self-consistent, which is not the property a pairing screen needs.
  * These matrices came from somewhere else and jsQR has to agree with them.
+ *
+ * `oat-pairing-frame` is a pairing URI framed by OAT with a fixed artifact id
+ * and seed, and drawn by `qrcode` directly — not through `renderPairingFrame` —
+ * so its module matrix is a golden the drawing path cannot quietly move.
  */
 
 interface Fixture {
   readonly size: number;
   readonly rows: readonly string[];
 }
+interface OatFixture extends Fixture {
+  readonly uri: string;
+  readonly artifactId: string;
+  readonly seed: number;
+  readonly frame: string;
+}
 const FIXTURES = JSON.parse(
   readFileSync(resolve(process.cwd(), 'tests/fixtures/qr-codes.json'), 'utf8'),
 ) as Record<string, Fixture>;
+const OAT = FIXTURES['oat-pairing-frame'] as OatFixture;
+
+const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
 /** Paint a module matrix into pixels, the way a camera would see it on a screen. */
 function render(fixture: Fixture, { scale = 6, quiet = 4, invert = false } = {}): QrFrame {
@@ -46,25 +64,82 @@ function render(fixture: Fixture, { scale = 6, quiet = 4, invert = false } = {})
   return { data, width: dim, height: dim };
 }
 
+const packetOf = (read: FrameRead | null): OatPacket => {
+  if (read?.kind !== 'packet') throw new Error(`expected a packet, read ${JSON.stringify(read)}`);
+  return read.packet;
+};
+
 afterEach(() => {
   delete (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector;
   vi.restoreAllMocks();
 });
 
-describe('decoding a real code with the bundled decoder', () => {
-  it('reads a six-digit pairing code', async () => {
-    expect(await decodeFrame(render(FIXTURES['482913']!))).toBe('482913');
+describe('decoding a real OAT pairing frame with the bundled decoder', () => {
+  it('reads the packet the fixture encodes, byte for byte', async () => {
+    const packet = packetOf(await decodeFrame(render(OAT)));
+    expect(hex(encodePacket(packet))).toBe(OAT.frame);
+    expect(hex(packet.artifactId)).toBe(OAT.artifactId);
+    expect(packet.seed).toBe(OAT.seed);
+    expect(packet.sourceBlockCount).toBe(1);
   });
 
-  it('reads a longer payload, which is a bigger symbol', async () => {
-    // 25x25 rather than 21x21 — a different version, so this is not the same
-    // decode path with different bits.
-    const payload = 'chatterang-pair:AQEBstub';
-    expect(await decodeFrame(render(FIXTURES[payload]!))).toBe(payload);
+  it('and the packet alone is the pairing code', async () => {
+    const packet = packetOf(await decodeFrame(render(OAT)));
+    const session = await openFountainSession(packet);
+    expect(session.addPacket(packet)).toBe(true);
+    const text = pairingUriFromBytes(session.reconstruct());
+    session.release();
+    expect(text).toBe(OAT.uri);
+    expect(decodePairingUri(text!).name).toBe('Desk');
   });
 
   it('reads it at a smaller module scale, as a camera further away would', async () => {
-    expect(await decodeFrame(render(FIXTURES['482913']!, { scale: 3 }))).toBe('482913');
+    expect(hex(encodePacket(packetOf(await decodeFrame(render(OAT, { scale: 3 })))))).toBe(OAT.frame);
+  });
+
+  it('matches OAT’s own reader on every frame both read', async () => {
+    /*
+     * `decodeFrame` runs the same steps as OAT's `decodePacketFromImageData`
+     * and keeps one answer that function throws away. Where OAT reads a packet,
+     * this must read the same one; where OAT reads nothing, this reads nothing
+     * or "a code that is not a packet" — never a packet of its own.
+     */
+    const frames = [render(OAT), render(OAT, { scale: 3 }), render(FIXTURES['482913']!), render(FIXTURES['chatterang-pair:AQEBstub']!)];
+    const blank: QrFrame = { data: new Uint8ClampedArray(120 * 120 * 4).fill(255), width: 120, height: 120 };
+    for (const frame of [...frames, blank]) {
+      const theirs = decodePacketFromImageData(frame);
+      const ours = await decodeFrame(frame);
+      if (theirs === null) expect(ours?.kind).not.toBe('packet');
+      else expect(packetOf(ours)).toEqual(theirs);
+    }
+  });
+
+  it('pins the header shape it recognises against OAT’s own encoder', () => {
+    // `decodeFrame` tells a damaged OAT frame from a menu's QR code by these
+    // bytes. If a release of OAT moved them, this is where it shows.
+    const uri = 'chatterang-pair:AQ';
+    const bytes = Uint8Array.from(uri, (c) => c.charCodeAt(0));
+    const packet = generatePackets(prepareSource(bytes, bytes.length, new Uint8Array(16).fill(0xee))).next().value;
+    const frame = encodePacket(packet);
+    expect(frame.length - packet.blockSize).toBe(OAT_HEADER_BYTES);
+    expect(frame[0]).toBe(1);
+    expect(frame[17]).toBe(1);
+  });
+});
+
+describe('a QR code that is not an OAT frame', () => {
+  it('reads a six-digit code as a code, and not as a packet', async () => {
+    expect(await decodeFrame(render(FIXTURES['482913']!))).toEqual({ kind: 'other' });
+  });
+
+  it('reads a pairing URI drawn as plain text as not a packet either', async () => {
+    /*
+     * The format before #127's ruling. No host draws it: the desktop screen
+     * draws OAT frames, and there is no other screen. So it is a QR code that
+     * is not a pairing code, which is what the scanner will say — one format,
+     * one parser, and no second path for a crafted code to aim at.
+     */
+    expect(await decodeFrame(render(FIXTURES['chatterang-pair:AQEBstub']!))).toEqual({ kind: 'other' });
   });
 
   it('returns null for a blank frame rather than throwing', async () => {
@@ -85,58 +160,44 @@ describe('decoding a real code with the bundled decoder', () => {
     }
     expect(await decodeFrame({ data, width: 120, height: 120 })).toBeNull();
   });
+
+  it('returns null for a frame too damaged to read, and does not throw', async () => {
+    // Paint over a band of the symbol wider than level M can correct.
+    const frame = render(OAT);
+    const { data, width } = frame;
+    for (let y = Math.floor(width * 0.35); y < Math.floor(width * 0.65); y += 1) {
+      for (let x = 0; x < width; x += 1) data[(y * width + x) * 4] = data[(y * width + x) * 4 + 1] = data[(y * width + x) * 4 + 2] = 0;
+    }
+    expect(await decodeFrame(frame)).toBeNull();
+  });
 });
 
-describe('the platform decoder, when there is one', () => {
-  it('is absent in this environment, which is what iOS looks like', () => {
-    // jsdom has no BarcodeDetector, and neither does any iOS origin measured
-    // in dev/probe-128. So every test above exercised the bundled path.
-    expect(hasNativeDetector()).toBe(false);
-  });
-
-  it('is used in preference when present', async () => {
+describe('the platform decoder is not used, even where there is one', () => {
+  it('is never constructed or asked, and the bundled decoder answers', async () => {
+    /*
+     * MEASURED, not assumed. In Chromium 152 on macOS, `BarcodeDetector`
+     * finds a 233-byte OAT pairing frame and returns a `rawValue` of length
+     * ZERO — the symbol found, every byte gone — and does the same when the
+     * frame's artifact id is plain ASCII, while the same URI drawn as a plain
+     * byte-mode QR code reads back exactly. See `src/lib/qr-decode.ts`.
+     */
     const detect = vi.fn().mockResolvedValue([{ rawValue: 'from-the-platform' }]);
+    const constructed = vi.fn();
     (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector = class {
+      constructor() {
+        constructed();
+      }
       detect = detect;
     };
-    expect(hasNativeDetector()).toBe(true);
-    expect(await decodeFrame(render(FIXTURES['482913']!))).toBe('from-the-platform');
-    expect(detect).toHaveBeenCalledOnce();
-  });
-
-  it('asks it for QR only, not every barcode format', async () => {
-    let options: { formats?: readonly string[] } | undefined;
-    (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector = class {
-      constructor(opts?: { formats?: readonly string[] }) { options = opts; }
-      detect = vi.fn().mockResolvedValue([]);
-    };
-    await decodeFrame(render(FIXTURES['482913']!));
-    expect(options?.formats).toEqual(['qr_code']);
-  });
-
-  it('reports no code as null, not as a failure', async () => {
-    (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector = class {
-      detect = vi.fn().mockResolvedValue([]);
-    };
-    expect(await decodeFrame(render(FIXTURES['482913']!))).toBeNull();
-  });
-
-  it('FALLS BACK to the bundled decoder when the platform one throws', async () => {
-    /*
-     * Some Android WebViews expose `BarcodeDetector` and then reject `detect`
-     * for formats they do not really support. A scanner that gave up there
-     * would be broken on exactly the devices #223 is about — and the bundled
-     * decoder is already downloaded, so using it costs nothing.
-     */
-    (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector = class {
-      detect = vi.fn().mockRejectedValue(new Error('NotSupportedError'));
-    };
-    expect(await decodeFrame(render(FIXTURES['482913']!))).toBe('482913');
+    expect(hex(encodePacket(packetOf(await decodeFrame(render(OAT)))))).toBe(OAT.frame);
+    expect(await decodeFrame(render(FIXTURES['482913']!))).toEqual({ kind: 'other' });
+    expect(constructed).not.toHaveBeenCalled();
+    expect(detect).not.toHaveBeenCalled();
   });
 });
 
 describe('the frame is borrowed, never kept', () => {
-  it('takes pixels and returns a string, with nothing to persist with', async () => {
+  it('takes pixels and returns a packet, with nothing to persist with', async () => {
     /*
      * #128 requires that a scan never persists a frame, and the camera usage
      * string promises the user exactly that in an OS dialog: "Nothing the
@@ -154,14 +215,15 @@ describe('the frame is borrowed, never kept', () => {
     // report on prose instead of on code.
     const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
-    const imports = [...code.matchAll(/^import\s.*?from\s+'([^']+)'/gm)].map((m) => m[1]);
-    expect(imports).toEqual([]);
+    // Static imports are TYPES only, erased at build: nothing loads with the module.
+    const imports = [...code.matchAll(/^import\s.*?from\s+'([^']+)'/gm)].map((m) => m[0]);
+    expect(imports).toEqual(["import type { OatPacket } from '@/lib/oat-fountain'"]);
 
-    const dynamic = [...code.matchAll(/await import\('([^']+)'\)/g)].map((m) => m[1]);
-    expect(dynamic).toEqual(['jsqr']);
+    const dynamic = [...code.matchAll(/\bimport\('([^']+)'\)/g)].map((m) => m[1]);
+    expect(dynamic).toEqual(['jsqr', '@/lib/oat-fountain']);
 
     // And nothing that could reach a store or a network, by name.
-    for (const forbidden of ['fetch', 'XMLHttpRequest', 'indexedDB', 'localStorage', 'Dexie', 'Worker']) {
+    for (const forbidden of ['fetch', 'XMLHttpRequest', 'indexedDB', 'localStorage', 'Dexie', 'Worker', 'BarcodeDetector']) {
       expect(code, `${forbidden} appears in the code`).not.toMatch(new RegExp(`\\b${forbidden}\\b`));
     }
     // The strip must not have eaten the file: the real code is still there.
@@ -171,7 +233,7 @@ describe('the frame is borrowed, never kept', () => {
   it('does not mutate the caller’s pixels', async () => {
     // A decoder that binarised in place would corrupt the frame a UI is still
     // painting to a canvas.
-    const frame = render(FIXTURES['482913']!);
+    const frame = render(OAT);
     const before = frame.data.slice();
     await decodeFrame(frame);
     expect(frame.data).toEqual(before);

@@ -20,7 +20,7 @@ import { StrictMode, act, useState, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const platform = vi.hoisted(() => ({ cameraScan: true }));
-const decoder = vi.hoisted(() => ({ decodeFrame: vi.fn<(frame: unknown) => Promise<string | null>>() }));
+const decoder = vi.hoisted(() => ({ decodeFrame: vi.fn<(frame: unknown) => Promise<FrameRead | null>>() }));
 
 vi.mock('@/lib/platform', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/platform')>();
@@ -45,6 +45,8 @@ import {
   type PairingOutcome,
   type PairingRequest,
 } from '@/lib/pairing';
+import { framesForPairingUri } from '@/lib/pairing-frames';
+import type { FrameRead } from '@/lib/qr-decode';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
 import {
   CAMERA_BUSY,
@@ -157,6 +159,15 @@ function code(over: Partial<PairingPayload> = {}): string {
   } as PairingPayload);
 }
 
+/**
+ * What the decoder reads from a pairing code on screen (#127): one OAT frame,
+ * drawn by the real frame helper, which alone is the whole code. The loop and
+ * its fountain session run as shipped on it.
+ */
+async function drawn(uri: string): Promise<FrameRead> {
+  return { kind: 'packet', packet: (await framesForPairingUri(uri)).next().value };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -221,7 +232,7 @@ const video = () => document.querySelector('video');
 const confirmOpen = () => [...document.querySelectorAll('[role="dialog"] h2')].some((h) => reads(h) === CONFIRM_TITLE);
 
 /** Press Scan with camera and wait for the preview. The decoder is left pending unless given. */
-async function scanning(decode?: () => Promise<string | null>) {
+async function scanning(decode?: () => Promise<FrameRead | null>) {
   if (decode) decoder.decodeFrame.mockImplementation(decode);
   await click(mustButton('Scan with camera'));
   return until(video, 'the camera preview');
@@ -375,12 +386,12 @@ describe('every exit turns the camera off', () => {
     const stream = streamOf(track);
     camera(async () => stream);
     await open(fakeController().controller);
-    const frame = deferred<string | null>();
+    const frame = deferred<FrameRead | null>();
     const preview = await scanning(() => frame.promise);
     expect(preview.srcObject).toBe(stream);
     expect(track.stop).not.toHaveBeenCalled();
 
-    frame.resolve(code());
+    frame.resolve(await drawn(code()));
     await until(confirmOpen, 'Confirm');
     expect(track.stop).toHaveBeenCalledTimes(1);
     expect(preview.srcObject).toBeNull();
@@ -490,7 +501,7 @@ describe('every exit turns the camera off', () => {
     const track = new FakeTrack();
     const stream = streamOf(track);
     const getUserMedia = camera(async () => stream);
-    const frame = deferred<string | null>();
+    const frame = deferred<FrameRead | null>();
     decoder.decodeFrame.mockImplementation(() => frame.promise);
     mounted.push(
       await render(
@@ -508,7 +519,7 @@ describe('every exit turns the camera off', () => {
     expect(track.stop).not.toHaveBeenCalled();
     expect(preview.srcObject).toBe(stream);
 
-    frame.resolve(code());
+    frame.resolve(await drawn(code()));
     await until(confirmOpen, 'Confirm');
     expect(track.stop).toHaveBeenCalledTimes(1);
   });
@@ -564,7 +575,7 @@ describe('each way a scan ends without a code has its own words and Scan again',
     const track = new FakeTrack();
     camera(async () => streamOf(track));
     await open(fakeController().controller);
-    decoder.decodeFrame.mockResolvedValue('chatterang-pair:!!!');
+    decoder.decodeFrame.mockResolvedValue(await drawn('chatterang-pair:!!!'));
     await click(mustButton('Scan with camera'));
     await until(() => button('Scan again'), 'Scan again');
     expect(status()).toEqual([SCAN_END_WORDING['invalid-code']]);
@@ -592,7 +603,7 @@ describe('each way a scan ends without a code has its own words and Scan again',
     const track = new FakeTrack();
     camera(async () => streamOf(track));
     await open(fakeController().controller);
-    decoder.decodeFrame.mockResolvedValueOnce('https://example.com/menu').mockImplementation(() => new Promise(() => {}));
+    decoder.decodeFrame.mockResolvedValueOnce({ kind: 'other' }).mockImplementation(() => new Promise(() => {}));
     await click(mustButton('Scan with camera'));
     await until(() => status().includes(NOT_A_PAIRING_CODE), 'the hint');
     expect(track.stop).not.toHaveBeenCalled();
@@ -609,7 +620,7 @@ describe('a scanned code is checked before anything is sent', () => {
     camera(async () => streamOf(track));
     const fake = fakeController();
     const sheet = await open(fake.controller);
-    decoder.decodeFrame.mockResolvedValueOnce(uri).mockImplementation(() => new Promise(() => {}));
+    decoder.decodeFrame.mockResolvedValueOnce(await drawn(uri)).mockImplementation(() => new Promise(() => {}));
     await click(mustButton('Scan with camera'));
     await until(() => confirmOpen() || button('Scan again'), 'Confirm or Scan again');
     return { ...fake, ...sheet, track };
@@ -676,7 +687,7 @@ describe('a scanned code is checked before anything is sent', () => {
     expect(dialog()).not.toBeNull();
 
     decoder.decodeFrame.mockReset();
-    decoder.decodeFrame.mockResolvedValueOnce(uri).mockImplementation(() => new Promise(() => {}));
+    decoder.decodeFrame.mockResolvedValueOnce(await drawn(uri)).mockImplementation(() => new Promise(() => {}));
     await click(mustButton('Scan with camera'));
     await until(confirmOpen, 'Confirm again');
     await click(mustButton('Pair'));
@@ -694,7 +705,7 @@ describe('a scanned code is checked before anything is sent', () => {
     const { controller, pair } = fakeController(() => pending.promise);
     camera(async () => streamOf(new FakeTrack()));
     const { onOutcome, onClose } = await open(controller);
-    decoder.decodeFrame.mockResolvedValueOnce(code()).mockImplementation(() => new Promise(() => {}));
+    decoder.decodeFrame.mockResolvedValueOnce(await drawn(code())).mockImplementation(() => new Promise(() => {}));
     await click(mustButton('Scan with camera'));
     await until(confirmOpen, 'Confirm');
     await click(mustButton('Pair'));

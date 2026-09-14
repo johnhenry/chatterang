@@ -35,8 +35,10 @@ import {
  * `handle.stop()` always reports `cancelled`, so the pane records why IT asked
  * before asking, and only a stop it caused while visible offers "Scan again".
  *
- * Nothing here keeps a frame. Pixels go from the video to the decoder and back
- * as text; `tests/pairing-scan-persists-nothing.test.tsx` watches a run.
+ * Nothing here keeps a frame. Pixels go from the video to the decoder and come
+ * back as an OAT packet; the loop collects packets into the pairing URI and lets
+ * go of every one of them when the scan ends, however it ends.
+ * `tests/pairing-scan-persists-nothing.test.tsx` watches a run.
  */
 
 export interface ScanPaneProps {

@@ -13,6 +13,12 @@
  * receives the parsed payload and nothing else — no pixels, no canvas, no
  * blob — and that no store, network path, clipboard or log receives anything.
  *
+ * Since #127 the decoder hands the loop OAT packets rather than text, and the
+ * loop collects them in a fountain session before parsing. So the mocked
+ * decoder returns REAL packets of the code, a fresh one per frame, the real
+ * session collects them, and the watch covers the packets as well: neither a
+ * packet nor any of its buffers may reach pair() or a log.
+ *
  * Its own file, because it mocks `@/db`, `@/lib/blobs`, both Capacitor storage
  * plugins and the decoder for the whole module graph.
  */
@@ -25,7 +31,7 @@ const spies = vi.hoisted(() => ({
   putBlob: vi.fn(async () => {}),
   preferencesSet: vi.fn(async () => {}),
   writeFile: vi.fn(async () => ({ uri: '' })),
-  decodeFrame: vi.fn<(frame: { data: Uint8ClampedArray; width: number; height: number }) => Promise<string | null>>(),
+  decodeFrame: vi.fn<(frame: { data: Uint8ClampedArray; width: number; height: number }) => Promise<FrameRead | null>>(),
 }));
 
 vi.mock('@/db', () => ({ db: { blobs: { put: spies.blobsPut } } }));
@@ -38,7 +44,10 @@ vi.mock('@capacitor/filesystem', async (importOriginal) => {
 vi.mock('@/lib/qr-decode', () => ({ decodeFrame: spies.decodeFrame }));
 
 import { ADDRESS_IPV4, HOST_DESKTOP, TRUST_BYTES, TRUST_SPKI_PIN, decodePairingUri, encodePairingUri } from '@chatterang/tunnel/pairing';
+import type { OatPacket } from '@/lib/oat-fountain';
 import type { PairingController, PairingOutcome, PairingRequest } from '@/lib/pairing';
+import { framesForPairingUri } from '@/lib/pairing-frames';
+import type { FrameRead } from '@/lib/qr-decode';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
 import { CONFIRM_TITLE } from '@/features/pairing/wording';
 import { CAMERA_USAGE_DESCRIPTION } from '../scripts/patch-native.mjs';
@@ -155,9 +164,15 @@ describe('a scan persists nothing', () => {
     const getUserMedia = vi.fn(async () => ({ getTracks: () => [track] }) as unknown as MediaStream);
     stub(navigator, 'mediaDevices', { value: { getUserMedia } });
     const frames: Uint8ClampedArray[] = [];
-    spies.decodeFrame.mockImplementation(async (frame) => {
+    // What the decoder hands the loop since #127: OAT packets of the code, a
+    // fresh one per frame, collected by the real fountain session.
+    const drawn = await framesForPairingUri(URI);
+    const packets: OatPacket[] = [];
+    spies.decodeFrame.mockImplementation(async (frame): Promise<FrameRead> => {
       frames.push(frame.data);
-      return URI;
+      const packet = drawn.next().value;
+      packets.push(packet);
+      return { kind: 'packet', packet };
     });
 
     const pair = vi.fn<(request: PairingRequest, signal?: AbortSignal) => Promise<PairingOutcome>>(async () => ({
@@ -212,16 +227,23 @@ describe('a scan persists nothing', () => {
     expect(request).toStrictEqual({ route: 'scanned', payload: decodePairingUri(URI) });
     // The fingerprint the Type pane's sentence says a scanned code carries.
     expect((request as Extract<PairingRequest, { route: 'scanned' }>).payload.trust).toHaveLength(TRUST_BYTES);
+    // Packets really flowed too, and none of their buffers is what pair() got.
+    expect(packets.length).toBeGreaterThanOrEqual(2);
+    const packetBuffers = packets.flatMap((packet) => [packet.payload, packet.artifactId]);
     for (const node of graph(request)) {
       expect(node instanceof Uint8ClampedArray, 'a frame buffer reached pair()').toBe(false);
       expect(node instanceof Blob, 'a blob reached pair()').toBe(false);
       expect(frames.includes(node as Uint8ClampedArray)).toBe(false);
+      expect(packets.includes(node as OatPacket), 'a packet reached pair()').toBe(false);
+      expect(packetBuffers.includes(node as Uint8Array), 'a packet buffer reached pair()').toBe(false);
     }
 
     // tests/setup.ts installs no console handling, so zero calls is not the
-    // claim. No argument may be a frame or carry the decoded text.
+    // claim. No argument may be a frame or a packet, or carry the decoded text.
     for (const arg of consoles.flatMap((spy) => spy.mock.calls.flat())) {
       expect(arg instanceof Uint8ClampedArray).toBe(false);
+      expect(arg instanceof Uint8Array).toBe(false);
+      expect(packets.includes(arg as OatPacket)).toBe(false);
       expect(String(arg)).not.toContain('chatterang-pair:');
     }
 
