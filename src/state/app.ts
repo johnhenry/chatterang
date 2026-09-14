@@ -176,6 +176,29 @@ export function installEgressRevoker(revoke: (connectionId: string) => Promise<v
   revokeEgressGrants = revoke;
 }
 
+/**
+ * Take one MCP server name's tools out of every chat's enabled list.
+ *
+ * Registered rather than imported, for the reason given on
+ * `installEgressRevoker` above: the chat store depends on this module, and
+ * `state/mcp` reaches this module lazily already.
+ *
+ * An MCP tool's id is keyed on the server's NAME (`mcp:notes.search`, built in
+ * `ai/mcp/tools.ts`), not on the server record. So an enable outlives the
+ * server it was given to: remove `notes` at one URL, add `notes` at another,
+ * and every chat that had turned `notes.search` on would send to the new host
+ * without being asked again. `state/mcp` calls this on add and on remove.
+ */
+let pruneMcpTools: (serverName: string) => Promise<void> = async () => {};
+
+export function installMcpToolPruner(prune: (serverName: string) => Promise<void>): void {
+  pruneMcpTools = prune;
+}
+
+export async function pruneMcpToolsFor(serverName: string): Promise<void> {
+  await pruneMcpTools(serverName);
+}
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   settings: DEFAULT_SETTINGS,

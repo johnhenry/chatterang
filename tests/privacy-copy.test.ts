@@ -410,6 +410,17 @@ describe('the privacy command', () => {
     expect(call).toHaveBeenCalledOnce();
   });
 
+  it('says removing a server takes its tools out of every chat that had them on', () => {
+    // The measurement is in `tests/mcp-lifecycle.test.ts`, which drives the
+    // real `useMcp` and chat store and needs `@/db` mocked to do it. It removes
+    // a server and reads every chat's tool list back; and it re-adds a server
+    // under the same name and shows the old enable no longer reaches it —
+    // which is what made "turned on per chat" false for the new server.
+    expect(shipped('features/settings/McpPanel.tsx')).toContain(
+      'and its tools will be removed from this device, and from every chat that had them on. Nothing on',
+    );
+  });
+
   it('says a destructive call asks about the server’s data, not about what leaves', async () => {
     const output = await privacyOutput({
       mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
