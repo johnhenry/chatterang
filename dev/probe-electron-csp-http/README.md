@@ -64,7 +64,13 @@ Shipped permission handler:
 
 No permission handler (the control for the handler) gave the same twelve
 results. The shipped handler received no permission request of any kind during
-any fetch.
+any fetch. It was consulted for permission checks, and denied every one: on each
+of the three pages, `media` twice and `geolocation`, `web-app-installation` and
+`background-sync` once each, fifteen in all. None concerns the network, and the
+no-handler session, which installs no check handler and grants every request,
+gave the same verdicts. A future Chromium that adds a local-network permission
+check would appear in the same `PROBE_PERMISSIONS` line, so read that line, not
+only the table.
 
 The control for the detector: the same fetches from a page whose URL is
 genuinely `https:`, with no CSP. The session intercepts that host, so nothing
