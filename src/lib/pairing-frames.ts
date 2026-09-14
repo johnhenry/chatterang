@@ -29,21 +29,31 @@
  *     desktop, IPv4 + four IPv6, "John’s MacBook Pro"      247   281   v12  65
  *     desktop, IPv4 + two IPv6, 64-byte name               258   292   v13  69
  *     server, 2 IPv4 + IPv6 + tailnet DNS, 64-byte name    291   325   v13  69
- *     server, IPv4 + 4 IPv6, 57-byte name                  296   330   v13  69
- *     server, IPv4 + 4 IPv6, 60-byte name — the cap        300   334   v14  73
+ *     server, IPv4 + 4 IPv6, 57-byte name — the cap        296   330   v13  69
+ *
+ * and past the cap, frames of URIs that `encodePairingUri` and
+ * `decodePairingUri` now refuse, drawn anyway to show where the edge is:
+ *
+ *     297 characters (no base64url body is this long)      297   331   v13  69
+ *     298 characters: IPv4 + 4 IPv6, 58-byte name          298   332   v14  73
+ *     299 characters                                       299   333   v14  73
+ *     300 characters: the old cap                          300   334   v14  73
  *
  * A frame is the URI's bytes plus OAT's 34-byte header, and the header is all it
  * costs: measured once with `qrcode@1.5.4` and not pinned, the first two URIs
- * drawn as plain text QR codes are v8 and v10. 296 characters is the longest
- * URI that stays at v13 — 330 bytes against v13-M's 331 — and the longer URIs
- * the cap admits draw at v14 (298 and 300 are pinned; base64url has no 297,
- * and 299 lies between them). `MAX_PAIRING_URI_LENGTH` records what that means
- * for a terminal.
+ * drawn as plain text QR codes are v8 and v10. v14 is 81 columns with the quiet
+ * zone, one too many for the terminal a headless server draws in, so the owner
+ * lowered `MAX_PAIRING_URI_LENGTH` from 300 to 296 (#127): every code draws at
+ * v13 or smaller. That constant records the rest of the argument.
  *
  * The field limits admit payloads the cap does not: one IPv4 and four IPv6
  * addresses with a 64-byte name is refused by `encodePairingUri` as too long
- * (pinned in the test). So the screen that calls this has to choose which
- * addresses, and how much of the name, to carry.
+ * (pinned in the test). The owner ruled what a screen does then: it calls
+ * `fitPairingPayload`, which drops the least reachable addresses and never
+ * shortens the name.
+ *
+ * ONE BLOCK, BOTH WAYS. This draws one-block frames only, and the phone refuses
+ * any frame that claims more (`classifyPacket` in `qr-scan.ts`, ruled on #127).
  *
  * ## Choices, and why
  *

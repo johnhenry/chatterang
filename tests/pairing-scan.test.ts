@@ -17,6 +17,7 @@ import type { FrameRead } from '@/lib/qr-decode';
 import {
   HAVE_CURRENT_DATA,
   MIN_SCAN_GAP_MS,
+  PAIRING_BLOCK_COUNT,
   classifyPacket,
   createFrameGrabber,
   openCamera,
@@ -34,9 +35,11 @@ import {
  * and an indicator light that stays on after they closed the sheet breaks that
  * promise in the only way they can see.
  *
- * #127: a pairing code is OAT frames now, so the loop holds a decoder session
- * between frames. The same promise covers it — every stop path releases it —
- * and a hostile or foreign frame must not be able to hang, crash or hijack it.
+ * #127: a pairing code is an OAT frame now, so the loop holds a decoder session
+ * for it. The same promise covers it — every stop path releases it — and a
+ * hostile or foreign frame must not be able to hang, crash or hijack it. The
+ * owner ruled that a frame claiming more than one block is not a pairing code,
+ * so the frames that reach a session are one block each.
  */
 
 const VALID_URI = encodePairingUri({
@@ -339,7 +342,44 @@ describe('the loop does not burn the CPU', () => {
   });
 });
 
-describe('a pairing code is OAT packets, collected (#127)', () => {
+describe('a pairing code is one OAT frame, collected (#127)', () => {
+  /** `uri` as one frame — the whole code — with a chosen artifact id. */
+  function oneBlock(uri: string, id: number): FrameRead {
+    const bytes = Uint8Array.from(uri, (c) => c.charCodeAt(0));
+    return { kind: 'packet', packet: generatePackets(prepareSource(bytes, bytes.length, new Uint8Array(16).fill(id))).next().value };
+  }
+
+  /**
+   * Real sessions that answer "not complete yet" for the first `holds[i]`
+   * packets the i-th session opened is given.
+   *
+   * WHY THIS EXISTS. Under the owner's ruling on #127 every frame the loop
+   * accepts is one block, and OAT's decoder completes a one-block code on its
+   * first packet, so a real session is never held from one frame to the next.
+   * The loop does not assume that, and these tests keep proving the paths that
+   * would matter if it did: every packet still reaches the real decoder, which
+   * copies its block; only the answer is held back. Before the ruling they used
+   * codes drawn in 16-byte blocks, which the loop now refuses (below).
+   */
+  function holdingSessions(holds: readonly number[]) {
+    const opened: { readonly release: ReturnType<typeof vi.fn>; fed: number }[] = [];
+    const openSession = vi.fn(async (packet: OatPacket): Promise<FrameSession> => {
+      const real = await openFountainSession(packet);
+      const entry = { release: vi.fn(() => real.release()), fed: 0 };
+      const hold = holds[opened.length] ?? 0;
+      opened.push(entry);
+      return {
+        addPacket: (p) => {
+          entry.fed += 1;
+          return real.addPacket(p) && entry.fed > hold;
+        },
+        reconstruct: () => real.reconstruct(),
+        release: entry.release,
+      };
+    });
+    return { openSession, opened };
+  }
+
   it('one frame is the whole code: delivered once, with the session released first', async () => {
     const { openSession, opened } = watchedSessions();
     const s = setup({ decode: async () => VALID, openSession });
@@ -356,42 +396,32 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
     expect(s.scheduler.step()).toBeNull();
   });
 
-  it('a code drawn in smaller blocks still completes, from enough of its frames, once', async () => {
-    const { openSession, opened } = watchedSessions();
-    const next = codeInBlocks(VALID_URI, 16);
-    const s = setup({ decode: async () => next(), openSession });
-    for (let i = 0; i < 300 && s.ends.length === 0; i += 1) {
+  it('a repeated frame of a code still being collected feeds the same session: no hint, no ending, and one result', async () => {
+    const { openSession, opened } = holdingSessions([2]);
+    const s = setup({ decode: async () => VALID, openSession });
+    for (let i = 0; i < 2; i += 1) {
       s.scheduler.step();
       await flush();
     }
-    expect(s.onResult).toHaveBeenCalledOnce();
-    expect(s.onResult.mock.calls[0]![0].name).toBe('Desk');
-    expect(s.decode.mock.calls.length).toBeGreaterThan(1);
+    expect(s.ends).toEqual([]);
+    s.scheduler.step();
+    await flush();
     expect(openSession).toHaveBeenCalledOnce();
+    expect(opened[0]!.fed).toBe(3);
     expect(opened[0]!.release).toHaveBeenCalledOnce();
-    expect(s.onHint).not.toHaveBeenCalled();
-  });
-
-  it('a repeated frame is harmless: no hint, no ending, and the code still completes once', async () => {
-    const next = codeInBlocks(VALID_URI, 16);
-    const first = next();
-    const reads = [first, first, first];
-    const s = setup({ decode: async () => reads.shift() ?? next() });
-    for (let i = 0; i < 300 && s.ends.length === 0; i += 1) {
-      s.scheduler.step();
-      await flush();
-    }
     expect(s.onHint).not.toHaveBeenCalled();
     expect(s.onResult).toHaveBeenCalledOnce();
     expect(s.ends).toEqual([{ reason: 'result' }]);
   });
 
-  describe('a partial code is released however the scan ends', () => {
+  describe('a code still being collected is released however the scan ends', () => {
     /*
      * FOUND BY MUTATION, the reason this block exists: with `dropSession()`
      * removed from teardown, every test above still passed, because a
      * complete code releases its session on the completion path. Only a code
-     * that is PART-collected when the scan ends proves the ending releases it.
+     * that is PART-collected when the scan ends proves the ending releases it —
+     * and since #127's ruling no real code ever is, so the session here holds
+     * its answer back (`holdingSessions`).
      */
     const endings: readonly [string, (s: ReturnType<typeof setup>) => void | Promise<void>, ScanEnd['reason']][] = [
       ['cancel, which is also the pane going to the background or closing', (s) => s.handle.stop(), 'cancelled'],
@@ -406,12 +436,12 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
 
     for (const [label, end, reason] of endings) {
       it(label, async () => {
-        const { openSession, opened } = watchedSessions();
-        const next = codeInBlocks(VALID_URI, 16);
-        const s = setup({ decode: async () => next(), openSession });
+        const { openSession, opened } = holdingSessions([Infinity]);
+        const s = setup({ decode: async () => VALID, openSession });
         s.scheduler.step();
         await flush();
         expect(opened).toHaveLength(1);
+        expect(opened[0]!.fed).toBe(1);
         expect(opened[0]!.release).not.toHaveBeenCalled();
         expect(s.ends).toEqual([]);
 
@@ -459,47 +489,46 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
   });
 
   describe('a packet from another code', () => {
-    it('replaces the code being collected, and the newcomer is delivered on its first frame', async () => {
+    it('a foreign one-block code replaces the code being collected, and is delivered on its first frame', async () => {
       /*
        * THE DECISION, pinned. Ignoring the newcomer would tie the phone to a
        * code the desktop may have withdrawn until the idle timeout; replacing
        * costs nothing when every frame is complete.
        */
-      const { openSession, opened } = watchedSessions();
+      const { openSession, opened } = holdingSessions([Infinity]);
       const other = encodePairingUri({ ...decodePairingUri(VALID_URI), name: 'Other desk' });
-      const partial = codeInBlocks(VALID_URI, 16, 1);
       const newcomer = await frameOf(other);
-      const reads = [partial(), newcomer];
+      const reads = [VALID, newcomer];
       const s = setup({ decode: async () => reads.shift() ?? null, openSession });
 
       s.scheduler.step();
       await flush();
       expect(opened).toHaveLength(1);
+      expect(s.ends).toEqual([]);
 
       s.scheduler.step();
       await flush();
       expect(opened[0]!.release).toHaveBeenCalledOnce();
+      expect(opened[0]!.fed, 'the newcomer was fed to the held session').toBe(1);
       expect(openSession).toHaveBeenCalledTimes(2);
       expect(s.onResult).toHaveBeenCalledOnce();
       expect(s.onResult.mock.calls[0]![0].name).toBe('Other desk');
     });
 
     it('with the same artifact id but another shape is another code too, and does not throw', async () => {
-      const { openSession, opened } = watchedSessions();
-      const partial = codeInBlocks(VALID_URI, 16, 5);
-      const bytes = Uint8Array.from(VALID_URI, (c) => c.charCodeAt(0));
-      const reshaped: FrameRead = {
-        kind: 'packet',
-        packet: generatePackets(prepareSource(bytes, bytes.length, new Uint8Array(16).fill(5))).next().value,
-      };
-      const reads = [partial(), reshaped];
+      const { openSession, opened } = holdingSessions([Infinity]);
+      const reshapedUri = encodePairingUri({ ...decodePairingUri(VALID_URI), name: 'Desk two' });
+      expect(reshapedUri.length).not.toBe(VALID_URI.length);
+      const reads = [oneBlock(VALID_URI, 5), oneBlock(reshapedUri, 5)];
       const s = setup({ decode: async () => reads.shift() ?? null, openSession });
       s.scheduler.step();
       await flush();
       s.scheduler.step();
       await flush();
       expect(opened[0]!.release).toHaveBeenCalledOnce();
+      expect(opened[0]!.fed).toBe(1);
       expect(s.onResult).toHaveBeenCalledOnce();
+      expect(s.onResult.mock.calls[0]![0].name).toBe('Desk two');
       expect(s.ends).toEqual([{ reason: 'result' }]);
     });
 
@@ -514,13 +543,11 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
        * FOUND BY MUTATION: with the comparison replaced by `return true`,
        * every other test still passed.
        */
-      const { openSession, opened } = watchedSessions();
+      const { openSession, opened } = holdingSessions([Infinity]);
       const dusk = encodePairingUri({ ...decodePairingUri(VALID_URI), name: 'Dusk', token: new Uint8Array(32).fill(9) });
       expect(dusk.length).toBe(VALID_URI.length);
-      const desk = codeInBlocks(VALID_URI, 16, 1);
-      const other = codeInBlocks(dusk, 16, 2);
-      const reads = [desk()];
-      const s = setup({ decode: async () => reads.shift() ?? other(), openSession });
+      const reads = [oneBlock(VALID_URI, 1), oneBlock(dusk, 2)];
+      const s = setup({ decode: async () => reads.shift() ?? null, openSession });
 
       s.scheduler.step();
       await flush();
@@ -530,12 +557,8 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
       s.scheduler.step();
       await flush();
       expect(opened[0]!.release, 'the first code was not let go').toHaveBeenCalledOnce();
+      expect(opened[0]!.fed, 'the other code was fed to the first code’s session').toBe(1);
       expect(openSession).toHaveBeenCalledTimes(2);
-
-      for (let i = 0; i < 300 && s.ends.length === 0; i += 1) {
-        s.scheduler.step();
-        await flush();
-      }
       expect(s.ends).toEqual([{ reason: 'result' }]);
       expect(s.onResult).toHaveBeenCalledOnce();
       expect(s.onResult.mock.calls[0]![0].name).toBe('Dusk');
@@ -612,15 +635,60 @@ describe('a pairing code is OAT packets, collected (#127)', () => {
       expect(s.scheduler.live()).toBe(1);
     });
 
+    it('that claims two blocks is not a pairing code, even when its blocks add up to one: the hint, and never a session', async () => {
+      /*
+       * #127's ruling. Every pairing code is one frame carrying the whole URI,
+       * so a frame claiming more blocks is not one. It is a TRUE header — the
+       * one OAT's own sender draws for any artifact it splits — so, like a
+       * larger transfer, it gets the hint rather than silence.
+       */
+      const half = Math.ceil(VALID_URI.length / 2);
+      const next = codeInBlocks(VALID_URI, half);
+      const frames = Array.from({ length: 40 }, () => next());
+      const packets = frames.map((frame) => (frame as { packet: OatPacket }).packet);
+      expect(packets.every((packet) => packet.sourceBlockCount === 2)).toBe(true);
+
+      // The control: refused for its shape, not its bytes. Outside the loop,
+      // OAT rebuilds exactly the valid pairing URI from these frames.
+      const outside = await openFountainSession(packets[0]!);
+      let complete = false;
+      for (const packet of packets) if (!complete) complete = outside.addPacket(packet);
+      expect(complete).toBe(true);
+      expect(decodePairingUri(String.fromCharCode(...outside.reconstruct())).name).toBe('Desk');
+      outside.release();
+
+      const openSession = vi.fn(openFountainSession);
+      const reads = [...frames];
+      const s = setup({ decode: async () => reads.shift() ?? null, openSession });
+      for (let i = 0; i < frames.length; i += 1) {
+        s.scheduler.step();
+        await flush();
+      }
+      expect(openSession).not.toHaveBeenCalled();
+      expect(s.onResult).not.toHaveBeenCalled();
+      expect(s.onHint).toHaveBeenCalledTimes(frames.length);
+      expect(s.onHint).toHaveBeenCalledWith('not-a-pairing-code');
+      expect(s.ends).toEqual([]);
+      expect(s.scheduler.live()).toBe(1);
+    });
+
     it('classifies each shape by what it describes', () => {
       const verdict = (over: Partial<OatPacket>) => classifyPacket((forged(over) as { packet: OatPacket }).packet);
+      expect(PAIRING_BLOCK_COUNT).toBe(1);
       expect(verdict({ blockSize: 130, totalLength: 130 })).toBe('pairing');
-      expect(verdict({ sourceBlockCount: 9, blockSize: 16, totalLength: 130 })).toBe('pairing');
-      expect(verdict({ blockSize: 300, totalLength: 300 })).toBe('pairing');
-      expect(verdict({ blockSize: 301, totalLength: 301 })).toBe('too-large');
-      expect(verdict({ sourceBlockCount: 4, blockSize: 300, totalLength: 1_000 })).toBe('too-large');
-      expect(verdict({ sourceBlockCount: 9, blockSize: 16, totalLength: 129 })).toBe('pairing');
+      expect(verdict({ blockSize: 296, totalLength: 296 })).toBe('pairing');
+      // One block padded past its length is still one block.
+      expect(verdict({ blockSize: 296, totalLength: 130 })).toBe('pairing');
+      expect(verdict({ blockSize: 297, totalLength: 297 })).toBe('too-large');
+      expect(verdict({ blockSize: 298, totalLength: 298 })).toBe('too-large');
+      expect(verdict({ blockSize: 300, totalLength: 300 })).toBe('too-large');
+      expect(verdict({ sourceBlockCount: 4, blockSize: 296, totalLength: 1_000 })).toBe('too-large');
+      expect(verdict({ sourceBlockCount: 2, blockSize: 65, totalLength: 130 })).toBe('many-blocks');
+      expect(verdict({ sourceBlockCount: 9, blockSize: 16, totalLength: 130 })).toBe('many-blocks');
+      expect(verdict({ sourceBlockCount: 9, blockSize: 16, totalLength: 129 })).toBe('many-blocks');
       expect(verdict({ sourceBlockCount: 10, blockSize: 16, totalLength: 130 })).toBe('malformed');
+      // Claiming two blocks while holding one is a lie, not a larger code: silence.
+      expect(verdict({ sourceBlockCount: 2, blockSize: 130, totalLength: 130 })).toBe('malformed');
       expect(verdict({ sourceBlockCount: 0, blockSize: 16, totalLength: 16 })).toBe('malformed');
       expect(verdict({ artifactId: new Uint8Array(15) })).toBe('malformed');
     });

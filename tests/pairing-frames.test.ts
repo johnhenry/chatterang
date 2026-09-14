@@ -17,10 +17,11 @@ import {
   TRUST_SPKI_PIN,
   decodePairingUri,
   encodePairingUri,
+  fitPairingPayload,
   type PairingAddress,
   type PairingPayload,
 } from '@chatterang/tunnel/pairing';
-import { FountainDecoder, generatePackets, prepareSource, type OatPacket } from '@/lib/oat-fountain';
+import { FountainDecoder, type OatPacket } from '@/lib/oat-fountain';
 import {
   ARTIFACT_ID_BYTES,
   PAIRING_FRAME_EC_LEVEL,
@@ -34,6 +35,7 @@ import { classifyPacket, openFountainSession, pairingUriFromBytes } from '@/lib/
 
 import { codeOf, sourceFiles } from './support/source-scan';
 import { decodePngDataUrl, type Pixels } from './support/png';
+import { uncappedPairingUri } from './support/uncapped-pairing-uri';
 
 /**
  * #127: THE PAIRING CODE AS OAT FRAMES, measured and read back from pixels.
@@ -134,26 +136,41 @@ const MEASURED: readonly {
     version: 13,
   },
   {
-    label: 'server, IPv4 + 4 IPv6, 57-byte name: the longest URI that stays at v13',
+    label: 'server, IPv4 + 4 IPv6, 57-byte name: the cap, and the longest URI that stays at v13',
     payload: payload({ hostKind: HOST_SERVER, addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'n'.repeat(57) }),
     uri: 296,
     frame: 330,
     version: 13,
   },
-  {
-    label: 'server, IPv4 + 4 IPv6, 58-byte name: the next URI there is',
-    payload: payload({ hostKind: HOST_SERVER, addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'n'.repeat(58) }),
-    uri: 298,
-    frame: 332,
+];
+
+/** A server with the five addresses above and a name of `bytes` bytes. */
+const fiveAddressServer = (bytes: number) =>
+  payload({ hostKind: HOST_SERVER, addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'n'.repeat(bytes) });
+
+/**
+ * PAST THE CAP: URIs of 297 to 300 characters, which `encodePairingUri` and
+ * `decodePairingUri` refuse since the owner lowered the cap from 300 to 296
+ * (#127), drawn anyway to show why. 298–300 are real payloads written without
+ * the cap (`support/uncapped-pairing-uri.ts`). No payload encodes to 297
+ * characters — a 281-character base64url body has a character left over — so
+ * that row is the scheme and 281 characters, for its length alone.
+ */
+const PAST_CAP: readonly {
+  readonly label: string;
+  readonly text: string;
+  readonly payload: PairingPayload | null;
+  readonly frame: number;
+  readonly version: number;
+}[] = [
+  { label: '297 characters, a length no payload encodes to', text: `chatterang-pair:${'A'.repeat(281)}`, payload: null, frame: 331, version: 13 },
+  ...([[58, 332], [59, 333], [60, 334]] as const).map(([bytes, frame]) => ({
+    label: `${bytes + 240} characters: server, IPv4 + 4 IPv6, ${bytes}-byte name`,
+    text: uncappedPairingUri(fiveAddressServer(bytes)),
+    payload: fiveAddressServer(bytes),
+    frame,
     version: 14,
-  },
-  {
-    label: 'server, IPv4 + 4 IPv6, 60-byte name: the cap',
-    payload: payload({ hostKind: HOST_SERVER, addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'n'.repeat(60) }),
-    uri: 300,
-    frame: 334,
-    version: 14,
-  },
+  })),
 ];
 
 /**
@@ -186,6 +203,22 @@ async function firstFrame(uri: string): Promise<OatPacket> {
   return (await framesForPairingUri(uri)).next().value;
 }
 
+/** The packet a read holds, or a failure naming what was read instead. */
+function packetOf(read: Awaited<ReturnType<typeof decodeFrame>>): OatPacket {
+  if (read?.kind !== 'packet') throw new Error(`expected a packet, read ${JSON.stringify(read)}`);
+  return read.packet;
+}
+
+/** The named reason a pairing call refused with, or null if it did not. */
+function refusal(run: () => unknown): unknown {
+  try {
+    run();
+    return null;
+  } catch (error) {
+    return error instanceof PairingParseError ? error.reason : error;
+  }
+}
+
 /** Collect one packet with the scanner's own session, and read the text back. */
 async function collectOne(packet: OatPacket): Promise<string | null> {
   const session = await openFountainSession(packet);
@@ -199,8 +232,12 @@ async function collectOne(packet: OatPacket): Promise<string | null> {
 
 describe('a real pairing payload, framed, drawn and read back from pixels', () => {
   it('the table covers the realistic cases and both edges of the cap', () => {
+    expect(MAX_PAIRING_URI_LENGTH).toBe(296);
     expect(MEASURED.map((row) => row.uri)).toContain(MAX_PAIRING_URI_LENGTH);
     expect(Math.max(...MEASURED.map((row) => row.uri))).toBe(MAX_PAIRING_URI_LENGTH);
+    expect(PAST_CAP.map((row) => row.text.length)).toEqual([297, 298, 299, 300]);
+    // The ruling's point: every code the cap admits draws at v13 or smaller.
+    expect(Math.max(...MEASURED.map((row) => row.version))).toBe(13);
   });
 
   for (const row of MEASURED) {
@@ -243,28 +280,57 @@ describe('a real pairing payload, framed, drawn and read back from pixels', () =
     expect(PAIRING_FRAME_QUIET_ZONE).toBe(4);
   });
 
-  it('a payload every field limit admits can still be too long to encode, so a screen must choose what to leave out', () => {
+  it('a payload every field limit admits but the cap does not is fitted by dropping an address, keeping the name, and scans at v13', async () => {
     /*
      * NOT A REALISTIC-OR-NOT CLAIM, a measured edge. The table above picks
      * names that fit; this one does not. One IPv4 and four IPv6 addresses — a
      * laptop with a link-local, a ULA and temporary global addresses has that
      * many — with a 64-byte name (21 CJK characters) is inside MAX_ADDRESSES
-     * and MAX_NAME_BYTES, and over MAX_PAIRING_URI_LENGTH. `encodePairingUri`
-     * refuses it, so #127's screen has to trim addresses or the name, and to
-     * stay at version 13 it has to reach 296 characters, not 300.
+     * and MAX_NAME_BYTES, and over MAX_PAIRING_URI_LENGTH. The owner ruled what
+     * gives way (#127): `fitPairingPayload` drops the least reachable address —
+     * the link-local one, which the payload cannot carry usefully — keeps the
+     * whole name, and the code it makes draws and scans like any other.
      */
     const over = payload({ addresses: [LAN, ULA, GLOBAL, LINK, ULA2], name: 'x'.repeat(MAX_NAME_BYTES) });
     expect(over.addresses.length).toBeLessThanOrEqual(MAX_ADDRESSES);
-    let reason: unknown = null;
-    try {
-      encodePairingUri(over);
-    } catch (error) {
-      reason = error instanceof PairingParseError ? error.reason : error;
-    }
-    expect(reason).toBe('too-long');
-    // One address fewer fits, at the version the terminal budget allows.
-    expect(encodePairingUri({ ...over, addresses: over.addresses.slice(0, 4) }).length).toBeLessThanOrEqual(296);
+    expect(refusal(() => encodePairingUri(over))).toBe('too-long');
+
+    const fitted = fitPairingPayload(over);
+    expect(fitted.addresses).toEqual([LAN, ULA, ULA2, GLOBAL]);
+    expect(fitted.name).toBe(over.name);
+    const uri = encodePairingUri(fitted);
+    expect(uri).toHaveLength(282);
+
+    const packet = await firstFrame(uri);
+    const pixels = decodePngDataUrl(await renderPairingFrame(packet));
+    expect(symbolOf(pixels).version, 'QR version at level M').toBe(13);
+    const scanned = packetOf(await decodeFrame(pixels));
+    expect(classifyPacket(scanned)).toBe('pairing');
+    expect(await collectOne(scanned)).toBe(uri);
+    expect(decodePairingUri(uri)).toEqual(fitted);
   });
+});
+
+describe('past the cap: the lengths the old cap admitted, drawn anyway (#127)', () => {
+  for (const row of PAST_CAP) {
+    it(row.label, async () => {
+      expect(row.text.length).toBeGreaterThan(MAX_PAIRING_URI_LENGTH);
+      if (row.payload !== null) expect(refusal(() => encodePairingUri(row.payload!)), 'encode').toBe('too-long');
+      expect(refusal(() => decodePairingUri(row.text)), 'decode').toBe('too-long');
+
+      const packet = await firstFrame(row.text);
+      expect(encodePacket(packet).length, 'frame bytes').toBe(row.frame);
+      const pixels = decodePngDataUrl(await renderPairingFrame(packet));
+      expect(symbolOf(pixels).quietZone).toBe(PAIRING_FRAME_QUIET_ZONE);
+      expect(symbolOf(pixels).version, 'QR version at level M').toBe(row.version);
+
+      // The phone refuses the frame for its length before any decoder exists,
+      // with the "not a pairing code" hint rather than a malformed-code ending.
+      const scanned = packetOf(await decodeFrame(pixels));
+      expect(scanned).toEqual(packet);
+      expect(classifyPacket(scanned)).toBe('too-large');
+    });
+  }
 });
 
 describe('every frame of a code is the whole code', () => {
@@ -293,30 +359,19 @@ describe('every frame of a code is the whole code', () => {
     expect(b1.artifactId).not.toEqual(a1.artifactId);
   });
 
-  it('a repeated frame is harmless, to a one-block code and to a many-block one', async () => {
+  it('a repeated frame is harmless', async () => {
+    /*
+     * One-block codes only. #303 also pinned a code drawn in 16-byte blocks
+     * completing from enough frames; the owner has since ruled (#127) that the
+     * phone refuses any frame claiming more than one block, so no pairing code
+     * is drawn that way and `tests/pairing-scan.test.ts` pins the refusal.
+     */
     const single = await firstFrame(uri);
     const session = await openFountainSession(single);
     expect(session.addPacket(single)).toBe(true);
     expect(session.addPacket(single)).toBe(true);
     expect(pairingUriFromBytes(session.reconstruct())).toBe(uri);
     session.release();
-
-    // A code drawn in 16-byte blocks: the fountain code proper. A repeat is
-    // ignored by seed, and the code still completes from enough frames.
-    const bytes = pairingUriToBytes(uri);
-    const source = prepareSource(bytes, 16, new Uint8Array(ARTIFACT_ID_BYTES).fill(9));
-    let seed = 1;
-    const packets = generatePackets(source, () => seed++);
-    const decoder = new FountainDecoder(source.sourceBlockCount, source.blockSize, source.totalLength);
-    const first = packets.next().value;
-    expect(first.sourceBlockCount).toBeGreaterThan(1);
-    expect(decoder.addPacket(first)).toBe(false);
-    expect(() => decoder.addPacket(first)).not.toThrow();
-    expect(decoder.packetsSeen).toBe(1);
-    let complete = false;
-    for (let i = 0; i < 500 && !complete; i += 1) complete = decoder.addPacket(packets.next().value);
-    expect(complete).toBe(true);
-    expect(pairingUriFromBytes(decoder.reconstruct())).toBe(uri);
   });
 
   it('released, a session holds nothing and refuses to be used', async () => {

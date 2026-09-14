@@ -39,7 +39,14 @@ import {
 } from '@chatterang/tunnel/pairing';
 import { generatePackets, prepareSource, type OatPacket } from '@/lib/oat-fountain';
 import type { FrameRead, QrFrame } from '@/lib/qr-decode';
-import { HAVE_CURRENT_DATA, startQrScan, type ScanEnd, type ScanHandle } from '@/lib/qr-scan';
+import {
+  HAVE_CURRENT_DATA,
+  openFountainSession,
+  startQrScan,
+  type FrameSession,
+  type ScanEnd,
+  type ScanHandle,
+} from '@/lib/qr-scan';
 
 /**
  * #128 and #127: WHAT THE CAMERA SAW IS UNREACHABLE ONCE THE SCAN ENDS.
@@ -54,6 +61,18 @@ import { HAVE_CURRENT_DATA, startQrScan, type ScanEnd, type ScanHandle } from '@
  *
  * THE CONTROL comes first: a session still collecting IS reachable, so a probe
  * that reported everything collected could not pass it.
+ *
+ * ONE BLOCK, AND WHAT THAT CHANGES HERE (#127). The owner ruled that the phone
+ * refuses any frame claiming more than one block, and OAT's decoder completes
+ * a one-block code on the first packet it is given, so a real code is never
+ * part-collected when a scan ends. The loop does not rely on that: it holds
+ * what it opened in a session, and every ending releases it. To keep proving
+ * that with the garbage collector, a PART-COLLECTED code here is a real
+ * one-block packet fed to a real, tracked decoder — which copies its block —
+ * inside a session that answers "not complete yet" ({@link holding}). Before
+ * the ruling these tests used a code drawn in 16-byte blocks; such a code is
+ * now refused before any decoder exists, and the last test proves that the
+ * same way.
  *
  * Two things the harness has to avoid, both of which make the probe report a
  * retention that is the test's own:
@@ -89,6 +108,26 @@ function packetsOf(blockSize: number, id: number): () => OatPacket {
   };
 }
 
+/** A pairing code as the desktop draws it: every frame one block, the whole URI. */
+const oneBlock = (id: number) => packetsOf(URI.length, id);
+
+/**
+ * The loop's own session — OAT's decoder, tracked — answering "not complete
+ * yet" to every packet, so the code it holds is still being collected. No
+ * `vi.fn`, and it keeps nothing but the real session.
+ */
+async function holding(packet: OatPacket): Promise<FrameSession> {
+  const real = await openFountainSession(packet);
+  return {
+    addPacket: (next) => {
+      real.addPacket(next);
+      return false;
+    },
+    reconstruct: () => real.reconstruct(),
+    release: () => real.release(),
+  };
+}
+
 /** Let promise chains and the decoder's `import()` settle. */
 const settle = async () => {
   for (let i = 0; i < 5; i += 1) await new Promise<void>((r) => setTimeout(r, 0));
@@ -110,6 +149,7 @@ interface Probe {
   readonly handle: ScanHandle;
   readonly ends: ScanEnd[];
   readonly results: string[];
+  readonly hints: () => number;
   readonly step: () => Promise<void>;
   readonly advance: (ms: number) => void;
   readonly fireEnded: () => void;
@@ -120,7 +160,7 @@ interface Probe {
 }
 
 /** A scan with no `vi.fn` anywhere a packet or a frame passes. */
-function scan(first: () => OatPacket): Probe {
+function scan(first: () => OatPacket, openSession?: (packet: OatPacket) => Promise<FrameSession>): Probe {
   const seen: WeakRef<object>[] = [];
   const ends: ScanEnd[] = [];
   const results: string[] = [];
@@ -129,6 +169,7 @@ function scan(first: () => OatPacket): Probe {
   let clock = 0;
   let next = first;
   let failing = false;
+  let hints = 0;
 
   const handle = startQrScan({
     stream: {
@@ -155,8 +196,12 @@ function scan(first: () => OatPacket): Probe {
       seen.push(new WeakRef(packet), new WeakRef(packet.payload), new WeakRef(packet.artifactId));
       return { kind: 'packet', packet };
     },
+    ...(openSession ? { openSession } : {}),
     onResult: (payload) => results.push(payload.name),
     onEnd: (end) => ends.push(end),
+    onHint: () => {
+      hints += 1;
+    },
     schedule: (run) => {
       queue.push(run);
       return () => {
@@ -173,6 +218,7 @@ function scan(first: () => OatPacket): Probe {
     ends,
     results,
     seen,
+    hints: () => hints,
     step: async () => {
       queue.shift()?.();
       await settle();
@@ -199,7 +245,7 @@ function fresh(): void {
 describe('once a scan ends, nothing the camera saw is reachable', () => {
   it('the control: a code still being collected IS reachable, so the probe can see a retention', async () => {
     fresh();
-    const s = scan(packetsOf(16, 1));
+    const s = scan(oneBlock(1), holding);
     await s.step();
     expect(tracked.decoders).toHaveLength(1);
     expect(s.ends).toEqual([]);
@@ -209,7 +255,7 @@ describe('once a scan ends, nothing the camera saw is reachable', () => {
 
   it('on a result: the decoder, every packet, every frame and the reconstructed bytes', async () => {
     fresh();
-    const s = scan(packetsOf(URI.length, 2));
+    const s = scan(oneBlock(2));
     await s.step();
     expect(s.results).toEqual(['Desk']);
     expect(s.ends).toEqual([{ reason: 'result' }]);
@@ -236,7 +282,7 @@ describe('once a scan ends, nothing the camera saw is reachable', () => {
   for (const [label, end, reason] of endings) {
     it(`${label}: a part-collected code`, async () => {
       fresh();
-      const s = scan(packetsOf(16, 3));
+      const s = scan(oneBlock(3), holding);
       await s.step();
       await s.step();
       expect(s.ends).toEqual([]);
@@ -251,13 +297,13 @@ describe('once a scan ends, nothing the camera saw is reachable', () => {
 
   it('a code replaced by another mid-scan is unreachable while the scan reads on', async () => {
     fresh();
-    const s = scan(packetsOf(16, 4));
+    const s = scan(oneBlock(4), holding);
     await s.step();
     expect(tracked.decoders).toHaveLength(1);
     const oldDecoder = tracked.decoders.slice();
     const oldPackets = s.seen.slice();
 
-    s.setNext(packetsOf(16, 5));
+    s.setNext(oneBlock(5));
     await s.step();
     expect(tracked.decoders).toHaveLength(2);
     expect(s.ends).toEqual([]);
@@ -265,5 +311,30 @@ describe('once a scan ends, nothing the camera saw is reachable', () => {
     expect(await reachable(oldPackets), "the replaced code's packets and frames").toBe(0);
     expect(await reachable(tracked.decoders), 'the live decoder').toBe(1);
     s.handle.stop();
+  });
+
+  it('a frame claiming two blocks never reaches a decoder, and none of it is reachable once the scan ends', async () => {
+    /*
+     * #127's ruling, seen by the collector: a code drawn in two blocks — whose
+     * blocks add up to a valid pairing URI — builds no decoder, is not held,
+     * and is let go like any other frame.
+     */
+    const half = Math.ceil(URI.length / 2);
+    expect(packetsOf(half, 6)().sourceBlockCount).toBe(2);
+
+    fresh();
+    const s = scan(packetsOf(half, 6));
+    await s.step();
+    await s.step();
+    await s.step();
+    expect(tracked.decoders, 'a decoder was built for a two-block frame').toHaveLength(0);
+    expect(s.results).toEqual([]);
+    expect(s.ends).toEqual([]);
+    expect(s.hints()).toBe(3);
+    expect(s.seen.length).toBeGreaterThanOrEqual(6);
+
+    s.handle.stop();
+    expect(s.ends.map((e) => e.reason)).toEqual(['cancelled']);
+    expect(await reachable(s.seen), 'packets and frames').toBe(0);
   });
 });
