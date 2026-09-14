@@ -33,11 +33,14 @@
  * the whole gate: somewhere the paired-device registry persists (#133 — the
  * store here is an interface, and its one implementation forgets on exit),
  * the identity loaded and handed to a binding (#179 — `identity.ts` makes the
- * key and its certificates and the TLS arm accepts them, but no app loads the
- * key or issues a certificate), a declared surface (#170), and the inbound
- * privacy copy on every surface that makes the outbound promise, landing in the same
- * change as the start path (#221, #158). A listener that carries turns also
- * waits on #7's background substrate, per #169's ruling.
+ * key and its certificates and the TLS arm accepts them; each app has a key
+ * loader, in `apps/desktop/src/tunnel-identity.ts` and
+ * `apps/server/src/tunnel-identity.ts`, and nothing calls either, and no app
+ * issues a certificate or passes one to a binding), a declared surface
+ * (#170), and the inbound privacy copy on every surface that makes the
+ * outbound promise, landing in the same change as the start path (#221,
+ * #158). A listener that carries turns also waits on #7's background
+ * substrate, per #169's ruling.
  */
 
 import { createServer } from 'node:http';

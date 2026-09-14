@@ -174,7 +174,9 @@ cannot, and throws rather than connecting without it. The phone's transport is
 
 `src/host/identity.ts` makes the key a paired client pins and the certificates
 that carry it; `src/host/identity-store.ts` keeps the key on disk for both apps.
-Neither binds anything, and neither is called by an app yet.
+Neither binds anything. Each app has a loader over the store
+(`apps/desktop/src/tunnel-identity.ts`, `apps/server/src/tunnel-identity.ts`),
+and nothing calls either loader yet.
 
 What they make is what the TLS arm of `TunnelBinding` serves (see "Who gets
 in"): `asTlsMaterial(tunnelKeyPkcs8Pem(key), certificate.certPem)`. The
@@ -223,7 +225,8 @@ re-issued from the same key serves the same one.
   the seam. The only implementation forgets every phone when the process ends.
 - **Handing the identity to a listener.** `identity.ts` makes the key and its
   certificates, `identity-store.ts` keeps the key, and the TLS arm accepts what
-  they make. No app loads the key, issues a certificate, or passes one to a
+  they make. Both apps have a key loader (`apps/*/src/tunnel-identity.ts`) and
+  nothing calls either; no app issues a certificate or passes one to a
   binding. Still open: key lifetime and rotation, how long a certificate lasts
   (`validDays` has no default), and whether the phone checks names or only the
   SPKI pin (#179, #180, #295).
