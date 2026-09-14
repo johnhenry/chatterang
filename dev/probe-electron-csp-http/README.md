@@ -209,12 +209,26 @@ app's origin, and shown only where Ollama needs one.
   comma, a `*`, a default port) gets no value, and the note says the app cannot
   tell.
 
+Wherever the note shows a value, it also says to put the value in quotes when it
+is set from a shell (the Shells residual below). At `capacitor://localhost`, and
+at no other origin, it also says the value is shared with other iOS apps (the
+iOS residual below). Both were ruled by the owner on #284.
+
 On desktop the note reads:
 
 > Ollama refuses this app until its `OLLAMA_ORIGINS` setting allows it. Add
 > `chatterang-desktop:*//app` to that setting. If it already has a value, put a
-> comma between them, with no spaces. Restart Ollama for the change to take
-> effect.
+> comma between them, with no spaces. If you set it from a shell, put the value
+> in quotes. Restart Ollama for the change to take effect.
+
+On iOS it reads:
+
+> Ollama refuses this app until its `OLLAMA_ORIGINS` setting allows it. Add
+> `capacitor:*//localhost` to that setting. Other iOS apps built on the same
+> framework send the same origin as this app by default, so this value also lets
+> them reach Ollama if they can reach the machine it runs on. If it already has a
+> value, put a comma between them, with no spaces. If you set it from a shell,
+> put the value in quotes. Restart Ollama for the change to take effect.
 
 ### Third run: the values the first version printed
 
@@ -250,7 +264,7 @@ What else each printed value lets in:
   `http://localhost:5273`, `http://127.0.0.1`, `https://0.0.0.0:8443`, `app://-`,
   `tauri://localhost`, `vscode-webview://abc` and the string `file://`. Each
   `server config` line listed the value ahead of the unchanged defaults. That is
-  why the note says to add the value to anything already set. The two-entry row
+  why the note says to add the value rather than replace the setting. The two-entry row
   shows a comma-joined value, with no space, keeps both.
 - `chatterang-desktop://app`, set exactly, was run once more: it panicked with
   the same message and exited 2 without listening.
@@ -334,6 +348,16 @@ What the rows show:
   side, stops Ollama from starting. So the note says to put a comma between the
   values only if the setting already has one, and to use no spaces.
 
+### Confirmed: the middle form the note prints
+
+A later run on a throwaway `ollama serve` 0.34.0 confirmed the middle form, one
+process per value, with the user's running Ollama untouched:
+
+| `OLLAMA_ORIGINS` | 200 | 403 |
+|---|---|---|
+| `chatterang-desktop:*//app` | `chatterang-desktop://app`; the string `chatterang-desktop:evil//app`, which is not a serialized origin | `chatterang-desktop://app-evil`, `chatterang-desktop://evil`, `xchatterang-desktop://app`, `evil.chatterang-desktop://app`, `capacitor://localhost`, `https://evil.example` |
+| `capacitor:*//localhost` | `capacitor://localhost` | `capacitor://localhost.evil`, `capacitor://evil`, `xcapacitor://localhost` |
+
 Residuals:
 
 - **Desktop.** The value admits exactly `chatterang-desktop://app`. Ollama
@@ -345,10 +369,16 @@ Residuals:
   iOS app is served from `capacitor://localhost` by default. So every Capacitor
   iOS app that keeps those defaults sends the same origin as this one.
   `capacitor:*//localhost`, like any value that admits this app there, admits
-  all of them wherever they can reach the server. Only a distinct `iosScheme` or
-  `hostname` would change that, and that is out of scope here.
+  all of them wherever they can reach the server. The owner ruled that the note
+  shows the value on iOS and says so, at `capacitor://localhost` only. Only a
+  distinct `iosScheme` or `hostname` would narrow it; that moves the app's
+  stored data to a new origin, and it is not part of this change.
 - **Shells.** The value contains `*`. Typed unquoted as a command argument in
   zsh, macOS's default shell, it stops the command with "no matches found".
   Measured: `zsh -c 'print -r -- chatterang-desktop:*//app'` and the same with
-  `*chatterang-desktop://app` both printed that and exited 1. The note does not
-  mention quoting.
+  `*chatterang-desktop://app` both printed that and exited 1. With no matching
+  file, `bash -c 'printf "%s\n" chatterang-desktop:*//app'` and
+  `sh -c 'printf "%s\n" capacitor:*//localhost'` printed the value unchanged and
+  exited 0, so the failure is zsh's, and loud. The owner ruled that
+  the note says, in platform-neutral words, to put the value in quotes when it is
+  set from a shell. It says so wherever it shows a value, and nowhere else.
