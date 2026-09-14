@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { McpNotSent, destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/mcp';
+import {
+  McpNotSent,
+  destinationHost,
+  mayHaveLeft,
+  qualifiedToolName,
+  unhandledOutcome,
+  unhandledWhy,
+  validateServerUrl,
+  type McpCallReceipt,
+} from '@/domain/mcp';
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
 import { McpManager, type McpToolDescriptor } from '@/ai/mcp/client';
 import { runToolCalls, type DestinationDecision } from '@/ai/middleware/tools';
@@ -289,16 +298,28 @@ describe('an MCP call receipt', () => {
     });
   });
 
-  it('is not taken for a destructive call the user declined, and is for one they allowed', async () => {
+  it('records a destructive call the user declined as not sent, and one they allowed as sent', async () => {
     const call = vi.fn(ok);
     const declined = mustCreateMcpTool(descriptor({ readOnly: false }), {
       ...acme,
       confirm: async () => false,
       call,
     });
-    const refused = await declined.execute({ q: 'x' }, { now: () => at });
+    const refused = await declined.execute({ q: 'héllo' }, { now: () => at });
     expect(call).not.toHaveBeenCalled();
-    expect(refused.receipt).toBeUndefined();
+    expect(refused.output).toBe('The user declined that tool call.');
+    // Declining the data-change question declines the call (#92, owner ruling
+    // OD7), and the record says it was that question and not the send sheet.
+    expect(refused.receipt).toEqual({
+      outcome: 'withheld',
+      why: 'declined',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 14,
+      at: at.getTime(),
+    });
 
     // The paired control, and the timing: the sheet takes a while to answer,
     // and the receipt says when the arguments LEFT — after the answer, not when
@@ -408,6 +429,28 @@ describe('an MCP call receipt', () => {
     expect(executed[0]?.receipt?.toolName).toBe('acme.search');
     expect(executed[1]?.isError).toBe(false);
     expect(executed[1]?.receipt).toBeUndefined();
+  });
+
+  it('keeps a record from a later build as if something left, and hands its outcome back to be shown', () => {
+    // An outcome this build has no branch for: a row a later build wrote. Every
+    // reader's `default` goes through `unhandledOutcome`, whose `never`
+    // parameter is the compile-time half; this is the runtime half.
+    const later = {
+      outcome: 'queued',
+      serverId: 'mcp_1',
+      serverName: 'acme',
+      host: 'api.acme.com',
+      toolName: 'acme.search',
+      bytes: 1,
+      at: 0,
+    } as unknown as McpCallReceipt;
+    expect(mayHaveLeft(later)).toBe(true);
+    expect(unhandledOutcome(later as never)).toBe('queued');
+    expect(unhandledWhy('held-by-policy' as never)).toBe('held-by-policy');
+
+    // The paired controls: the outcomes this build knows.
+    expect(mayHaveLeft({ ...later, outcome: 'failed' } as McpCallReceipt)).toBe(true);
+    expect(mayHaveLeft({ ...later, outcome: 'withheld', why: 'declined' } as McpCallReceipt)).toBe(false);
   });
 });
 

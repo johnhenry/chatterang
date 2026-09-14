@@ -568,7 +568,7 @@ describe('the record of what left follows the generation that sent it', () => {
             ...MCP_TOOL,
             isError: true,
             output: 'The user did not allow sending this call’s arguments to notes.example.',
-            receipt: { ...RECEIPT, outcome: 'withheld' },
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' },
           },
         ],
       }),
@@ -580,6 +580,57 @@ describe('the record of what left follows the generation that sent it', () => {
         const headline = document.querySelector('.tool__head')?.textContent ?? '';
         expect(headline).toContain('not sent');
         expect(headline, 'a call that was never sent did not fail').not.toContain('failed');
+      },
+    );
+  });
+
+  it('says a destructive call that was declined was not sent, and which question stopped it', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I did not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'The user declined that tool call.',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'declined' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual([
+          'Not sent to notes.example (notes) — it could change data there, and was declined.',
+        ]);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send|was not allowed/);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+        expect(document.querySelector('.tool__head')?.textContent ?? '').toContain('not sent');
+      },
+    );
+  });
+
+  it('says a call held back for a reason a later build added was not sent, with that reason', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I did not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'not sent',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'held-by-policy' } as unknown as McpCallReceipt,
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — held-by-policy.']);
       },
     );
   });

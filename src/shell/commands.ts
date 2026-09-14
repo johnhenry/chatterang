@@ -26,7 +26,7 @@ import {
 } from '@/domain/manifest';
 import { deriveTitle, reachKind } from '@/domain/chat';
 import type { Reach, ToolInvocation } from '@/domain/chat';
-import type { McpCallReceipt } from '@/domain/mcp';
+import { unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 
 export interface ShellOutput {
   readonly stdout: string;
@@ -1057,12 +1057,18 @@ function receiptClause(receipt: McpCallReceipt): string {
     case 'failed':
       return `${receipt.toolName} tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived`;
     case 'withheld':
-      return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
-    default: {
+      // What held it back, as the thread says it.
+      switch (receipt.why) {
+        case 'not-allowed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
+        case 'declined':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — it could change data there, and was declined`;
+        default:
+          return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
+      }
+    default:
       // A new outcome has to say what it means here before this compiles.
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      return unhandledOutcome(receipt);
   }
 }
 

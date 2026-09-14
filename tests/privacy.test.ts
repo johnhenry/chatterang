@@ -686,6 +686,7 @@ describe('MCP arguments do not leave the device without a grant', () => {
       // Recorded as not sent, and sized as what would have gone (#92, OD7).
       expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
         outcome: 'withheld',
+        why: 'not-allowed',
         serverId: PROBE_SERVER.serverId,
         serverName: 'notes',
         host: 'notes.example',
@@ -748,7 +749,49 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(tool?.type === 'tool' && tool.tool.output).toBe(
       'The user did not allow sending this call’s arguments to notes.example.',
     );
-    expect(tool?.type === 'tool' && tool.tool.receipt?.outcome).toBe('withheld');
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({ outcome: 'withheld', why: 'not-allowed' });
+  });
+
+  it('sends nothing, and records it as not sent, when the person declines a destructive call its server was allowed', async () => {
+    // Owner ruling OD7 covers every way a person declines a call. The grant is
+    // held here, so what stops this one is the second question (OD1): whether
+    // a call the server does not call read-only may change data there.
+    const declines = async (answer: boolean) => {
+      const probe = mcpProbe({ readOnly: false });
+      probe.confirm.mockResolvedValue(answer);
+      toolRegistry.register(probe.tool);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+      toolRegistry.unregister(probe.tool.id);
+      const tool = events.find((event) => event.type === 'tool');
+      return { probe, receipt: tool?.type === 'tool' ? tool.tool.receipt : undefined };
+    };
+
+    const declined = await declines(false);
+    expect(declined.probe.confirm).toHaveBeenCalledOnce();
+    expect(declined.probe.call, 'it was not sent').not.toHaveBeenCalled();
+    expect(declined.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'declined',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    });
+
+    // The paired control: allowed at the same confirm, it goes, and says so.
+    const allowed = await declines(true);
+    expect(allowed.probe.call).toHaveBeenCalledOnce();
+    expect(allowed.receipt?.outcome).toBe('sent');
   });
 
   it('asks once for every call to one server in a batch, and "these calls" sends exactly those', async () => {

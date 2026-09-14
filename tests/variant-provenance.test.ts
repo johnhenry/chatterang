@@ -1075,7 +1075,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
   it('is not a reason to keep an empty turn when it records a call that was not sent', async () => {
     // A withheld record says nothing left, so there is no egress for an empty
     // generation to be the only trace of (#92, OD7).
-    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld' } };
+    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
     useChats.setState({
       messages: [
         USER,
@@ -1092,7 +1092,7 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     // The paired control is "is written down while the turn is still running":
     // the same held-open turn, with a receipt that says something left.
     const turn = heldOpen();
-    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld' } };
+    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
     script = [{ text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, hang: turn.hang }];
     const sending = useChats.getState().send('hello');
     try {

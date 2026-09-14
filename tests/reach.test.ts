@@ -527,7 +527,7 @@ describe('the receipts a turn kept, in the transcript', () => {
           role: 'assistant',
           createdAt: 1,
           content: 'ok',
-          toolCalls: [call('a.example'), { ...withheld, receipt: { ...withheld.receipt, outcome: 'withheld' } }],
+          toolCalls: [call('a.example'), { ...withheld, receipt: { ...withheld.receipt, outcome: 'withheld', why: 'not-allowed' } }],
         },
       ] as unknown as Parameters<typeof renderTranscript>[1],
     );
@@ -536,6 +536,45 @@ describe('the receipts a turn kept, in the transcript', () => {
       `${line('a.example')}.\n- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — it was not allowed.\n`,
     );
     expect(transcript).not.toContain('sent 12 bytes of arguments to b.example');
+  });
+
+  it('prints a destructive call that was declined as not sent, and says which question stopped it', () => {
+    const declined = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...declined, receipt: { ...declined.receipt, outcome: 'withheld', why: 'declined' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — it could change data there, and was declined.\n',
+    );
+    expect(transcript).not.toContain('it was not allowed');
+  });
+
+  it('prints a reason a later build added as not sent, with the reason as stored', () => {
+    const later = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...later, receipt: { ...later.receipt, outcome: 'withheld', why: 'held-by-policy' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — held-by-policy.\n',
+    );
   });
 
   it('still exports when a stored receipt’s time cannot be read', () => {

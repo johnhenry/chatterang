@@ -303,6 +303,7 @@ export async function runToolCalls(
       if (destination) {
         receipt = {
           outcome: 'withheld',
+          why: 'not-allowed',
           serverId: destination.serverId,
           serverName: destination.serverName,
           host: destination.host,

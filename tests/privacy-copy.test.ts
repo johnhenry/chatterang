@@ -765,6 +765,61 @@ describe('the privacy command', () => {
     expect(transcript).not.toContain('notes.note sent');
   });
 
+  /*
+   * A DESTRUCTIVE CALL DECLINED AT ITS OWN CONFIRM IS RECORDED AS NOT SENT
+   * (#92, owner ruling OD7), and says it was that question: its server was
+   * allowed, and changing data there was not. Measured through the real
+   * dispatcher, rendered by the real thread, transcript and sheet.
+   */
+  it('says a destructive call that was declined was not sent — and it was not', async () => {
+    expect(shipped('features/chat/MessageView.tsx')).toContain(
+      'return `Not sent to ${where} — it could change data there, and was declined.`;',
+    );
+
+    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+    const tool = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: false,
+        destructive: true,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => false, call },
+    );
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }],
+      // The grant is held, so the confirm is the only thing that can stop it.
+      { enabledIds: [tool.id], destinations: { isGranted: () => true } },
+    );
+    const record = executed[0]!;
+    expect(call, 'it was not sent').not.toHaveBeenCalled();
+    expect(record.receipt).toMatchObject({ outcome: 'withheld', why: 'declined' });
+
+    const thread = await threadText(record);
+    expect(thread).toContain('Not sent to notes.example (notes) — it could change data there, and was declined.');
+    expect(thread).not.toMatch(/Sent \d+ bytes|Tried to send|it was not allowed/);
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'I did not file it.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note was not sent to notes.example (notes) at ${utc(record.receipt!.at)} — it could change data there, and was declined.`,
+    );
+    expect(transcript).not.toContain('it was not allowed');
+
+    // Nothing went, so the reply the sheet would carry is this app's, this turn
+    // and a turn later.
+    expect(toolOutputSheetBody([record], [], 'GPT-4o mini', 40)).toContain(
+      'notes.note was not sent to notes.example; this app wrote its reply',
+    );
+    expect(toolOutputSheetBody([], [{ toolCalls: [record] }], 'GPT-4o mini', 40)).toContain(
+      'notes.note, which was not sent to notes.example',
+    );
+  });
+
   /**
    * The sentence that replaced "withholds it … if the reply diverted to a
    * fallback". That one was measured false: `stream()` tests `isGranted`
@@ -1167,6 +1222,25 @@ describe('the tool-output sheet', () => {
     const withheldEarlier = toolOutputSheetBody([], [{ toolCalls: [withheld] }], 'GPT-4o mini', 40);
     expect(withheldEarlier).toContain('notes.note, which was not sent to notes.example');
     expect(withheldEarlier).not.toContain('returned from');
+
+    // A record a later build wrote: a reason, or an outcome, this build has no
+    // branch for. The sheet names the tool and says what it can, and neither
+    // calls the reply this app's own nor says the server returned it.
+    const laterWhy = {
+      ...withheld,
+      receipt: { ...withheld.receipt!, why: 'held-by-policy' },
+    } as unknown as typeof withheld;
+    const laterWhyBody = toolOutputSheetBody([laterWhy], [{ toolCalls: [laterWhy] }], 'GPT-4o mini', 40);
+    expect(laterWhyBody).toContain('notes.note was not sent to notes.example (held-by-policy)');
+    expect(laterWhyBody).toContain('notes.note, which was not sent to notes.example (held-by-policy)');
+    expect(laterWhyBody).not.toMatch(/this app wrote its reply|own data|returned this from/);
+    const laterOutcome = {
+      ...withheld,
+      receipt: { ...withheld.receipt!, outcome: 'queued' },
+    } as unknown as typeof withheld;
+    const laterOutcomeBody = toolOutputSheetBody([laterOutcome], [], 'GPT-4o mini', 40);
+    expect(laterOutcomeBody).toContain('notes.note queued');
+    expect(laterOutcomeBody).not.toMatch(/own data|returned this from/);
 
     // And the sheet the app raises is built by this function, not a copy of it.
     expect(shipped('state/chat.ts')).toContain(

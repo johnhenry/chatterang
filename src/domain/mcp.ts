@@ -108,24 +108,26 @@ export interface ToolDestination {
  *
  * `sent` and `failed` are taken when the call is handed over, not when it
  * returns, so `at` is when the arguments left and a call that then failed still
- * has one. `withheld` is taken at dispatch for a call this conversation did not
- * allow to leave (#6, owner ruling OD7): the person said no, or nobody could be
- * asked. It records what did NOT go, so the thread and the export can say so,
- * and no reader may count it as egress — see {@link mayHaveLeft}.
- *
- * A call that stopped for any other reason has none: one declined at the
- * destructive confirm after it was allowed, or refused with {@link McpNotSent}.
+ * has one. `withheld` records what did NOT go, so the thread and the export can
+ * say so, and no reader may count it as egress — see {@link mayHaveLeft}. Owner
+ * ruling OD7 covers every way a call is held back, and `why` says which
+ * ({@link WithheldWhy}).
  *
  * `outcome` is a discriminant rather than optional flags so that every reader
- * has to say what it does with each value.
+ * has to say what it does with each value, and `why` exists only on the outcome
+ * it explains, for the same reason.
  *
  * `bytes` is the UTF-8 length of the arguments as JSON — the part the model
  * composed — not the size of the request envelope around them; for a withheld
  * call, the size of what would have gone. There is no hash: the arguments
  * themselves are stored beside this, on the invocation.
  */
-export interface McpCallReceipt {
-  readonly outcome: 'sent' | 'failed' | 'withheld';
+export type McpCallReceipt =
+  | (McpCallFields & { readonly outcome: 'sent' | 'failed' })
+  | (McpCallFields & { readonly outcome: 'withheld'; readonly why: WithheldWhy });
+
+/** What every receipt records, whatever became of the call. */
+export interface McpCallFields {
   readonly serverId: string;
   readonly serverName: string;
   readonly host: string;
@@ -137,13 +139,27 @@ export interface McpCallReceipt {
 }
 
 /**
+ * Why a call's arguments were withheld (#92, owner ruling OD7).
+ *
+ * - `not-allowed`: this conversation did not allow the server — the person said
+ *   no to the send sheet, or nobody could be asked (#6).
+ * - `declined`: the server was allowed, and the person said no when asked about
+ *   a call the server does not call read-only changing data there.
+ *
+ * Each reads differently in the thread and the export, because each is a
+ * different thing to have happened, and only one of them was a person refusing
+ * to send.
+ */
+export type WithheldWhy = 'not-allowed' | 'declined';
+
+/**
  * Could this call's arguments have reached the server?
  *
  * The question a record of egress is kept for. `failed` answers yes, because a
- * call can fail after its arguments arrived; `withheld` answers no. An outcome
- * this build has never heard of — a row written by a later one — falls to the
- * `never` branch and answers with the outcome itself, which is truthy: kept as
- * if something left, the direction it is safe to be wrong in.
+ * call can fail after its arguments arrived; `withheld` answers no, whatever
+ * held the call back. An outcome this build has never heard of — a row written
+ * by a later one — falls to the `never` branch and answers true: kept as if
+ * something left, the direction it is safe to be wrong in.
  */
 export function mayHaveLeft(receipt: McpCallReceipt | undefined): boolean {
   if (receipt === undefined) return false;
@@ -153,11 +169,33 @@ export function mayHaveLeft(receipt: McpCallReceipt | undefined): boolean {
       return true;
     case 'withheld':
       return false;
-    default: {
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+    default:
+      unhandledOutcome(receipt);
+      return true;
   }
+}
+
+/**
+ * The outcome of a receipt no branch of a reader handles: a row written by a
+ * later build.
+ *
+ * Called from a switch's `default`. Its parameter is `never`, so that switch
+ * stops compiling the moment an outcome is added and left unhandled; at
+ * runtime it hands back what was stored, for the reader to show. The receipt
+ * is passed rather than its `outcome`, because once every member of the union
+ * is handled the receipt itself is `never` and has no `outcome` to read.
+ */
+export function unhandledOutcome(receipt: never): string {
+  return String((receipt as { readonly outcome?: unknown }).outcome);
+}
+
+/**
+ * The same for a withheld receipt's `why`: a reason a later build added. The
+ * reader still knows the call was not sent, and shows the reason as stored
+ * rather than guessing what it meant.
+ */
+export function unhandledWhy(why: never): string {
+  return String(why);
 }
 
 /**

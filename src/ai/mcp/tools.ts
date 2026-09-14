@@ -35,6 +35,7 @@ import {
   argumentBytes,
   destinationHost,
   qualifiedToolName,
+  type McpCallFields,
   type McpCallReceipt,
   type ToolDestination,
 } from '@/domain/mcp';
@@ -119,23 +120,8 @@ export function createMcpTool(
       // change data there. They are different harms, so a grant for the whole
       // conversation never answers this one (#6); a read-only call asks
       // nothing more here.
-      if (!descriptor.readOnly) {
-        const approved = await options.confirm(
-          `run “${descriptor.name}” on ${host}, which may change data there`,
-        );
-        if (!approved) {
-          return { output: 'The user declined that tool call.', isError: true };
-        }
-      }
-
-      // THE RECEIPT IS TAKEN HERE: after the confirm, so a declined call has
-      // none, and before the hand-off, so `at` is when the arguments left and a
-      // call that then throws still has one. `now` is read once; the catch
-      // below must not read it again.
       const bytes = argumentBytes(input);
-      const at = context.now().getTime();
-      const receipt = (outcome: McpCallReceipt['outcome']): McpCallReceipt => ({
-        outcome,
+      const fields = (at: number): McpCallFields => ({
         serverId: options.serverId,
         serverName: descriptor.server,
         host,
@@ -143,6 +129,29 @@ export function createMcpTool(
         bytes,
         at,
       });
+
+      if (!descriptor.readOnly) {
+        const approved = await options.confirm(
+          `run “${descriptor.name}” on ${host}, which may change data there`,
+        );
+        if (!approved) {
+          // RECORDED AS NOT SENT (#92, owner ruling OD7). Saying no to the
+          // data-change question declines the call as surely as a no to the
+          // send sheet does, and the record says which of the two it was.
+          return {
+            output: 'The user declined that tool call.',
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'declined' },
+          };
+        }
+      }
+
+      // THE SENT RECEIPT IS TAKEN HERE: after the confirm, so `at` is not when
+      // the question was first asked, and before the hand-off, so `at` is when
+      // the arguments left and a call that then throws still has one. `now` is
+      // read once; the catch below must not read it again.
+      const at = context.now().getTime();
+      const receipt = (outcome: 'sent' | 'failed'): McpCallReceipt => ({ ...fields(at), outcome });
 
       try {
         const result = await options.call(

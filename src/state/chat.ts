@@ -48,7 +48,13 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import { mayHaveLeft, type McpCallReceipt, type ToolDestination } from '@/domain/mcp';
+import {
+  mayHaveLeft,
+  unhandledOutcome,
+  unhandledWhy,
+  type McpCallReceipt,
+  type ToolDestination,
+} from '@/domain/mcp';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -1130,13 +1136,20 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
     case 'failed':
       return [receipt.toolName, `did not complete on ${receipt.host}`];
     case 'withheld':
-      // Nothing went, so nothing came back: the output is this app's refusal.
-      return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
-    default: {
+      // Nothing went, so nothing came back: the output is this app's refusal,
+      // whatever held the call back. A reason added later has to say whether
+      // that is still so before this compiles.
+      switch (receipt.why) {
+        case 'not-allowed':
+        case 'declined':
+          return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
+        default:
+          // Not sent; whose words came back is not this build's to say.
+          return [receipt.toolName, `was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`];
+      }
+    default:
       // A new outcome has to say where its output came from before this compiles.
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      return [tool.name, unhandledOutcome(receipt)];
   }
 }
 
@@ -1148,11 +1161,15 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
     case 'failed':
       return `${names}, which did not complete on ${receipt.host}`;
     case 'withheld':
-      return `${names}, which was not sent to ${receipt.host}`;
-    default: {
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      switch (receipt.why) {
+        case 'not-allowed':
+        case 'declined':
+          return `${names}, which was not sent to ${receipt.host}`;
+        default:
+          return `${names}, which was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`;
+      }
+    default:
+      return unhandledOutcome(receipt);
   }
 }
 

@@ -6,7 +6,7 @@ import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
 import { currentVariant, ranOnDevice } from '@/domain/chat';
-import { mayHaveLeft, type McpCallReceipt } from '@/domain/mcp';
+import { mayHaveLeft, unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
@@ -384,8 +384,11 @@ function Thinking({ text }: { text: string }): ReactNode {
  * calling it not sent would be wrong in the flattering direction. A withheld
  * call is the one that is not sent, and says so without claiming where the
  * arguments are now: a remote model wrote them, so they were never only here.
+ * It also says what held it back, because "not allowed" and "declined when
+ * asked about changing data" are different answers to different questions.
  *
- * An exhaustive switch, so an outcome added later cannot compile unrendered.
+ * Exhaustive switches, so an outcome or a reason added later cannot compile
+ * unrendered.
  */
 function receiptSentence(receipt: McpCallReceipt): string {
   const where = `${receipt.host} (${receipt.serverName})`;
@@ -396,11 +399,16 @@ function receiptSentence(receipt: McpCallReceipt): string {
     case 'failed':
       return `Tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived.`;
     case 'withheld':
-      return `Not sent to ${where} — it was not allowed.`;
-    default: {
-      const unhandled: never = receipt.outcome;
-      return unhandled;
-    }
+      switch (receipt.why) {
+        case 'not-allowed':
+          return `Not sent to ${where} — it was not allowed.`;
+        case 'declined':
+          return `Not sent to ${where} — it could change data there, and was declined.`;
+        default:
+          return `Not sent to ${where} — ${unhandledWhy(receipt.why)}.`;
+      }
+    default:
+      return unhandledOutcome(receipt);
   }
 }
 
