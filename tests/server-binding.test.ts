@@ -303,6 +303,29 @@ describe('the command line', () => {
       expect(() => parseArgv([token]), token).toThrow(/unknown option/);
     }
   });
+
+  it('exports the table without letting an importer edit it', () => {
+    // The barrel hands `SERVER_FLAGS` to anything that imports the server, and
+    // a row's `set` IS the parser. Frozen at the top only, `--host` stays one
+    // assignment away from writing `tlsKeyPath` while every test above passes.
+    expect(Object.isFrozen(SERVER_FLAGS)).toBe(true);
+    const table = SERVER_FLAGS as Record<string, unknown>;
+    const first = table['--root'];
+    expect(() => {
+      table['--root'] = first;
+    }).toThrow(TypeError);
+
+    for (const [flag, spec] of Object.entries(SERVER_FLAGS)) {
+      expect(Object.isFrozen(spec), flag).toBe(true);
+      // Written back unchanged, so a table that is NOT frozen fails here
+      // without leaving an edited row behind for the tests that follow.
+      const row = spec as { set: unknown };
+      const { set } = row;
+      expect(() => {
+        row.set = set;
+      }, flag).toThrow(TypeError);
+    }
+  });
 });
 
 describe('the operator token', () => {

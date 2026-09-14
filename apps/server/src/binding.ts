@@ -363,17 +363,29 @@ export interface ServerFlag {
  * Only OWN keys are flags. `parseArgv` looks a token up with `Object.hasOwn`,
  * so `constructor` or `__proto__` meets the refusal rather than finding
  * `Object.prototype` behind a plain index.
+ *
+ * FROZEN ROW BY ROW, not only at the top. The table leaves this file through
+ * the `@chatterang/server` barrel, and its rows hold behaviour, not labels.
+ * Freezing the outer object alone seals which flags exist, but leaves
+ * `SERVER_FLAGS['--host'].set` one assignment away from writing `tlsKeyPath`;
+ * `readonly` forbids that only in the type checker. Every row goes through
+ * {@link takesValue}, so no row can be written without the freeze.
  */
 export const SERVER_FLAGS: Readonly<Record<string, ServerFlag>> = Object.freeze({
-  '--root': { arity: 'value', set: (out, value) => (out.root = value) },
-  '--bundle': { arity: 'value', set: (out, value) => (out.bundle = value) },
-  '--hosts': { arity: 'value', set: (out, value) => (out.hosts = value) },
-  '--port': { arity: 'value', set: (out, value) => (out.port = Number(value)) },
-  '--host': { arity: 'value', set: (out, value) => (out.host = value) },
-  '--advertise': { arity: 'value', set: (out, value) => (out.advertise = value) },
-  '--tls-key': { arity: 'value', set: (out, value) => (out.tlsKeyPath = value) },
-  '--tls-cert': { arity: 'value', set: (out, value) => (out.tlsCertPath = value) },
+  '--root': takesValue((out, value) => (out.root = value)),
+  '--bundle': takesValue((out, value) => (out.bundle = value)),
+  '--hosts': takesValue((out, value) => (out.hosts = value)),
+  '--port': takesValue((out, value) => (out.port = Number(value))),
+  '--host': takesValue((out, value) => (out.host = value)),
+  '--advertise': takesValue((out, value) => (out.advertise = value)),
+  '--tls-key': takesValue((out, value) => (out.tlsKeyPath = value)),
+  '--tls-cert': takesValue((out, value) => (out.tlsCertPath = value)),
 });
+
+/** A frozen row for a flag that consumes the token after it. */
+function takesValue(set: ServerFlag['set']): ServerFlag {
+  return Object.freeze({ arity: 'value', set });
+}
 
 /**
  * Read the flags this server understands, and refuse the ones it does not.
