@@ -552,6 +552,58 @@ describe('a chat deleted while a turn is running in it', () => {
     expect(rowsFor('mcp_turn')).toEqual([]);
   });
 
+  it.each(['deleted', 'only stopped'] as const)(
+    'takes down the MCP send sheet its turn waits on when the chat is %s, and writes the not-sent record only for a chat still there',
+    async (how) => {
+      // The real engine, the real store policy and the real approval queue. A
+      // call waits on its send sheet. Deleting the chat stops the turn, and a
+      // stopped turn takes that sheet down and records the call as not sent
+      // (#92). That record is a message row like any other: for a deleted chat
+      // it must not be written back. The control is Stop on a chat nothing
+      // deletes, which shows the record does reach the table otherwise.
+      const id = how === 'deleted' ? 'sheet_deleted' : 'sheet_stopped';
+      const probe = mcpProbe();
+      given({ ...chat(id, 1), tools: [probe.tool.id] });
+      useChats.setState({ activeChatId: id });
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+
+      let removing: Promise<void> = Promise.resolve();
+      let sending: Promise<void> = Promise.resolve();
+      try {
+        toolRegistry.register(probe.tool);
+        engine.router.replace(QWEN.engine, recordingBackend([MCP_CALL, 'Done.']).adapter);
+        useApp.setState({ engine: engine as never, approvals: [] });
+        sending = useChats.getState().send('file my bank details');
+        await until(() => useApp.getState().approvals.length === 1);
+
+        if (how === 'deleted') removing = useChats.getState().removeChat(id);
+        else useChats.getState().stop();
+        await Promise.all([removing, sending]);
+      } finally {
+        for (const approval of useApp.getState().approvals) useApp.getState().answerApproval(approval.id, false);
+        await Promise.all([removing, sending]);
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(useApp.getState().approvals, 'the sheet is taken down').toEqual([]);
+      expect(probe.call, 'nothing left for the call').not.toHaveBeenCalled();
+      if (how === 'deleted') {
+        expect(rowsFor(id), 'no row carries the not-sent record back').toEqual([]);
+        expect(fake.chats.has(id)).toBe(false);
+        expect(await relaunch()).toEqual([]);
+      } else {
+        const rows = rowsFor(id) as Message[];
+        expect(rows.map((row) => row.role)).toEqual(['user', 'assistant']);
+        expect(rows[1]?.streaming).toBe(false);
+        expect(rows[1]?.toolCalls?.[0]?.receipt).toMatchObject({
+          outcome: 'withheld',
+          why: 'stopped',
+          host: 'notes.example',
+        });
+      }
+    },
+  );
+
   it('does not hand the turn to the engine when the delete is asked for while its prompt is being built', async () => {
     // An image in the thread is read back from its payload while the prompt is
     // built. A stopped signal handed to the engine still lets it raise a sheet
