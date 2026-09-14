@@ -17,15 +17,17 @@
  * NO `.` export at all, so there is nothing for a bare import to resolve to —
  * belt and braces, both asserted.
  *
- * NOT IMPLEMENTED HERE, AND THE REASON CHANGED. Node ships a WebSocket client
- * and no WebSocket server (#157) — that half still holds. What no longer holds
- * is the other half this comment used to carry: whether the listener sits
+ * WHAT IS HERE, AND WHAT IS NOT. Node ships a WebSocket client and no WebSocket
+ * server (#157), which is why this half carries `ws`. Whether the listener sits
  * behind plaintext LAN plus an application-layer handshake or behind a native
  * socket plugin was #181's call, and #181 made it on 2026-09-11: **a native
  * socket plugin, on both platforms. One transport, not two.**
  *
- * This file is still the shape rather than the server, because the server is
- * #157 and #158. It is not waiting on anybody.
+ * What this file builds is rung 0 of that (#156): a real listener that speaks
+ * the real wire format, on loopback, with no TLS and no credential. It exists to
+ * hold the protocol to its word. No app starts it, and none may until the
+ * listener has a device credential (#135), certificate material (#179) and a
+ * declared surface (#170) to stand behind.
  */
 
 import { createServer } from 'node:http';
@@ -136,7 +138,19 @@ export interface TunnelHostOptions {
 export async function createTunnelHost(options: TunnelHostOptions = {}): Promise<TunnelHost> {
   const { WebSocketServer } = await import('ws');
   const server = createServer();
-  const sockets = new WebSocketServer({ server });
+  /*
+   * `noServer`, AND THE UPGRADE WIRED BY HAND, because `{ server }` is what
+   * turned a busy port into a crash. Handed a server, `ws` adds its own `error`
+   * listener to it that re-emits on the WebSocketServer
+   * (`ws/lib/websocket-server.js:125-131`), and nothing listened there — so
+   * EADDRINUSE was thrown from inside the server's own `emit`, before any
+   * `once('error')` added afterwards could run. With `noServer` the server's
+   * events are this file's alone. This is the `ws` README's own pattern.
+   */
+  const sockets = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request, socket, head) => {
+    sockets.handleUpgrade(request, socket, head, (ws) => sockets.emit('connection', ws, request));
+  });
 
   const inbox: TunnelFrame[] = [];
   let wake: (() => void) | null = null;
@@ -231,13 +245,19 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
     });
   });
 
-  await new Promise<void>((resolve) => server.listen(options.port ?? 0, '127.0.0.1', resolve));
+  // A busy port rejects rather than hanging, as `apps/server/src/index.ts`'s
+  // own listen does. Removed on success so a later error is not a rejection of
+  // a promise that already resolved.
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(options.port ?? 0, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
 
   return {
     server,
-    get close_(): TunnelClose | null {
-      return ended;
-    },
     async send(frame) {
       assertSendable(frame);
       peer?.send(encodeFrame(frame));
@@ -302,5 +322,10 @@ export async function createTunnelHost(options: TunnelHostOptions = {}): Promise
       await new Promise<void>((resolve) => sockets.close(() => resolve()));
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
-  } as TunnelHost;
+    /*
+     * `satisfies`, NOT `as`. The cast hid a `get close_()` that `TunnelHost`
+     * never declared and nothing read; `satisfies` makes an undeclared member
+     * a compile error rather than something a reviewer has to notice.
+     */
+  } satisfies TunnelHost;
 }

@@ -48,10 +48,11 @@ the drift the contracts guard exists to prevent.
 
 ## What is deliberately not here
 
-- **A transport.** Not built. No longer *undecided* — #181 chose a native
-  socket plugin on both platforms. Both seams (`createTunnelClient`,
-  `createTunnelHost`) throw, naming the ticket that would build them (#156,
-  #157/#158) rather than one that would decide them.
+- **A production transport.** #181 chose a native socket plugin on both
+  platforms, and that plugin is not built. What exists is rung 0 (#156):
+  `createTunnelClient` and `createTunnelHost` speak the real wire format over
+  loopback `ws://`, with no TLS and no credential, and no app starts the
+  listener.
 - **`TunnelBinding`.** It belongs in `src/host/`, modelled on
   `apps/server/src/binding.ts` — bind address and credentials as one union, so
   the unsafe combination cannot be written down. There is one arm to write now;
