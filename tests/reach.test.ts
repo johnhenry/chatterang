@@ -518,6 +518,26 @@ describe('the receipts a turn kept, in the transcript', () => {
     );
   });
 
+  it('prints a call that was not allowed as not sent, beside one that was sent', () => {
+    const withheld = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [call('a.example'), { ...withheld, receipt: { ...withheld.receipt, outcome: 'withheld' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      `${line('a.example')}.\n- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — it was not allowed.\n`,
+    );
+    expect(transcript).not.toContain('sent 12 bytes of arguments to b.example');
+  });
+
   it('still exports when a stored receipt’s time cannot be read', () => {
     // `toISOString` throws on an invalid date. One bad row must cost its own
     // timestamp, not the whole file and every `/chats/*.md` beside it.

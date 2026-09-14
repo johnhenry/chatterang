@@ -48,7 +48,7 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import type { McpCallReceipt, ToolDestination } from '@/domain/mcp';
+import { mayHaveLeft, type McpCallReceipt, type ToolDestination } from '@/domain/mcp';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -692,9 +692,14 @@ function generationsSoFar(target: Message): MessageVariant[] {
   return all.filter((variant) => variant.content.length > 0 || carriesReceipt(variant));
 }
 
-/** Did any tool call in this generation hand its arguments to an MCP server? */
+/**
+ * Did any tool call in this generation hand its arguments to an MCP server?
+ *
+ * A withheld call did not, so a generation holding only that record is not
+ * kept for it: nothing left for the record to be the only trace of.
+ */
 function carriesReceipt(variant: MessageVariant): boolean {
-  return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
+  return variant.toolCalls?.some((call) => mayHaveLeft(call.receipt)) ?? false;
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */
@@ -850,7 +855,8 @@ async function runGeneration(
           ];
           patch((message) => ({ ...message, toolCalls }));
 
-          // A receipt says bytes left the device, so it is written down NOW.
+          // A receipt that says bytes may have left the device is written down
+          // NOW. A withheld one waits for the turn to end like any other text.
           // Until this, nothing reached the database before the turn ended, and
           // a turn that errored, was stopped or was killed afterwards took the
           // record with it. The row goes in still marked streaming; `openChat`
@@ -863,7 +869,7 @@ async function runGeneration(
           // opens another chat mid-turn the running row is not in it — so the
           // lookup found nothing and nothing was written. It is the row `patch`
           // keeps on screen, field for field.
-          if (event.tool.receipt) {
+          if (mayHaveLeft(event.tool.receipt)) {
             const split = splitThinking(raw);
             await db.messages.put({
               ...placeholder,
@@ -1123,6 +1129,9 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
       return [receipt.toolName, `returned this from ${receipt.host}`];
     case 'failed':
       return [receipt.toolName, `did not complete on ${receipt.host}`];
+    case 'withheld':
+      // Nothing went, so nothing came back: the output is this app's refusal.
+      return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
     default: {
       // A new outcome has to say where its output came from before this compiles.
       const unhandled: never = receipt.outcome;
@@ -1138,6 +1147,8 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
       return `what ${names} returned from ${receipt.host}`;
     case 'failed':
       return `${names}, which did not complete on ${receipt.host}`;
+    case 'withheld':
+      return `${names}, which was not sent to ${receipt.host}`;
     default: {
       const unhandled: never = receipt.outcome;
       return unhandled;

@@ -1006,8 +1006,8 @@ export function renderTranscript(
 }
 
 /**
- * One line per call a turn handed to an MCP server, for every generation the
- * turn kept.
+ * One line per MCP call a turn recorded — handed to a server, or withheld from
+ * one — for every generation the turn kept.
  *
  * EVERY GENERATION ONCE. When the displayed generation is a record in
  * `variants`, the row's own fields are its projection (`applyVariant`), so the
@@ -1056,6 +1056,8 @@ function receiptClause(receipt: McpCallReceipt): string {
       return `${receipt.toolName} sent ${receipt.bytes} bytes of arguments to ${where} at ${when}`;
     case 'failed':
       return `${receipt.toolName} tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived`;
+    case 'withheld':
+      return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
     default: {
       // A new outcome has to say what it means here before this compiles.
       const unhandled: never = receipt.outcome;

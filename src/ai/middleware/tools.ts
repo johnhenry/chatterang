@@ -296,6 +296,21 @@ export async function runToolCalls(
       // typed; nothing in it came from the model or the server.
       output = refused.get(index)!;
       isError = true;
+      // RECORDED AS NOT SENT (#92, owner ruling OD7), so the thread and the
+      // export can say what did not go. Only for a call with a destination:
+      // an `mcp:` tool refused for declaring none has no host to name.
+      const destination = tool.destination;
+      if (destination) {
+        receipt = {
+          outcome: 'withheld',
+          serverId: destination.serverId,
+          serverName: destination.serverName,
+          host: destination.host,
+          toolName: tool.name,
+          bytes: argumentBytes(call.input),
+          at: Date.now(),
+        };
+      }
     } else if (tool.destination && onHeldGrant.has(index) && !options.destinations.isGranted(tool.destination)) {
       // A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was
       // asked about. An earlier call in the batch can run for as long as its

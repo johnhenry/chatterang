@@ -103,30 +103,61 @@ export interface ToolDestination {
 }
 
 /**
- * The record that a tool call's arguments were handed to an MCP server (#92).
+ * The record of what became of a tool call's arguments bound for an MCP server
+ * (#92).
  *
- * Taken when the call is handed over, not when it returns, so `at` is when the
- * arguments left and a call that then failed still has one. A call that never
- * left — declined at the confirm sheet, or refused with {@link McpNotSent} — has
- * none: a receipt says something left, and nothing did.
+ * `sent` and `failed` are taken when the call is handed over, not when it
+ * returns, so `at` is when the arguments left and a call that then failed still
+ * has one. `withheld` is taken at dispatch for a call this conversation did not
+ * allow to leave (#6, owner ruling OD7): the person said no, or nobody could be
+ * asked. It records what did NOT go, so the thread and the export can say so,
+ * and no reader may count it as egress — see {@link mayHaveLeft}.
+ *
+ * A call that stopped for any other reason has none: one declined at the
+ * destructive confirm after it was allowed, or refused with {@link McpNotSent}.
  *
  * `outcome` is a discriminant rather than optional flags so that every reader
  * has to say what it does with each value.
  *
  * `bytes` is the UTF-8 length of the arguments as JSON — the part the model
- * composed — not the size of the request envelope around them. There is no
- * hash: the arguments themselves are stored beside this, on the invocation.
+ * composed — not the size of the request envelope around them; for a withheld
+ * call, the size of what would have gone. There is no hash: the arguments
+ * themselves are stored beside this, on the invocation.
  */
 export interface McpCallReceipt {
-  readonly outcome: 'sent' | 'failed';
+  readonly outcome: 'sent' | 'failed' | 'withheld';
   readonly serverId: string;
   readonly serverName: string;
   readonly host: string;
   /** Server-qualified (`notes.search`), whichever spelling the model called it by. */
   readonly toolName: string;
   readonly bytes: number;
-  /** Epoch milliseconds, taken as the arguments were handed to the server. */
+  /** Epoch milliseconds: when the arguments were handed to the server, or were withheld. */
   readonly at: number;
+}
+
+/**
+ * Could this call's arguments have reached the server?
+ *
+ * The question a record of egress is kept for. `failed` answers yes, because a
+ * call can fail after its arguments arrived; `withheld` answers no. An outcome
+ * this build has never heard of — a row written by a later one — falls to the
+ * `never` branch and answers with the outcome itself, which is truthy: kept as
+ * if something left, the direction it is safe to be wrong in.
+ */
+export function mayHaveLeft(receipt: McpCallReceipt | undefined): boolean {
+  if (receipt === undefined) return false;
+  switch (receipt.outcome) {
+    case 'sent':
+    case 'failed':
+      return true;
+    case 'withheld':
+      return false;
+    default: {
+      const unhandled: never = receipt.outcome;
+      return unhandled;
+    }
+  }
 }
 
 /**

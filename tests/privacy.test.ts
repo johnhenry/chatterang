@@ -683,7 +683,15 @@ describe('MCP arguments do not leave the device without a grant', () => {
       expect(probe.call, target.backendId).not.toHaveBeenCalled();
       const tool = events.find((event) => event.type === 'tool');
       expect(tool?.type === 'tool' && tool.tool.output).toContain('were not sent to notes.example');
-      expect(tool?.type === 'tool' && tool.tool.receipt).toBeUndefined();
+      // Recorded as not sent, and sized as what would have gone (#92, OD7).
+      expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
+        outcome: 'withheld',
+        serverId: PROBE_SERVER.serverId,
+        serverName: 'notes',
+        host: 'notes.example',
+        toolName: 'notes.note',
+        bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+      });
       toolRegistry.unregister(probe.tool.id);
     }
   });
@@ -693,11 +701,13 @@ describe('MCP arguments do not leave the device without a grant', () => {
     const { probe, run } = setUp();
     const request = ask('deny');
 
-    await run({ ...GRANTED_PROBE, request });
+    const events = await run({ ...GRANTED_PROBE, request });
 
     expect(probe.call).toHaveBeenCalledOnce();
     expect(probe.call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
     expect(request).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt?.outcome).toBe('sent');
   });
 
   it('is not answered by a grant for another server, or for the same server at another address', async () => {
@@ -738,6 +748,7 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(tool?.type === 'tool' && tool.tool.output).toBe(
       'The user did not allow sending this call’s arguments to notes.example.',
     );
+    expect(tool?.type === 'tool' && tool.tool.receipt?.outcome).toBe('withheld');
   });
 
   it('asks once for every call to one server in a batch, and "these calls" sends exactly those', async () => {
@@ -923,6 +934,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(execute).not.toHaveBeenCalled();
     const tool = events.find((event) => event.type === 'tool');
     expect(tool?.type === 'tool' && tool.tool.output).toContain('does not say where its arguments would go');
+    // No destination, so no host to record a not-sent call against.
+    expect(tool?.type === 'tool' && tool.tool.receipt).toBeUndefined();
 
     // The control: the same tool under an id that does not claim to be MCP runs.
     toolRegistry.unregister('mcp:x.y');

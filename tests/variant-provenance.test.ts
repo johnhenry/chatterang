@@ -1054,6 +1054,67 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
   });
 
+  it('is kept when a turn whose call failed after it was handed over is regenerated', async () => {
+    // A failed call may have delivered its arguments before it failed, so its
+    // record is kept for the same reason a sent one is.
+    const failed: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'failed' } };
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [failed], provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    const row = assistantRow();
+    expect(row.variants?.map((variant) => variant.content)).toEqual(['', 'NEW ANSWER']);
+    expect(row.variants?.[0]?.toolCalls?.[0]?.receipt?.outcome).toBe('failed');
+  });
+
+  it('is not a reason to keep an empty turn when it records a call that was not sent', async () => {
+    // A withheld record says nothing left, so there is no egress for an empty
+    // generation to be the only trace of (#92, OD7).
+    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld' } };
+    useChats.setState({
+      messages: [
+        USER,
+        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [withheld], provenance: ON_DEVICE },
+      ],
+    });
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
+    await useChats.getState().regenerate('msg_a');
+
+    expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
+  });
+
+  it('is not written down mid-turn when it records a call that was not sent', async () => {
+    // The paired control is "is written down while the turn is still running":
+    // the same held-open turn, with a receipt that says something left.
+    const turn = heldOpen();
+    const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld' } };
+    script = [{ text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, hang: turn.hang }];
+    const sending = useChats.getState().send('hello');
+    try {
+      // Polled off the store: the placeholder does not exist until `send` has
+      // written the user's turn.
+      await until(() =>
+        useChats
+          .getState()
+          .messages.some((row) => row.role === 'assistant' && (row.toolCalls?.length ?? 0) > 0),
+      );
+      for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
+      expect(storedRows().some((row) => row.streaming === true)).toBe(false);
+    } finally {
+      turn.release();
+      await sending;
+    }
+    // It is kept with the finished turn, like the rest of the generation.
+    const finished = storedRows().filter((row) => row.role === 'assistant' && !row.streaming).at(-1);
+    expect(finished?.toolCalls?.[0]?.receipt?.outcome).toBe('withheld');
+  });
+
   it('is kept when a regeneration that failed after sending is regenerated again', async () => {
     // The row shows a generation that was never appended to its list: its
     // index is one past the end, where the failed regeneration was being made.

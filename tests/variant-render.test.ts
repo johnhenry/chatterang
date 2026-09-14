@@ -518,6 +518,7 @@ describe('the record of what left follows the generation that sent it', () => {
       expect(bodyText()).toBe('REMOTE ANSWER');
       expect(receipts()).toEqual([SENT]);
       expect(toolChips(), 'and the host is in the block’s head').toEqual(['notes.example']);
+      expect(document.querySelector('.tool__head .chip')?.className).toBe('chip chip--remote');
 
       await act(async () => {
         byLabel('Next version').click();
@@ -550,6 +551,35 @@ describe('the record of what left follows the generation that sent it', () => {
           `Tried to send 30 bytes of arguments to notes.example (notes) at ${new Date(RECEIPT.at).toLocaleString()} — the call failed, so they may or may not have arrived.`,
         ]);
         expect(document.body.textContent).not.toContain('Sent 30 bytes');
+      },
+    );
+  });
+
+  it('says a call that was not allowed was not sent, and does not style it as leaving', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'I could not file it.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'The user did not allow sending this call’s arguments to notes.example.',
+            receipt: { ...RECEIPT, outcome: 'withheld' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — it was not allowed.']);
+        expect(document.body.textContent).not.toMatch(/Sent 30 bytes|Tried to send/);
+        expect(toolChips()).toEqual(['notes.example']);
+        expect(document.querySelector('.tool__head .chip')?.className).toBe('chip');
+        const headline = document.querySelector('.tool__head')?.textContent ?? '';
+        expect(headline).toContain('not sent');
+        expect(headline, 'a call that was never sent did not fail').not.toContain('failed');
       },
     );
   });

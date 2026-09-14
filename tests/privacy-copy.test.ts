@@ -715,6 +715,56 @@ describe('the privacy command', () => {
     expect(transcript).not.toContain('notes.note sent');
   });
 
+  /*
+   * A CALL THAT WAS NOT ALLOWED IS RECORDED AS NOT SENT (#92, owner ruling
+   * OD7). Measured through the real dispatcher with the person saying no, and
+   * rendered by the real thread and the real transcript.
+   */
+  it('says a call that was not allowed was not sent — and it was not', async () => {
+    expect(shipped('features/chat/MessageView.tsx')).toContain(
+      'return `Not sent to ${where} — it was not allowed.`;',
+    );
+
+    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+    const tool = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: true,
+        destructive: false,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => true, call },
+    );
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      // Called by its id, which the dispatcher allows: the record still names
+      // the tool the way the tool list does, not the way the model spelled it.
+      [{ type: 'tool_use' as const, id: 'c1', name: tool.id, input: { text: SECRET } }],
+      {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => false, request: async () => 'deny' as const },
+      },
+    );
+    const record = executed[0]!;
+    expect(call, 'it was not sent').not.toHaveBeenCalled();
+    expect(record.receipt?.outcome).toBe('withheld');
+    expect(record.receipt?.toolName).toBe('notes.note');
+
+    const thread = await threadText(record);
+    expect(thread).toContain('Not sent to notes.example (notes) — it was not allowed.');
+    expect(thread).not.toMatch(/Sent \d+ bytes|Tried to send/);
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'I could not file it.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note was not sent to notes.example (notes) at ${utc(record.receipt!.at)} — it was not allowed.`,
+    );
+    expect(transcript).not.toContain('notes.note sent');
+  });
+
   /**
    * The sentence that replaced "withholds it … if the reply diverted to a
    * fallback". That one was measured false: `stream()` tests `isGranted`
@@ -1096,6 +1146,27 @@ describe('the tool-output sheet', () => {
     expect(failedBody).not.toContain('mcp:');
     expect(failedBody).not.toContain('returned this from');
     expect(failedBody).not.toContain('own data');
+
+    // A call that was not allowed went nowhere and nothing came back: its
+    // output is this app's refusal, and the sheet says the call was not sent.
+    const { executed: refused } = await runToolCalls(
+      new ToolRegistry([answers]),
+      [{ type: 'tool_use', id: 'c3', name: answers.name, input: { text: SECRET } }],
+      {
+        enabledIds: [answers.id],
+        destinations: { isGranted: () => false, request: async () => 'deny' as const },
+      },
+    );
+    const withheld = refused[0]!;
+    expect(withheld.receipt?.outcome).toBe('withheld');
+    const withheldBody = toolOutputSheetBody([withheld], [], 'GPT-4o mini', 40);
+    expect(withheldBody).toContain('notes.note was not sent to notes.example; this app wrote its reply');
+    expect(withheldBody).not.toContain('returned this from');
+    expect(withheldBody).not.toContain('did not complete');
+    // And on a turn after it.
+    const withheldEarlier = toolOutputSheetBody([], [{ toolCalls: [withheld] }], 'GPT-4o mini', 40);
+    expect(withheldEarlier).toContain('notes.note, which was not sent to notes.example');
+    expect(withheldEarlier).not.toContain('returned from');
 
     // And the sheet the app raises is built by this function, not a copy of it.
     expect(shipped('state/chat.ts')).toContain(

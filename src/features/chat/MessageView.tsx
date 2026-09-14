@@ -6,7 +6,7 @@ import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
 import { currentVariant, ranOnDevice } from '@/domain/chat';
-import type { McpCallReceipt } from '@/domain/mcp';
+import { mayHaveLeft, type McpCallReceipt } from '@/domain/mcp';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { speak, stopSpeaking } from '@/lib/voice';
@@ -381,7 +381,9 @@ function Thinking({ text }: { text: string }): ReactNode {
  * model composed, and the request envelope and bearer header around it are not
  * in it (`domain/mcp.ts`). A failed call is described as neither sent nor not
  * sent — it may have failed before the server read it or after — because
- * calling it not sent would be wrong in the flattering direction.
+ * calling it not sent would be wrong in the flattering direction. A withheld
+ * call is the one that is not sent, and says so without claiming where the
+ * arguments are now: a remote model wrote them, so they were never only here.
  *
  * An exhaustive switch, so an outcome added later cannot compile unrendered.
  */
@@ -393,6 +395,8 @@ function receiptSentence(receipt: McpCallReceipt): string {
       return `Sent ${receipt.bytes} bytes of arguments to ${where} at ${when}.`;
     case 'failed':
       return `Tried to send ${receipt.bytes} bytes of arguments to ${where} at ${when} — the call failed, so they may or may not have arrived.`;
+    case 'withheld':
+      return `Not sent to ${where} — it was not allowed.`;
     default: {
       const unhandled: never = receipt.outcome;
       return unhandled;
@@ -418,13 +422,19 @@ function ToolCall({ tool }: { tool: ToolInvocation }): ReactNode {
         <Icon name="tool" size={13} />
         <span className="tool__name">{tool.name}</span>
         {receipt ? (
-          <span className="chip chip--remote">
+          // Styled as leaving only when something may have: a withheld call
+          // names where it was bound, in the neutral chip.
+          <span className={mayHaveLeft(receipt) ? 'chip chip--remote' : 'chip'}>
             <Icon name="cloud" size={10} />
             {receipt.host}
           </span>
         ) : null}
         <span className="grow truncate" style={{ opacity: 0.75 }}>
-          {tool.isError ? 'failed' : (tool.output ?? '').slice(0, 60)}
+          {receipt?.outcome === 'withheld'
+            ? 'not sent'
+            : tool.isError
+              ? 'failed'
+              : (tool.output ?? '').slice(0, 60)}
         </span>
         {tool.durationMs !== undefined ? (
           <span className="readout">{tool.durationMs}ms</span>
