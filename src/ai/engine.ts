@@ -535,10 +535,10 @@ export class ChatterangEngine {
     stack.push(
       createResilienceMiddleware({
         resolveFallback: () => this.#resolveFallback(),
-        // NO `mayDivert`, and leaving it out is the refusal. This middleware
-        // returns early on streamed requests, so the only request it acts on is
-        // `complete()`'s, and `complete()` must not divert (see there). It still
-        // reads the device and passes a failure through untouched.
+        // NO `clearForFallback`, and leaving it out is the refusal. This
+        // middleware returns early on streamed requests, so the only request it
+        // acts on is `complete()`'s, and `complete()` must not divert (see
+        // there). It still reads the device and passes a failure through untouched.
         onFallback: (event) => {
           this.#lastFallback = event;
           this.#options.onFallback?.(event);
@@ -546,8 +546,13 @@ export class ChatterangEngine {
       }),
     );
 
-    // Retries only help transient remote failures; a local OOM will not fix
-    // itself on a second attempt, so the predicate excludes local backends.
+    // Retries only an error its backend marked retryable (`isRetryable === true`,
+    // aimatey's default predicate), and on the same backend: a retry runs the
+    // rest of the stack again and never picks another backend, so it is not a
+    // divert. No predicate is passed, so a local backend's error is retried too
+    // when it is marked retryable; a plain Error, such as a local OOM, is not.
+    // This used to say "the predicate excludes local backends". There is no
+    // such predicate.
     stack.push(
       createRetryMiddleware({
         maxAttempts: 2,
@@ -1201,9 +1206,12 @@ export class ChatterangEngine {
      * destination. This path has no event to announce it with and no sheet to
      * raise, and a grant in `request.egress` was given for `request.target`,
      * not for whichever backend a failure picks. So it refuses. The middleware
-     * is built without `mayDivert` (see `#middleware`): a failure surfaces as
-     * the error, and on a hot device the local backend serves the turn, which
-     * is what both already did with nothing nominated.
+     * is built without `clearForFallback` (see `#middleware`): a failure
+     * surfaces as the error, and on a hot device the local backend serves the
+     * turn, which is what both already did with nothing nominated. Were that
+     * hook supplied, the middleware still would not forward `outgoing` below,
+     * which is cleared for `request.target`. It sends only what the hook
+     * clears for the fallback.
      *
      * Whether an unattended caller should EVER divert, for instance under a
      * stored conversation grant for the fallback, is a ruling nobody has made

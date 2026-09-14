@@ -176,6 +176,14 @@ describe('complete() never diverts a turn to the fallback', () => {
     expect(refused.error).toBe(unnominated.error);
   });
 
+  /*
+   * The two below pin the REFUSAL on this path, not the reach check. The engine
+   * supplies no `clearForFallback`, so the middleware refuses before reach
+   * matters, and both would still pass with `isLocal` removed from the failure
+   * handler (measured). The reach check is pinned by the middleware unit tests
+   * "does not divert a remote failure, even where diverting is allowed" and
+   * "does not divert a turn declared not local, whatever its backend is called".
+   */
   it('does not divert a remote failure', async () => {
     engine.router.register('conn_primary', failingBackend('provider 500'));
 

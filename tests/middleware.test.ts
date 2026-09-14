@@ -12,7 +12,9 @@ import {
   classifyFailure,
   createResilienceMiddleware,
   describeFallback,
+  type FallbackTarget,
 } from '@/ai/middleware/resilience';
+import { clearForDestination, markTainted } from '@/ai/taint';
 import { ToolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 
 /* ── Fixtures ───────────────────────────────────────────────────────── */
@@ -283,10 +285,16 @@ describe('resilience middleware', () => {
    * is `engine.complete()`'s, since it returns early on every streamed one, and
    * `complete()` has none of what makes the streamed divert consented: no
    * announcement before anything is sent, no egress gate for the new
-   * destination. On main these branches diverted from nomination alone.
+   * destination. On main these branches diverted from nomination alone, and
+   * forwarded the messages as they had been cleared for the ORIGINAL target.
    * `tests/complete-divert.test.ts` measures that through the real engine.
    */
-  it('does not divert without `mayDivert`, even with a fallback nominated', async () => {
+
+  /** Lets everything through with the marks stripped: the divert mechanism under test, not a policy. */
+  const sendsEverything = (ctx: MiddlewareContext) =>
+    clearForDestination(ctx.request.messages, { allowed: true, note: () => '[withheld]' });
+
+  it('does not divert without `clearForFallback`, even with a fallback nominated', async () => {
     const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
     const onFallback = vi.fn();
     const middleware = createResilienceMiddleware({
@@ -307,21 +315,109 @@ describe('resilience middleware', () => {
     expect(onFallback).not.toHaveBeenCalled();
   });
 
-  it('does not divert when `mayDivert` answers anything but true', async () => {
+  it('does not divert when `clearForFallback` answers anything but a message list', async () => {
+    const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
+
+    for (const answer of [null, undefined, true, 'yes']) {
+      const middleware = createResilienceMiddleware({
+        resolveFallback: () => ({ name: 'openai-1', adapter }),
+        clearForFallback: (() => answer) as unknown as () => null,
+      });
+
+      await expect(
+        middleware(
+          context({ backendName: 'llama-cpp' }),
+          vi.fn(async () => {
+            throw new Error('boom');
+          }),
+        ),
+      ).rejects.toThrow('boom');
+    }
+    expect(adapter.execute).not.toHaveBeenCalled();
+  });
+
+  it('sends the fallback only what `clearForFallback` cleared for it, not the request as cleared for the original target', async () => {
+    // `complete()` clears for `request.target`. For a local target that keeps
+    // the tainted bytes AND the mark, which is right for this device and wrong
+    // for a cloud. Before the hook the middleware spread those messages
+    // through to the fallback unchanged (measured: the secret and
+    // `chatterangTaint` both arrived).
+    const secret = 'PASSPHRASE-ORTHOGONAL-PANGOLIN-7731';
+    const history = clearForDestination(
+      [
+        { role: 'user', content: 'name this chat' },
+        markTainted({ role: 'assistant', content: `the notes say ${secret}` }),
+      ],
+      { allowed: true, note: () => '[withheld]', local: true },
+    );
+    const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
+    const clearForFallback = vi.fn((ctx: MiddlewareContext, _fallback: FallbackTarget) =>
+      clearForDestination(ctx.request.messages, {
+        allowed: false,
+        note: (characters) => `[${characters} characters withheld]`,
+      }),
+    );
+    const middleware = createResilienceMiddleware({
+      resolveFallback: () => ({ name: 'openai-1', adapter }),
+      clearForFallback,
+    });
+
+    await middleware(
+      context({ backendName: 'llama-cpp', request: request({ messages: history }) }),
+      vi.fn(async () => {
+        throw new Error('not enough memory');
+      }),
+    );
+
+    // The precondition: what the request carried really was the dangerous shape.
+    expect(JSON.stringify(history)).toContain(secret);
+    expect(JSON.stringify(history)).toContain('chatterangTaint');
+
+    expect(clearForFallback).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ name: 'openai-1' }),
+    );
+    const sent = (adapter.execute as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as IRChatRequest;
+    const body = JSON.stringify(sent.messages);
+    expect(body).not.toContain(secret);
+    expect(body).not.toContain('chatterangTaint');
+    expect(body).toContain('characters withheld');
+  });
+
+  it('will not take messages that were never cleared: the type refuses them', () => {
+    const middleware = createResilienceMiddleware({
+      resolveFallback: () => null,
+      // @ts-expect-error -- `IRMessage[]` is not `ClearedMessage[]`; only `clearForDestination` brands a message.
+      clearForFallback: (ctx) => ctx.request.messages,
+    });
+    expect(middleware).toBeTypeOf('function');
+  });
+
+  it('does not divert a turn declared not local, whatever its backend is called', async () => {
+    // A turn aimed at a paired desktop runs llama.cpp there, not here. The
+    // engine says so with `custom.local: false`, and that declaration wins over
+    // a name that would otherwise read as local. The engine-level paired test
+    // cannot see this check, because the engine supplies no `clearForFallback`
+    // and so refuses before reach matters.
     const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter }),
-      mayDivert: () => false,
+      clearForFallback: sendsEverything,
     });
 
     await expect(
       middleware(
-        context({ backendName: 'llama-cpp' }),
+        context({
+          backendName: 'llama-cpp',
+          request: request({
+            metadata: { requestId: 'req_1', timestamp: 0, custom: { local: false, toolIds: [] } },
+          }),
+        }),
         vi.fn(async () => {
-          throw new Error('boom');
+          throw new Error('desktop asleep');
         }),
       ),
-    ).rejects.toThrow('boom');
+    ).rejects.toThrow('desktop asleep');
     expect(adapter.execute).not.toHaveBeenCalled();
   });
 
@@ -333,7 +429,7 @@ describe('resilience middleware', () => {
     const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter }),
-      mayDivert: () => true,
+      clearForFallback: sendsEverything,
     });
 
     await expect(
@@ -360,7 +456,7 @@ describe('resilience middleware', () => {
     const onFallback = vi.fn();
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter, modelId: 'gpt-4o-mini' }),
-      mayDivert: () => true,
+      clearForFallback: sendsEverything,
       onFallback,
     });
 
@@ -386,7 +482,7 @@ describe('resilience middleware', () => {
 
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter, modelId: 'gpt-4o-mini' }),
-      mayDivert: () => true,
+      clearForFallback: sendsEverything,
     });
 
     await middleware(
@@ -407,7 +503,7 @@ describe('resilience middleware', () => {
     // Allowed to divert, so the abort is the only thing that stops it.
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter }),
-      mayDivert: () => true,
+      clearForFallback: sendsEverything,
     });
 
     const controller = new AbortController();

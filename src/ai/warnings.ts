@@ -65,10 +65,15 @@ export function warningsOf(warnings: readonly IRWarning[] | undefined): TurnWarn
  * The warning for a turn the Router diverted to another backend.
  *
  * The streaming path never reaches the resilience middleware, so it produces
- * its own `FallbackEvent` and the middleware's warning is never written. Both
- * paths now describe the divert the same way by coming through here, rather
- * than one saying it in `metadata.warnings` and the other in an event nobody
- * converts — which was the same one-fact-two-channels shape all over again.
+ * its own `FallbackEvent`, and this is what converts it. That is the only
+ * divert the app performs. `complete()` does run the middleware, whose divert
+ * would write a warning of its own into `metadata.warnings`, but the engine
+ * builds it without `clearForFallback`, so `complete()` never diverts and that
+ * warning is never written (tests/complete-divert.test.ts). This used to say
+ * both paths describe the divert through here. Should the middleware's divert
+ * ever be enabled, it should come through here too, rather than one path saying
+ * it in `metadata.warnings` and the other in an event nobody converts — the
+ * one-fact-two-channels shape.
  *
  * `model-substituted` rather than `capability-unsupported`: every
  * `FallbackReason` ends with a different model serving the turn, which is what

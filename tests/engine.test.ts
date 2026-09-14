@@ -361,9 +361,10 @@ describe('ChatterangEngine.stream', () => {
 
 
   /*
-   * THE NON-STREAMING DOOR. `complete` serves tools, titling and benchmarks,
-   * and it reaches tools through the MIDDLEWARE rather than through the loop
-   * above — which returns early on every streamed request. So every test above
+   * THE NON-STREAMING DOOR. Nothing under `src/` calls `complete` today; only
+   * tests do, and #197's queue is the caller planned. It reaches tools through
+   * the MIDDLEWARE rather than through the loop above — which returns early on
+   * every streamed request. So every test above
    * is silent about it. The ids travel in `metadata.custom.toolIds` through the
    * real bridge; if they did not arrive, the middleware fails closed and the
    * positive case below would not run its tool. That is what makes it a test of

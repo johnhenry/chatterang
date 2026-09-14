@@ -12,13 +12,13 @@
  * fallback is recorded in the message's provenance.
  *
  * In the middleware below a nomination is necessary and not sufficient. It
- * diverts a request only when its caller says that request may go
- * (`mayDivert`), and only a turn that runs on this device is eligible. The
- * engine never says so: this middleware returns early on streamed requests, so
- * the one request it acts on is `complete()`'s, and `complete()` has nothing to
- * announce a divert with and no gate for the new destination. The divert a chat
- * turn gets is `ChatterangEngine.stream`'s own, built from the exports above
- * the middleware.
+ * diverts a request only when its caller supplies `clearForFallback`, which
+ * hands back the messages cleared for the fallback, and only a turn that runs
+ * on this device is eligible. The engine never supplies it: this middleware
+ * returns early on streamed requests, so the one request it acts on is
+ * `complete()`'s, and `complete()` has nothing to announce a divert with and no
+ * gate for the new destination. The divert a chat turn gets is
+ * `ChatterangEngine.stream`'s own, built with the exports above the middleware.
  */
 
 import type {
@@ -30,6 +30,7 @@ import type {
   MiddlewareNext,
 } from '@johnhenry/aimatey-types';
 
+import type { ClearedMessage } from '@/ai/taint';
 import { LlamaCpp } from '@/plugins/llama-cpp';
 import type { ThermalState } from '@/plugins/llama-cpp';
 
@@ -59,15 +60,29 @@ export interface ResilienceOptions {
   /** The backend to divert to, or null when the user has nominated none. */
   resolveFallback: () => FallbackTarget | null;
   /**
-   * Whether THIS request may be sent to the fallback. Leaving it out is a
-   * refusal, and so is any answer but `true`.
+   * What THIS request may carry to the fallback: its messages, cleared for the
+   * fallback, or null to refuse. Leaving it out is a refusal, and so is any
+   * answer but a message list.
    *
-   * A nomination names the backend a divert would use. It does not say that a
-   * given request may leave without the person being told first, or without
-   * the egress gate running for the new destination. `stream()` does both of
-   * those itself. A caller that can do neither leaves this out.
+   * A nomination names the backend a divert would use. It does not say what a
+   * given request may take there. The messages on `context.request` were
+   * cleared for the ORIGINAL target. For a local target nothing was withheld
+   * and the taint mark was kept, so forwarding them would hand tool output to
+   * the fallback still carrying this app's mark. So the middleware never sends
+   * them. It sends only what this returns, and the `ClearedMessage` brand means
+   * the answer has been through `clearForDestination`, the same enforcement
+   * `ChatterangEngine#toIR` relies on. Which grant covers the fallback, if any,
+   * is the caller's to decide.
+   *
+   * Clearing is not the whole of consent. `stream()` also announces a divert
+   * before anything is sent, and can raise the egress sheet for the new
+   * destination. A caller that can do neither leaves this out, as the engine
+   * does.
    */
-  mayDivert?: (context: MiddlewareContext) => boolean;
+  clearForFallback?: (
+    context: MiddlewareContext,
+    fallback: FallbackTarget,
+  ) => readonly ClearedMessage[] | null;
   /** Refuse to start a local generation above this thermal level (0–1). */
   thermalCeiling?: number;
   /** Refuse to start when free memory drops below this many bytes. */
@@ -180,15 +195,25 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
     /*
      * Where a divert is decided, for both branches below.
      *
-     * The caller must say THIS request may go, and that is asked before the
-     * fallback is resolved, so a refusal never depends on what happens to be
-     * nominated. Only a turn that runs on this device is eligible, which is the
-     * rule `stream()` follows (`runsOnThisDevice`). The failure handler used to
-     * skip both checks: it diverted on nomination alone, and a remote or paired
-     * turn that failed went to the fallback too (tests/complete-divert.test.ts).
+     * Only a turn that runs on this device is eligible, which is the rule
+     * `stream()` follows (`runsOnThisDevice`), and the caller must supply
+     * `clearForFallback`. Both are checked before the fallback is resolved, so
+     * a refusal never depends on what happens to be nominated. The failure
+     * handler used to skip both: it diverted on nomination alone, and a remote
+     * or paired turn that failed went to the fallback too
+     * (tests/complete-divert.test.ts).
+     *
+     * What goes is only what `clearForFallback` cleared for the fallback. The
+     * request's own messages were cleared for the original target, and they are
+     * never forwarded.
      */
-    const divertTarget = (): FallbackTarget | null =>
-      isLocal && options.mayDivert?.(context) === true ? options.resolveFallback() : null;
+    const divert = (): { fallback: FallbackTarget; messages: readonly ClearedMessage[] } | null => {
+      if (!isLocal || !options.clearForFallback) return null;
+      const fallback = options.resolveFallback();
+      if (!fallback) return null;
+      const messages = options.clearForFallback(context, fallback);
+      return Array.isArray(messages) ? { fallback, messages } : null;
+    };
 
     // Pre-flight: only local engines are subject to device pressure.
     if (isLocal) {
@@ -200,8 +225,9 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
 
       if (pressure) {
         // Refused, the local backend takes the turn, as it does with nothing nominated.
-        const fallback = divertTarget();
-        if (fallback) {
+        const diverted = divert();
+        if (diverted) {
+          const { fallback, messages } = diverted;
           options.onFallback?.({
             reason: pressure.reason,
             from: backendName,
@@ -209,7 +235,7 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
             detail: pressure.detail,
           });
           const response = await fallback.adapter.execute(
-            retarget(context.request, fallback),
+            retarget(context.request, fallback, messages),
             context.signal,
           );
           return annotate(response, backendName, fallback.name, pressure.reason);
@@ -222,13 +248,14 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
     } catch (error) {
       if (context.signal?.aborted) throw error;
 
-      const fallback = divertTarget();
-      if (!fallback) throw error;
+      const diverted = divert();
+      if (!diverted) throw error;
+      const { fallback, messages } = diverted;
 
       const { reason, detail } = classifyFailure(error);
       options.onFallback?.({ reason, from: backendName, to: fallback.name, detail });
       const response = await fallback.adapter.execute(
-        retarget(context.request, fallback),
+        retarget(context.request, fallback, messages),
         context.signal,
       );
       return annotate(response, backendName, fallback.name, reason);
@@ -240,11 +267,20 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
  * Point a request at the fallback backend. The local model id means nothing
  * to a remote provider, so it is replaced (or dropped, letting the adapter's
  * own default apply), and the router's explicit-backend hint is rewritten.
+ *
+ * The messages are replaced too, with the ones cleared for the fallback. The
+ * request's own were cleared for the original target, and spreading them
+ * through is how a local turn's tainted history reached the cloud still marked.
  */
-function retarget(request: IRChatRequest, fallback: FallbackTarget): IRChatRequest {
+function retarget(
+  request: IRChatRequest,
+  fallback: FallbackTarget,
+  messages: readonly ClearedMessage[],
+): IRChatRequest {
   const { model: _localModel, ...parameters } = request.parameters ?? {};
   return {
     ...request,
+    messages,
     parameters: fallback.modelId ? { ...parameters, model: fallback.modelId } : parameters,
     metadata: {
       ...request.metadata,

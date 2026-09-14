@@ -117,9 +117,11 @@ diverts to the fallback: it rewrites the request for the new backend (the local
 model id means nothing to OpenAI), announces the divert before anything is
 sent, runs the egress gate again for the new destination, and the thread shows
 a labelled notice. The middleware form, which is what `complete()` runs, diverts
-only when its caller says that request may (`mayDivert`), and the engine never
-does: `complete()` has nothing to announce a divert with and no sheet to raise,
-so a failure there is the error and a hot device serves the turn locally.
+only when its caller supplies `clearForFallback`, and then sends only the
+messages that hook cleared for the fallback, never the ones cleared for the
+original target. The engine never supplies it: `complete()` has nothing to
+announce a divert with and no sheet to raise, so a failure there is the error
+and a hot device serves the turn locally.
 Nothing diverts unless the user has nominated a fallback backend — sending a
 conversation off-device is a consent decision, not an error-handling detail.
 

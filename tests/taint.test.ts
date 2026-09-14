@@ -884,9 +884,10 @@ describe('a secret copied into a tool ARGUMENT is still withheld', () => {
 
 describe('the non-streaming path', () => {
   it('withholds tainted history, where before it sent whatever it was handed', async () => {
-    // `complete` is used by titling and by benchmarks. It built its IR request
-    // straight from `request.messages`, so the stream path's gate never ran for
-    // it. The branded `ClearedMessage` is what made that impossible to keep.
+    // Nothing under `src/` calls `complete` today; only tests do. It built its
+    // IR request straight from `request.messages`, so the stream path's gate
+    // never ran for it. The branded `ClearedMessage` is what made that
+    // impossible to keep.
     const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
     const cloud = recordingBackend(['A title']);
     engine.router.register('cloud', cloud.adapter);
