@@ -39,6 +39,7 @@ import {
 } from '@chatterang/tunnel/pairing';
 import { isLocalEngine } from '@/domain/manifest';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
+import { capabilities } from '@/lib/platform';
 import {
   pairingController,
   validateScannedPayload,
@@ -70,7 +71,7 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
-import { byLabel, click, mustButton, render, settle, typeInto } from './support/pairing-dom';
+import { byLabel, click, dialog, mustButton, render, settle, typeInto } from './support/pairing-dom';
 import {
   SPECIFIER,
   codeOf,
@@ -2257,7 +2258,6 @@ describe('the pairing sheet admits what typing a code does not check', () => {
       createElement(PairingSheet, { controller: { available: true, pair }, onClose: () => {}, onOutcome: () => {} }),
     );
     try {
-      await click(mustButton('Type'));
       await typeInto(byLabel('Computer address'), host);
       await typeInto(byLabel('Six-digit code'), code);
       await click(mustButton('Chatterang desktop app'));
@@ -2275,6 +2275,26 @@ describe('the pairing sheet admits what typing a code does not check', () => {
       "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
         'fingerprint; six typed digits do not.',
     );
+
+    // On screen from the start (#124): the sheet opens on Type even on a row
+    // that can scan, so the sentence is read before a route is picked, not only
+    // by someone who went looking for Type. Nothing is pressed first.
+    expect(capabilities().cameraScan, 'jsdom runs the web row, which can scan').toBe(true);
+    const opened = await render(
+      createElement(PairingSheet, {
+        controller: { available: true, pair: vi.fn(async (): Promise<PairingOutcome> => ({ kind: 'refused', reason: 'unreachable' })) },
+        onClose: () => {},
+        onOutcome: () => {},
+      }),
+    );
+    try {
+      expect(reads(dialog()?.textContent ?? '')).toContain(
+        "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
+          'fingerprint; six typed digits do not.',
+      );
+    } finally {
+      await opened.unmount();
+    }
 
     // Six typed digits do not: the typed request has no trust field, and no
     // payload that could carry one.

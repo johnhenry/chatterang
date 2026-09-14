@@ -165,6 +165,8 @@ describe('a scan persists nothing', () => {
       deviceName: 'Desk',
     }));
     mounted.push(await render(<Harness controller={{ available: true, pair }} />));
+    // The sheet opens on Type (#124); Scan is one tap away.
+    await click(mustButton('Scan'));
 
     // Once: read, Confirm, Cancel.
     await click(mustButton('Scan with camera'));

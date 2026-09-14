@@ -8,8 +8,9 @@
  * loop, the pane and the sheet all run as shipped, and the pane takes no
  * test-only props.
  *
- * What is measured: the camera is not asked for until the person presses Scan
- * with camera; every camera outcome lands somewhere honest; every exit turns
+ * What is measured: the sheet opens on Type even where a camera can scan
+ * (#124); the camera is not asked for until the person presses Scan with
+ * camera; every camera outcome lands somewhere honest; every exit turns
  * the camera off, including closing mid-prompt and going to the background; a
  * scanned code is validated and its name attributed before anything is sent;
  * and Confirm sends the payload exactly as it was read.
@@ -178,11 +179,19 @@ function Harness(props: { controller: PairingController; onOutcome: (o: Paired) 
   );
 }
 
-async function open(controller: PairingController) {
+/** Select Scan. The sheet opens on Type (#124), so every scan starts with this tap. */
+async function scanPane() {
+  await click(mustButton('Scan'));
+  expect(mustButton('Scan').getAttribute('aria-pressed')).toBe('true');
+}
+
+/** Open the sheet, and select Scan unless the test measures what it opens on. */
+async function open(controller: PairingController, { selectScan = true } = {}) {
   const onOutcome = vi.fn<(o: Paired) => void>();
   const onClose = vi.fn();
   mounted.push(await render(<Harness controller={controller} onOutcome={onOutcome} onClose={onClose} />));
   expect(dialog()).not.toBeNull();
+  if (selectScan) await scanPane();
   return { onOutcome, onClose, mount: mounted[mounted.length - 1]! };
 }
 
@@ -209,13 +218,32 @@ async function scanning(decode?: () => Promise<string | null>) {
 
 /* ── Asking for the camera ──────────────────────────────────────────── */
 
+const TYPED_ADMISSION =
+  "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate fingerprint; six typed digits do not.";
+
 describe('the camera is asked for only when the person presses Scan with camera (D4)', () => {
-  it('offers Scan and Type from the start, and requests nothing on open or on switching panes', async () => {
+  it('opens on Type where a camera can scan, with the admission on screen and Scan one tap away (#124)', async () => {
+    // The owner ruled that the sheet always opens on Type, so the typed route's
+    // admission is read before a route is picked. The camera row here is true.
+    const getUserMedia = camera(async () => streamOf(new FakeTrack()));
+    await open(fakeController().controller, { selectScan: false });
+
+    expect(mustButton('Type').getAttribute('aria-pressed')).toBe('true');
+    expect(mustButton('Scan').getAttribute('aria-pressed')).toBe('false');
+    expect(byLabel('Computer address')).toBeInstanceOf(HTMLInputElement);
+    expect(reads(dialog())).toContain(TYPED_ADMISSION);
+    expect(button('Scan with camera')).toBeNull();
+    await settle();
+    expect(getUserMedia).not.toHaveBeenCalled();
+
+    await click(mustButton('Scan'));
+    expect(button('Scan with camera')).not.toBeNull();
+  });
+
+  it('requests nothing on open or on switching panes, and asks once Scan with camera is pressed', async () => {
     const getUserMedia = camera(async () => streamOf(new FakeTrack()));
     await open(fakeController().controller);
 
-    expect(mustButton('Scan').getAttribute('aria-pressed')).toBe('true');
-    expect(mustButton('Type').getAttribute('aria-pressed')).toBe('false');
     expect(button('Scan with camera')).not.toBeNull();
     await settle();
     await click(mustButton('Type'));
@@ -233,12 +261,13 @@ describe('the camera is asked for only when the person presses Scan with camera 
   it('offers Type alone where the platform row has no camera, and says nothing about one', async () => {
     platform.cameraScan = false;
     const getUserMedia = camera(async () => streamOf(new FakeTrack()));
-    await open(fakeController().controller);
+    await open(fakeController().controller, { selectScan: false });
 
     expect(button('Scan')).toBeNull();
     expect(button('Type')).toBeNull();
     expect(button('Scan with camera')).toBeNull();
     expect(byLabel('Computer address')).toBeInstanceOf(HTMLInputElement);
+    expect(reads(dialog())).toContain(TYPED_ADMISSION);
     expect(document.querySelector('.field__error')).toBeNull();
     expect(status()).toEqual([]);
     expect(reads(dialog())).not.toMatch(/camera/i);
@@ -317,6 +346,7 @@ describe('every exit turns the camera off', () => {
       if (parentKeepsIt) {
         mount = await render(<PairingSheet controller={controller} onClose={() => {}} onOutcome={() => {}} />);
         mounted.push(mount);
+        await scanPane();
       } else {
         mount = (await open(controller)).mount;
       }
@@ -420,6 +450,7 @@ describe('every exit turns the camera off', () => {
       ),
     );
 
+    await scanPane();
     await click(mustButton('Scan with camera'));
     const preview = await until(video, 'the camera preview');
     await settle();

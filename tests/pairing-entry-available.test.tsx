@@ -22,6 +22,7 @@ vi.mock('@/lib/pairing', async (importOriginal) => {
 });
 
 import type { PairingOutcome } from '@/lib/pairing';
+import { capabilities } from '@/lib/platform';
 import { PairingEntry } from '@/features/pairing/PairingEntry';
 import { useApp } from '@/state/app';
 
@@ -49,14 +50,16 @@ afterEach(async () => {
 });
 
 /**
- * Settle until the lazy sheet has loaded, or fail naming it. Then select Type:
- * every test here pairs by typing, and under jsdom the sheet opens on Scan.
+ * Settle until the lazy sheet has loaded, or fail naming it. It opens on Type,
+ * which every test here pairs by, although the real `web` row jsdom runs can
+ * scan (#124): so Type here is the sheet's choice, not a missing camera.
  */
 async function sheetLoaded(): Promise<HTMLElement> {
   for (let i = 0; i < 50 && dialog() === null; i += 1) await settle();
   const found = dialog();
   expect(found, 'the lazy sheet never loaded').not.toBeNull();
-  await click(mustButton('Type'));
+  expect(capabilities().cameraScan, 'this row can scan').toBe(true);
+  expect(mustButton('Type').getAttribute('aria-pressed'), 'the sheet opened on Type').toBe('true');
   return found!;
 }
 

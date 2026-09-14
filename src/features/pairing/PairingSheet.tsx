@@ -43,10 +43,12 @@ import {
  * asking the accessor, so the gate is read in exactly one place, and it imports
  * no store, so whatever it holds lives and dies with the sheet.
  *
- * TWO PANES, BOTH VISIBLE FROM THE START (D4). Scan is offered only where the
- * platform row says a camera can scan, and it asks for the camera only when
- * the person presses "Scan with camera"; Type is one segment away. Where no
- * camera row exists there is no Scan segment and no text about a camera.
+ * TWO PANES, AND IT OPENS ON TYPE (D4, and the owner's ruling on #124 after
+ * it). Scan is offered only where the platform row says a camera can scan, one
+ * segment away, and it asks for the camera only when the person presses "Scan
+ * with camera". The sheet opens on Type even then, so the admission that typing
+ * is weaker is on screen from the start. Where no camera row exists there is
+ * no Scan segment and no text about a camera.
  *
  * A SCANNED CODE IS CHECKED, THEN ATTRIBUTED (D11). `validateScannedPayload`
  * refuses it before any confirm step, and Confirm quotes the name as the one
@@ -106,7 +108,10 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
 
   // A platform row, read once: it does not change while the sheet is open.
   const [cameraScan] = useState(() => capabilities().cameraScan);
-  const [pane, setPane] = useState<Pane>(cameraScan ? 'scan' : 'type');
+  // Type first, camera row or not (#124): the admission that typing is weaker
+  // is read before the person picks a route, not only by someone who went
+  // looking for Type.
+  const [pane, setPane] = useState<Pane>('type');
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<PairingPayload | null>(null);
 
