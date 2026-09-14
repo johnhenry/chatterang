@@ -50,7 +50,8 @@ export function McpPanel(): ReactNode {
           An MCP server adds tools the model can call — issue trackers, databases, your own
           services. They run on someone else’s machine, so calling one{' '}
           <strong>sends the arguments off this device</strong>. Every MCP tool has to be turned
-          on per chat, and anything that can change data asks first.
+          on per chat, no call’s arguments are sent until you allow that server, and anything
+          that can change data asks first.
         </p>
 
         {servers.length > 0 ? (
@@ -157,7 +158,7 @@ export function McpPanel(): ReactNode {
         title="Remove this server?"
         body={
           confirmRemove
-            ? `“${confirmRemove.name}” and its tools will be removed from this device, and from every chat that had them on. Nothing on ${destinationHost(confirmRemove.url)} changes.`
+            ? `“${confirmRemove.name}” and its tools will be removed from this device, and from every chat that had them on, along with any chat’s permission to send to it. Nothing on ${destinationHost(confirmRemove.url)} changes.`
             : ''
         }
         confirmLabel="Remove"

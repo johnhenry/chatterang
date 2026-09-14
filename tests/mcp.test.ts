@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { McpNotSent, destinationHost, qualifiedToolName, validateServerUrl } from '@/domain/mcp';
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
 import { McpManager, type McpToolDescriptor } from '@/ai/mcp/client';
-import { runToolCalls } from '@/ai/middleware/tools';
+import { runToolCalls, type DestinationDecision } from '@/ai/middleware/tools';
 import { BUILT_IN_TOOLS, ToolRegistry } from '@/ai/tools/registry';
 
 /**
@@ -135,7 +135,7 @@ describe('confirmation', () => {
     expect(confirm).toHaveBeenCalled();
   });
 
-  it('does not prompt per call for a read-only tool — the per-chat opt-in is the boundary', async () => {
+  it('a read-only tool adds no data-change question of its own — whether its arguments may leave is asked at dispatch', async () => {
     const confirm = vi.fn(async (_action: string) => true);
     const tool = mustCreateMcpTool(descriptor({ readOnly: true }), {
       serverId: 'mcp_1',
@@ -145,6 +145,75 @@ describe('confirmation', () => {
     });
     await tool.execute({}, context);
     expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Two questions, in order (#6, owner ruling OD1). Whether the arguments may
+ * leave is asked at dispatch; whether a call the server does not call read-only
+ * may change data there is asked by the tool. A grant never answers the second.
+ */
+describe('a call that could change data on its server', () => {
+  const acme = { serverId: 'mcp_1', serverUrl: 'https://api.acme.com/mcp' };
+  const use = (name: string) => [{ type: 'tool_use' as const, id: 'c1', name, input: { q: 'x' } }];
+
+  it('asks what leaves before what changes, and a refusal reaches neither', async () => {
+    const order: string[] = [];
+    const confirm = vi.fn(async (_action: string) => {
+      order.push('changes');
+      return true;
+    });
+    const call = vi.fn(async () => {
+      order.push('sent');
+      return { content: [{ type: 'text', text: 'ok' }] };
+    });
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+    const registry = new ToolRegistry([tool]);
+    const asking = (answer: 'deny' | 'calls') => ({
+      isGranted: () => false,
+      request: async () => {
+        order.push('leaves');
+        return answer;
+      },
+    });
+
+    await runToolCalls(registry, use(tool.name), { enabledIds: [tool.id], destinations: asking('deny') });
+    expect(order, 'a call not allowed to leave asks nothing more and sends nothing').toEqual(['leaves']);
+
+    order.length = 0;
+    await runToolCalls(registry, use(tool.name), { enabledIds: [tool.id], destinations: asking('calls') });
+    expect(order).toEqual(['leaves', 'changes', 'sent']);
+  });
+
+  it('still asks about changing data when the conversation holds a grant', async () => {
+    const confirm = vi.fn(async (_action: string) => false);
+    const call = vi.fn();
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+
+    const { executed } = await runToolCalls(new ToolRegistry([tool]), use(tool.name), {
+      enabledIds: [tool.id],
+      destinations: { isGranted: () => true },
+    });
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0]?.[0]).toContain('may change data there');
+    expect(call).not.toHaveBeenCalled();
+    expect(executed[0]?.output).toBe('The user declined that tool call.');
+  });
+
+  it('treats an answer it does not recognise as a refusal', async () => {
+    // Fails closed: only the two affirmative answers send anything.
+    const call = vi.fn(async () => ({ content: [] }));
+    const tool = mustCreateMcpTool(descriptor({ readOnly: true }), { ...acme, confirm: async () => true, call });
+
+    const { executed } = await runToolCalls(new ToolRegistry([tool]), use(tool.name), {
+      enabledIds: [tool.id],
+      destinations: { isGranted: () => false, request: async () => 'always' as unknown as DestinationDecision },
+    });
+
+    expect(call).not.toHaveBeenCalled();
+    expect(executed[0]?.isError).toBe(true);
+    expect(executed[0]?.output).toContain('did not allow');
   });
 });
 
@@ -332,7 +401,7 @@ describe('an MCP call receipt', () => {
         { type: 'tool_use', id: 'c1', name: mcp.id, input: { q: 'x' } },
         { type: 'tool_use', id: 'c2', name: 'calculate', input: { expression: '1 + 1' } },
       ],
-      { enabledIds: [mcp.id, 'calculator'] },
+      { enabledIds: [mcp.id, 'calculator'], destinations: { isGranted: () => true } },
     );
 
     expect(executed[0]?.receipt?.host).toBe('api.acme.com');

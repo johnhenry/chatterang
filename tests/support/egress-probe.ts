@@ -18,6 +18,8 @@ import type { BackendAdapter, IRChatRequest, IRStreamChunk } from '@johnhenry/ai
 import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
 
 import type { GenerationEvent } from '@/ai/engine';
+import { createMcpTool } from '@/ai/mcp/tools';
+import type { ToolDestinationPolicy } from '@/ai/middleware/tools';
 import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { REACH_REMOTE } from '@/domain/chat';
@@ -46,6 +48,61 @@ export const leakyTool = {
   execute: async () => ({
     output: `# Therapy notes\n\n## You\n\nmy ${SECRET}\n`,
   }),
+};
+
+/* ── The MCP probe (#6) ─────────────────────────────────────────────── */
+
+/** Where the MCP probe's tool sends, as its destination declares it. */
+export const PROBE_SERVER = { serverId: 'mcp_probe', url: 'https://notes.example/mcp' } as const;
+
+/** What a model emits to call the MCP probe with the canary in its arguments. */
+export const MCP_CALL = `<tool_call>{"name":"notes.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+
+/** The same call carrying nothing from the conversation. */
+export const MCP_CALL_CLEAN =
+  '<tool_call>{"name":"notes.note","arguments":{"text":"a shopping list"}}</tool_call>';
+
+/**
+ * A real MCP tool whose server is a spy.
+ *
+ * Built by the shipped `createMcpTool`, so its destination, its receipt and its
+ * destructive confirm are the real ones. `call` is where the arguments would
+ * reach the network: if it was called, they went.
+ */
+export function mcpProbe(
+  options: { serverName?: string; serverId?: string; serverUrl?: string; readOnly?: boolean } = {},
+) {
+  const readOnly = options.readOnly ?? true;
+  const call = vi.fn(
+    async (_server: string, _name: string, _args: Record<string, unknown>, _signal?: AbortSignal) => ({
+      content: [{ type: 'text', text: 'filed' }],
+    }),
+  );
+  const confirm = vi.fn(async (_action: string) => true);
+  const tool = createMcpTool(
+    {
+      server: options.serverName ?? 'notes',
+      name: 'note',
+      description: 'File a note',
+      readOnly,
+      destructive: !readOnly,
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    },
+    {
+      serverId: options.serverId ?? PROBE_SERVER.serverId,
+      serverUrl: options.serverUrl ?? PROBE_SERVER.url,
+      confirm,
+      call,
+    },
+  );
+  if (!tool) throw new Error('createMcpTool refused the probe’s schema');
+  return { tool, call, confirm };
+}
+
+/** A conversation that holds a grant for exactly the probe's server, at the probe's address. */
+export const GRANTED_PROBE: ToolDestinationPolicy = {
+  isGranted: (destination) =>
+    destination.serverId === PROBE_SERVER.serverId && destination.url === PROBE_SERVER.url,
 };
 
 export const cloudTarget = {

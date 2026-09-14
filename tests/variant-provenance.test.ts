@@ -32,6 +32,8 @@ import type { InstalledModel } from '@/db';
 import type { Message, Provenance, ToolInvocation } from '@/domain/chat';
 import type { McpCallReceipt } from '@/domain/mcp';
 import type { ToolEgressPolicy } from '@/ai/engine';
+import type { DestinationRequest, ToolDestinationPolicy } from '@/ai/middleware/tools';
+import type { ApprovalPrompt } from '@/state/app';
 
 /* ── The database, stubbed at the table boundary ────────────────────── */
 
@@ -57,9 +59,9 @@ vi.mock('@/db', () => ({
 const { act } = await import('react');
 const { createRoot } = await import('react-dom/client');
 
-const { useChats, buildMessages } = await import('@/state/chat');
+const { useChats, buildMessages, mcpSendSheet } = await import('@/state/chat');
 const { useModels } = await import('@/state/models');
-const { useApp } = await import('@/state/app');
+const { useApp, revokeMcpGrantsFor } = await import('@/state/app');
 const { catalogEntry } = await import('@/data/catalog');
 const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { MessageView } = await import('@/features/chat/MessageView');
@@ -144,10 +146,17 @@ interface Turn {
   readonly hang?: Promise<void>;
   /** Throw after the tool event instead of finishing — the store's `catch`. */
   readonly throwWith?: string;
+  /** Ask the MCP policy the store handed over, as the dispatcher does before a call. */
+  readonly asksMcp?: DestinationRequest;
+  /** Run once `asksMcp` is answered, still inside the turn, with the policy it was asked through. */
+  readonly thenMcp?: (policy: ToolDestinationPolicy) => Promise<void>;
 }
 
 /** Turns the fake engine hands back, in order. */
 let script: Turn[] = [];
+
+/** What each `asksMcp` turn got back, and whether the policy then held a grant. */
+let mcpAnswers: { decision?: string; granted?: boolean }[] = [];
 
 /**
  * The engine, replaced by a recorder.
@@ -158,9 +167,21 @@ let script: Turn[] = [];
  */
 function scriptedEngine(): unknown {
   return {
-    async *stream(request: { readonly egress?: ToolEgressPolicy }) {
+    async *stream(request: {
+      readonly egress?: ToolEgressPolicy;
+      readonly mcpEgress?: ToolDestinationPolicy;
+    }) {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
+      if (turn.asksMcp) {
+        // What `runToolCalls` does with the policy: ask, and hand a
+        // conversation answer back to be kept.
+        const policy = request.mcpEgress;
+        const decision = await policy?.request?.(turn.asksMcp);
+        if (decision === 'conversation') policy?.onGranted?.(turn.asksMcp.destination);
+        mcpAnswers.push({ decision, granted: policy?.isGranted(turn.asksMcp.destination) });
+        if (policy && turn.thenMcp) await turn.thenMcp(policy);
+      }
       if (turn.asksEgress) {
         await request.egress?.request?.({
           backendId: 'conn_openai',
@@ -1190,5 +1211,150 @@ describe('the tool-output sheet over an earlier reply', () => {
       false,
     );
     expect(trimmed.derivedReplies).toEqual([]);
+  });
+});
+
+/* ── The MCP send sheet, through the store (#6) ───────────────────────── */
+
+describe('the MCP send sheet, through the store’s own policy', () => {
+  const ASK: DestinationRequest = {
+    destination: {
+      kind: 'mcp',
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    },
+    calls: [{ toolName: 'notes.note', bytes: 30, preview: '{"text":"a note"}' }],
+  };
+
+  /** Send one turn whose engine asks the MCP policy, and answer the sheet as told. */
+  async function answering(
+    answer: 'no' | 'yes' | 'conversation',
+    thenMcp?: Turn['thenMcp'],
+  ): Promise<(ApprovalPrompt | undefined)[]> {
+    const prompts: (ApprovalPrompt | undefined)[] = [];
+    const original = useApp.getState().requestApproval;
+    useApp.setState({
+      requestApproval: async (_action: string, prompt?: ApprovalPrompt) => {
+        prompts.push(prompt);
+        if (answer === 'conversation') prompt?.onExtended?.();
+        return answer !== 'no';
+      },
+    });
+    mcpAnswers = [];
+    try {
+      script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK, thenMcp }];
+      await useChats.getState().send('file it');
+    } finally {
+      useApp.setState({ requestApproval: original });
+    }
+    return prompts;
+  }
+
+  const grants = () => useChats.getState().chats.find((chat) => chat.id === 'c1')?.egressGrants ?? [];
+
+  /**
+   * Hold open every write of a chat that carries a grant, until released.
+   *
+   * Without it, whether a grant's write has landed by the next line depends on
+   * how many microtasks that line happens to wait, and a test of what the
+   * policy remembers could pass on the stored grant instead.
+   */
+  function holdingGrantWrites(): { release: () => void; restore: () => void } {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    tables.chats.put.mockImplementation((async (chat: { egressGrants?: readonly unknown[] }) => {
+      if (chat.egressGrants?.length) await held;
+    }) as never);
+    return {
+      release: () => release(),
+      restore: () => {
+        release();
+        tables.chats.put.mockImplementation(async () => {});
+      },
+    };
+  }
+
+  it('raises the sheet `mcpSendSheet` builds, and a no sends nothing and keeps nothing', async () => {
+    const prompts = await answering('no');
+
+    expect(prompts).toHaveLength(1);
+    const { action: _action, ...sheet } = mcpSendSheet(ASK);
+    expect(prompts[0]).toMatchObject(sheet);
+    expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
+    expect(grants()).toEqual([]);
+  });
+
+  it('keeps a conversation answer for this chat and this server, and honours it at once', async () => {
+    await answering('conversation');
+
+    // Held before the write lands, so a call made straight after is not asked again.
+    expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: true }]);
+    await vi.waitFor(() =>
+      expect(grants()).toEqual([
+        { kind: 'mcp', serverId: 'mcp_notes', url: 'https://notes.example/mcp', grantedAt: expect.any(Number) },
+      ]),
+    );
+  });
+
+  it('stops honouring a conversation answer once the server’s grants are withdrawn, within the same turn', async () => {
+    // A local model can loop over tool batches for a long time. Switching the
+    // server off and back on in Settings drops the stored grant, and brings
+    // the same record back at the same address — so the live check in
+    // `state/mcp.ts` passes again. What the policy remembered of the answer
+    // must not outlast that, or the privacy command's "Every grant to a server
+    // is dropped when it is removed or switched off" is false until the turn ends.
+    const granted: boolean[] = [];
+    const write = holdingGrantWrites();
+    try {
+      await answering('conversation', async (policy) => {
+        // Still being written, so what answers here is the policy's own memory
+        // of the answer. Another server's revocation is not this one's.
+        await revokeMcpGrantsFor('mcp_other');
+        granted.push(policy.isGranted(ASK.destination));
+
+        write.release();
+        await vi.waitFor(() => expect(grants()).toHaveLength(1));
+        // What `useMcp.toggle('mcp_notes', false)` and `remove` call.
+        await revokeMcpGrantsFor('mcp_notes');
+        granted.push(policy.isGranted(ASK.destination));
+      });
+    } finally {
+      write.restore();
+    }
+
+    expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: true }]);
+    expect(granted).toEqual([true, false]);
+    expect(grants()).toEqual([]);
+  });
+
+  it('keeps nothing of a conversation answer withdrawn before its write landed', async () => {
+    // The revocation runs while the grant is still being written, so it finds
+    // nothing stored to drop; the write then lands after it.
+    const granted: boolean[] = [];
+    const write = holdingGrantWrites();
+    try {
+      await answering('conversation', async (policy) => {
+        await revokeMcpGrantsFor('mcp_notes');
+        granted.push(policy.isGranted(ASK.destination));
+        write.release();
+      });
+    } finally {
+      write.restore();
+    }
+
+    expect(granted).toEqual([false]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(grants()).toEqual([]);
+  });
+
+  it('does not keep a plain yes: it covered the calls on the sheet', async () => {
+    await answering('yes');
+
+    expect(mcpAnswers).toEqual([{ decision: 'calls', granted: false }]);
+    expect(grants()).toEqual([]);
   });
 });

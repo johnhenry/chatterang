@@ -67,6 +67,25 @@ export function qualifiedToolName(serverName: string, toolName: string): string 
 }
 
 /**
+ * The size of a call's arguments: their UTF-8 length as JSON, the part the
+ * model composed. One function for the sheet that asks and the receipt that
+ * records, so the number a person allowed and the number written down after
+ * are the same number.
+ */
+export function argumentBytes(input: Record<string, unknown>): number {
+  return new TextEncoder().encode(JSON.stringify(input)).length;
+}
+
+/**
+ * A call's arguments as JSON, cut short for a sheet. Cut by code point, so a
+ * truncation never splits a character in half.
+ */
+export function argumentPreview(input: Record<string, unknown>, limit = 120): string {
+  const points = Array.from(JSON.stringify(input));
+  return points.length <= limit ? points.join('') : `${points.slice(0, limit - 1).join('')}…`;
+}
+
+/**
  * Where a tool sends its arguments, carried on the tool itself.
  *
  * COPIED IN, as `PairedDevice` in domain/chat.ts is: the name and host are what

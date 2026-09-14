@@ -23,7 +23,12 @@ import type {
   ToolUseContent,
 } from '@johnhenry/aimatey-types';
 
-import type { McpCallReceipt } from '@/domain/mcp';
+import {
+  argumentBytes,
+  argumentPreview,
+  type McpCallReceipt,
+  type ToolDestination,
+} from '@/domain/mcp';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
 export interface ExecutedTool {
@@ -45,6 +50,54 @@ export interface ToolMiddlewareOptions {
   /** Notified as each tool finishes, so the UI can render it live. */
   onToolExecuted?: (tool: ExecutedTool) => void;
 }
+
+/* ── Where a call's arguments may go (#6) ────────────────────────────── */
+
+/** One call as the send sheet lists it. */
+export interface DestinationCall {
+  /** Server-qualified, as the tool list names it. */
+  readonly toolName: string;
+  readonly bytes: number;
+  /** The arguments as JSON, cut short. The model wrote them, and a sheet must say so. */
+  readonly preview: string;
+}
+
+/** What a person is asked to allow: one destination, and every call in this batch bound for it. */
+export interface DestinationRequest {
+  readonly destination: ToolDestination;
+  readonly calls: readonly DestinationCall[];
+}
+
+/**
+ * `calls` sends exactly the calls the request listed, and covers nothing
+ * later; `conversation` allows this server, at this address, in this
+ * conversation until the grant is revoked; `deny` sends nothing.
+ *
+ * There is no answer for the rest of the turn. A later batch's arguments may
+ * have been written after a tool's output was read (`composedAfterOutput` in
+ * `ai/engine.ts`), and an answer given over a harmless call on screen must not
+ * cover one the person never saw.
+ */
+export type DestinationDecision = 'calls' | 'conversation' | 'deny';
+
+export interface ToolDestinationPolicy {
+  /** Grants the conversation already holds for this destination. */
+  isGranted(destination: ToolDestination): boolean;
+  /**
+   * Ask. Absent means there is nobody to ask, which is a refusal.
+   *
+   * AN UNATTENDED CALLER MUST LEAVE THIS OUT. The app's own answer waits on
+   * `requestApproval`, which resolves only when a person answers the sheet, so
+   * a queued or background run that supplied it would hang rather than refuse
+   * (#103, #199).
+   */
+  request?(request: DestinationRequest): Promise<DestinationDecision>;
+  /** Persist a `conversation` answer. */
+  onGranted?(destination: ToolDestination): void;
+}
+
+/** Sends nothing anywhere: for a caller with no conversation to hold a grant and no one to ask. */
+export const NO_DESTINATIONS: ToolDestinationPolicy = Object.freeze({ isGranted: () => false });
 
 /**
  * Recognise a textual tool call. Local models produce these in a handful of
@@ -202,6 +255,13 @@ export async function runToolCalls(
    */
   options: {
     enabledIds: readonly string[];
+    /*
+     * REQUIRED FOR THE SAME REASON (#6). A tool's `execute` cannot see the
+     * conversation or what it has allowed, so this is the one place a call
+     * that leaves the device can be asked about before its arguments go —
+     * and a caller that forgot to pass it must not compile.
+     */
+    destinations: ToolDestinationPolicy;
     signal?: AbortSignal;
     onToolExecuted?: (tool: ExecutedTool) => void;
   },
@@ -209,13 +269,18 @@ export async function runToolCalls(
   const results: MessageContent[] = [];
   const executed: ExecutedTool[] = [];
 
-  for (const call of calls) {
+  // A tool this chat did not enable gets the SAME answer as a tool that does
+  // not exist. A distinct "not enabled" message would tell the model which
+  // tools are installed that the user chose not to give it.
+  const tools = calls.map((call) => enabledTool(registry, options.enabledIds, call.name));
+  // Asked BEFORE any call in the batch runs, so a sheet lists every call its
+  // answer covers, and a destructive call's own confirm comes after it.
+  const { refused, onHeldGrant } = await refusedDestinations(calls, tools, options.destinations);
+
+  for (const [index, call] of calls.entries()) {
     if (options.signal?.aborted) break;
 
-    // A tool this chat did not enable gets the SAME answer as a tool that does
-    // not exist. A distinct "not enabled" message would tell the model which
-    // tools are installed that the user chose not to give it.
-    const tool = enabledTool(registry, options.enabledIds, call.name);
+    const tool = tools[index];
     const started = performance.now();
 
     let output: string;
@@ -225,6 +290,21 @@ export async function runToolCalls(
 
     if (!tool) {
       output = `No tool named "${call.name}" is available.`;
+      isError = true;
+    } else if (refused.has(index)) {
+      // Written by this app from the destination's host, which the person
+      // typed; nothing in it came from the model or the server.
+      output = refused.get(index)!;
+      isError = true;
+    } else if (tool.destination && onHeldGrant.has(index) && !options.destinations.isGranted(tool.destination)) {
+      // A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was
+      // asked about. An earlier call in the batch can run for as long as its
+      // server takes, and switching this server off and on again meanwhile
+      // withdraws the grant but brings back the same record at the same
+      // address, so the live check in `state/mcp.ts` passes. Without this the
+      // call went anyway, after the privacy command's "Every grant to a server
+      // is dropped when it is removed or switched off" had become true.
+      output = `This call’s arguments were not sent to ${tool.destination.host}: this conversation’s permission for that server was withdrawn before it went.`;
       isError = true;
     } else {
       try {
@@ -259,6 +339,77 @@ export async function runToolCalls(
   }
 
   return { results, executed };
+}
+
+/**
+ * The calls in a batch whose arguments may not leave, each with what the model
+ * is told instead.
+ *
+ * Grouped by destination — the server record's id AND its address, because a
+ * record whose URL changed is somewhere else — and asked about once per group,
+ * so a sheet lists every call its answer covers and no call it does not.
+ * Nothing is remembered past this batch: see {@link DestinationDecision}.
+ *
+ * Fails closed twice. A tool with an `mcp:` id that declares no destination is
+ * not sent, because nothing can say where it would go. And any answer other
+ * than `calls` or `conversation` is a refusal.
+ *
+ * `onHeldGrant` names the calls let through only by a grant the conversation
+ * already held, which the dispatcher reads again before each one runs. An
+ * answer given in this batch is not in it: whether withdrawing a grant voids
+ * the calls a person just allowed on screen is not ruled.
+ */
+async function refusedDestinations(
+  calls: readonly ToolUseContent[],
+  tools: readonly (ChatterangTool | undefined)[],
+  policy: ToolDestinationPolicy,
+): Promise<{ refused: Map<number, string>; onHeldGrant: Set<number> }> {
+  const refused = new Map<number, string>();
+  const onHeldGrant = new Set<number>();
+  const groups = new Map<string, { destination: ToolDestination; indices: number[] }>();
+
+  tools.forEach((tool, index) => {
+    if (tool === undefined) return;
+    const destination = tool.destination;
+    if (destination === undefined) {
+      if (tool.id.startsWith('mcp:')) {
+        refused.set(index, `${tool.name} was not sent: it does not say where its arguments would go.`);
+      }
+      return;
+    }
+    const key = `${destination.serverId} ${destination.url}`;
+    const group = groups.get(key) ?? { destination, indices: [] };
+    group.indices.push(index);
+    groups.set(key, group);
+  });
+
+  for (const { destination, indices } of groups.values()) {
+    if (policy.isGranted(destination)) {
+      for (const index of indices) onHeldGrant.add(index);
+      continue;
+    }
+
+    let decision: DestinationDecision = 'deny';
+    if (policy.request) {
+      decision = await policy.request({
+        destination,
+        calls: indices.map((index) => ({
+          toolName: tools[index]!.name,
+          bytes: argumentBytes(calls[index]!.input),
+          preview: argumentPreview(calls[index]!.input),
+        })),
+      });
+      if (decision === 'conversation') policy.onGranted?.(destination);
+    }
+    if (decision === 'calls' || decision === 'conversation') continue;
+
+    const reason = policy.request
+      ? `The user did not allow sending this call’s arguments to ${destination.host}.`
+      : `This call’s arguments were not sent to ${destination.host}: this conversation has not allowed that server, and nobody could be asked.`;
+    for (const index of indices) refused.set(index, reason);
+  }
+
+  return { refused, onHeldGrant };
 }
 
 function structuredToolCalls(message: IRMessage): ToolUseContent[] {
@@ -303,6 +454,10 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
 
       const batch = await runToolCalls(options.registry, calls, {
         enabledIds: enabledToolIds(context.request),
+        // A DELIBERATE CLIFF. This path (`engine.complete`) has no conversation
+        // to hold a grant and no moment to raise a sheet in, so no call that
+        // leaves the device is sent from it, granted or not (#6).
+        destinations: NO_DESTINATIONS,
         signal: context.signal,
         onToolExecuted: options.onToolExecuted,
       });

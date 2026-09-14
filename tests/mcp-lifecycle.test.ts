@@ -105,7 +105,9 @@ async function callNotesSearchIn(chatId: string): Promise<void> {
   await runToolCalls(
     toolRegistry,
     [{ type: 'tool_use', id: 'call_1', name: 'notes.search', input: { q: 'bank details' } }],
-    { enabledIds: toolsOf(chatId) },
+    // Every destination allowed: what this file measures is the enable, and
+    // the grant is measured in `privacy.test.ts` and `egress-grants.test.ts`.
+    { enabledIds: toolsOf(chatId), destinations: { isGranted: () => true } },
   );
 }
 
@@ -352,7 +354,7 @@ describe('a surface that never loaded the chat store', () => {
    * Measured in a fresh module graph, so the chat store this file imported
    * above is not the one that installed anything.
    */
-  it('refuses to add or remove a server rather than skipping the prune', async () => {
+  it('refuses to add, remove or switch off a server rather than skipping the prune or the revoke', async () => {
     vi.resetModules();
     const alone = (await import('@/state/mcp')).useMcp;
 
@@ -365,9 +367,16 @@ describe('a surface that never loaded the chat store', () => {
     alone.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
     await expect(alone.getState().remove('mcp_a')).rejects.toThrow('the chat store is not loaded');
 
+    // Switching a server off withdraws every chat's grant to send to it (#6),
+    // and with nothing installed to do that it refuses rather than pretending.
+    alone.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+    await expect(alone.getState().toggle('mcp_a', false)).rejects.toThrow('the chat store is not loaded');
+
     // The paired control: the same fresh graph, once the chat store has loaded.
+    alone.setState({ servers: [] });
     await import('@/state/chat');
     expect(await alone.getState().add({ name: 'notes', url: 'https://b.example/mcp' })).toBeNull();
     expect(tables.mcpServers.put).toHaveBeenCalledOnce();
+    await expect(alone.getState().toggle(alone.getState().servers[0]!.id, false)).resolves.toBeUndefined();
   });
 });

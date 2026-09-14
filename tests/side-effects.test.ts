@@ -6,6 +6,8 @@ import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { toolRegistry } from '@/ai/tools/registry';
 
+import { MCP_CALL, mcpProbe, recordingBackend, sent } from './support/egress-probe';
+
 const manifest = catalogEntry('qwen3-4b-instruct-q4km')!;
 const resolver = {
   getManifest: (id: string) => (id === manifest.id ? manifest : null),
@@ -193,6 +195,30 @@ describe('side-effect counting', () => {
     });
 
     expect(res.message.content).not.toBe('');
+  });
+
+  it('never sends an MCP call’s arguments from complete(), granted or not', async () => {
+    // #45's named surface. complete() has no conversation to hold a grant and
+    // nobody to ask (#6), so its tool middleware refuses every call that leaves
+    // — even when the caller hands it a policy that would allow one.
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    const backend = recordingBackend([MCP_CALL, 'Filed.']);
+    engine.router.register('scripted', backend.adapter);
+
+    await engine.complete({
+      messages: [{ role: 'user', content: 'file a note' }],
+      target: targetFor('llama-cpp', manifest.id, manifest.name, 'scripted'),
+      toolIds: [probe.tool.id],
+      mcpEgress: { isGranted: () => true, request: async () => 'conversation' },
+    });
+
+    expect(probe.call).not.toHaveBeenCalled();
+    // Not vacuous: the call reached the dispatcher, and the model was told it
+    // did not go.
+    expect(sent(backend.seen).at(-1)).toContain('were not sent to notes.example');
+    toolRegistry.unregister(probe.tool.id);
   });
 
   it('does not divert twice when a streamed local turn fails over', async () => {

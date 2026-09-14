@@ -73,7 +73,7 @@ export function SettingsScreen(): ReactNode {
                 {mcpToolCount > 0 ? (
                   <li>
                     The arguments of any MCP tool the model calls, to the server that tool comes
-                    from. Nothing is asked before they go.
+                    from. The app asks before they go, per server.
                   </li>
                 ) : null}
                 <li>
@@ -277,7 +277,8 @@ export function SettingsScreen(): ReactNode {
               </div>
               <p className="section__hint">
                 Optional. Adds tools the model can call on servers you choose — their arguments
-                leave this device when called, and every one has to be enabled per chat.
+                leave this device once you allow that server, and every one has to be enabled per
+                chat.
               </p>
               <button
                 type="button"

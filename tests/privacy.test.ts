@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { BackendAdapter, IRStreamChunk } from '@johnhenry/aimatey-types';
+import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
 
 import {
   ChatterangEngine,
@@ -9,7 +11,12 @@ import {
   type ToolEgressPolicy,
   type ToolEgressRequest,
 } from '@/ai/engine';
-import { reachPaired } from '@/domain/chat';
+import type {
+  DestinationDecision,
+  DestinationRequest,
+  ToolDestinationPolicy,
+} from '@/ai/middleware/tools';
+import { holdsGrant, reachPaired, type EgressGrant } from '@/domain/chat';
 import { toolRegistry } from '@/ai/tools/registry';
 import { buildPayload } from '@/lib/leaderboard';
 import { stripForSpeech } from '@/lib/voice';
@@ -20,11 +27,16 @@ import { BUILT_IN_PERSONAS, MARKETPLACE } from '@/data/personas';
 import type { BenchmarkRun } from '@/db';
 import {
   CALL,
+  GRANTED_PROBE,
+  MCP_CALL,
+  MCP_CALL_CLEAN,
+  PROBE_SERVER,
   SECRET,
   callsThenFails,
   cloudTarget,
   drainEvents,
   leakyTool,
+  mcpProbe,
   probeManifest,
   probeResolver,
   recordingBackend,
@@ -521,4 +533,317 @@ describe('tool output does not leave the device without a grant', () => {
     });
   });
 
+});
+
+/* ── MCP arguments and the network (#6) ──────────────────────────────── */
+
+/**
+ * The promise: an MCP tool call's arguments do not reach its server unless this
+ * conversation allows that server, at that address — whatever model wrote them.
+ *
+ * Driven against a LOCAL model on purpose. The tool-output gate never runs for
+ * one, so nothing here can pass because another rule held the bytes back. The
+ * server is a spy, and whether it was called is the whole measurement.
+ */
+describe('MCP arguments do not leave the device without a grant', () => {
+  const local = (): EngineTarget =>
+    targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted');
+  const ask = (answer: DestinationDecision) =>
+    vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => answer);
+
+  afterEach(() => {
+    for (const id of ['mcp:notes.note', 'mcp:archive.note', 'mcp:mirror.note', 'mcp:x.y', 'x.y']) {
+      toolRegistry.unregister(id);
+    }
+  });
+
+  function setUp(turns: string[] = [MCP_CALL, 'Done.']) {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('scripted', recordingBackend(turns).adapter);
+    engine.router.register('cloud', recordingBackend(turns).adapter);
+    const run = (
+      mcpEgress?: ToolDestinationPolicy,
+      options: { target?: EngineTarget; toolIds?: string[] } = {},
+    ) =>
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: options.target ?? local(),
+          toolIds: options.toolIds ?? [probe.tool.id],
+          mcpEgress,
+        }),
+      );
+    return { engine, probe, run };
+  }
+
+  /** A local backend that cannot take the turn at all, so it diverts. */
+  function failsAtOnce(): BackendAdapter {
+    return new FunctionBackendAdapter({
+      execute: async () => {
+        throw new Error('not enough memory');
+      },
+      // eslint-disable-next-line require-yield
+      executeStream: async function* (): AsyncGenerator<IRStreamChunk> {
+        throw new Error('not enough memory');
+      },
+    });
+  }
+
+  it('sends nothing with no policy, from a local model or a remote one', async () => {
+    for (const target of [local(), cloudTarget]) {
+      const { probe, run } = setUp();
+      const events = await run(undefined, { target });
+
+      expect(probe.call, target.backendId).not.toHaveBeenCalled();
+      const tool = events.find((event) => event.type === 'tool');
+      expect(tool?.type === 'tool' && tool.tool.output).toContain('were not sent to notes.example');
+      expect(tool?.type === 'tool' && tool.tool.receipt).toBeUndefined();
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+
+  it('sends the call, unasked, when the conversation holds a grant for that server', async () => {
+    // The paired control for every refusal in this block.
+    const { probe, run } = setUp();
+    const request = ask('deny');
+
+    await run({ ...GRANTED_PROBE, request });
+
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(probe.call).toHaveBeenCalledWith('notes', 'note', { text: SECRET }, undefined);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('is not answered by a grant for another server, or for the same server at another address', async () => {
+    const others: EgressGrant[][] = [
+      [{ kind: 'mcp', serverId: 'mcp_other', url: PROBE_SERVER.url, grantedAt: 1 }],
+      [{ kind: 'mcp', serverId: PROBE_SERVER.serverId, url: 'https://other.example/mcp', grantedAt: 1 }],
+      [{ connectionId: PROBE_SERVER.serverId, grantedAt: 1 }],
+    ];
+    for (const grants of others) {
+      const { probe, run } = setUp();
+      await run({
+        isGranted: (destination) =>
+          holdsGrant(grants, { kind: 'mcp', serverId: destination.serverId, url: destination.url }),
+      });
+      expect(probe.call, JSON.stringify(grants)).not.toHaveBeenCalled();
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    // The control: the grant the tool's own destination names does answer it.
+    const { probe, run } = setUp();
+    const own: EgressGrant[] = [{ kind: 'mcp', ...PROBE_SERVER, grantedAt: 1 }];
+    await run({
+      isGranted: (destination) =>
+        holdsGrant(own, { kind: 'mcp', serverId: destination.serverId, url: destination.url }),
+    });
+    expect(probe.call).toHaveBeenCalledOnce();
+  });
+
+  it('sends nothing when the person says no', async () => {
+    const { probe, run } = setUp();
+    const request = ask('deny');
+
+    const events = await run({ isGranted: () => false, request });
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(probe.call).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.output).toBe(
+      'The user did not allow sending this call’s arguments to notes.example.',
+    );
+  });
+
+  it('asks once for every call to one server in a batch, and "these calls" sends exactly those', async () => {
+    const { probe, run } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
+    const request = ask('calls');
+
+    await run({ isGranted: () => false, request });
+
+    expect(request).toHaveBeenCalledOnce();
+    const asked = request.mock.calls[0]![0];
+    expect(asked.destination).toEqual(probe.tool.destination);
+    expect(asked.calls.map((call) => call.preview)).toEqual([
+      `{"text":"${SECRET}"}`,
+      '{"text":"a shopping list"}',
+    ]);
+    expect(probe.call).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks separately for one server id at two addresses', async () => {
+    const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
+    const { probe, run } = setUp([MCP_CALL + archiveCall, 'Done.']);
+    // The same server record id, at a different URL: somewhere else.
+    const archive = mcpProbe({ serverName: 'archive', serverUrl: 'https://other.example/mcp' });
+    toolRegistry.register(archive.tool);
+    const request = ask('calls');
+
+    await run({ isGranted: () => false, request }, { toolIds: [probe.tool.id, archive.tool.id] });
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls.map(([asked]) => asked.destination.url)).toEqual([
+      PROBE_SERVER.url,
+      'https://other.example/mcp',
+    ]);
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(archive.call).toHaveBeenCalledOnce();
+  });
+
+  it('does not let a grant for one server answer another server on the same host, or at the same address', async () => {
+    // The test above cannot tell a key on the address from a key on the host
+    // the sheet shows: its two addresses are on different hosts. These two
+    // share one. A gateway serving several servers under one host is ordinary,
+    // and a group keyed on anything coarser than the record's id and address
+    // is checked against its FIRST call's destination — so the grant held for
+    // the probe would carry the others' arguments unasked.
+    const archiveCall = '<tool_call>{"name":"archive.note","arguments":{"text":"old"}}</tool_call>';
+    const mirrorCall = '<tool_call>{"name":"mirror.note","arguments":{"text":"copy"}}</tool_call>';
+    const { probe, run } = setUp([MCP_CALL + archiveCall + mirrorCall, 'Done.']);
+    const archive = mcpProbe({
+      serverName: 'archive',
+      serverId: 'mcp_archive',
+      serverUrl: 'https://notes.example/archive/mcp',
+    });
+    const mirror = mcpProbe({ serverName: 'mirror', serverId: 'mcp_mirror' });
+    toolRegistry.register(archive.tool);
+    toolRegistry.register(mirror.tool);
+    expect(archive.tool.destination?.host).toBe(probe.tool.destination?.host);
+    expect(mirror.tool.destination?.url).toBe(probe.tool.destination?.url);
+    const request = ask('deny');
+
+    await run(
+      { ...GRANTED_PROBE, request },
+      { toolIds: [probe.tool.id, archive.tool.id, mirror.tool.id] },
+    );
+
+    // The control: the server the grant names is sent to, unasked.
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(request.mock.calls.map(([asked]) => asked.destination.serverId)).toEqual([
+      'mcp_archive',
+      'mcp_mirror',
+    ]);
+    expect(archive.call).not.toHaveBeenCalled();
+    expect(mirror.call).not.toHaveBeenCalled();
+  });
+
+  it('does not send a later call once its server’s held grant is withdrawn while an earlier call runs', async () => {
+    // The grant is read when the batch is asked about, and an earlier call can
+    // run for as long as its server takes. Switching the later call's server
+    // off and on meanwhile withdraws the grant and brings back the same record
+    // at the same address, so only reading the grant again at the call stops it.
+    const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
+    const withdrawing = async (withdraw: boolean) => {
+      const { probe, run } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+      const archive = mcpProbe({
+        serverName: 'archive',
+        serverId: 'mcp_archive',
+        serverUrl: 'https://archive.example/mcp',
+      });
+      toolRegistry.register(archive.tool);
+      const held = new Set([PROBE_SERVER.serverId, 'mcp_archive']);
+      probe.call.mockImplementation(async () => {
+        if (withdraw) held.delete('mcp_archive');
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+      const request = ask('conversation');
+
+      const events = await run(
+        { isGranted: (destination) => held.has(destination.serverId), request },
+        { toolIds: [probe.tool.id, archive.tool.id] },
+      );
+      toolRegistry.unregister(archive.tool.id);
+      toolRegistry.unregister(probe.tool.id);
+      const tools = events.flatMap((event) => (event.type === 'tool' ? [event.tool] : []));
+      return { probe, archive, request, tools };
+    };
+
+    // The control: nothing withdrawn, both go, nobody asked.
+    const kept = await withdrawing(false);
+    expect(kept.probe.call).toHaveBeenCalledOnce();
+    expect(kept.archive.call).toHaveBeenCalledOnce();
+
+    const withdrawn = await withdrawing(true);
+    expect(withdrawn.probe.call).toHaveBeenCalledOnce();
+    expect(withdrawn.archive.call).not.toHaveBeenCalled();
+    // Refused, not asked again mid-batch: the sheet the person answers lists
+    // a batch before it runs.
+    expect(withdrawn.request).not.toHaveBeenCalled();
+    expect(withdrawn.tools.map((tool) => tool.output)).toEqual([
+      'filed',
+      'This call’s arguments were not sent to archive.example: this conversation’s permission for that server was withdrawn before it went.',
+    ]);
+  });
+
+  it('hands a conversation answer back to be kept, naming the server and its address', async () => {
+    const { probe, run } = setUp();
+    const onGranted = vi.fn();
+
+    await run({ isGranted: () => false, request: ask('conversation'), onGranted });
+
+    expect(onGranted).toHaveBeenCalledOnce();
+    expect(onGranted).toHaveBeenCalledWith(probe.tool.destination);
+    expect(probe.call).toHaveBeenCalledOnce();
+  });
+
+  it('refuses unasked after a fallback, unless the conversation already holds a grant', async () => {
+    const diverted = async (policy: ToolDestinationPolicy) => {
+      const probe = mcpProbe();
+      toolRegistry.register(probe.tool);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register('scripted', failsAtOnce());
+      engine.router.register('cloud', recordingBackend([MCP_CALL, 'Done.']).adapter);
+      engine.setFallbackBackend('cloud');
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: policy,
+        }),
+      );
+      toolRegistry.unregister(probe.tool.id);
+      return { probe, events };
+    };
+
+    const request = ask('conversation');
+    const refused = await diverted({ isGranted: () => false, request });
+    // The divert really happened, so the rule under test really ran.
+    expect(refused.events.some((event) => event.type === 'fallback')).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+    expect(refused.probe.call).not.toHaveBeenCalled();
+
+    const granted = await diverted({ ...GRANTED_PROBE, request });
+    expect(granted.events.some((event) => event.type === 'fallback')).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+    expect(granted.probe.call).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a tool with an mcp: id that does not say where it sends, whatever is allowed', async () => {
+    const execute = vi.fn(async () => ({ output: 'sent' }));
+    const unlabelled = {
+      name: 'x.y',
+      description: 'd',
+      summary: 's',
+      parameters: { type: 'object' as const },
+      sensitive: true,
+      execute,
+    };
+    const everything: ToolDestinationPolicy = { isGranted: () => true, request: ask('conversation') };
+    const call = ['<tool_call>{"name":"x.y","arguments":{}}</tool_call>', 'Done.'];
+
+    toolRegistry.register({ ...unlabelled, id: 'mcp:x.y' });
+    const { run } = setUp(call);
+    const events = await run(everything, { toolIds: ['mcp:x.y'] });
+    expect(execute).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.output).toContain('does not say where its arguments would go');
+
+    // The control: the same tool under an id that does not claim to be MCP runs.
+    toolRegistry.unregister('mcp:x.y');
+    toolRegistry.register({ ...unlabelled, id: 'x.y' });
+    await setUp(call).run(everything, { toolIds: ['x.y'] });
+    expect(execute).toHaveBeenCalledOnce();
+  });
 });

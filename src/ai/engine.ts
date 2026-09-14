@@ -33,6 +33,7 @@ import {
   runToolCalls,
   stripToolSyntax,
   type ExecutedTool,
+  type ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
 import {
   checkDevicePressure,
@@ -371,6 +372,16 @@ export interface GenerationRequest {
    * it withholds by default, and the model is told why.
    */
   readonly egress?: ToolEgressPolicy;
+  /**
+   * Consent for sending an MCP tool call's arguments to its server (#6).
+   *
+   * Omitting it is a refusal, as with `egress`: no call that leaves the device
+   * is sent. It is consulted whatever the target — a local model's call sends
+   * its arguments to the server just as a remote model's does.
+   *
+   * An unattended caller must leave out `request`; see `ToolDestinationPolicy`.
+   */
+  readonly mcpEgress?: ToolDestinationPolicy;
   readonly signal?: AbortSignal;
 }
 
@@ -908,6 +919,7 @@ export class ChatterangEngine {
 
       const batch = await runToolCalls(toolRegistry, calls, {
         enabledIds: request.toolIds ?? [],
+        destinations: this.#mcpDestinations(request.mcpEgress),
         signal: request.signal,
       });
       tools.push(...batch.executed);
@@ -941,6 +953,28 @@ export class ChatterangEngine {
       },
       provenance: { ...this.#provenance(target), toolEgress },
       tools,
+    };
+  }
+
+  /**
+   * The MCP gate for one batch of tool calls (#6).
+   *
+   * Built per batch, because a fallback can fire between batches. Once a turn
+   * has diverted, the person is already waiting on a turn that is failing and
+   * there is no honest moment to raise a sheet — the reason the tool-output
+   * gate above refuses rather than asks. So the same rule: a grant this
+   * conversation already holds still covers the call, and anything else is
+   * refused without asking.
+   *
+   * Nothing is cached here. A `calls` answer covers the one batch it was
+   * given over, and the next batch asks again.
+   */
+  #mcpDestinations(policy: ToolDestinationPolicy | undefined): ToolDestinationPolicy {
+    const ask = this.#lastFallback === null ? policy?.request?.bind(policy) : undefined;
+    return {
+      isGranted: (destination) => policy?.isGranted(destination) === true,
+      request: ask,
+      onGranted: (destination) => policy?.onGranted?.(destination),
     };
   }
 

