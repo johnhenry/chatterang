@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ChatterangEngine, targetFor } from '@/ai/engine';
@@ -22,6 +23,7 @@ import {
   NATIVE_PATCHES,
 } from '../scripts/patch-native.mjs';
 import { isLocalEngine } from '@/domain/manifest';
+import { pairingController } from '@/lib/pairing';
 import type { IRMessage } from '@johnhenry/aimatey-types';
 import {
   chatterangCommands,
@@ -1258,5 +1260,292 @@ describe('the camera permission, applied by the sync step', () => {
     expect(once).toContain('android:allowBackup="false"');
     expect(once).toContain('android.permission.CAMERA');
     expect(patchAndroidCamera(patchAndroidManifest(once))).toBe(once);
+  });
+});
+
+/* ── Pairing, which no privacy sentence admits yet (#128, #130) ──────── */
+
+/**
+ * THE SEAM AND THE COPY MOVE TOGETHER, OR NEITHER DOES.
+ *
+ * `src/lib/pairing.ts` ships a controller whose `available` is false, and
+ * `tests/pairing-seam.test.ts` already fails the day that changes. Nothing
+ * checked what has to change WITH it. A phone that can pair sends a
+ * conversation to a machine that is not a provider, and every privacy surface
+ * below was written about a phone that cannot. A pairing also has to be
+ * somewhere a person can see and revoke it (#137), in a table that holds it
+ * (#133), under an id (#125).
+ *
+ * So both are BICONDITIONALS on the one value the seam exports:
+ *
+ *   the privacy body names a paired device    ⇔  pairingController().available
+ *   panel on disk, panel mounted, table kept  ⇔  pairingController().available
+ *
+ * Flip the accessor alone and both fail. Write pairing into a privacy sentence
+ * first and that surface fails, because this build still cannot pair. Neither
+ * direction passes by editing these lines; each passes by the product changing.
+ *
+ * WHAT IT DOES NOT DO is choose the words. Any `pair`, `paired` or `pairing` in
+ * a privacy body's copy satisfies it. The sentences are #217's and #221's, and
+ * the change that makes pairing reachable owes them verbatim pins against a
+ * measurement, like every other block in this file. The README count above
+ * accepts the same weakness for the same reason: it is a forcing function, not
+ * a spelling test.
+ *
+ * COPY, NOT CODE. Two bodies hold code — `startProse`, and the `privacy`
+ * command's `run` — so a code body is read as a TypeScript tree, and only what
+ * a person can be shown counts: JSX text, and the contents of string and
+ * template literals. A comment is not in that tree, and an identifier is not
+ * copy. Read as raw text, `const paired = …` in `startProse` passed for a
+ * sentence nobody wrote, and failed as copy ahead of conduct when nothing was
+ * shown. Toward "can pair", the word has to sit in a PHRASE, a literal with a
+ * space in it, because a bare `'paired'` is a value compared against rather
+ * than a word shown. Toward "cannot pair", any literal naming pairing fails,
+ * one word or not.
+ *
+ * SCOPED TO THE PRIVACY BODY, NOT THE FILE, because the files already name
+ * pairing about other things: `transcriptWhere` in `shell/commands.ts` has
+ * `case 'paired':`, and `db/index.ts` names #133's table in three comments.
+ * Each body is cut between anchors and its copy must still carry two sentences
+ * pinned elsewhere, so an anchor that stops matching fails as a missing surface
+ * instead of passing as an empty one. The welcome screen is two bodies: its
+ * privacy paragraph, and "Not ready to download?", which says where a
+ * conversation goes when a provider has it.
+ *
+ * THE KEY IS ONE GLOBAL. `pairingController()` answers the same on every
+ * platform, so under jsdom this reads the only answer there is. If D8 makes
+ * availability per platform — a phone that can pair, a browser that cannot —
+ * this key has to become "any platform that can pair" in that change, or a
+ * phones-only controller reads false here and the copy check refuses sentences
+ * that are true on phones. Which platforms may pair is D8's to decide, not this
+ * test's.
+ */
+describe('a paired device is named exactly where pairing is available', () => {
+  const available = pairingController().available;
+  const source = (path: string): string => readFileSync(resolve(process.cwd(), path), 'utf8');
+
+  /**
+   * Comments out of CODE: HTML, block and JSX comments, and a `//` that starts
+   * a line or follows whitespace. Used where the question is whether code
+   * declares something — a mounted panel, a table key — not what a person reads.
+   */
+  const withoutComments = (text: string): string =>
+    text
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|\s)\/\/.*$/gm, '$1');
+
+  /**
+   * The words a body can show a person, one entry per run of text or literal.
+   *
+   * Markdown has one comment form, so README copy is its text without
+   * `<!-- -->`. A TypeScript body is parsed, and its copy is every JSX text node
+   * and string or template literal lying wholly between the anchors: the parser,
+   * not a regex, decides what is a comment and what is an identifier.
+   */
+  const copyIn = (file: string, text: string, from = 0, to = text.length): readonly string[] => {
+    if (file.endsWith('.md')) return [text.slice(from, to).replace(/<!--[\s\S]*?-->/g, '')];
+    const tree = ts.createSourceFile(
+      file,
+      text,
+      ts.ScriptTarget.Latest,
+      true,
+      file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+    );
+    const words: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if (node.end <= from || node.getStart(tree) >= to) return;
+      if (
+        (ts.isJsxText(node) ||
+          ts.isStringLiteral(node) ||
+          ts.isNoSubstitutionTemplateLiteral(node) ||
+          ts.isTemplateHead(node) ||
+          ts.isTemplateMiddle(node) ||
+          ts.isTemplateTail(node)) &&
+        node.getStart(tree) >= from &&
+        node.end <= to
+      ) {
+        words.push(node.text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+    return words;
+  };
+
+  const PAIR_WORD = /\bpair(?:ed|ing)?\b/i;
+  /** Some literal or run of text names pairing — a sentence, or a bare value. */
+  const mentionsPairing = (copy: readonly string[]): boolean => copy.some((words) => PAIR_WORD.test(words));
+  /** Some PHRASE names pairing: a literal with a space in it, not a value compared against. */
+  const namesPairing = (copy: readonly string[]): boolean =>
+    copy.some((words) => PAIR_WORD.test(words) && /\s/.test(words.trim()));
+
+  const README_TEXT = source('README.md');
+  const COMMANDS = source('src/shell/commands.ts');
+  const ONBOARDING = source('src/features/onboarding/Onboarding.tsx');
+  const CHAT = source('src/features/chat/ChatScreen.tsx');
+  const SETTINGS = source('src/features/settings/SettingsScreen.tsx');
+
+  /** A body between two anchors — its raw text and its copy — or empty when an anchor is missing. */
+  const body = (file: string, text: string, from: number, to: number) =>
+    from < 0 || to < from
+      ? { raw: '', copy: [] as readonly string[] }
+      : { raw: text.slice(from, to), copy: copyIn(file, text, from, to) };
+
+  const onboardingProse = ONBOARDING.indexOf('Chatterang runs language models on this device');
+  const notReady = ONBOARDING.indexOf('<h2>Not ready to download?</h2>');
+  const privacyCommand = COMMANDS.indexOf("name: 'privacy'");
+  const startProse = CHAT.indexOf('export function startProse(');
+
+  const surfaces: readonly {
+    name: string;
+    raw: string;
+    copy: readonly string[];
+    pinned: readonly string[];
+  }[] = [
+    {
+      name: 'README.md, ## Privacy',
+      ...body('README.md', README_TEXT, README_TEXT.indexOf('## Privacy'), README_TEXT.indexOf('## Licence')),
+      pinned: ['Nothing is asked before they go', 'generated from the code'],
+    },
+    {
+      // The command object, to its closing brace — not the rest of the file.
+      name: 'the `privacy` command',
+      ...body('commands.ts', COMMANDS, privacyCommand, COMMANDS.indexOf('\n  };\n', privacyCommand)),
+      pinned: ['What can leave a conversation is the list above.', 'platform backup is off'],
+    },
+    {
+      // The paragraph and the JSX comment above it, which says "repair".
+      name: 'the welcome screen’s privacy paragraph',
+      ...body(
+        'Onboarding.tsx',
+        ONBOARDING,
+        ONBOARDING.lastIndexOf('{/*', onboardingProse),
+        ONBOARDING.indexOf('</p>', onboardingProse),
+      ),
+      pinned: ['Chatterang runs language models on this device', 'Settings › Shell has a privacy command.'],
+    },
+    {
+      // Where a conversation goes for someone who skips the download.
+      name: 'the welcome screen’s “Not ready to download?” paragraph',
+      ...body('Onboarding.tsx', ONBOARDING, notReady, ONBOARDING.indexOf('</p>', notReady)),
+      pinned: ['use Chatterang straight away.', 'What you send goes to that provider'],
+    },
+    {
+      name: 'a chat’s opening line (`startProse`)',
+      ...body('ChatScreen.tsx', CHAT, startProse, CHAT.indexOf('\n}\n', startProse)),
+      pinned: ['Everything here stays here.', 'is marked Remote in the thread.'],
+    },
+    {
+      // The card only: the next section is where a pairing entry would go.
+      name: 'the settings privacy card',
+      ...body(
+        'SettingsScreen.tsx',
+        SETTINGS,
+        SETTINGS.indexOf('{/* ── Privacy first'),
+        SETTINGS.indexOf('{/* ── Appearance'),
+      ),
+      pinned: ['No provider is enabled, so nothing you type is sent to one.', 'run privacy in the shell.'],
+    },
+  ];
+
+  it('finds every privacy body, each still carrying the sentences pinned elsewhere', () => {
+    for (const surface of surfaces) {
+      expect(surface.raw.length, `${surface.name}: empty — an anchor moved`).toBeGreaterThan(0);
+      const copy = reads(surface.copy.join(' '));
+      for (const sentence of surface.pinned) {
+        expect(copy, `${surface.name}: lost "${sentence}" — the cut moved, or reading ate copy`).toContain(
+          sentence,
+        );
+      }
+    }
+  });
+
+  it('the word matcher reads copy — not comments, not identifiers, not a word that merely contains "pair"', () => {
+    const tsx = (snippet: string): readonly string[] => copyIn('control.tsx', snippet);
+
+    for (const phrase of [
+      '<p>Pair with a computer</p>',
+      '<li>a paired computer</li>',
+      "const lines = ['  - what you send, to a paired desktop'];",
+      "const s = 'to a paired computer';",
+      'const body = `Pairing sends ${name} the conversation.`;',
+      "return { body: 'see https://example.com for your paired phone' };",
+    ]) {
+      expect(namesPairing(tsx(phrase)), phrase).toBe(true);
+    }
+
+    for (const notCopy of [
+      '<p>{/* a paired device, one day */}</p>',
+      '/* pairing */',
+      '// paired later',
+      'const x = 1; // the paired case',
+      // Code that knows about pairing is not a sentence that admits it.
+      'const paired = true;',
+      'const pairing = pairingController();',
+      'if (pairing.available) return null;',
+      '<Section paired={paired} />',
+      "const s = 'Three rounds of this repair produced three false sentences';",
+      "const s = 'pairs of brackets, impaired';",
+    ]) {
+      expect(mentionsPairing(tsx(notCopy)), notCopy).toBe(false);
+    }
+
+    // A value compared against names pairing without being a phrase: refused
+    // while this build cannot pair, and not enough once it can.
+    const compared = tsx("if (target.kind === 'paired') return null;");
+    expect(mentionsPairing(compared)).toBe(true);
+    expect(namesPairing(compared)).toBe(false);
+
+    expect(namesPairing(copyIn('README.md', 'Pairing sends the conversation there.'))).toBe(true);
+    expect(mentionsPairing(copyIn('README.md', '<!-- a paired device, one day -->'))).toBe(false);
+
+    // The scoping is doing work: the whole of commands.ts names `'paired'` in a
+    // literal, and the welcome screen's body carries "repair" in its comment.
+    expect(
+      mentionsPairing(copyIn('commands.ts', COMMANDS)),
+      'commands.ts no longer names paired; this control is stale',
+    ).toBe(true);
+    expect(surfaces[2]!.raw).toContain('repair');
+  });
+
+  it('every privacy body names a paired device if and only if this build can pair', () => {
+    for (const surface of surfaces) {
+      expect(
+        available ? namesPairing(surface.copy) : mentionsPairing(surface.copy),
+        available
+          ? `pairingController().available is true, and ${surface.name} still describes a phone ` +
+              'that cannot pair. A paired computer is somewhere the conversation goes, and this ' +
+              'surface has to say so, in words a person is shown, in the same change (#217, #221). ' +
+              'Any "pair" word in a phrase passes here; the sentence is not this test’s to choose, ' +
+              'and it owes a verbatim pin.'
+          : `${surface.name} shows a pairing word while pairingController().available is false — ` +
+              'copy ahead of conduct. Take it out, or land it with the controller that makes it true.',
+      ).toBe(available);
+    }
+  });
+
+  it('a paired-device panel is mounted and a table holds devices if and only if this build can pair', () => {
+    const PANEL = 'src/features/settings/PairedDevicesPanel.tsx';
+    const panel = existsSync(resolve(process.cwd(), PANEL));
+    const mounted = withoutComments(SETTINGS).includes('<PairedDevicesPanel');
+
+    // Read from `.stores({…})`, not from the file: `db/index.ts` already says
+    // "paired" in comments about the table that does not exist.
+    const keys = [...withoutComments(source('src/db/index.ts')).matchAll(/\.stores\(\s*\{([\s\S]*?)\}\s*\)/g)]
+      .flatMap((stores) => [...(stores[1] ?? '').matchAll(/([A-Za-z_$][\w$]*)\s*:/g)])
+      .map((key) => key[1] ?? '');
+    expect(keys, 'the store reader sees no tables, so the answer below means nothing').toEqual(
+      expect.arrayContaining(['chats', 'messages', 'mcpServers', 'blobs']),
+    );
+    const table = keys.some((key) => /pair/i.test(key));
+
+    expect(
+      panel && mounted && table,
+      `panel ${PANEL}: ${panel}; mounted in SettingsScreen: ${mounted}; a Dexie table named for ` +
+        `pairing: ${table}; pairingController().available: ${available}. A pairing nobody can see, ` +
+        'revoke or keep is not one to ship: the panel (#137), the table (#133) and its id (#125) ' +
+        'land with the controller.',
+    ).toBe(available);
   });
 });

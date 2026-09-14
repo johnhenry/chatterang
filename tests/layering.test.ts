@@ -1208,3 +1208,112 @@ describe('the desktop bridge stays platform-free', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * The pairing building blocks have one way in, and it is the seam (#128, #130).
+ *
+ * `pairingController().available` is false, and whatever offers pairing is
+ * meant to key on it. Nothing enforced that. A screen could import the scanner,
+ * the pairing half or `getUserMedia` directly, never ask the seam, and ask for
+ * a camera for a feature that cannot work — which `src/lib/pairing.ts` says
+ * does not happen. That is the Marketplace failure (c8a3082): a gate that held
+ * only because nothing had walked around it yet.
+ *
+ * `tests/pairing-scan.test.ts` reads what the two lib files import. It says
+ * nothing about who imports THEM, and its `from '…'` regex does not see
+ * `import('…')`. This reads every file in `src/` through `SPECIFIER`, which
+ * sees all four doors, and resolves relative paths rather than matching names.
+ *
+ * `pake` and `binding` are banned with `pairing`: they are the other two halves
+ * of the same exchange (the CPace step, and the binding that joins it to the
+ * parser), and neither has a use in `src/` outside a pairing controller.
+ *
+ * WHAT IT CANNOT SEE: the camera half is a NAME, `getUserMedia`. A camera
+ * reached another way — `<input type="file" capture>`, which a phone's WebView
+ * hands to the system camera, or a native plugin — passes, so neither this nor
+ * `src/lib/pairing.ts` claims more than that name.
+ *
+ * When the sheet lands under `src/features/pairing/`, ALLOWED widens to it in
+ * that change, alongside a rule that only `SettingsScreen.tsx` imports it.
+ */
+describe('only the pairing seam reaches the pairing building blocks', () => {
+  const ALLOWED = new Set(['lib/pairing.ts', 'lib/qr-scan.ts', 'lib/qr-decode.ts']);
+  const BLOCKS = new Set(['lib/pairing', 'lib/qr-scan', 'lib/qr-decode']);
+  const TUNNEL_PAIRING =
+    /^@chatterang\/tunnel\/(?:pairing|pake|binding)(?:\/|$)|(?:^|\/)packages\/tunnel\/(?:src\/)?(?:pairing|pake|binding)(?:\/|$)/;
+  const CAMERA = /\b(?:webkit|moz)?getusermedia\b/i;
+
+  const scanned = files;
+
+  /** The module a specifier names, as a path under `src/` with no extension — or null. */
+  const inSrc = (file: string, specifier: string): string | null => {
+    const target = specifier.startsWith('@/')
+      ? resolve(SRC, specifier.slice(2))
+      : specifier.startsWith('.')
+        ? resolve(file, '..', specifier)
+        : null;
+    if (target === null) return null;
+    return relative(SRC, target)
+      .replaceAll('\\', '/')
+      .replace(/\.(?:[cm]?[jt]s|[jt]sx)$/, '')
+      .replace(/\/index$/, '');
+  };
+
+  /** Each way this file reaches pairing: the specifier, or `getUserMedia`. */
+  const reaches = (file: string, source: string): string[] => {
+    const code = codeOf(source);
+    const doors = [...code.matchAll(new RegExp(SPECIFIER.source, 'g'))]
+      .map((match) => match[1] ?? '')
+      .filter((specifier) => TUNNEL_PAIRING.test(specifier) || BLOCKS.has(inSrc(file, specifier) ?? ''));
+    return CAMERA.test(code) ? [...doors, 'getUserMedia'] : doors;
+  };
+
+  it('finds the seam and the scanner reaching them, so the rule is not vacuous', () => {
+    expect(scanned.length).toBeGreaterThan(30);
+    const reachers = scanned.filter((file) => reaches(file, readFileSync(file, 'utf8')).length > 0).map(rel);
+    expect(reachers).toEqual(expect.arrayContaining(['lib/pairing.ts', 'lib/qr-scan.ts']));
+  });
+
+  it('no other file in src/ imports the pairing half or the scanner, or names getUserMedia', () => {
+    const offenders = scanned
+      .filter((file) => !ALLOWED.has(rel(file)))
+      .flatMap((file) => reaches(file, readFileSync(file, 'utf8')).map((door) => `${rel(file)} -> ${door}`));
+    expect(
+      offenders,
+      'Something in src/ reached pairing without the seam. Whatever offers pairing goes through ' +
+        '`pairingController()` and renders nothing while `available` is false; if this is that ' +
+        'entry point, widen ALLOWED to it here, in the same change, and say why.',
+    ).toEqual([]);
+  });
+
+  it('the matcher sees every door, resolves relative paths, and ignores a comment', () => {
+    // Asserted from a screen's position, because that is where a second door
+    // would be written.
+    const at = resolve(SRC, 'features/chat/X.tsx');
+    for (const door of [
+      "import { pairingController } from '@/lib/pairing';",
+      "const m = await import('@/lib/qr-scan');",
+      "import { decodeFrame } from '../../lib/qr-decode';",
+      "export { openCamera } from '@/lib/qr-scan.js';",
+      "const { parsePairingUri } = require('@chatterang/tunnel/pairing');",
+      "import { cpace } from '@chatterang/tunnel/pake';",
+      "import { bind } from '@chatterang/tunnel/binding';",
+      "const p = await import('../../../packages/tunnel/src/pairing/index');",
+      'const s = await navigator.mediaDevices.getUserMedia({ video: true });',
+      "const s = navigator.mediaDevices['getUserMedia'];",
+    ]) {
+      expect(reaches(at, door), door).not.toEqual([]);
+    }
+    for (const allowed of [
+      '// `getUserMedia` needs a secure origin',
+      "/* import('@/lib/qr-scan') once the sheet exists */",
+      "import { capabilities } from '@/lib/platform';",
+      "import { encodeFrame } from '@chatterang/tunnel/wire';",
+      "import { copy } from '@/lib/pairing-copy';",
+      // Resolved, not matched by name: from features/chat this is a sibling.
+      "import { x } from './pairing';",
+    ]) {
+      expect(reaches(at, allowed), allowed).toEqual([]);
+    }
+  });
+});
