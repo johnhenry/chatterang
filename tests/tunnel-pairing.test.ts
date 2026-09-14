@@ -26,6 +26,8 @@ import {
   type PairingPayload,
 } from '@chatterang/tunnel/pairing';
 
+import { uncappedPairingUri } from './support/uncapped-pairing-uri';
+
 /**
  * #134. The payload a pairing QR carries.
  *
@@ -414,6 +416,60 @@ describe('the size budget', () => {
       }),
     );
     expect(worst.length).toBeGreaterThan(MAX_PAIRING_URI_LENGTH / 2);
+  });
+
+  describe('is 296 characters, so every code draws at QR version 13 (ruled on #127)', () => {
+    /*
+     * One IPv4 and four IPv6 addresses: with a 57-byte name the URI is exactly
+     * 296 characters, and each byte more of name adds a character or two —
+     * 298, 299, 300, the lengths the old cap of 300 admitted and an 80-column
+     * terminal cannot show. `tests/pairing-frames.test.ts` measures the QR
+     * versions; this pins the cap on both sides of the codec.
+     */
+    const five = [
+      V4(192, 168, 1, 23),
+      ...[1, 2, 3, 4].map((n): PairingAddress => ({ kind: ADDRESS_IPV6, value: new Uint8Array(16).fill(n) })),
+    ];
+    const at = (nameBytes: number) => payload({ hostKind: HOST_SERVER, addresses: five, name: 'n'.repeat(nameBytes) });
+    const reasonOf = (run: () => unknown): unknown => {
+      try {
+        run();
+        return null;
+      } catch (error) {
+        return error instanceof PairingParseError ? error.reason : error;
+      }
+    };
+
+    it('is the number the ruling names', () => {
+      expect(MAX_PAIRING_URI_LENGTH).toBe(296);
+    });
+
+    it('encodes and decodes a 296-character code', () => {
+      const edge = encodePairingUri(at(57));
+      expect(edge).toHaveLength(296);
+      expect(decodePairingUri(edge).name).toBe('n'.repeat(57));
+    });
+
+    it('refuses to encode 298, 299 or 300 characters', () => {
+      for (const [nameBytes, length] of [[58, 298], [59, 299], [60, 300]] as const) {
+        expect(uncappedPairingUri(at(nameBytes)), `${nameBytes}-byte name`).toHaveLength(length);
+        expect(reasonOf(() => encodePairingUri(at(nameBytes))), `${length} characters`).toBe('too-long');
+      }
+    });
+
+    it('refuses to decode them too, so the phone and the screen agree where the edge is', () => {
+      // The helper writes exactly what the encoder writes, where the encoder will write it.
+      expect(uncappedPairingUri(at(57))).toBe(encodePairingUri(at(57)));
+      expect(uncappedPairingUri(at(1))).toBe(encodePairingUri(at(1)));
+      for (const nameBytes of [58, 59, 60]) {
+        const uri = uncappedPairingUri(at(nameBytes));
+        expect(reasonOf(() => decodePairingUri(uri)), `${uri.length} characters`).toBe('too-long');
+      }
+      // 297 characters is a length no payload encodes to, and it is refused for
+      // its length before its malformed body is read.
+      const edge = encodePairingUri(at(57));
+      expect(reasonOf(() => decodePairingUri(`${edge}A`))).toBe('too-long');
+    });
   });
 });
 

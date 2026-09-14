@@ -14,15 +14,18 @@
  * no 2D canvas and no camera, and a loop that can only be tested on a phone is
  * a loop whose stop paths are never tested.
  *
- * ## A pairing code is OAT frames, collected (#127)
+ * ## A pairing code is one OAT frame (#127)
  *
  * The desktop draws the pairing URI as `@johnhenry/oat-qr-fountain` frames
  * (`src/lib/pairing-frames.ts`). `decodeFrame` turns a frame into a packet;
- * this loop feeds packets to OAT's `FountainDecoder` until the URI can be
- * reconstructed, then parses the text with `decodePairingUri` exactly as it
- * parsed a scanned string before. A pairing code's frames each carry the whole
- * URI, so in practice the first packet read completes it — but the loop does
- * not assume that, and a code drawn with smaller blocks still completes.
+ * this loop feeds the packet to OAT's `FountainDecoder`, reconstructs the URI,
+ * then parses the text with `decodePairingUri` exactly as it parsed a scanned
+ * string before. Every pairing code is ONE BLOCK, so each frame carries the
+ * whole URI, and the owner ruled on #127 that a frame claiming more blocks is
+ * not a pairing code at all ({@link classifyPacket}). So the first packet of a
+ * code completes it. The loop still holds what it opens in a session rather
+ * than assuming that, so the promises below never rest on a decoder's
+ * arithmetic.
  *
  * Four things this adds, each decided rather than inherited:
  *
@@ -37,20 +40,20 @@
  *     loop's: 0.1.0 caches a degree table per block count in a module-level
  *     `Map` (`robustSolitonTable` in its `lt.js`) that nothing clears. It holds
  *     numbers derived from the block count alone, never a byte of any block,
- *     and `classifyPacket` bounds the block count to 300, so at most 300
- *     tables. A pairing code, with one block, adds only the table for 1.
+ *     and `classifyPacket` admits no block count but 1, so a scan adds at most
+ *     the table for 1.
  *   - A PACKET FROM ANOTHER CODE REPLACES THE ONE BEING COLLECTED. A different
  *     artifact id, block count, block size or length is a different code, and
  *     OAT's decoder throws on the last three. Ignoring the newcomer would tie
  *     the phone to a code the desktop may have withdrawn and redrawn with a new
  *     token until the idle timeout; replacing costs nothing when every frame is
- *     complete, because the newcomer's first frame finishes it. The cost is
- *     that two multi-frame codes interleaved would never finish — the pairing
- *     codec never draws one.
- *   - A PACKET THAT DOES NOT DESCRIBE A PAIRING-SIZED PAYLOAD NEVER REACHES THE
- *     DECODER. OAT 0.1.0's `decodePacket` accepts any `uint32` block count and
- *     its decoder's constructor does work in proportion to it, synchronously:
- *     one hostile frame is a hang. See {@link classifyPacket}.
+ *     complete, because the newcomer's first frame finishes it — and every
+ *     frame that reaches a session is complete, because a frame claiming more
+ *     than one block is refused first.
+ *   - A PACKET THAT DOES NOT DESCRIBE A ONE-BLOCK, PAIRING-SIZED PAYLOAD NEVER
+ *     REACHES THE DECODER. OAT 0.1.0's `decodePacket` accepts any `uint32`
+ *     block count and its decoder's constructor does work in proportion to it,
+ *     synchronously: one hostile frame is a hang. See {@link classifyPacket}.
  *   - NOTHING THAT GOES WRONG INSIDE A SESSION ENDS THE SCAN. A decoder that
  *     throws on a packet, or a reconstruction that fails, drops the session and
  *     the loop keeps reading. Only a decoder that cannot load ends it.
@@ -201,9 +204,12 @@ export function createFrameGrabber(
 /**
  * What a packet's header describes, before anything is built for it.
  *
- *   - `pairing`: a self-consistent payload no longer than a pairing URI may be.
+ *   - `pairing`: a self-consistent payload in ONE block, no longer than a
+ *     pairing URI may be.
  *   - `too-large`: a well-formed OAT transfer of something bigger — a real
  *     artifact, just not a pairing code. The person is told so.
+ *   - `many-blocks`: a well-formed OAT transfer that claims more than one
+ *     block, whatever its size. Not a pairing code, and the person is told so.
  *   - `malformed`: a header that contradicts itself — zero lengths, a block
  *     count that does not follow from the length and block size, a payload of
  *     the wrong size. Ignored without a word, like a frame with no code.
@@ -213,9 +219,33 @@ export function createFrameGrabber(
  * `FountainDecoder` constructor allocates and computes in proportion to the
  * block count. Bounding the length and the block size by
  * `MAX_PAIRING_URI_LENGTH`, and requiring the block count to follow from them,
- * bounds the block count too.
+ * bounds the block count; requiring it to be 1 fixes it.
+ *
+ * ONE BLOCK, RULED BY THE OWNER (#127). Every pairing code is a single frame
+ * that carries the whole URI (`src/lib/pairing-frames.ts` draws nothing else),
+ * so a frame claiming more blocks is not a pairing code — even when the bytes
+ * its blocks would add up to are a valid pairing URI. Refusing it narrows what
+ * a foreign or hostile frame can make the phone do to a constant, and keeps
+ * OAT 0.1.0's per-block-count table cache at its one entry. When OAT 0.1.1's
+ * own block-count bound arrives, this stays as the second guard. Multi-frame
+ * pairing codes would need a new decision.
+ *
+ * WHY `many-blocks` GETS THE HINT, and is not ignored like `malformed`. #303's
+ * line between the two is whether the header is TRUE: a header that
+ * contradicts itself is damage or forgery and earns silence, while a header
+ * that describes a real transfer of something that is not a pairing code earns
+ * "that is not a pairing code" (`too-large`). A self-consistent many-block
+ * header is the second kind — it is exactly what OAT's own sender draws for any
+ * artifact it splits, and what a desktop drawing some future multi-frame code
+ * would draw. Silence there would leave the person holding the phone at a code
+ * that never scans until the idle timeout, which is the failure `qr-decode.ts`
+ * already refuses for a newer OAT version. Self-consistency is checked FIRST,
+ * so a forged header with a huge block count stays silent.
  */
-export type PacketVerdict = 'pairing' | 'too-large' | 'malformed';
+export type PacketVerdict = 'pairing' | 'too-large' | 'many-blocks' | 'malformed';
+
+/** The only block count a pairing code has. See {@link classifyPacket}. */
+export const PAIRING_BLOCK_COUNT = 1;
 
 export function classifyPacket(packet: OatPacket): PacketVerdict {
   const { sourceBlockCount, blockSize, totalLength, payload, artifactId } = packet;
@@ -223,6 +253,7 @@ export function classifyPacket(packet: OatPacket): PacketVerdict {
   if (sourceBlockCount === 0 || blockSize === 0 || totalLength === 0) return 'malformed';
   if (sourceBlockCount !== Math.ceil(totalLength / blockSize)) return 'malformed';
   if (totalLength > MAX_PAIRING_URI_LENGTH || blockSize > MAX_PAIRING_URI_LENGTH) return 'too-large';
+  if (sourceBlockCount !== PAIRING_BLOCK_COUNT) return 'many-blocks';
   return 'pairing';
 }
 
@@ -500,7 +531,7 @@ export function startQrScan(options: ScanOptions): ScanHandle {
     if (read.kind === 'other') return hint(delay);
     const verdict = classifyPacket(read.packet);
     if (verdict === 'malformed') return next(delay);
-    if (verdict === 'too-large') return hint(delay);
+    if (verdict === 'too-large' || verdict === 'many-blocks') return hint(delay);
     return collect(read.packet, delay);
   };
 

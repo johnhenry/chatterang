@@ -194,6 +194,10 @@ export interface PairingPayload {
    * enumerate them yet — so offering one and being wrong costs a failed
    * pairing, while offering several costs a network-topology leak to whoever
    * photographs a code that expires in ninety seconds. The second is smaller.
+   *
+   * When they do not all fit {@link MAX_PAIRING_URI_LENGTH},
+   * {@link fitPairingPayload} decides which are carried, and in what order
+   * (ruled on #127).
    */
   readonly addresses: readonly PairingAddress[];
   /** Human-readable, so the phone can say "Pair with John's MacBook?" */
@@ -207,9 +211,9 @@ export const TRUST_BYTES = 32;
 export const TOKEN_BYTES = 32;
 
 /**
- * The hard cap on the whole URI, in characters.
+ * The hard cap on the whole URI, in characters: 296, RULED BY THE OWNER (#127).
  *
- * TWO CONSUMERS NOW, and the second one is tighter and differently shaped.
+ * TWO CONSUMERS, and the second one is tighter and differently shaped.
  *
  * #134 budgeted against "a mid-size QR at error-correction level M … scannable
  * on a laptop screen at arm's length". Server pairing added a terminal: a
@@ -218,37 +222,39 @@ export const TOKEN_BYTES = 32;
  * wants a 4-module quiet zone each side, so an 80-column terminal fits version
  * 13 (69 + 8 = 77 columns) and no more.
  *
- * DERIVED, THEN MEASURED AGAINST THE FRAME #127 DRAWS — and the measurement
- * moved the edge. 300 characters was chosen against the byte-mode capacity of a
- * version-13 code at level M with margin, from the module arithmetic above,
- * for a QR holding the URI alone. #127's ruling draws the URI as an OAT frame
+ * DERIVED, THEN MEASURED AGAINST THE FRAME #127 DRAWS, THEN RULED. The first
+ * cap, 300, was derived from the byte-mode capacity of a version-13 code at
+ * level M for a QR holding the URI alone. #127 draws the URI as an OAT frame
  * instead (`src/lib/pairing-frames.ts`), which adds a 34-byte header, and
- * `tests/pairing-frames.test.ts` draws payloads built with this encoder, reads
- * the pixels back through the phone's decoder, and pins the version of each:
+ * `tests/pairing-frames.test.ts` draws those frames, reads the pixels back
+ * through the phone's decoder, and pins the version of each:
  *
- *     payload                                     URI   frame   QR at M
- *     desktop, one IPv4, short name               130    164    v9
- *     desktop, three addresses, 64-byte name      258    292    v13
- *     server, four addresses incl. DNS, 64 bytes  291    325    v13
- *     server, five addresses, 57-byte name        296    330    v13
- *     server, five addresses, 60-byte name        300    334    v14
+ *     URI   frame   QR at M
+ *     291    325    v13     server, four addresses incl. DNS, 64-byte name
+ *     296    330    v13     server, five addresses, 57-byte name
+ *     297    331    v13     no pairing URI is this long (see below)
+ *     298    332    v14     73 + 8 = 81 columns: does not fit 80
+ *     299    333    v14
+ *     300    334    v14
  *
- * So the derivation holds up to 296 characters and NOT for the three longer
- * URIs this cap admits: 298, 299 and 300 characters draw at version 14, which
- * with the quiet zone above is 73 + 8 = 81 columns and does not fit 80. The cap
- * is deliberately left at 300; whether to lower it to 296 belongs with the
- * terminal renderer (#124), not to a change that only measured it.
+ * So the old cap admitted three lengths that do not fit a terminal, and the
+ * owner lowered it to 296: EVERY CODE DRAWS AT VERSION 13 OR SMALLER. 297 is
+ * not the edge, although its frame is exactly v13-M's 331 bytes, because
+ * base64url never produces it — a 281-character body leaves one character
+ * over, which encodes no whole byte, so no payload encodes to 297 characters.
+ * 296 is therefore the longest URI this encoder can emit that
+ * stays at v13, and a URI of 297 to 300 characters is refused as `too-long` by
+ * the encoder AND the parser, so the phone agrees with the screen about where
+ * the edge is.
  *
  * THE CAP BINDS BEFORE THE FIELD LIMITS DO, and a real host can reach it. One
  * IPv4 and four IPv6 addresses — what a laptop with a link-local, a ULA and
  * temporary global addresses carries — with a 64-byte name (21 CJK characters)
- * is inside MAX_ADDRESSES and MAX_NAME_BYTES and is refused here as
- * `too-long`; `tests/pairing-frames.test.ts` pins it. So whatever draws a code
- * chooses which addresses, and how much of the name, to carry, and should aim
- * at 296 characters rather than 300. Nothing has been scanned by a camera yet —
- * that is still #127's screen.
+ * is inside MAX_ADDRESSES and MAX_NAME_BYTES and is refused here as `too-long`.
+ * The owner ruled what gives way: ADDRESSES, NEVER THE NAME. See
+ * {@link fitPairingPayload}.
  */
-export const MAX_PAIRING_URI_LENGTH = 300;
+export const MAX_PAIRING_URI_LENGTH = 296;
 
 /** Everything that can be wrong with a payload, named rather than numbered. */
 export type PairingError =
@@ -473,6 +479,156 @@ export function encodePairingUri(payload: PairingPayload): string {
   // from and what it is not.
   if (uri.length > MAX_PAIRING_URI_LENGTH) throw new PairingParseError('too-long');
   return uri;
+}
+
+/* ── fitting a host's addresses into the budget (#127) ────────────────── */
+
+/**
+ * How likely a phone is to reach an address as this payload carries it, most
+ * likely first. {@link PAIRING_REACH_ORDER} is the order; see
+ * {@link fitPairingPayload} for why it is this one.
+ */
+export type PairingReach =
+  | 'private-ipv4'
+  | 'unique-local-ipv6'
+  | 'public-ipv4'
+  | 'public-ipv6'
+  | 'dns-name'
+  | 'unusable';
+
+export const PAIRING_REACH_ORDER: readonly PairingReach[] = [
+  'private-ipv4',
+  'unique-local-ipv6',
+  'public-ipv4',
+  'public-ipv6',
+  'dns-name',
+  'unusable',
+];
+
+/**
+ * Which {@link PairingReach} an address falls in. Bytes in, because the
+ * payload holds bytes; see {@link fitPairingPayload} for each boundary.
+ */
+export function pairingAddressReach(address: PairingAddress): PairingReach {
+  const v = address.value;
+  if (address.kind === ADDRESS_IPV4 && v.length === 4) {
+    const [a, b] = [v[0]!, v[1]!];
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 'private-ipv4';
+    if (a === 0 || a === 127 || (a === 169 && b === 254) || a >= 224) return 'unusable';
+    return 'public-ipv4';
+  }
+  if (address.kind === ADDRESS_IPV6 && v.length === 16) {
+    if ((v[0]! & 0xfe) === 0xfc) return 'unique-local-ipv6';
+    if (v[0] === 0xfe && (v[1]! & 0xc0) === 0x80) return 'unusable';
+    if (v[0] === 0xff) return 'unusable';
+    let zeroes = 0;
+    for (let i = 0; i < 15; i += 1) if (v[i] === 0) zeroes += 1;
+    if (zeroes === 15 && (v[15] === 0 || v[15] === 1)) return 'unusable';
+    return 'public-ipv6';
+  }
+  if (address.kind === ADDRESS_DNS) return isMulticastDnsName(address) ? 'unusable' : 'dns-name';
+  return 'unusable';
+}
+
+/** Why a payload could not be fitted into the budget at all. */
+export type PairingFitReason =
+  /**
+   * Even the single most reachable address, beside the whole name, is over
+   * {@link MAX_PAIRING_URI_LENGTH}. Only a long DNS name can do it: the name is
+   * at most 64 bytes, and one IP address of either family always fits beside
+   * it, so this is a host whose every address is a name.
+   */
+  'no-address-fits';
+
+export class PairingFitError extends Error {
+  override readonly name = 'PairingFitError';
+  constructor(readonly reason: PairingFitReason) {
+    super(`pairing code cannot be drawn: ${reason}`);
+  }
+}
+
+/**
+ * The largest payload that fits the budget: THE WHOLE NAME, and as many of the
+ * host's addresses as fit, most reachable first. Ruled by the owner on #127.
+ *
+ * WHAT GIVES WAY, AND WHAT DOES NOT. When a payload is over
+ * {@link MAX_PAIRING_URI_LENGTH}, addresses are dropped from the END of the
+ * order below, one at a time, until {@link encodePairingUri} accepts it. The
+ * name is NEVER truncated: it is what the phone shows in "Pair with …?", and
+ * a name cut mid-word — or mid-character, since the budget is bytes — is a
+ * name the person has to trust without recognising. Rejected by the owner:
+ * truncating the name first, and making the user choose addresses.
+ *
+ * THE ORDER, and it is applied even when nothing has to be dropped, because a
+ * code's addresses are "most-preferred first" ({@link PairingPayload.addresses})
+ * and the phone tries them in that order. Within one class the host's own
+ * order is kept. The classes are the codec's three address kinds, split by
+ * what a phone on the same network can do with each:
+ *
+ *   1. `private-ipv4` — RFC 1918: 10/8, 172.16/12, 192.168/16. The address a
+ *      phone on the same Wi-Fi reaches, and six bytes each.
+ *   2. `unique-local-ipv6` — fc00::/7. The same network by IPv6, and stable,
+ *      unlike the temporary globals a laptop cycles through.
+ *   3. `public-ipv4` — every other unicast IPv4, INCLUDING CGNAT's 100.64/10.
+ *      Checked rather than assumed: `apps/server/src/addresses.ts` ranks only
+ *      RFC 1918 as private and puts 100.64/10 with the globally routable
+ *      addresses, and nothing else in the codebase ranks reachability. A
+ *      tailnet address is 100.64/10, and whether it deserves to rank higher is
+ *      a question for that ranking, not a second answer here.
+ *   4. `public-ipv6` — every other unicast IPv6.
+ *   5. `dns-name` — a name costs the phone a lookup through whatever resolver
+ *      it has, may resolve to any of the above, and costs 2 + its length bytes
+ *      where an address costs 6 or 18, so dropping one frees the most room.
+ *   6. `unusable` — what a phone cannot use AS CARRIED, dropped before anything
+ *      else. IPv6 link-local (fe80::/10) is here, not beside the ULA as the
+ *      ruling's summary put it, and the codec is why: an address holds sixteen
+ *      bytes and no zone index, so a link-local address arrives with its
+ *      interface left to chance — the reason `typed.ts` refuses a zone
+ *      (`zone-index-unsupported`) and `apps/server/src/addresses.ts` never
+ *      advertises fe80::/10 at all. With it: IPv4 link-local 169.254/16 (DHCP
+ *      failed, per the same file), loopback 127/8 and ::1, the unspecified
+ *      0/8 and ::, multicast and reserved IPv4 224/3 and IPv6 ff00::/8, and a
+ *      `.local` name ({@link isMulticastDnsName}: v1 resolves no mDNS).
+ *
+ * Classes 1–4 are the ranks `apps/server/src/addresses.ts` already gives the
+ * addresses a headless server advertises, restated because this half imports
+ * nothing; `tests/tunnel-pairing-fit.test.ts` holds the two to the same order.
+ *
+ * STRICTLY FROM THE END. A shorter address later in the order is never carried
+ * in place of a longer one earlier that does not fit; that would put a less
+ * reachable address in the code instead of a more reachable one, which is a
+ * reordering the ruling did not make.
+ *
+ * AT LEAST ONE ADDRESS, because the format requires one (`no-addresses`). If
+ * the most reachable address alone does not fit beside the name, this throws
+ * {@link PairingFitError} `no-address-fits` rather than returning a code that
+ * could not be dialled.
+ *
+ * FAILS CLOSED ON EVERYTHING ELSE. Only `too-long` is fitted. Any other refusal
+ * from {@link encodePairingUri} — a bad name, no addresses, more than
+ * {@link MAX_ADDRESSES}, a malformed address — is thrown as it is: each is
+ * wrong with every smaller payload too, and silently dropping a malformed
+ * address would hide a host bug inside a code that happens to scan.
+ */
+export function fitPairingPayload(payload: PairingPayload): PairingPayload {
+  const ranked = payload.addresses
+    .map((address, index) => ({ address, index, rank: PAIRING_REACH_ORDER.indexOf(pairingAddressReach(address)) }))
+    // The index breaks ties, so the host's order within a class survives even
+    // on an engine whose sort is not stable — V8 before 7.0 was not, and #223
+    // is about exactly those runtimes.
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((entry) => entry.address);
+
+  for (let count = ranked.length; ; count -= 1) {
+    const candidate: PairingPayload = { ...payload, addresses: ranked.slice(0, count) };
+    try {
+      encodePairingUri(candidate);
+      return candidate;
+    } catch (error) {
+      if (!(error instanceof PairingParseError) || error.reason !== 'too-long') throw error;
+    }
+    if (count <= 1) throw new PairingFitError('no-address-fits');
+  }
 }
 
 /**
