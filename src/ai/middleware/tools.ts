@@ -650,6 +650,12 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
       });
       executed.push(...batch.executed);
 
+      // STOPPED, as the streaming loop in `ai/engine.ts` does. Every refused
+      // call is recorded above whatever the signal says, so a stopped batch
+      // still hands back results; without this the backend was handed a
+      // follow-up request over those refusals after Stop (#92).
+      if (context.signal?.aborted) break;
+
       const results = batch.results;
       if (results.length === 0) break;
 
