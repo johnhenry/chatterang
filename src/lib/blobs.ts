@@ -77,6 +77,76 @@ export async function deleteBlobs(ids: readonly string[]): Promise<void> {
   if (ids.length > 0) await db.blobs.bulkDelete([...ids]);
 }
 
+/** How many holds each payload has, by attachment id. See `holdBlobs`. */
+const holds = new Map<string, number>();
+
+/** For each sweep running now, every id held at any moment since it started. See `sweepOrphanBlobs`. */
+const sweeps = new Set<Set<string>>();
+
+/**
+ * Keep payloads from `sweepOrphanBlobs` until the function returned is called.
+ * Calling it twice lets go once.
+ *
+ * A payload is written when its image is ATTACHED, and nothing on disk names it
+ * until the row of the message it is sent in is written. Until then only a hold
+ * says it is wanted: the composer holds a draft's payloads while they are on
+ * screen, and a message row being written holds the payloads it names
+ * (`putMessage` in state/chat.ts) — from the moment `useChats.send` is called,
+ * which is the moment the composer lets go.
+ */
+export function holdBlobs(ids: readonly string[]): () => void {
+  for (const id of ids) {
+    holds.set(id, (holds.get(id) ?? 0) + 1);
+    for (const kept of sweeps) kept.add(id);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const id of ids) {
+      const left = (holds.get(id) ?? 1) - 1;
+      if (left > 0) holds.set(id, left);
+      else holds.delete(id);
+    }
+  };
+}
+
+/**
+ * Delete every payload that no message row names and nothing holds. Run once
+ * the chat list has loaded (`useChats.load`).
+ *
+ * The composer deletes a draft's payloads when the draft lets them go, but not
+ * every draft is let go: the app can be killed with one on screen. And a chat
+ * deleted before its image was sent took only what its rows named. Either way a
+ * payload stayed on the device that nothing named and no screen could show.
+ *
+ * WHAT IS KEPT: a payload a row names in what this read, and one held AT ANY
+ * MOMENT from the start of the sweep until its delete is made — not only one
+ * held when the delete is made. A message sent after the rows were read writes
+ * its row and lets go of its hold before the delete, and its row is not in
+ * what was read. So the sweep is registered before it reads anything, and every
+ * hold taken while it runs is noted against it.
+ *
+ * Every payload in the table is an attachment's (see the top of this file). A
+ * read that fails deletes nothing.
+ */
+export async function sweepOrphanBlobs(): Promise<void> {
+  const kept = new Set(holds.keys());
+  sweeps.add(kept);
+  try {
+    const named = new Set<string>();
+    const [stored] = await Promise.all([
+      db.blobs.toCollection().primaryKeys(),
+      db.messages.each((row) => {
+        for (const attachment of row.attachments ?? []) named.add(attachment.id);
+      }),
+    ]);
+    await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
+  } finally {
+    sweeps.delete(kept);
+  }
+}
+
 /** Total bytes held by attachment payloads, for the storage readout. */
 export async function blobBytes(): Promise<number> {
   let total = 0;

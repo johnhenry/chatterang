@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AttachmentImage } from '@/features/chat/AttachmentImage';
 
 import { Icon } from '@/ui/Icon';
-import { putBlob } from '@/lib/blobs';
+import { deleteBlobs, holdBlobs, putBlob } from '@/lib/blobs';
 import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
@@ -36,6 +36,39 @@ export function Composer({
   const textarea = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const toast = useApp((state) => state.toast);
+
+  /*
+   * EVERY PAYLOAD THIS DRAFT HAS WRITTEN OR IS WRITING, by attachment id, with
+   * the hold that keeps it from the launch sweep (`holdBlobs` in lib/blobs).
+   *
+   * An image's payload is written when it is attached, before any message names
+   * it. So when the draft lets one go — its chip is removed, or this component
+   * unmounts with it unsent, which every switch to another tab does — the draft
+   * deletes it. Nothing else would: no message names it, and deleting a chat
+   * takes only what that chat's messages name. Sending hands it over instead;
+   * see `send`.
+   */
+  const drafted = useRef(new Map<string, () => void>());
+
+  const discard = useCallback((ids: readonly string[]) => {
+    const releases = ids.flatMap((id) => {
+      const release = drafted.current.get(id);
+      drafted.current.delete(id);
+      return release ? [release] : [];
+    });
+    // A delete that fails leaves the payload to the next launch's sweep, which
+    // only a hold would stop.
+    void deleteBlobs(ids)
+      .catch(() => undefined)
+      .finally(() => {
+        for (const release of releases) release();
+      });
+  }, []);
+
+  useEffect(() => {
+    const draft = drafted.current;
+    return () => discard([...draft.keys()]);
+  }, [discard]);
 
   /*
    * DICTATION DOES NOT SURVIVE THIS COMPONENT, and neither does its model.
@@ -103,6 +136,14 @@ export function Composer({
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
     onSend(trimmed, attachments);
+    // HANDED OVER, NOT LET GO: these are the message's now, so the draft stops
+    // holding them without deleting them. `useChats.send` writes the row that
+    // names them, and that write holds them from the moment `send` is called,
+    // before this line runs.
+    for (const attachment of attachments) {
+      drafted.current.get(attachment.id)?.();
+      drafted.current.delete(attachment.id);
+    }
     setText('');
     setAttachments([]);
   }, [generating, text, attachments, onSend]);
@@ -135,7 +176,23 @@ export function Composer({
         // is needed to lay it out and label it. A File is already a Blob, so
         // nothing is re-encoded here.
         const id = newId('att');
-        await putBlob(id, file);
+        // Held and noted as this draft's BEFORE it is written, so a sweep that
+        // runs during the write keeps it, and a composer that goes away during
+        // the write deletes it.
+        drafted.current.set(id, holdBlobs([id]));
+        try {
+          await putBlob(id, file);
+        } catch (error) {
+          discard([id]);
+          throw error;
+        }
+        // Let go while it was being written: the composer went away, and the
+        // delete it made then ran before this write landed. So it is made again,
+        // and nothing more is written for a draft that is gone.
+        if (!drafted.current.has(id)) {
+          await deleteBlobs([id]);
+          return;
+        }
         added.push({ kind: 'image', id, mediaType: file.type, bytes: file.size });
       }
 
@@ -193,11 +250,12 @@ export function Composer({
                   type="button"
                   className="attachment__remove"
                   aria-label="Remove attachment"
-                  onClick={() =>
+                  onClick={() => {
                     setAttachments((current) =>
                       current.filter((entry) => entry.id !== attachment.id),
-                    )
-                  }
+                    );
+                    discard([attachment.id]);
+                  }}
                 >
                   ×
                 </button>

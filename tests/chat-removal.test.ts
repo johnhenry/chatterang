@@ -91,6 +91,9 @@ const fake = vi.hoisted(() => {
       }),
     },
     blobs: {
+      put: vi.fn(async (row: Row) => {
+        blobs.set(row.id, { id: row.id });
+      }),
       get: async (id: string) => {
         const row = blobs.get(id);
         await gate('blobs.get');
@@ -99,11 +102,21 @@ const fake = vi.hoisted(() => {
       bulkDelete: vi.fn(async (ids: string[]) => {
         for (const id of ids) blobs.delete(id);
       }),
+      toCollection: () => ({ primaryKeys: async () => [...blobs.keys()] }),
     },
     models: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
     settings: { get: vi.fn(async () => undefined), put: vi.fn(async () => {}) },
     connections: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+    mcpServers: { toArray: async () => [] },
   };
+  /** Every message row, as a scan of the whole table reads them: its snapshot is taken when it is made. */
+  Object.assign(db.messages, {
+    each: async (callback: (row: Row) => void) => {
+      const snapshot = [...messages.values()].map(clone);
+      await gate('messages.scan');
+      for (const row of snapshot) callback(row);
+    },
+  });
 
   /** The cascade `db/index.ts` runs, attachment payloads included, applied when it is made. */
   const deleteChat = vi.fn(async (chatId: string) => {
@@ -156,6 +169,7 @@ const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { ChatterangEngine } = await import('@/ai/engine');
 const { toolRegistry } = await import('@/ai/tools/registry');
 const { MCP_CALL, mcpProbe, probeResolver, recordingBackend } = await import('./support/egress-probe');
+const { putBlob } = await import('@/lib/blobs');
 
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
@@ -1103,5 +1117,110 @@ describe('loading the chat list', () => {
 
     expect(inStore('listed_gone')).toBe(false);
     expect(inStore('listed_kept')).toBe(true);
+  });
+});
+
+/* ── Attachment payloads ─────────────────────────────────────────────── */
+
+describe('an attachment payload no message names', () => {
+  /*
+   * The composer writes an image's payload as it is attached, before any
+   * message names it, and a chat's delete takes only the payloads its rows
+   * name. So an image attached in a chat deleted before it was sent stayed on
+   * disk, named by nothing: "removed from this device" was not so for it. The
+   * composer now deletes a draft's payload when the draft is dropped
+   * (`tests/composer-drafts.test.tsx`), and each launch deletes the payloads no
+   * message names — except any a draft or a send holds.
+   */
+  const image = (id: string) => ({ kind: 'image' as const, id, mediaType: 'image/png', bytes: 3 });
+
+  it('is gone by the next launch when its chat was deleted before the image was sent', async () => {
+    given(chat('unsent', 1));
+    useChats.setState({ activeChatId: 'unsent' });
+    await putBlob('att_unsent', new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }));
+    expect(fake.blobs.has('att_unsent'), 'the control: attaching wrote it').toBe(true);
+
+    await useChats.getState().removeChat('unsent');
+    await relaunch();
+
+    expect(fake.blobs.has('att_unsent'), 'the next launch').toBe(false);
+  });
+
+  it('is taken at the next launch, and a payload a message names is kept', async () => {
+    given(chat('named', 1));
+    const row: Message = {
+      id: 'named_user',
+      chatId: 'named',
+      role: 'user',
+      content: 'look',
+      attachments: [image('att_named')],
+      createdAt: 1,
+    };
+    fake.messages.set(row.id, structuredClone(row));
+    fake.blobs.set('att_named', { id: 'att_named' });
+    fake.blobs.set('att_loose', { id: 'att_loose' });
+
+    await relaunch();
+
+    expect(fake.blobs.has('att_named'), 'named by a message').toBe(true);
+    expect(fake.blobs.has('att_loose'), 'named by nothing').toBe(false);
+  });
+
+  it('keeps the image of a message sent while the launch’s sweep is reading the threads', async () => {
+    // The sweep reads every row before the message is written, so what it read
+    // names nothing; the image was held by the send from the moment it was
+    // asked for until its row was written.
+    given(chat('sending', 1));
+    useChats.setState({ activeChatId: 'sending' });
+    fake.blobs.set('att_sending', { id: 'att_sending' });
+    script = [{ text: 'A cat.' }];
+    fake.hold('messages.scan');
+
+    const loading = useChats.getState().load();
+    try {
+      await until(() => fake.pending('messages.scan') === 1);
+      await useChats.getState().send('look at this', [image('att_sending')]);
+      expect(
+        (rowsFor('sending') as Message[]).some((row) => row.attachments?.some((entry) => entry.id === 'att_sending')),
+        'the control: its row was written while the sweep read',
+      ).toBe(true);
+    } finally {
+      fake.release('messages.scan');
+    }
+    await loading;
+
+    expect(fake.blobs.has('att_sending'), 'the sent image').toBe(true);
+  });
+
+  it('keeps the image of a message refused while its chat’s delete ran, when the delete fails and writes it back', async () => {
+    given(chat('refused_image', 1));
+    useChats.setState({ activeChatId: 'refused_image' });
+    fake.blobs.set('att_refused', { id: 'att_refused' });
+    script = [{ text: 'A cat.' }];
+    const refusing = held();
+    fake.deleteChat.mockImplementationOnce(async () => {
+      await refusing.promise;
+      throw new Error('The disk is full.');
+    });
+
+    const removing = useChats.getState().removeChat('refused_image');
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      await until(() => fake.deleteChat.mock.calls.length === 1);
+      sending = useChats.getState().send('look at this', [image('att_refused')]);
+      // Refused, and kept to be written if the delete fails. The turn waits behind the delete.
+      await until(() => useChats.getState().messages.some((message) => message.role === 'user'));
+      expect(rowsFor('refused_image'), 'nothing names it on disk').toEqual([]);
+
+      await useChats.getState().load();
+    } finally {
+      refusing.release();
+    }
+    await expect(removing).rejects.toThrow('The disk is full.');
+    await sending;
+
+    const user = (rowsFor('refused_image') as Message[]).find((row) => row.role === 'user');
+    expect(user?.attachments?.map((entry) => entry.id), 'the message is written back').toEqual(['att_refused']);
+    expect(fake.blobs.has('att_refused'), 'with its image').toBe(true);
   });
 });

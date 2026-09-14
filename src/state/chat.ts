@@ -8,7 +8,7 @@
 
 import { create } from 'zustand';
 
-import { blobToBase64, deleteBlobs } from '@/lib/blobs';
+import { blobToBase64, deleteBlobs, holdBlobs, sweepOrphanBlobs } from '@/lib/blobs';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
@@ -53,8 +53,10 @@ import {
   unhandledOutcome,
   unhandledWhy,
   type McpCallReceipt,
+  type McpServerConfig,
   type ToolDestination,
 } from '@/domain/mcp';
+import type { ProviderConnection } from '@/ai/providers';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -259,6 +261,20 @@ const removedChats = new Set<string>();
  */
 const refusedRows = new Map<string, Map<string, Message>>();
 
+/**
+ * The holds on the attachment payloads of the rows in `refusedRows`, by chat,
+ * present exactly as long as that chat's entry there. A refused row is in no
+ * table the launch sweep reads, and is written after all if the delete fails,
+ * so what it names is kept until the delete has settled. See `holdBlobs`.
+ */
+const refusedHolds = new Map<string, (() => void)[]>();
+
+/** Let go of what `refusedHolds` holds for a chat whose delete has settled. */
+function releaseRefused(chatId: string): void {
+  for (const release of refusedHolds.get(chatId) ?? []) release();
+  refusedHolds.delete(chatId);
+}
+
 /** A turn that has been claimed, with the chat it runs in and what stops it. */
 interface LiveTurn {
   readonly chatId: string;
@@ -330,24 +346,35 @@ function releaseTurn(set: (partial: Partial<ChatState>) => void, turn: LiveTurn)
  * composer writes an image's payload when it is attached, and the delete takes
  * only the payloads the rows it found name. So those go too — once the delete
  * has landed, and only if it did: a chat whose delete failed may still show
- * them.
+ * them. Until the delete has settled they are held (`refusedHolds`).
+ *
+ * A row being written holds the payloads it names until it is written, because
+ * until then nothing on disk names them and the launch sweep would take them
+ * (`sweepOrphanBlobs`). The hold is taken in the step `send` is called in, which
+ * is the step the composer lets go of them in.
  */
 async function putMessage(message: Message): Promise<void> {
+  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
   // Asked in the same step the put is made. A delete asked for after this makes
   // its own write after the put, and the table applies them in that order, so
   // it takes the row with it; one asked for before is seen here.
   if (!removedChats.has(message.chatId)) {
-    await db.messages.put(message);
+    const release = holdBlobs(payloads);
+    try {
+      await db.messages.put(message);
+    } finally {
+      release();
+    }
     return;
   }
   const refused = refusedRows.get(message.chatId);
   if (refused) {
     refused.set(message.id, message);
+    refusedHolds.get(message.chatId)?.push(holdBlobs(payloads));
     return;
   }
   // The delete has landed: nothing will write this row, and nothing else names
   // its payloads.
-  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
   if (payloads.length === 0) return;
   await writeInTurn(message.chatId, async () => {
     if (removedChats.has(message.chatId)) await deleteBlobs(payloads);
@@ -395,6 +422,41 @@ function withdrawnBeforeTheList(chat: Chat): Chat | null {
   const tools = chat.tools.filter((id) => !prefixes.some((prefix) => id.startsWith(prefix)));
   if (egressGrants.length === grants.length && tools.length === chat.tools.length) return null;
   return { ...chat, egressGrants, tools };
+}
+
+/**
+ * Which grants read from disk still name somewhere to send to, and the ids of
+ * the connections and servers whose grants are withdrawn outright.
+ *
+ * A withdrawal — removing a connection or an MCP server, or switching one off —
+ * writes each chat that holds a grant for it, one after another. An app killed
+ * part-way left the rest on disk, and loaded back they came on again with the
+ * connection or server, unasked. So a grant stands only while what it names is
+ * there as it was granted: a connection that exists and is on, or an MCP server
+ * that exists, is on, and is at the address the grant names. Judged through
+ * `holdsGrant`, so each kind answers for its own key only, against the
+ * connections and servers read from disk beside the chat list.
+ *
+ * A server at a new address is not withdrawn outright: a grant for where it is
+ * now stands, and one given while the old address's goes is kept.
+ */
+function grantsThatStand(
+  connections: readonly ProviderConnection[],
+  servers: readonly McpServerConfig[],
+  chats: readonly Chat[],
+): { stands: (grant: EgressGrant) => boolean; connections: Set<string>; servers: Set<string> } {
+  const on = connections.filter((connection) => connection.enabled);
+  const up = servers.filter((server) => server.enabled);
+  const stands = (grant: EgressGrant): boolean =>
+    on.some((connection) => holdsGrant([grant], { kind: 'provider', connectionId: connection.id })) ||
+    up.some((server) => holdsGrant([grant], { kind: 'mcp', serverId: server.id, url: server.url }));
+  const gone = { connections: new Set<string>(), servers: new Set<string>() };
+  for (const grant of chats.flatMap((chat) => chat.egressGrants ?? [])) {
+    if (stands(grant)) continue;
+    if (grant.kind !== 'mcp') gone.connections.add(grant.connectionId);
+    else if (!up.some((server) => server.id === grant.serverId)) gone.servers.add(grant.serverId);
+  }
+  return { stands, ...gone };
 }
 
 /** The error an interrupted turn is recovered with. */
@@ -478,7 +540,13 @@ export const useChats = create<ChatState>((set, get) => ({
   controller: null,
 
   async load() {
-    const stored = await db.chats.orderBy('updatedAt').reverse().toArray();
+    const [stored, connections, servers] = await Promise.all([
+      db.chats.orderBy('updatedAt').reverse().toArray(),
+      // Read beside the list, so its grants are judged against what was on disk
+      // with them. See `grantsThatStand`.
+      db.connections.toArray(),
+      db.mcpServers.toArray(),
+    ]);
     // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
     // the engine is, before this read lands, and ⌘N there starts a chat. A read
     // taken before that chat was written replaced the store without it, and the
@@ -494,20 +562,46 @@ export const useChats = create<ChatState>((set, get) => ({
     beforeTheList.connections.clear();
     beforeTheList.servers.clear();
     beforeTheList.toolPrefixes.clear();
+    // Grants on disk naming a connection or server that is not there as it was
+    // granted. Counted as being withdrawn before the store holds them, as a
+    // revocation counts before it reads: neither policy answers on one
+    // meanwhile, and a yes given to one of those destinations while they go goes
+    // with them. See `grantsThatStand` and `withdrawals`.
+    const standing = grantsThatStand(connections, servers, unseen);
+    const finishes = [
+      ...[...standing.connections].map((id) => providerWithdrawals.begin(id)),
+      ...[...standing.servers].map((id) => mcpWithdrawals.begin(id)),
+    ];
     set({ loaded: true, chats: sortChats([...held, ...unseen.map((chat, at) => stripped[at] ?? chat)]) });
     // And on disk, in each chat's turn.
-    await Promise.all(
-      stripped.flatMap((chat) =>
-        chat
-          ? [
-              writeInTurn(chat.id, async () => {
-                const current = get().chats.find((entry) => entry.id === chat.id);
-                if (current) await db.chats.put(current);
-              }),
-            ]
-          : [],
-      ),
+    const rewritten = stripped.flatMap((chat) =>
+      chat
+        ? [
+            writeInTurn(chat.id, async () => {
+              const current = get().chats.find((entry) => entry.id === chat.id);
+              if (current) await db.chats.put(current);
+            }),
+          ]
+        : [],
     );
+    // Queued in the step the store took the chats, each a function of the chat
+    // as it stands when written, so a grant written before it lands is judged
+    // and one written after is not touched. Not activity in the conversation.
+    const withdrawn = Promise.all(
+      unseen
+        .filter((chat) => (chat.egressGrants ?? []).some((grant) => !standing.stands(grant)))
+        .map((chat) =>
+          get().updateChat(chat.id, (current) => {
+            const grants = current.egressGrants ?? [];
+            const egressGrants = grants.filter(standing.stands);
+            return egressGrants.length === grants.length ? null : { egressGrants, updatedAt: current.updatedAt };
+          }),
+        ),
+    ).finally(() => {
+      for (const finish of finishes) finish();
+    });
+    // And the attachment payloads no message names. See `sweepOrphanBlobs`.
+    await Promise.all([...rewritten, withdrawn, sweepOrphanBlobs()]);
   },
 
   async openChat(chatId) {
@@ -626,6 +720,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // has just deleted.
     removedChats.add(chatId);
     if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
+    if (!refusedHolds.has(chatId)) refusedHolds.set(chatId, []);
     for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
     return writeInTurn(chatId, async () => {
       try {
@@ -640,6 +735,7 @@ export const useChats = create<ChatState>((set, get) => ({
         const writing = refused.map((message) => db.messages.put(message));
         removedChats.delete(chatId);
         await Promise.allSettled(writing);
+        releaseRefused(chatId);
         throw error;
       }
       // Landed. The rows refused meanwhile are never written, and their payloads
@@ -648,7 +744,11 @@ export const useChats = create<ChatState>((set, get) => ({
         (message.attachments ?? []).map((attachment) => attachment.id),
       );
       refusedRows.delete(chatId);
-      if (payloads.length > 0) await deleteBlobs(payloads);
+      try {
+        if (payloads.length > 0) await deleteBlobs(payloads);
+      } finally {
+        releaseRefused(chatId);
+      }
       set({
         chats: get().chats.filter((chat) => chat.id !== chatId),
         ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
@@ -672,7 +772,10 @@ export const useChats = create<ChatState>((set, get) => ({
       if (!chat) return;
       const changes = typeof patch === 'function' ? patch(chat) : patch;
       if (!changes) return;
-      const updated = { ...chat, ...changes, updatedAt: Date.now() };
+      // A change is activity in the conversation unless it carries `updatedAt`
+      // itself, as the launch's withdrawal of grants that name nowhere does:
+      // that is not something the person did in it, and must not reorder the list.
+      const updated = { ...chat, updatedAt: Date.now(), ...changes };
       await db.chats.put(updated);
       set({
         chats: sortChats(get().chats.map((entry) => (entry.id === chatId ? updated : entry))),
