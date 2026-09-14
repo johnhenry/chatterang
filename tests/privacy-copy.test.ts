@@ -1211,6 +1211,7 @@ describe('a listening socket forces the privacy copy to change', () => {
    */
   const HOST_EXPORTS: Readonly<Record<string, 'listens' | 'binds nothing'>> = {
     createTunnelHost: 'listens',
+    createTunnelListener: 'listens',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [

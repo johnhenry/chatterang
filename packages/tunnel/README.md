@@ -46,13 +46,42 @@ and a wire format is a format *plus* the pair of functions that reads and writes
 it. Splitting `TunnelFrame` from `encodeFrame` across two packages is exactly
 the drift the contracts guard exists to prevent.
 
+## One listener, many tunnels
+
+`createTunnelListener` is the long-lived half (#158): it binds once and hands
+out a `Tunnel` per connection. Each tunnel owns its inbox, its sequence guard,
+its `ended` latch and its socket, so two peers' frames never interleave into
+one stream, and closing one tunnel leaves the others and the listener running.
+That per-tunnel close is the primitive #135's revocation needs; revocation
+itself is not here.
+
+`maxTunnels` is required and has no default, because how many tunnels an app
+holds is that app's decision rather than this package's. A connection past the
+cap is closed with `TUNNEL_CAP_CLOSE_CODE` before any greeting is sent. The
+code lives in `wire/` so the client can name it, and `createTunnelClient`
+reports it as `TUNNEL_FULL` rather than `PEER_GONE`. A slot frees when a socket
+closes, not when its tunnel is classified: a peer that said `bye` and kept its
+socket open still holds a connection.
+
+#169's items are recommendations, not rulings. Two are built here: several
+concurrent connections, and a cap enforced at accept time. The third, replacing
+a device's stale socket with its new one, is deferred because it needs device
+identity (#135), and none exists yet.
+
+`createTunnelHost` is rung 0's single tunnel on top of the listener: capped at
+one, and it stops accepting once that tunnel ends. A late peer is refused at
+connect, and a peer already mid-request is dropped at its upgrade, rather than
+either handshaking onto a tunnel that is already over. The check is at the
+upgrade because `server.close()` alone lets a connection that is already inside
+a request finish upgrading.
+
 ## What is deliberately not here
 
 - **A production transport.** #181 chose a native socket plugin on both
   platforms, and that plugin is not built. What exists is rung 0 (#156):
-  `createTunnelClient` and `createTunnelHost` speak the real wire format over
-  loopback `ws://`, with no TLS and no credential, and no app starts the
-  listener.
+  `createTunnelClient`, `createTunnelHost` and `createTunnelListener` speak the
+  real wire format over loopback `ws://`, with no TLS and no credential, and no
+  app starts a listener.
 - **`TunnelBinding`.** It belongs in `src/host/`, modelled on
   `apps/server/src/binding.ts` — bind address and credentials as one union, so
   the unsafe combination cannot be written down. There is one arm to write now;

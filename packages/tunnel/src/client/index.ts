@@ -37,7 +37,13 @@
  */
 
 import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
-import { TUNNEL_WIRE_VERSION, decodeFrame, encodeFrame, type TunnelFrame } from '../wire/index.js';
+import {
+  TUNNEL_CAP_CLOSE_CODE,
+  TUNNEL_WIRE_VERSION,
+  decodeFrame,
+  encodeFrame,
+  type TunnelFrame,
+} from '../wire/index.js';
 
 /**
  * The client end of a tunnel.
@@ -165,14 +171,29 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
     wake?.();
   });
 
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (event: CloseEvent) => {
+    /*
+     * A REFUSAL IS NOT A CUT. A listener already holding as many tunnels as
+     * its app allows closes a new connection with `TUNNEL_CAP_CLOSE_CODE`
+     * before sending anything (#169). Read as PEER_GONE, a full desktop looks
+     * exactly like a cable pulled mid-stream, which is neither true nor
+     * something a screen can explain.
+     */
+    if (event.code === TUNNEL_CAP_CLOSE_CODE) {
+      finish({
+        kind: 'abnormal',
+        code: 'TUNNEL_FULL',
+        message: 'the other device is already holding as many connections as it allows',
+      });
+      return;
+    }
     /*
      * See the host's identical branch. `bye` is obliged on a deliberate close
      * (#260), so a socket that goes away without one is reported as abnormal
      * rather than as the end of a stream — which is the distinction #185 says
      * does not currently exist and which #156's faults 3 and 4 assert.
      */
-    // Unconditional; the latch holds every other answer. See the host's.
+    // Otherwise unconditional; the latch holds every other answer. See the host's.
     finish({ kind: 'abnormal', code: 'PEER_GONE', message: 'the peer went away without a bye' });
   });
 
