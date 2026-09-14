@@ -318,6 +318,20 @@ class ChatterangDatabase extends Dexie {
      * bodies. This is v8 because it landed. Whoever goes next takes v9.
      */
     this.version(8).stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' });
+
+    /**
+     * v9 — `ToolInvocation.receipt`, the record that an MCP call's arguments
+     * were handed to a server (#92).
+     *
+     * NO UPGRADE FUNCTION, as v8. The field is optional, and a call made before
+     * this version has no receipt because none was taken: backfilling one from
+     * a stored invocation would state a time nobody recorded.
+     *
+     * Restated as v4 to v8 are; no index mentions `toolCalls`. Per v7's note,
+     * #133 and #195 still describe themselves as v7. Whoever goes next takes
+     * v10.
+     */
+    this.version(9).stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' });
   }
 }
 

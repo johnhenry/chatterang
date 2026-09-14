@@ -19,7 +19,12 @@ import { create } from 'zustand';
 
 import { db } from '@/db';
 import { newId } from '@/domain/chat';
-import { validateServerUrl, type McpServerConfig, type McpServerState } from '@/domain/mcp';
+import {
+  McpNotSent,
+  validateServerUrl,
+  type McpServerConfig,
+  type McpServerState,
+} from '@/domain/mcp';
 import { mcpManager, type McpToolDescriptor } from '@/ai/mcp/client';
 import { createMcpTool } from '@/ai/mcp/tools';
 import { toolRegistry } from '@/ai/tools/registry';
@@ -147,11 +152,25 @@ export const useMcp = create<McpState>((set, get) => ({
         let registered = 0;
         for (const descriptor of tools) {
           const tool = createMcpTool(descriptor, {
+            serverId: server.id,
             serverUrl: server.url,
             // Imported lazily to avoid a cycle: state/app builds the engine,
             // which reads the tool registry this writes into.
             confirm: async (action) => (await import('@/state/app')).useApp.getState().requestApproval(action),
-            call: (s, n, args, signal) => mcpManager.callTool(s, n, args, signal),
+            call: async (s, n, args, signal) => {
+              // THE LIVE CHECK. Calls are routed by server NAME (client.ts), and
+              // this tool was built for one server record. A confirm sheet can
+              // stay open indefinitely while that server is removed and another
+              // is added under the same name at a different URL; without this,
+              // the arguments would go to the newcomer under a receipt naming
+              // the host this tool was built for. A refusal, not a failure:
+              // nothing has left.
+              const live = get().servers.find((entry) => entry.id === server.id);
+              if (!live || !live.enabled || live.url !== server.url || live.name !== s) {
+                throw new McpNotSent('the server changed since this call was prepared');
+              }
+              return mcpManager.callTool(s, n, args, signal);
+            },
           });
           // `null` when the server's schema failed validation. Skipped rather
           // than registered with a trimmed one -- see src/ai/mcp/schema.ts --

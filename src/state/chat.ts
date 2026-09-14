@@ -60,6 +60,20 @@ import { usePersonas } from '@/state/personas';
  */
 const HISTORY_TURNS = 64;
 
+/**
+ * The row of the generation running right now, if there is one.
+ *
+ * A turn's row is written to the database mid-turn once a tool call has handed
+ * something to a server (see the `tool` case in `runGeneration`), so a stored
+ * row still marked `streaming` is either this one or one whose generation was
+ * interrupted — the app was closed or killed while it ran. `openChat` tells
+ * the two apart by this.
+ */
+let livePlaceholderId: string | null = null;
+
+/** The error an interrupted turn is recovered with. */
+const INTERRUPTED = 'This reply was interrupted before it finished.';
+
 /** What the current thread costs against the model's context window. */
 export interface ContextUsage {
   /** Tokens the next prompt is expected to occupy. */
@@ -128,7 +142,21 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async openChat(chatId) {
-    const messages = await db.messages.where('chatId').equals(chatId).sortBy('createdAt');
+    const stored = await db.messages.where('chatId').equals(chatId).sortBy('createdAt');
+    const messages: Message[] = [];
+    for (const row of stored) {
+      // A stored row marked streaming whose generation is not running was
+      // interrupted. Left alone it would show a caret for ever and refuse to be
+      // cycled. It keeps what it had — its text so far and its tool calls,
+      // receipts included — and becomes the failed turn it is.
+      if (row.streaming && row.id !== livePlaceholderId) {
+        const interrupted: Message = { ...row, streaming: false, error: INTERRUPTED };
+        await db.messages.put(interrupted);
+        messages.push(interrupted);
+      } else {
+        messages.push(row);
+      }
+    }
     set({ activeChatId: chatId, messages });
     get().refreshContext();
   },
@@ -423,10 +451,29 @@ function editedVariant(message: Message, text: string): Message {
  * on display is in it — so there is nothing to append. A row that has not is
  * its own only generation. Empty text is dropped: a turn that failed before it
  * wrote anything is not a version anyone can flip back to.
+ *
+ * UNLESS IT HANDED SOMETHING TO A SERVER. A generation carrying an MCP receipt
+ * is kept with no text, because the receipt is the only record that those
+ * bytes left, and regenerating is not a reason to forget that. For the same
+ * reason a regeneration that failed or was interrupted — a row whose index is
+ * past the end of its list, showing a generation whose record was never
+ * appended — is appended here when it carries one. Without a receipt it is
+ * dropped, as it always was.
  */
 function generationsSoFar(target: Message): MessageVariant[] {
-  const all = target.variants ?? [currentVariant(target)];
-  return all.filter((variant) => variant.content.length > 0);
+  const listed = target.variants;
+  const shown = currentVariant(target);
+  const offList =
+    listed !== undefined &&
+    target.variantIndex !== undefined &&
+    target.variantIndex >= listed.length;
+  const all = listed === undefined ? [shown] : offList && carriesReceipt(shown) ? [...listed, shown] : listed;
+  return all.filter((variant) => variant.content.length > 0 || carriesReceipt(variant));
+}
+
+/** Did any tool call in this generation hand its arguments to an MCP server? */
+function carriesReceipt(variant: MessageVariant): boolean {
+  return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */
@@ -530,6 +577,8 @@ async function runGeneration(
     },
   });
 
+  livePlaceholderId = placeholder.id;
+
   try {
     const stream = engine.stream({
       messages: built.messages,
@@ -572,9 +621,31 @@ async function runGeneration(
               output: event.tool.output,
               isError: event.tool.isError,
               durationMs: event.tool.durationMs,
+              // An explicit property, for #259's reason given in `done` below:
+              // a spread keeps compiling after the field it copies is deleted.
+              receipt: event.tool.receipt,
             },
           ];
           patch((message) => ({ ...message, toolCalls }));
+
+          // A receipt says bytes left the device, so it is written down NOW.
+          // Until this, nothing reached the database before the turn ended, and
+          // a turn that errored, was stopped or was killed afterwards took the
+          // record with it. The row goes in still marked streaming; `openChat`
+          // recovers it if this generation never finishes. A call still in
+          // flight when the app dies has no record — that write would have to
+          // happen before the hand-off, inside the dispatcher.
+          if (event.tool.receipt) {
+            const inProgress = get().messages.find((message) => message.id === placeholder.id);
+            if (inProgress) {
+              await db.messages.put(inProgress);
+              // A regenerated turn's row now holds the generations of the row
+              // it replaces, so that row goes now rather than after the turn.
+              // Otherwise a kill from here on leaves both, and the reopened
+              // thread shows the turn twice.
+              if (options.replaceMessageId) await db.messages.delete(options.replaceMessageId);
+            }
+          }
           break;
         }
 
@@ -682,6 +753,10 @@ async function runGeneration(
             ...placeholder,
             content: partial.content.trim(),
             thinking: partial.thinking || undefined,
+            // The calls happened, and a receipt among them says something left.
+            // The placeholder has none, so without this line a failed turn
+            // erased exactly the record it most needed to keep.
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             streaming: false,
             error: event.message,
           };
@@ -697,11 +772,17 @@ async function runGeneration(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Generation failed.';
-    const failed: Message = { ...placeholder, streaming: false, error: message };
+    const failed: Message = {
+      ...placeholder,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      streaming: false,
+      error: message,
+    };
     await db.messages.put(failed);
     patch(() => failed);
     app.toast(message, 'crit');
   } finally {
+    if (livePlaceholderId === placeholder.id) livePlaceholderId = null;
     set({ generating: false, controller: null });
     app.setActivity('idle');
     app.setLiveRate(null);

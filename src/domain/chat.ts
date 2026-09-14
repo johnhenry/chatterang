@@ -10,6 +10,7 @@
 import type { WarningCategory } from '@johnhenry/aimatey-types';
 
 import type { EngineId, SamplerSettings } from './manifest';
+import type { McpCallReceipt } from './mcp';
 
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -46,6 +47,11 @@ export interface ToolInvocation {
   readonly output?: string;
   readonly isError?: boolean;
   readonly durationMs?: number;
+  /**
+   * Present when this call's arguments were handed to an MCP server. It moves
+   * with its generation, as the rest of the invocation does.
+   */
+  readonly receipt?: McpCallReceipt;
 }
 
 /**

@@ -23,6 +23,7 @@ import type {
   ToolUseContent,
 } from '@johnhenry/aimatey-types';
 
+import type { McpCallReceipt } from '@/domain/mcp';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
 export interface ExecutedTool {
@@ -33,6 +34,8 @@ export interface ExecutedTool {
   readonly isError: boolean;
   readonly durationMs: number;
   readonly display?: { readonly kind: 'html' | 'json' | 'text'; readonly value: string };
+  /** Copied from the tool's result: this call's arguments went to an MCP server. */
+  readonly receipt?: McpCallReceipt;
 }
 
 export interface ToolMiddlewareOptions {
@@ -218,6 +221,7 @@ export async function runToolCalls(
     let output: string;
     let isError = false;
     let display: ExecutedTool['display'];
+    let receipt: ExecutedTool['receipt'];
 
     if (!tool) {
       output = `No tool named "${call.name}" is available.`;
@@ -231,6 +235,7 @@ export async function runToolCalls(
         output = result.output;
         isError = Boolean(result.isError);
         display = result.display;
+        receipt = result.receipt;
       } catch (error) {
         output = error instanceof Error ? error.message : String(error);
         isError = true;
@@ -247,6 +252,7 @@ export async function runToolCalls(
       isError,
       durationMs: Math.round(performance.now() - started),
       display,
+      receipt,
     };
     executed.push(record);
     options.onToolExecuted?.(record);

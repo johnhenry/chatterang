@@ -28,12 +28,20 @@
 
 import type { JSONSchema } from '@johnhenry/aimatey-types';
 
-import { destinationHost, qualifiedToolName } from '@/domain/mcp';
+import {
+  McpNotSent,
+  destinationHost,
+  qualifiedToolName,
+  type McpCallReceipt,
+  type ToolDestination,
+} from '@/domain/mcp';
 import { checkToolSchema } from '@/ai/mcp/schema';
 import type { ChatterangTool, ToolResult } from '@/ai/tools/registry';
 import type { McpToolDescriptor } from '@/ai/mcp/client';
 
 export interface McpToolOptions {
+  /** The server record's id: the one thing that tells two same-name servers apart. */
+  readonly serverId: string;
   /** The server's URL, for showing where a call goes. */
   readonly serverUrl: string;
   /** Shown to the user before a destructive call runs. */
@@ -72,12 +80,23 @@ export function createMcpTool(
     return null;
   }
 
+  const destination: ToolDestination = {
+    kind: 'mcp',
+    serverId: options.serverId,
+    serverName: descriptor.server,
+    host,
+    url: options.serverUrl,
+  };
+
   return {
     id: `mcp:${qualified}`,
     name: qualified,
     summary: `${descriptor.description || descriptor.name} — sends data to ${host}`,
     // Unconditional. See invariant 1 above.
     sensitive: true,
+    // Unconditional too: a tool that leaves the device says where, by server
+    // id, so what checks or records a call never has to trust a name.
+    destination,
     description: [
       descriptor.description || `The ${descriptor.name} tool on ${descriptor.server}.`,
       '',
@@ -104,6 +123,22 @@ export function createMcpTool(
         }
       }
 
+      // THE RECEIPT IS TAKEN HERE: after the confirm, so a declined call has
+      // none, and before the hand-off, so `at` is when the arguments left and a
+      // call that then throws still has one. `now` is read once; the catch
+      // below must not read it again.
+      const bytes = new TextEncoder().encode(JSON.stringify(input)).length;
+      const at = context.now().getTime();
+      const receipt = (outcome: McpCallReceipt['outcome']): McpCallReceipt => ({
+        outcome,
+        serverId: options.serverId,
+        serverName: descriptor.server,
+        host,
+        toolName: qualified,
+        bytes,
+        at,
+      });
+
       try {
         const result = await options.call(
           descriptor.server,
@@ -111,11 +146,19 @@ export function createMcpTool(
           input,
           context.signal,
         );
-        return renderResult(result);
+        return { ...renderResult(result), receipt: receipt('sent') };
       } catch (error) {
+        // Refused before anything left, so there is nothing to record.
+        if (error instanceof McpNotSent) {
+          return { output: `${qualified} was not sent: ${error.message}`, isError: true };
+        }
+        // Anything else may have failed after the arguments were delivered — a
+        // server error, a connection dropped mid-response. It is recorded as an
+        // attempt, which is the direction it is safe to be wrong in.
         return {
           output: `${qualified} failed: ${error instanceof Error ? error.message : String(error)}`,
           isError: true,
+          receipt: receipt('failed'),
         };
       }
     },

@@ -286,7 +286,7 @@ const v6 = versions.find((version) => version._cfg?.version === 6)?._cfg?.conten
 const v7 = versions.find((version) => version._cfg?.version === 7)?._cfg?.contentUpgrade;
 
 describe('the versions these migrations claim', () => {
-  it('are 6, 7 and 8, each declared once, in order, with 8 the highest', () => {
+  it('are 6, 7, 8 and 9, each declared once, in order, with 9 the highest', () => {
     /*
      * Two `.version(n)` calls sharing an n is worse than the bug being fixed:
      * Dexie keeps the last and the other migration silently never runs.
@@ -306,8 +306,9 @@ describe('the versions these migrations claim', () => {
     expect(declared).toContain(6);
     expect(declared).toContain(7);
     expect(declared).toContain(8);
+    expect(declared).toContain(9);
     expect(new Set(declared).size).toBe(declared.length);
-    expect(Math.max(...declared)).toBe(8);
+    expect(Math.max(...declared)).toBe(9);
     expect([...declared]).toEqual([...declared].sort((a, b) => a - b));
   });
 
