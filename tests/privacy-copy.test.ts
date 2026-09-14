@@ -24,7 +24,6 @@ import {
   IOS_INFO_PLIST,
   NATIVE_PATCHES,
 } from '../scripts/patch-native.mjs';
-import { createElement } from 'react';
 
 import {
   ADDRESS_DNS,
