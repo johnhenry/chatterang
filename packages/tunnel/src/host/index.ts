@@ -25,9 +25,12 @@
  *
  * What this file builds is rung 0 of that (#156): a real listener that speaks
  * the real wire format, on loopback, with no TLS and no credential. It exists to
- * hold the protocol to its word. No app starts it, and none may until the
- * listener has a device credential (#135), certificate material (#179) and a
- * declared surface (#170) to stand behind.
+ * hold the protocol to its word. No app starts it. What has to exist before one
+ * may is AT LEAST this, and #158 holds the whole gate: a device credential
+ * (#135), certificate material (#179), a declared surface (#170), and the
+ * inbound privacy copy on every surface that makes the outbound promise,
+ * landing in the same change as the start path (#221, #158). A listener that
+ * carries turns also waits on #7's background substrate, per #169's ruling.
  */
 
 import { createServer } from 'node:http';
