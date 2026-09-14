@@ -88,9 +88,18 @@ function join(manager: LockManager): Promise<void> {
   });
 }
 
-export async function putBlob(id: string, data: Blob): Promise<void> {
+/**
+ * Write an attachment's payload.
+ *
+ * `wanted` is asked once this window has joined, in the step the write is made.
+ * A payload let go while the window was still joining — a draft thrown away with
+ * the chat it was being written in — is not written at all, rather than written
+ * and deleted again.
+ */
+export async function putBlob(id: string, data: Blob, wanted: () => boolean = () => true): Promise<void> {
   // Not before another window's sweep can see this one. See "Other windows".
   await joined;
+  if (!wanted()) return;
   await db.blobs.put({
     id,
     mediaType: data.type || 'application/octet-stream',

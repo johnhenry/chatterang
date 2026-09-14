@@ -8,6 +8,7 @@ import { clearAllConversations, eraseEverything } from '@/db';
 import { formatBytes } from '@/domain/manifest';
 import { osVoicesReady, speak, type VoiceOption } from '@/lib/voice';
 import { useApp, type ThemeChoice, type VoiceMode } from '@/state/app';
+import { useChats } from '@/state/chat';
 import { useModels, modelsWith } from '@/state/models';
 import { ProvidersPanel } from '@/features/settings/ProvidersPanel';
 import { McpPanel } from '@/features/settings/McpPanel';
@@ -436,6 +437,15 @@ export function SettingsScreen(): ReactNode {
         destructive
         onCancel={() => setConfirmClearChats(false)}
         onConfirm={() => {
+          // The composer's draft goes first — text, chips and payloads — so no
+          // chip is left naming a payload the clear takes (owner ruling,
+          // 2026-09-14). `App.tsx` unmounts the composer while Settings is open,
+          // which lets the draft go already, but that is a matter of layout and
+          // this is the guarantee. It stays discarded if the clear fails. A draft
+          // in another tab of the server profile is that tab's and is not
+          // reached: nothing tells that tab, the clear takes its payloads with
+          // every other, and its chips show nothing until it reloads.
+          useChats.getState().discardDraft();
           void clearAllConversations().then(() => window.location.reload());
           setConfirmClearChats(false);
         }}

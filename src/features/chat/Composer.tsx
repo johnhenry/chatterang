@@ -5,6 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { deleteBlobs, holdBlobs, putBlob } from '@/lib/blobs';
 import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
+import { useChats } from '@/state/chat';
 import { useModels, modelsWith } from '@/state/models';
 import { hasFinePointer } from '@/lib/platform';
 import { commandFor, registerCommand } from '@/lib/keys';
@@ -69,6 +70,37 @@ export function Composer({
     const draft = drafted.current;
     return () => discard([...draft.keys()]);
   }, [discard]);
+
+  /*
+   * THROWN AWAY BY THE STORE — text, chips and payloads, in the step it is asked
+   * for — when the chat it is being written in is deleted, or every conversation
+   * is (owner rulings, 2026-09-14; `discardDraft` in state/chat.ts). This
+   * component is not keyed by chat, so the draft carried over into whichever
+   * chat opened next, and its images stayed on the device.
+   *
+   * An image still being written goes like the rest: `addImages` deletes it once
+   * its write lands, and writes nothing if this window had not joined the others
+   * yet. Dictation into the draft is stopped, and whatever it still transcribes
+   * is dropped rather than typed into the next chat.
+   */
+  const draftNumber = useRef(0);
+  const discardDraft = useCallback(() => {
+    draftNumber.current += 1;
+    dictation.current?.stop();
+    dictation.current = null;
+    setDictating(false);
+    discard([...drafted.current.keys()]);
+    setText('');
+    setAttachments([]);
+  }, [discard]);
+
+  useEffect(
+    () =>
+      useChats.subscribe((state, previous) => {
+        if (state.draftDiscards !== previous.draftDiscards) discardDraft();
+      }),
+    [discardDraft],
+  );
 
   /*
    * DICTATION DOES NOT SURVIVE THIS COMPONENT, and neither does its model.
@@ -181,14 +213,16 @@ export function Composer({
         // the write deletes it.
         drafted.current.set(id, holdBlobs([id]));
         try {
-          await putBlob(id, file);
+          // Not written at all if it is let go before this window has joined.
+          await putBlob(id, file, () => drafted.current.has(id));
         } catch (error) {
           discard([id]);
           throw error;
         }
-        // Let go while it was being written: the composer went away, and the
-        // delete it made then ran before this write landed. So it is made again,
-        // and nothing more is written for a draft that is gone.
+        // Let go while it was being written — the composer went away, or the
+        // draft was thrown away — and the delete made then ran before this write
+        // landed. So it is made again, and nothing more is written for a draft
+        // that is gone.
         if (!drafted.current.has(id)) {
           await deleteBlobs([id]);
           return;
@@ -216,23 +250,37 @@ export function Composer({
     }
 
     setDictating(true);
+    // Dictation belongs to the draft it was started in. See `discardDraft`.
+    const started = draftNumber.current;
+    const current = (): boolean => draftNumber.current === started;
     try {
       const session = await ensureSession('stt', speechModel.paths.model, speechModel.paths);
-      dictation.current = await startDictation({
+      if (!current()) return;
+      const handle = await startDictation({
         handle: session.handle,
-        onPartial: (partial) => setText(partial),
+        onPartial: (partial) => {
+          if (current()) setText(partial);
+        },
         onFinal: (final) => {
+          if (!current()) return;
           if (final) setText(final);
           setDictating(false);
           dictation.current = null;
         },
         onError: (message) => {
+          if (!current()) return;
           toast(message, 'crit');
           setDictating(false);
           dictation.current = null;
         },
       });
+      if (!current()) {
+        handle.stop();
+        return;
+      }
+      dictation.current = handle;
     } catch (error) {
+      if (!current()) return;
       toast(error instanceof Error ? error.message : 'Dictation failed to start.', 'crit');
       setDictating(false);
     }

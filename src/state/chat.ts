@@ -535,11 +535,24 @@ interface ChatState {
    * aborts every claimed turn, and a chat's delete every one in that chat.
    */
   controller: AbortController | null;
+  /**
+   * How many times the store has thrown away the draft in the composer. The
+   * composer discards its text and images in the step this changes. See
+   * `discardDraft`.
+   */
+  draftDiscards: number;
 
   load: () => Promise<void>;
   openChat: (chatId: string) => Promise<void>;
   newChat: (options?: { mode?: ChatMode; personaId?: string | null }) => Promise<string>;
   removeChat: (chatId: string) => Promise<void>;
+  /**
+   * Throw away the draft in the composer: its text, and every image attached to
+   * it, whose payloads the composer deletes in the same step. Owner rulings of
+   * 2026-09-14: deleting the chat a draft is being written in throws it away
+   * (`removeChat`), and so does Settings' delete of every conversation.
+   */
+  discardDraft: () => void;
   renameChat: (chatId: string, title: string) => Promise<void>;
   togglePin: (chatId: string) => Promise<void>;
   /**
@@ -584,6 +597,7 @@ export const useChats = create<ChatState>((set, get) => ({
   generating: false,
   context: null,
   controller: null,
+  draftDiscards: 0,
 
   async load() {
     const [stored, connections, servers] = await Promise.all([
@@ -774,6 +788,10 @@ export const useChats = create<ChatState>((set, get) => ({
     return chat.id;
   },
 
+  discardDraft() {
+    set({ draftDiscards: get().draftDiscards + 1 });
+  },
+
   removeChat(chatId) {
     // IN THE CHAT'S TURN, like every other write to it. Run straight away, the
     // delete was under way while a write queued behind another one ran, found
@@ -789,6 +807,30 @@ export const useChats = create<ChatState>((set, get) => ({
     if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
     if (!refusedHolds.has(chatId)) refusedHolds.set(chatId, []);
     for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
+    // AND THE DRAFT BEING WRITTEN IN IT, NOW, when it is the chat open: its text,
+    // its images, and their payloads (owner ruling, 2026-09-14). Left in the
+    // composer, it carried over into whichever chat opened next, and its images
+    // stayed on the device until they were sent, removed, or swept at the next
+    // launch. Deleting another chat leaves the draft alone.
+    //
+    // NOT BROUGHT BACK IF THE DELETE FAILS, unlike the rows refused while it ran,
+    // which are written back below. Those are the conversation, which is still
+    // there, and some record what nothing can record again. The draft is what
+    // the person was about to send in a conversation they asked to delete, and
+    // its payloads went at once; bringing them back would mean keeping them until
+    // the delete had settled. So it fails closed.
+    //
+    // A SEND ALREADY MADE IS NOT THE DRAFT. Sending hands the draft's images to
+    // the message and the composer lets go of them: they are refused with its row
+    // while this runs, then taken or written back with it (`putMessage`), never
+    // left named by a row after being deleted.
+    //
+    // ANOTHER WINDOW'S DRAFT IS ITS OWN. Each tab the server profile serves has a
+    // store and a composer of its own, and nothing tells one what another has
+    // deleted. A draft there keeps its text and images: no row names them, so
+    // this delete does not take them, and that window's lock keeps them from any
+    // sweep (lib/blobs.ts).
+    if (get().activeChatId === chatId) get().discardDraft();
     return writeInTurn(chatId, async () => {
       try {
         await deleteChat(chatId);
