@@ -144,8 +144,9 @@ const FONT_FILE_ORIGIN = 'https://fonts.gstatic.com';
  * `validateServerUrl` (`src/domain/mcp.ts`) has always taken plain http on
  * `localhost` and `127.0.0.1`. The old policy refused those servers in a
  * packaged build; `http:` lets them connect, so the McpPanel hint that said
- * "https only." now names the localhost exception. Whether MCP should keep that
- * exception was not part of this ruling.
+ * "https only." now names the localhost exception. The owner ruled on #284 to
+ * keep it: those servers work here, behind the same per-server MCP grant as a
+ * remote server (refs #6), and MCP tools stay sensitive.
  */
 export const CSP_PRODUCTION = [
   "default-src 'self'",
