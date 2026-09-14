@@ -1043,14 +1043,21 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
   });
 
   it('is the receipt keeping it: the same empty turn without one is dropped, as before', async () => {
-    useChats.setState({
-      messages: [
-        USER,
-        { id: 'msg_a', chatId: 'c1', role: 'assistant', content: '', createdAt: 2, toolCalls: [TOOL], provenance: ON_DEVICE },
-      ],
-    });
-    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE }];
-    await useChats.getState().regenerate('msg_a');
+    // Driven through `send`, as the not-sent cases below are. The store writes
+    // `receipt` onto every tool call it records, so a call to a tool that runs
+    // on this device carries the key with nothing in it: a check for the key
+    // rather than for a receipt would keep this version, and a row seeded
+    // without the key could not tell.
+    script = [
+      { text: '', provenance: ON_DEVICE, tool: TOOL },
+      { text: 'NEW ANSWER', provenance: ON_DEVICE },
+    ];
+    await useChats.getState().send('hello');
+    const first = assistantRow();
+    expect(first.content).toBe('');
+    expect(first.toolCalls?.map((call) => 'receipt' in call), 'the store wrote the key, empty').toEqual([true]);
+    expect(first.toolCalls?.[0]?.receipt).toBeUndefined();
+    await useChats.getState().regenerate(first.id);
 
     expect(assistantRow().variants?.map((variant) => variant.content)).toEqual(['NEW ANSWER']);
   });
@@ -1208,7 +1215,8 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
           role: 'assistant',
           content: 'half a repl',
           createdAt: 2,
-          toolCalls: [TOOL],
+          // The key present and empty, as the store writes it for a local tool.
+          toolCalls: [{ ...TOOL, receipt: undefined }],
           error: 'This reply ended before it was complete.',
           variants: [{ content: 'FIRST ANSWER', provenance: REMOTE }],
           variantIndex: 1,
