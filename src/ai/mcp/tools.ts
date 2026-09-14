@@ -40,6 +40,7 @@ import {
   type ToolDestination,
 } from '@/domain/mcp';
 import { checkToolSchema } from '@/ai/mcp/schema';
+import { unlessStopped } from '@/ai/middleware/tools';
 import type { ChatterangTool, ToolResult } from '@/ai/tools/registry';
 import type { McpToolDescriptor } from '@/ai/mcp/client';
 
@@ -48,8 +49,11 @@ export interface McpToolOptions {
   readonly serverId: string;
   /** The server's URL, for showing where a call goes. */
   readonly serverUrl: string;
-  /** Shown to the user before a destructive call runs. */
-  confirm(action: string): Promise<boolean>;
+  /**
+   * Shown to the user before a destructive call runs. `signal` is the turn's:
+   * Stop takes the sheet down, and the call does not go.
+   */
+  confirm(action: string, signal?: AbortSignal): Promise<boolean>;
   call(
     server: string,
     name: string,
@@ -131,9 +135,21 @@ export function createMcpTool(
       });
 
       if (!descriptor.readOnly) {
-        const approved = await options.confirm(
-          `run “${descriptor.name}” on ${host}, which may change data there`,
-        );
+        const action = `run “${descriptor.name}” on ${host}, which may change data there`;
+        const approved = context.signal?.aborted
+          ? undefined
+          : await unlessStopped(options.confirm(action, context.signal), context.signal);
+        // STOPPED WHILE ASKING (#92). The owner's ruling is that nothing leaves
+        // after Stop; it names the send sheet, and this is the other sheet a
+        // call waits on, so it is held to the same. Read off the signal, not
+        // the answer: a yes that lands with or after Stop does not send.
+        if (context.signal?.aborted) {
+          return {
+            output: `${qualified} was not sent: the reply was stopped.`,
+            isError: true,
+            receipt: { ...fields(context.now().getTime()), outcome: 'withheld', why: 'stopped' },
+          };
+        }
         if (!approved) {
           // RECORDED AS NOT SENT (#92, owner ruling OD7). Saying no to the
           // data-change question declines the call as surely as a no to the

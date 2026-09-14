@@ -173,8 +173,10 @@ export const useMcp = create<McpState>((set, get) => ({
             serverId: server.id,
             serverUrl: server.url,
             // Imported lazily to avoid a cycle: state/app builds the engine,
-            // which reads the tool registry this writes into.
-            confirm: async (action) => (await import('@/state/app')).useApp.getState().requestApproval(action),
+            // which reads the tool registry this writes into. The turn's signal
+            // goes with the sheet, so Stop takes it down.
+            confirm: async (action, signal) =>
+              (await import('@/state/app')).useApp.getState().requestApproval(action, undefined, signal),
             call: async (s, n, args, signal) => {
               // THE LIVE CHECK. Calls are routed by server NAME (client.ts), and
               // this tool was built for one server record. A confirm sheet can

@@ -28,6 +28,7 @@ import {
   argumentPreview,
   type McpCallReceipt,
   type ToolDestination,
+  type WithheldWhy,
 } from '@/domain/mcp';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
@@ -86,18 +87,51 @@ export interface ToolDestinationPolicy {
   /**
    * Ask. Absent means there is nobody to ask, which is a refusal.
    *
+   * `signal` is the turn's. Once it aborts the dispatcher stops waiting, and
+   * every call the request covered is recorded as not sent whatever is
+   * answered later; an implementation should take its sheet down then, as the
+   * app's `requestApproval` does.
+   *
    * AN UNATTENDED CALLER MUST LEAVE THIS OUT. The app's own answer waits on
-   * `requestApproval`, which resolves only when a person answers the sheet, so
-   * a queued or background run that supplied it would hang rather than refuse
-   * (#103, #199).
+   * `requestApproval`, which resolves only when a person answers the sheet or
+   * the turn is stopped, so a queued or background run that supplied it would
+   * hang rather than refuse (#103, #199).
    */
-  request?(request: DestinationRequest): Promise<DestinationDecision>;
+  request?(request: DestinationRequest, signal?: AbortSignal): Promise<DestinationDecision>;
   /** Persist a `conversation` answer. */
   onGranted?(destination: ToolDestination): void;
 }
 
 /** Sends nothing anywhere: for a caller with no conversation to hold a grant and no one to ask. */
 export const NO_DESTINATIONS: ToolDestinationPolicy = Object.freeze({ isGranted: () => false });
+
+/**
+ * `waiting`, or `undefined` as soon as `signal` aborts — whichever is first.
+ *
+ * For a question put to a person mid-turn (#92, owner ruling OD7). Stop has to
+ * end the wait when nobody answers, and an answer that arrives after Stop must
+ * reach nothing, so a caller checks `signal.aborted` after this rather than
+ * trusting the value: an answer and an abort can land in the same tick.
+ */
+export function unlessStopped<T>(waiting: Promise<T>, signal: AbortSignal | undefined): Promise<T | undefined> {
+  if (signal === undefined) return waiting;
+  // An abort that already happened fires no event, so it is read here.
+  if (signal.aborted) return Promise.resolve(undefined);
+  return new Promise<T | undefined>((resolve, reject) => {
+    const stop = (): void => resolve(undefined);
+    signal.addEventListener('abort', stop, { once: true });
+    waiting.then(
+      (value) => {
+        signal.removeEventListener('abort', stop);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', stop);
+        reject(error);
+      },
+    );
+  });
+}
 
 /**
  * Recognise a textual tool call. Local models produce these in a handful of
@@ -275,10 +309,18 @@ export async function runToolCalls(
   const tools = calls.map((call) => enabledTool(registry, options.enabledIds, call.name));
   // Asked BEFORE any call in the batch runs, so a sheet lists every call its
   // answer covers, and a destructive call's own confirm comes after it.
-  const { refused, onHeldGrant } = await refusedDestinations(calls, tools, options.destinations);
+  const { refused, onHeldGrant } = await refusedDestinations(
+    calls,
+    tools,
+    options.destinations,
+    options.signal,
+  );
 
   for (const [index, call] of calls.entries()) {
-    if (options.signal?.aborted) break;
+    const refusal = refused.get(index);
+    // Nothing runs once the turn is stopped. A call Stop held back is still
+    // written down below, so the thread can say it did not go.
+    if (options.signal?.aborted && refusal?.why !== 'stopped') continue;
 
     const tool = tools[index];
     const started = performance.now();
@@ -291,10 +333,10 @@ export async function runToolCalls(
     if (!tool) {
       output = `No tool named "${call.name}" is available.`;
       isError = true;
-    } else if (refused.has(index)) {
+    } else if (refusal) {
       // Written by this app from the destination's host, which the person
       // typed; nothing in it came from the model or the server.
-      output = refused.get(index)!;
+      output = refusal.output;
       isError = true;
       // RECORDED AS NOT SENT (#92, owner ruling OD7), so the thread and the
       // export can say what did not go. Only for a call with a destination:
@@ -303,7 +345,7 @@ export async function runToolCalls(
       if (destination) {
         receipt = {
           outcome: 'withheld',
-          why: 'not-allowed',
+          why: refusal.why,
           serverId: destination.serverId,
           serverName: destination.serverName,
           host: destination.host,
@@ -366,9 +408,11 @@ export async function runToolCalls(
  * so a sheet lists every call its answer covers and no call it does not.
  * Nothing is remembered past this batch: see {@link DestinationDecision}.
  *
- * Fails closed twice. A tool with an `mcp:` id that declares no destination is
- * not sent, because nothing can say where it would go. And any answer other
- * than `calls` or `conversation` is a refusal.
+ * Fails closed three times. A tool with an `mcp:` id that declares no
+ * destination is not sent, because nothing can say where it would go. Any
+ * answer other than `calls` or `conversation` is a refusal. And once the turn
+ * is stopped nothing more is asked, and a question already open is dropped:
+ * every call it covered is refused as stopped, whatever is answered after.
  *
  * `onHeldGrant` names the calls let through only by a grant the conversation
  * already held, which the dispatcher reads again before each one runs. An
@@ -379,8 +423,9 @@ async function refusedDestinations(
   calls: readonly ToolUseContent[],
   tools: readonly (ChatterangTool | undefined)[],
   policy: ToolDestinationPolicy,
-): Promise<{ refused: Map<number, string>; onHeldGrant: Set<number> }> {
-  const refused = new Map<number, string>();
+  signal: AbortSignal | undefined,
+): Promise<{ refused: Map<number, Refusal>; onHeldGrant: Set<number> }> {
+  const refused = new Map<number, Refusal>();
   const onHeldGrant = new Set<number>();
   const groups = new Map<string, { destination: ToolDestination; indices: number[] }>();
 
@@ -389,7 +434,10 @@ async function refusedDestinations(
     const destination = tool.destination;
     if (destination === undefined) {
       if (tool.id.startsWith('mcp:')) {
-        refused.set(index, `${tool.name} was not sent: it does not say where its arguments would go.`);
+        refused.set(index, {
+          output: `${tool.name} was not sent: it does not say where its arguments would go.`,
+          why: 'not-allowed',
+        });
       }
       return;
     }
@@ -405,27 +453,42 @@ async function refusedDestinations(
       continue;
     }
 
-    let decision: DestinationDecision = 'deny';
+    let decision: DestinationDecision | undefined = 'deny';
     if (policy.request) {
-      decision = await policy.request({
+      const asked: DestinationRequest = {
         destination,
         calls: indices.map((index) => ({
           toolName: tools[index]!.name,
           bytes: argumentBytes(calls[index]!.input),
           preview: argumentPreview(calls[index]!.input),
         })),
-      });
+      };
+      decision = signal?.aborted ? undefined : await unlessStopped(policy.request(asked, signal), signal);
+      // STOPPED WHILE ASKING (#92, owner ruling OD7). Read off the signal, not
+      // the answer: nothing leaves after Stop, no grant is kept from a sheet
+      // answered after it, and every call the sheet covered is recorded.
+      if (signal?.aborted) {
+        const output = `This call’s arguments were not sent to ${destination.host}: the reply was stopped.`;
+        for (const index of indices) refused.set(index, { output, why: 'stopped' });
+        continue;
+      }
       if (decision === 'conversation') policy.onGranted?.(destination);
     }
     if (decision === 'calls' || decision === 'conversation') continue;
 
-    const reason = policy.request
+    const output = policy.request
       ? `The user did not allow sending this call’s arguments to ${destination.host}.`
       : `This call’s arguments were not sent to ${destination.host}: this conversation has not allowed that server, and nobody could be asked.`;
-    for (const index of indices) refused.set(index, reason);
+    for (const index of indices) refused.set(index, { output, why: 'not-allowed' });
   }
 
   return { refused, onHeldGrant };
+}
+
+/** What the model is told instead of a result, and why the call was held back. */
+interface Refusal {
+  readonly output: string;
+  readonly why: WithheldWhy;
 }
 
 function structuredToolCalls(message: IRMessage): ToolUseContent[] {

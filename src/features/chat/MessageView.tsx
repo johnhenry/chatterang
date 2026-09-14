@@ -406,6 +406,8 @@ function receiptSentence(receipt: McpCallReceipt): string {
           return `Not sent to ${where} — it could change data there, and was declined.`;
         case 'server-changed':
           return `Not sent to ${where} — the server changed before it went.`;
+        case 'stopped':
+          return `Not sent to ${where} — the reply was stopped before it went.`;
         default:
           return `Not sent to ${where} — ${unhandledWhy(receipt.why)}.`;
       }

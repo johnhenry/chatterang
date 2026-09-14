@@ -959,6 +959,10 @@ export class ChatterangEngine {
       tools.push(...batch.executed);
       for (const tool of batch.executed) yield { type: 'tool', tool };
 
+      // STOPPED. What Stop held back is recorded above, and nothing more is
+      // asked or sent: the model is not run again over those refusals, which
+      // for a remote one would first raise the tool-output sheet after Stop.
+      if (request.signal?.aborted) break;
       if (batch.results.length === 0) break;
 
       const assistantTurn: IRMessage = { role: 'assistant', content: [...calls] };

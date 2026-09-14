@@ -660,6 +660,32 @@ describe('the record of what left follows the generation that sent it', () => {
     );
   });
 
+  it('says a call held back by Stop was not sent, and that the reply was stopped', async () => {
+    await mounted(
+      fixedMessage({
+        id: 'm1',
+        chatId: 'c1',
+        role: 'assistant',
+        content: 'Stopped.',
+        createdAt: 1,
+        toolCalls: [
+          {
+            ...MCP_TOOL,
+            isError: true,
+            output: 'This call’s arguments were not sent to notes.example: the reply was stopped.',
+            receipt: { ...RECEIPT, outcome: 'withheld', why: 'stopped' },
+          },
+        ],
+      }),
+      () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the reply was stopped before it went.']);
+        expect(document.body.textContent).not.toMatch(
+          /Sent 30 bytes|Tried to send|was not allowed|was declined|server changed/,
+        );
+      },
+    );
+  });
+
   it('reads the receipt off the displayed generation even when the row disagrees', async () => {
     const { receipt: _none, ...unreceipted } = MCP_TOOL;
     await mounted(

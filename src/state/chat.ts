@@ -1143,6 +1143,7 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
         case 'not-allowed':
         case 'declined':
         case 'server-changed':
+        case 'stopped':
           return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
         default:
           // Not sent; whose words came back is not this build's to say.
@@ -1166,6 +1167,7 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
         case 'not-allowed':
         case 'declined':
         case 'server-changed':
+        case 'stopped':
           return `${names}, which was not sent to ${receipt.host}`;
         default:
           return `${names}, which was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`;
@@ -1326,16 +1328,22 @@ function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
         .grantMcpEgress(chatId, { serverId: destination.serverId, url: destination.url });
     },
 
-    async request(asked) {
+    async request(asked, signal) {
       askedAt.set(keyOf(asked.destination), mcpWithdrawals.count(asked.destination.serverId));
       const { action, ...prompt } = mcpSendSheet(asked);
       let extended = false;
-      const allowed = await useApp.getState().requestApproval(action, {
-        ...prompt,
-        onExtended: () => {
-          extended = true;
+      // The turn's signal goes with the sheet, so Stop takes it down. The no
+      // that follows is read as stopped by the dispatcher, not as a refusal.
+      const allowed = await useApp.getState().requestApproval(
+        action,
+        {
+          ...prompt,
+          onExtended: () => {
+            extended = true;
+          },
         },
-      });
+        signal,
+      );
       if (!allowed) return 'deny';
       return extended ? 'conversation' : 'calls';
     },

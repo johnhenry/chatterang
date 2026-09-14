@@ -794,6 +794,173 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(allowed.receipt?.outcome).toBe('sent');
   });
 
+  /*
+   * STOP, WHILE A CALL WAITS ON A PERSON (#92, owner ruling OD7): nothing leaves
+   * after it, the sheet does not hold the turn open, and every call the sheet
+   * covered is recorded as not sent.
+   */
+
+  /** `running`, or a failure if it is still waiting on a sheet nobody will answer. */
+  function settled<T>(running: Promise<T>): Promise<T> {
+    return Promise.race([
+      running,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('the turn is still waiting on a sheet nobody answered')), 1000),
+      ),
+    ]);
+  }
+
+  it('sends nothing after Stop while the send sheet is open, and keeps nothing answered after', async () => {
+    const { engine, probe } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
+    const controller = new AbortController();
+    let answer: (decision: DestinationDecision) => void = () => {};
+    const request = vi.fn(
+      (_asked: DestinationRequest, _signal?: AbortSignal) =>
+        new Promise<DestinationDecision>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const onGranted = vi.fn();
+
+    const running = drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: { isGranted: () => false, request, onGranted },
+        signal: controller.signal,
+      }),
+    );
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    expect(request.mock.calls[0]![1], 'the sheet is handed the turn’s signal').toBe(controller.signal);
+
+    controller.abort();
+    // Nobody answered, and the turn still ends.
+    const events = await settled(running);
+    // An answer that arrives after Stop reaches nothing.
+    answer('conversation');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    expect(onGranted, 'no grant is kept from a sheet answered after Stop').not.toHaveBeenCalled();
+    const receipts = events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt] : []));
+    // Both calls the sheet covered, each recorded, each sized as what would have gone.
+    expect(receipts.map((receipt) => receipt?.outcome === 'withheld' && receipt.why)).toEqual(['stopped', 'stopped']);
+    expect(receipts.map((receipt) => receipt?.bytes)).toEqual([
+      new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+      new TextEncoder().encode(JSON.stringify({ text: 'a shopping list' })).length,
+    ]);
+    expect(receipts[0]).toMatchObject({ host: 'notes.example', toolName: 'notes.note' });
+  });
+
+  it('sends nothing when the answer and Stop land in the same tick', async () => {
+    const { engine, probe } = setUp();
+    const controller = new AbortController();
+
+    const events = await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id],
+          mcpEgress: {
+            isGranted: () => false,
+            request: async () => {
+              controller.abort();
+              return 'calls';
+            },
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+
+    expect(probe.call).not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+    expect(tool?.type === 'tool' && tool.tool.output).toBe(
+      'This call’s arguments were not sent to notes.example: the reply was stopped.',
+    );
+  });
+
+  it('sends nothing after Stop while a destructive call’s own confirm is open, even when it is answered yes after', async () => {
+    // The ruling names the send sheet; its stated effect is that nothing leaves
+    // after Stop, so the other sheet a call waits on is held to it too.
+    const probe = mcpProbe({ readOnly: false });
+    let yes: (approved: boolean) => void = () => {};
+    probe.confirm.mockImplementation(
+      (_action: string, _signal?: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          yes = resolve;
+        }),
+    );
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    engine.router.register('scripted', recordingBackend([MCP_CALL, 'Done.']).adapter);
+    const controller = new AbortController();
+
+    const running = drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        signal: controller.signal,
+      }),
+    );
+    await vi.waitFor(() => expect(probe.confirm).toHaveBeenCalledOnce());
+    expect(probe.confirm.mock.calls[0]![1], 'the confirm is handed the turn’s signal').toBe(controller.signal);
+
+    controller.abort();
+    const events = await settled(running);
+    yes(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe.call, 'nothing leaves after Stop').not.toHaveBeenCalled();
+    const tool = events.find((event) => event.type === 'tool');
+    expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+      host: 'notes.example',
+    });
+    expect(tool?.type === 'tool' && tool.tool.output).toBe('notes.note was not sent: the reply was stopped.');
+  });
+
+  it('does not run the model again, or ask to send tool output, after Stop', async () => {
+    // A remote model reads the refusals only by being run again, which would
+    // first raise the tool-output sheet — after Stop.
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([MCP_CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+    const controller = new AbortController();
+    const egressRequest = vi.fn(async (_: ToolEgressRequest) => 'turn' as const);
+
+    await settled(
+      drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: cloudTarget,
+          toolIds: [probe.tool.id],
+          egress: { isGranted: () => false, request: egressRequest },
+          mcpEgress: {
+            isGranted: () => false,
+            request: async () => {
+              controller.abort();
+              return 'calls';
+            },
+          },
+          signal: controller.signal,
+        }),
+      ),
+    );
+
+    expect(probe.call).not.toHaveBeenCalled();
+    expect(egressRequest, 'no sheet is raised after Stop').not.toHaveBeenCalled();
+    expect(cloud.seen, 'the model is not run again over the refusal').toHaveLength(1);
+  });
+
   it('asks once for every call to one server in a batch, and "these calls" sends exactly those', async () => {
     const { probe, run } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
     const request = ask('calls');

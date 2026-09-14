@@ -597,6 +597,25 @@ describe('the receipts a turn kept, in the transcript', () => {
     expect(transcript).not.toMatch(/was not allowed|was declined/);
   });
 
+  it('prints a call held back by Stop as not sent, and says the reply was stopped', () => {
+    const stopped = call('b.example');
+    const transcript = renderTranscript(
+      { title: 'T', updatedAt: 0 },
+      [
+        {
+          role: 'assistant',
+          createdAt: 1,
+          content: 'ok',
+          toolCalls: [{ ...stopped, receipt: { ...stopped.receipt, outcome: 'withheld', why: 'stopped' } }],
+        },
+      ] as unknown as Parameters<typeof renderTranscript>[1],
+    );
+
+    expect(transcript).toContain(
+      '- x.search was not sent to b.example (x) at 2026-09-02 00:00:00 UTC — the reply was stopped before it went.\n',
+    );
+  });
+
   it('still exports when a stored receipt’s time cannot be read', () => {
     // `toISOString` throws on an invalid date. One bad row must cost its own
     // timestamp, not the whole file and every `/chats/*.md` beside it.

@@ -148,11 +148,14 @@ export interface McpCallFields {
  * - `server-changed`: nobody refused it. The server record it was prepared for
  *   was removed, switched off, renamed or pointed elsewhere while it waited, or
  *   no client was left to send it ({@link McpNotSent}).
+ * - `stopped`: the reply was stopped while the call waited on a person — the
+ *   send sheet or the data-change confirm. Nothing leaves after Stop, so an
+ *   answer that came later did not count.
  *
  * Each reads differently in the thread and the export, because each is a
  * different thing to have happened.
  */
-export type WithheldWhy = 'not-allowed' | 'declined' | 'server-changed';
+export type WithheldWhy = 'not-allowed' | 'declined' | 'server-changed' | 'stopped';
 
 /**
  * Could this call's arguments have reached the server?

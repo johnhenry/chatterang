@@ -131,8 +131,14 @@ interface AppState {
 
   toast: (message: string, tone?: ToastTone, action?: Toast['action']) => void;
   dismissToast: (id: string) => void;
-  /** Ask the user to approve something the model wants to do. */
-  requestApproval: (action: string, prompt?: ApprovalPrompt) => Promise<boolean>;
+  /**
+   * Ask the user to approve something the model wants to do.
+   *
+   * `signal` is the asking turn's. Once it aborts the sheet is taken down and
+   * the answer is no; a caller that must tell that no from a person's reads
+   * `signal.aborted`.
+   */
+  requestApproval: (action: string, prompt?: ApprovalPrompt, signal?: AbortSignal) => Promise<boolean>;
   answerApproval: (id: string, approved: boolean) => void;
 }
 
@@ -375,10 +381,28 @@ export const useApp = create<AppState>((set, get) => ({
     set({ toasts: get().toasts.filter((toast) => toast.id !== id) });
   },
 
-  requestApproval(action, prompt) {
+  requestApproval(action, prompt, signal) {
     return new Promise<boolean>((resolve) => {
+      // A turn already stopped raises nothing.
+      if (signal?.aborted) {
+        resolve(false);
+        return;
+      }
       const id = newId('ask');
-      set({ approvals: [...get().approvals, { id, action, ...prompt, resolve }] });
+      // STOP TAKES THE SHEET DOWN (#92, owner ruling OD7). The turn that asked
+      // is over: a sheet left on screen would ask about something that can no
+      // longer happen, and until someone answered it the turn could not end.
+      // Only this approval goes; another turn's stays where it is.
+      const dismiss = (): void => {
+        set({ approvals: get().approvals.filter((entry) => entry.id !== id) });
+        resolve(false);
+      };
+      signal?.addEventListener('abort', dismiss, { once: true });
+      const answered = (approved: boolean): void => {
+        signal?.removeEventListener('abort', dismiss);
+        resolve(approved);
+      };
+      set({ approvals: [...get().approvals, { id, action, ...prompt, resolve: answered }] });
     });
   },
 

@@ -170,14 +170,15 @@ function scriptedEngine(): unknown {
     async *stream(request: {
       readonly egress?: ToolEgressPolicy;
       readonly mcpEgress?: ToolDestinationPolicy;
+      readonly signal?: AbortSignal;
     }) {
       const turn = script.shift();
       if (!turn) throw new Error('the script ran out of turns');
       if (turn.asksMcp) {
-        // What `runToolCalls` does with the policy: ask, and hand a
-        // conversation answer back to be kept.
+        // What `runToolCalls` does with the policy: ask, with the turn's
+        // signal, and hand a conversation answer back to be kept.
         const policy = request.mcpEgress;
-        const decision = await policy?.request?.(turn.asksMcp);
+        const decision = await policy?.request?.(turn.asksMcp, request.signal);
         if (decision === 'conversation') policy?.onGranted?.(turn.asksMcp.destination);
         mcpAnswers.push({ decision, granted: policy?.isGranted(turn.asksMcp.destination) });
         if (policy && turn.thenMcp) await turn.thenMcp(policy);
@@ -1338,6 +1339,47 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       },
     };
   }
+
+  it('is taken down when the turn is stopped, and the turn ends', async () => {
+    // The real queue and the real policy: nothing here replaces `requestApproval`.
+    useApp.setState({ approvals: [] });
+    mcpAnswers = [];
+    script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
+    const sending = useChats.getState().send('file it');
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    expect(useApp.getState().approvals[0]?.title).toBe(mcpSendSheet(ASK).title);
+
+    useChats.getState().stop();
+
+    await vi.waitFor(() => expect(useApp.getState().approvals).toEqual([]));
+    await sending;
+    // Stop's no is the policy's answer; the dispatcher reads it off the signal.
+    expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
+    expect(grants()).toEqual([]);
+  });
+
+  it('dismisses only the stopped turn’s sheet, raises none once stopped, and lets an earlier answer stand', async () => {
+    useApp.setState({ approvals: [] });
+    const actions = () => useApp.getState().approvals.map((entry) => entry.action);
+    const other = new AbortController();
+    const stopping = new AbortController();
+    const theirs = useApp.getState().requestApproval('from another turn', undefined, other.signal);
+    const ours = useApp.getState().requestApproval('from this turn', undefined, stopping.signal);
+    expect(actions()).toEqual(['from another turn', 'from this turn']);
+
+    stopping.abort();
+    await expect(ours).resolves.toBe(false);
+    expect(actions(), 'another turn’s sheet stays').toEqual(['from another turn']);
+
+    const late = useApp.getState().requestApproval('after Stop', undefined, stopping.signal);
+    expect(actions(), 'a stopped turn raises nothing').toEqual(['from another turn']);
+    await expect(late).resolves.toBe(false);
+
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    await expect(theirs).resolves.toBe(true);
+    other.abort();
+    expect(useApp.getState().approvals).toEqual([]);
+  });
 
   it('raises the sheet `mcpSendSheet` builds, and a no sends nothing and keeps nothing', async () => {
     const prompts = await answering('no');

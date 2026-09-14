@@ -12,7 +12,7 @@ import {
 } from '@/domain/mcp';
 import { createMcpTool, renderResult } from '@/ai/mcp/tools';
 import { McpManager, type McpToolDescriptor } from '@/ai/mcp/client';
-import { runToolCalls, type DestinationDecision } from '@/ai/middleware/tools';
+import { runToolCalls, unlessStopped, type DestinationDecision } from '@/ai/middleware/tools';
 import { BUILT_IN_TOOLS, ToolRegistry } from '@/ai/tools/registry';
 
 /**
@@ -224,6 +224,55 @@ describe('a call that could change data on its server', () => {
     expect(executed[0]?.isError).toBe(true);
     expect(executed[0]?.output).toContain('did not allow');
   });
+});
+
+/**
+ * Stop, while a call waits on a person (#92, owner ruling OD7). The end-to-end
+ * measurements are in `privacy.test.ts`; these are the two halves under them.
+ */
+describe('a call waiting on a person when the turn is stopped', () => {
+  const acme = { serverId: 'mcp_1', serverUrl: 'https://api.acme.com/mcp' };
+  const stoppedSignal = () => {
+    const controller = new AbortController();
+    controller.abort();
+    return controller.signal;
+  };
+  const never = <T>() => new Promise<T>(() => {});
+
+  it('asks nothing once the turn is already stopped, at dispatch or at the confirm', async () => {
+    const call = vi.fn(async () => ({ content: [] }));
+    const confirm = vi.fn(async (_action: string, _signal?: AbortSignal) => true);
+    const tool = mustCreateMcpTool(descriptor({ readOnly: false }), { ...acme, confirm, call });
+    const request = vi.fn(async () => 'calls' as const);
+
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use', id: 'c1', name: tool.name, input: { q: 'x' } }],
+      { enabledIds: [tool.id], destinations: { isGranted: () => false, request }, signal: stoppedSignal() },
+    );
+    expect(request, 'no sheet is raised for a stopped turn').not.toHaveBeenCalled();
+    expect(executed[0]?.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+
+    const direct = await tool.execute({ q: 'x' }, { signal: stoppedSignal(), now: () => new Date(0) });
+    expect(confirm, 'no confirm is raised for a stopped turn').not.toHaveBeenCalled();
+    expect(direct.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped', at: 0 });
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it('hands back the answer, or nothing once stopped, and never waits past Stop', async () => {
+    expect(await unlessStopped(Promise.resolve('yes'), undefined)).toBe('yes');
+    const live = new AbortController();
+    expect(await unlessStopped(Promise.resolve('yes'), live.signal)).toBe('yes');
+    await expect(unlessStopped(Promise.reject(new Error('boom')), live.signal)).rejects.toThrow('boom');
+
+    const stopping = new AbortController();
+    const waiting = unlessStopped(never<string>(), stopping.signal);
+    stopping.abort();
+    expect(await waiting).toBeUndefined();
+
+    // Stopped before it was asked: an abort that already happened fires no event.
+    expect(await unlessStopped(never<string>(), stoppedSignal())).toBeUndefined();
+  }, 2000);
 });
 
 describe('result rendering', () => {

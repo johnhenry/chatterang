@@ -877,6 +877,68 @@ describe('the privacy command', () => {
     );
   });
 
+  /*
+   * A CALL HELD BACK BY STOP IS RECORDED AS NOT SENT (#92, owner ruling OD7),
+   * and says the reply was stopped. Measured through the real dispatcher, with
+   * Stop landing while the send sheet is open.
+   */
+  it('says a call held back by Stop was not sent — and it was not', async () => {
+    expect(shipped('features/chat/MessageView.tsx')).toContain(
+      'return `Not sent to ${where} — the reply was stopped before it went.`;',
+    );
+
+    const call = vi.fn(async () => ({ content: [{ type: 'text', text: 'filed' }] }));
+    const tool = mustCreateMcpTool(
+      {
+        server: 'notes',
+        name: 'note',
+        description: 'File a note',
+        readOnly: true,
+        destructive: false,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      { serverId: 'mcp_notes', serverUrl: 'https://notes.example/mcp', confirm: async () => true, call },
+    );
+    const controller = new AbortController();
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use' as const, id: 'c1', name: tool.name, input: { text: SECRET } }],
+      {
+        enabledIds: [tool.id],
+        destinations: {
+          isGranted: () => false,
+          request: async () => {
+            controller.abort();
+            return 'calls' as const;
+          },
+        },
+        signal: controller.signal,
+      },
+    );
+    const record = executed[0]!;
+    expect(call, 'it was not sent').not.toHaveBeenCalled();
+    expect(record.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+
+    const thread = await threadText(record);
+    expect(thread).toContain('Not sent to notes.example (notes) — the reply was stopped before it went.');
+    expect(thread).not.toMatch(/Sent \d+ bytes|Tried to send|was not allowed|was declined|server changed/);
+
+    const transcript = renderTranscript({ title: 'T', updatedAt: 0 }, [
+      { role: 'assistant', content: 'Stopped.', createdAt: 1, toolCalls: [record] },
+    ]);
+    expect(transcript).toContain(
+      `- notes.note was not sent to notes.example (notes) at ${utc(record.receipt!.at)} — the reply was stopped before it went.`,
+    );
+
+    expect(record.output).toBe('This call’s arguments were not sent to notes.example: the reply was stopped.');
+    expect(toolOutputSheetBody([record], [], 'GPT-4o mini', 40)).toContain(
+      'notes.note was not sent to notes.example; this app wrote its reply',
+    );
+    expect(toolOutputSheetBody([], [{ toolCalls: [record] }], 'GPT-4o mini', 40)).toContain(
+      'including notes.note, which was not sent to notes.example. ',
+    );
+  });
+
   /**
    * The sentence that replaced "withholds it … if the reply diverted to a
    * fallback". That one was measured false: `stream()` tests `isGranted`

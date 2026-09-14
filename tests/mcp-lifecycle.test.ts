@@ -75,6 +75,7 @@ const { useChats } = await import('@/state/chat');
 const { useMcp } = await import('@/state/mcp');
 const { toolRegistry } = await import('@/ai/tools/registry');
 const { runToolCalls } = await import('@/ai/middleware/tools');
+const { useApp } = await import('@/state/app');
 
 function chat(id: string, tools: string[]): Chat {
   return {
@@ -374,6 +375,58 @@ describe('a call prepared for one server', () => {
       host: 'a.example',
       serverId: 'mcp_a',
     });
+  });
+});
+
+describe('a destructive call’s confirm when the turn is stopped', () => {
+  /**
+   * `state/mcp.ts` raises the confirm through the app's own queue, so whether
+   * Stop takes it down depends on that wiring handing the turn's signal over.
+   * Through the real registry, dispatcher and queue.
+   */
+  async function destructiveNotes() {
+    manager.listTools.mockImplementationOnce(async () =>
+      manager.state.configured.map((config) => ({
+        server: config.name,
+        name: 'search',
+        description: 'Search notes',
+        inputSchema: { type: 'object', properties: {} },
+        readOnly: false,
+        destructive: true,
+      })),
+    );
+    useMcp.setState({ servers: [server('mcp_a', 'notes', 'https://a.example/mcp')] });
+    await useMcp.getState().reconnect();
+    useApp.setState({ approvals: [] });
+  }
+
+  const dispatch = (signal: AbortSignal) =>
+    runToolCalls(
+      toolRegistry,
+      [{ type: 'tool_use', id: 'call_1', name: 'notes.search', input: { q: 'bank details' } }],
+      { enabledIds: ['mcp:notes.search'], destinations: { isGranted: () => true }, signal },
+    );
+
+  it('is taken down by Stop, and the call goes nowhere', async () => {
+    // The paired control: the same confirm answered yes, and the call goes.
+    await destructiveNotes();
+    const answered = dispatch(new AbortController().signal);
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    expect((await answered).executed[0]?.receipt?.outcome).toBe('sent');
+    expect(manager.callTool).toHaveBeenCalledOnce();
+
+    manager.callTool.mockClear();
+    await destructiveNotes();
+    const controller = new AbortController();
+    const stopping = dispatch(controller.signal);
+    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    controller.abort();
+    const { executed } = await stopping;
+
+    expect(useApp.getState().approvals, 'the confirm is not left on screen').toEqual([]);
+    expect(manager.callTool).not.toHaveBeenCalled();
+    expect(executed[0]?.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped', host: 'a.example' });
   });
 });
 
