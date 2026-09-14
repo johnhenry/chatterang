@@ -102,6 +102,70 @@ let livePlaceholderId: string | null = null;
 const mcpRevocations = new Map<string, number>();
 const mcpRevocationsOf = (serverId: string): number => mcpRevocations.get(serverId) ?? 0;
 
+/**
+ * How many times each connection's grants have been withdrawn, by connection id.
+ *
+ * The same count, for the same two reasons, on the provider side. A
+ * conversation answer's grant is written with `void` (`egressPolicy`), so a
+ * connection removed or switched off while that write was in flight had its
+ * grants read before this one was among them, dropped nothing, and the grant
+ * landed after it — permission to send tool output to a connection that had
+ * been switched off. And the engine holds an answer for the rest of a turn
+ * (`decided` in its `stream`): switching a connection off and on again
+ * registers the same id, so nothing about the target said the answer was
+ * stale, and the turn went on sending to it unasked. `grantEgress` withdraws
+ * its own grant when this moved while it was written, and the engine honours a
+ * yes only while this stands (`ToolEgressPolicy.revocations`).
+ *
+ * Per connection, like the MCP count: a revocation scoped to one chat also
+ * makes other chats' in-flight answers to that connection ask again, which
+ * fails closed.
+ */
+const providerRevocations = new Map<string, number>();
+const providerRevocationsOf = (connectionId: string): number =>
+  providerRevocations.get(connectionId) ?? 0;
+
+/**
+ * A change to one chat: the fields to set, or a function of the chat AS IT
+ * STANDS WHEN THE CHANGE IS WRITTEN that returns them — or `null`, for none.
+ *
+ * Anything that takes something out of a list, or adds to one, passes a
+ * function. A list computed from an earlier read carries back whatever was
+ * taken out of it since.
+ */
+export type ChatPatch = Partial<Chat> | ((chat: Chat) => Partial<Chat> | null);
+
+/**
+ * The write each chat is waiting on, by chat id.
+ *
+ * `updateChat` read the chat, awaited its put, then set the store, and nothing
+ * stopped two of those overlapping. Both read the chat before either landed,
+ * so the later one wrote back every field of the chat it had read. That lost
+ * the other's change, and was worse when the other was a revocation: a rename
+ * that ran while a grant was being withdrawn wrote the grant back, into the
+ * table and the store. Writes to one chat now run one at a time, each applied
+ * to the chat as the write before it left it.
+ *
+ * NOTHING RUNNING INSIDE A WRITE MAY WAIT ON ANOTHER WRITE TO THE SAME CHAT:
+ * that write is queued behind this one, and neither would finish. The
+ * post-write re-checks in `grantEgress` and `grantMcpEgress` run after their
+ * write has finished for exactly that reason.
+ */
+const chatWrites = new Map<string, Promise<void>>();
+
+function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> {
+  const before = chatWrites.get(chatId) ?? Promise.resolve();
+  const written = before.then(write);
+  // What the next write waits on settles either way. A put that failed is
+  // reported to its own caller, and must not wedge every later write to the chat.
+  const settled = written.catch(() => {});
+  chatWrites.set(chatId, settled);
+  void settled.then(() => {
+    if (chatWrites.get(chatId) === settled) chatWrites.delete(chatId);
+  });
+  return written;
+}
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -136,7 +200,11 @@ interface ChatState {
   removeChat: (chatId: string) => Promise<void>;
   renameChat: (chatId: string, title: string) => Promise<void>;
   togglePin: (chatId: string) => Promise<void>;
-  updateChat: (chatId: string, patch: Partial<Chat>) => Promise<void>;
+  /**
+   * Change one chat, after every write to it already under way. A function
+   * patch is applied to the chat as that write left it; see `chatWrites`.
+   */
+  updateChat: (chatId: string, patch: ChatPatch) => Promise<void>;
   /** Let this conversation send tool output to one connection, until revoked. */
   grantEgress: (chatId: string, connectionId: string) => Promise<void>;
   /**
@@ -293,63 +361,78 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async togglePin(chatId) {
-    const chat = get().chats.find((entry) => entry.id === chatId);
-    if (chat) await get().updateChat(chatId, { pinned: !chat.pinned });
+    await get().updateChat(chatId, (chat) => ({ pinned: !chat.pinned }));
   },
 
-  async updateChat(chatId, patch) {
-    const chat = get().chats.find((entry) => entry.id === chatId);
-    if (!chat) return;
-    const updated = { ...chat, ...patch, updatedAt: Date.now() };
-    await db.chats.put(updated);
-    set({
-      chats: sortChats(get().chats.map((entry) => (entry.id === chatId ? updated : entry))),
+  updateChat(chatId, patch) {
+    return writeInTurn(chatId, async () => {
+      // Read HERE, once every earlier write to this chat has landed — not when
+      // the caller asked. See `chatWrites`.
+      const chat = get().chats.find((entry) => entry.id === chatId);
+      if (!chat) return;
+      const changes = typeof patch === 'function' ? patch(chat) : patch;
+      if (!changes) return;
+      const updated = { ...chat, ...changes, updatedAt: Date.now() };
+      await db.chats.put(updated);
+      set({
+        chats: sortChats(get().chats.map((entry) => (entry.id === chatId ? updated : entry))),
+      });
     });
   },
 
   async grantEgress(chatId, connectionId) {
-    const chat = get().chats.find((entry) => entry.id === chatId);
-    if (!chat) return;
-    if (holdsGrant(chat.egressGrants, { kind: 'provider', connectionId })) return;
-    const egressGrants: EgressGrant[] = [
-      ...(chat.egressGrants ?? []),
-      { connectionId, grantedAt: Date.now() },
-    ];
-    await get().updateChat(chatId, { egressGrants });
+    const revocations = providerRevocationsOf(connectionId);
+    // A function of the chat as it stands when this is written, so a grant
+    // withdrawn meanwhile is not carried back in with the list.
+    await get().updateChat(chatId, (chat) =>
+      holdsGrant(chat.egressGrants, { kind: 'provider', connectionId })
+        ? null
+        : { egressGrants: [...(chat.egressGrants ?? []), { connectionId, grantedAt: Date.now() }] },
+    );
+    // A revocation that started while this was queued or being written read the
+    // chat before the grant was in it, and dropped nothing. Checked after the
+    // write has finished, never inside it. See `providerRevocations`.
+    if (providerRevocationsOf(connectionId) !== revocations) {
+      await get().revokeEgress(connectionId, chatId);
+    }
   },
 
   async revokeEgress(connectionId, chatId) {
+    // Counted before anything is read or awaited, so an answer or a write
+    // already under way sees it however the rest of this interleaves.
+    providerRevocations.set(connectionId, providerRevocationsOf(connectionId) + 1);
+    const names = (grant: EgressGrant): boolean =>
+      grant.kind !== 'mcp' && grant.connectionId === connectionId;
     const affected = get().chats.filter(
-      (chat) =>
-        (chatId === undefined || chat.id === chatId) &&
-        holdsGrant(chat.egressGrants, { kind: 'provider', connectionId }),
+      (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
     );
     for (const chat of affected) {
-      await get().updateChat(chat.id, {
-        egressGrants: (chat.egressGrants ?? []).filter(
-          (grant) => grant.kind === 'mcp' || grant.connectionId !== connectionId,
-        ),
-      });
+      await get().updateChat(chat.id, (current) =>
+        (current.egressGrants ?? []).some(names)
+          ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
+          : null,
+      );
     }
   },
 
   async grantMcpEgress(chatId, { serverId, url }) {
     const revocations = mcpRevocationsOf(serverId);
-    const chat = get().chats.find((entry) => entry.id === chatId);
-    if (!chat) return;
-    if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return;
-    // A grant for this server at an address it no longer has is REPLACED, not
-    // kept beside the new one. It covers nothing now, and a list that kept it
-    // would read as permission to send wherever the server used to be.
-    const egressGrants: EgressGrant[] = [
-      ...(chat.egressGrants ?? []).filter(
-        (grant) => grant.kind !== 'mcp' || grant.serverId !== serverId,
-      ),
-      { kind: 'mcp', serverId, url, grantedAt: Date.now() },
-    ];
-    await get().updateChat(chatId, { egressGrants });
-    // A revocation that started while this was being written read the chat
-    // before the grant was in it, and dropped nothing. See `mcpRevocations`.
+    await get().updateChat(chatId, (chat) => {
+      if (holdsGrant(chat.egressGrants, { kind: 'mcp', serverId, url })) return null;
+      // A grant for this server at an address it no longer has is REPLACED, not
+      // kept beside the new one. It covers nothing now, and a list that kept it
+      // would read as permission to send wherever the server used to be.
+      const egressGrants: EgressGrant[] = [
+        ...(chat.egressGrants ?? []).filter(
+          (grant) => grant.kind !== 'mcp' || grant.serverId !== serverId,
+        ),
+        { kind: 'mcp', serverId, url, grantedAt: Date.now() },
+      ];
+      return { egressGrants };
+    });
+    // A revocation that started while this was queued or being written read the
+    // chat before the grant was in it, and dropped nothing. Checked after the
+    // write has finished, never inside it. See `mcpRevocations`.
     if (mcpRevocationsOf(serverId) !== revocations) await get().revokeMcpEgress(serverId, chatId);
   },
 
@@ -362,9 +445,11 @@ export const useChats = create<ChatState>((set, get) => ({
       (chat) => (chatId === undefined || chat.id === chatId) && (chat.egressGrants ?? []).some(names),
     );
     for (const chat of affected) {
-      await get().updateChat(chat.id, {
-        egressGrants: (chat.egressGrants ?? []).filter((grant) => !names(grant)),
-      });
+      await get().updateChat(chat.id, (current) =>
+        (current.egressGrants ?? []).some(names)
+          ? { egressGrants: (current.egressGrants ?? []).filter((grant) => !names(grant)) }
+          : null,
+      );
     }
   },
 
@@ -390,10 +475,10 @@ export const useChats = create<ChatState>((set, get) => ({
     if (chat.messageCount === 0 || chat.title === 'New chat' || chat.title === 'Task') {
       await get().updateChat(chatId, { title: deriveTitle(text) });
     }
-    await get().updateChat(chatId, {
-      messageCount: chat.messageCount + 1,
+    await get().updateChat(chatId, (current) => ({
+      messageCount: current.messageCount + 1,
       preview: text.slice(0, 120),
-    });
+    }));
 
     await runGeneration(set, get, { chatId });
   },
@@ -873,14 +958,11 @@ async function runGeneration(
 
     if (runsOnThisDevice(target)) void useModels.getState().noteUse(target.modelId);
 
-    const chatNow = get().chats.find((entry) => entry.id === chat.id);
-    if (chatNow) {
-      const last = get().messages.at(-1);
-      await useChats.getState().updateChat(chat.id, {
-        messageCount: chatNow.messageCount + 1,
-        preview: last?.content.slice(0, 120) ?? chatNow.preview,
-      });
-    }
+    const last = get().messages.at(-1);
+    await useChats.getState().updateChat(chat.id, (chatNow) => ({
+      messageCount: chatNow.messageCount + 1,
+      preview: last?.content.slice(0, 120) ?? chatNow.preview,
+    }));
   }
 }
 
@@ -1018,6 +1100,10 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     onGranted: (backendId) => {
       void useChats.getState().grantEgress(chatId, backendId);
     },
+
+    // What ends the answer the engine holds for the rest of the turn, once the
+    // connection it names is removed or switched off. See `providerRevocations`.
+    revocations: (backendId) => providerRevocationsOf(backendId),
 
     async request({ backendId, modelName, tools, characters }) {
       const app = useApp.getState();
@@ -1454,8 +1540,13 @@ installMcpToolPruner(async (serverName) => {
   const prefix = `mcp:${serverName}.`;
   for (const chat of useChats.getState().chats) {
     if (!chat.tools.some((id) => id.startsWith(prefix))) continue;
-    await useChats.getState().updateChat(chat.id, {
-      tools: chat.tools.filter((id) => !id.startsWith(prefix)),
-    });
+    // A function of the chat as it stands when written, for the reason the
+    // grant writes are: a list read before another write landed would put back
+    // whatever that write changed.
+    await useChats.getState().updateChat(chat.id, (current) =>
+      current.tools.some((id) => id.startsWith(prefix))
+        ? { tools: current.tools.filter((id) => !id.startsWith(prefix)) }
+        : null,
+    );
   }
 });

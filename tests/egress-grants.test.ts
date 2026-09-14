@@ -317,3 +317,344 @@ describe('an MCP grant', () => {
     expect(grantsOf('c1')).toEqual([{ connectionId: 'shared', grantedAt: expect.any(Number) }]);
   });
 });
+
+/* ── Writes that overlap ─────────────────────────────────────────────── */
+
+type Chat = import('@/domain/chat').Chat;
+type ApprovalPrompt = import('@/state/app').ApprovalPrompt;
+
+const OPENAI = {
+  id: 'conn_openai',
+  providerId: 'openai',
+  label: 'OpenAI',
+  apiKey: '',
+  baseUrl: '',
+  defaultModel: 'gpt-4o-mini',
+  enabled: true,
+  models: [],
+  createdAt: 0,
+};
+
+/**
+ * The chats table, held open.
+ *
+ * Every put is recorded in the order it was MADE, which is the order IndexedDB
+ * applies overlapping readwrite transactions in, so `stored` is what the table
+ * holds once they have all committed. Each put then waits until it is released,
+ * which is how a test starts one write while another is still in flight.
+ */
+function holdingChatWrites() {
+  const stored = new Map<string, Chat>();
+  const waiting: (() => void)[] = [];
+  let holding = true;
+  const releaseAll = (): void => {
+    holding = false;
+    for (const resolve of waiting.splice(0)) resolve();
+  };
+  chatsTable.put.mockImplementation((async (chat: Chat) => {
+    stored.set(chat.id, structuredClone(chat));
+    if (holding) await new Promise<void>((resolve) => waiting.push(resolve));
+  }) as never);
+  return {
+    stored,
+    /** Puts started and not yet released. */
+    pending: () => waiting.length,
+    /** Let the oldest put still waiting finish. */
+    releaseFirst: () => waiting.shift()?.(),
+    /** Let every put finish, and every later one go straight through. */
+    releaseAll,
+    restore: () => {
+      releaseAll();
+      chatsTable.put.mockImplementation(async () => {});
+    },
+  };
+}
+
+/** The connections a chat's provider grants name, as the table holds the chat. */
+const storedConnections = (stored: Map<string, Chat>, id: string): string[] =>
+  (stored.get(id)?.egressGrants ?? []).flatMap((grant) => (grant.kind === 'mcp' ? [] : [grant.connectionId]));
+
+const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('a provider grant, written while something else writes the same chat', () => {
+  beforeEach(() => {
+    seed();
+    useApp.setState({ connections: [{ ...OPENAI }] });
+    chatsTable.put.mockClear();
+  });
+
+  it('does not survive a revocation that ran while it was being written', async () => {
+    // A conversation answer is written with `void` (`egressPolicy`), and a
+    // revocation reads the chats before it writes. One that starts while the
+    // grant's write is in flight finds nothing in c1 to drop, and the grant
+    // lands after it. c2 already holds one, so the revocation is itself still
+    // being written when c1's write lands.
+    await useChats.getState().grantEgress('c2', 'conn_openai');
+    const db = holdingChatWrites();
+    try {
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      const revoking = useChats.getState().revokeEgress('conn_openai');
+      await vi.waitFor(() => expect(db.pending()).toBe(2));
+      // c1's grant lands while the revocation's write to c2 is still held, so
+      // whatever the grant checks after its write, it checks before the
+      // revocation has awaited anything of its own.
+      db.releaseFirst();
+      await macrotask();
+      db.releaseAll();
+      await Promise.all([granting, revoking]);
+
+      expect(connectionsOf('c1')).toEqual([]);
+      expect(connectionsOf('c2')).toEqual([]);
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+      expect(storedConnections(db.stored, 'c2'), 'the table').toEqual([]);
+
+      // The control: a grant asked for after the revocation is kept.
+      await useChats.getState().grantEgress('c1', 'conn_openai');
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
+      expect(storedConnections(db.stored, 'c1')).toEqual(['conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
+
+  it('survives a revocation of another connection that ran while it was being written', async () => {
+    // The check above is per connection. One that counted every connection's
+    // revocations together would quietly undo this answer too.
+    const db = holdingChatWrites();
+    try {
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await useChats.getState().revokeEgress('conn_ollama');
+      db.releaseAll();
+      await granting;
+
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
+      expect(storedConnections(db.stored, 'c1')).toEqual(['conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
+
+  it('is not written back by a rename that ran while its revocation was being written', async () => {
+    // Worse than a lost write. The rename reads c1 while the store still holds
+    // the grant, and its put — every field of the chat it read, not only the
+    // title — lands after the revocation's, in the table and in the store.
+    await useChats.getState().grantEgress('c1', 'conn_openai');
+    const db = holdingChatWrites();
+    try {
+      const switchingOff = useApp.getState().toggleConnection('conn_openai', false);
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      const renaming = useChats.getState().renameChat('c1', 'Renamed');
+      await macrotask();
+      db.releaseFirst();
+      await switchingOff;
+      db.releaseAll();
+      await renaming;
+
+      const chat = useChats.getState().chats.find((entry) => entry.id === 'c1');
+      expect(connectionsOf('c1')).toEqual([]);
+      expect(chat?.title, 'and the rename is not lost either').toBe('Renamed');
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual([]);
+      expect(db.stored.get('c1')?.title).toBe('Renamed');
+    } finally {
+      db.restore();
+    }
+  });
+
+  it('does not bring back another connection’s grant whose revocation was being written', async () => {
+    // The same resurrection from the grant's side: a grant that appends to the
+    // list it read, rather than to the list as it stands when it is written,
+    // carries a revoked grant back in with it.
+    await useChats.getState().grantEgress('c1', 'conn_ollama');
+    const db = holdingChatWrites();
+    try {
+      const revoking = useChats.getState().revokeEgress('conn_ollama');
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      await macrotask();
+      db.releaseFirst();
+      await revoking;
+      db.releaseAll();
+      await granting;
+
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual(['conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
+
+  it('does not take away another connection’s grant that was written while it waited its turn', async () => {
+    // The other way round. A revocation that wrote the list it read when it
+    // started would not have the grant queued ahead of it, and would drop an
+    // answer the person gave — a lost write rather than a leak, but the same
+    // defect. So a revocation filters the list as it stands when it is written.
+    await useChats.getState().grantEgress('c1', 'conn_ollama');
+    const db = holdingChatWrites();
+    try {
+      const renaming = useChats.getState().renameChat('c1', 'Renamed');
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      const granting = useChats.getState().grantEgress('c1', 'conn_openai');
+      const revoking = useChats.getState().revokeEgress('conn_ollama');
+      await macrotask();
+      db.releaseAll();
+      await Promise.all([renaming, granting, revoking]);
+
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
+      expect(storedConnections(db.stored, 'c1'), 'the table').toEqual(['conn_openai']);
+    } finally {
+      db.restore();
+    }
+  });
+});
+
+describe('an MCP grant, written while something else writes the same chat', () => {
+  const NOTES = { serverId: 'mcp_notes', url: 'https://notes.example/mcp' };
+  const mcpGrantsIn = (grants: readonly EgressGrant[] | undefined): string[] =>
+    (grants ?? []).flatMap((grant) => (grant.kind === 'mcp' ? [grant.serverId] : []));
+
+  beforeEach(() => {
+    seed();
+    useMcp.setState({
+      servers: [{ id: 'mcp_notes', name: 'notes', url: NOTES.url, enabled: true, createdAt: 1 }],
+      states: {},
+    });
+    chatsTable.put.mockClear();
+  });
+
+  it('is not written back by a rename that ran while its revocation was being written', async () => {
+    await useChats.getState().grantMcpEgress('c1', NOTES);
+    const db = holdingChatWrites();
+    try {
+      // What Settings does when the server is switched off.
+      const switchingOff = useMcp.getState().toggle('mcp_notes', false);
+      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      const renaming = useChats.getState().renameChat('c1', 'Renamed');
+      await macrotask();
+      db.releaseFirst();
+      await switchingOff;
+      db.releaseAll();
+      await renaming;
+
+      const chat = useChats.getState().chats.find((entry) => entry.id === 'c1');
+      expect(mcpGrantsIn(chat?.egressGrants)).toEqual([]);
+      expect(chat?.title).toBe('Renamed');
+      expect(mcpGrantsIn(db.stored.get('c1')?.egressGrants), 'the table').toEqual([]);
+      expect(db.stored.get('c1')?.title).toBe('Renamed');
+    } finally {
+      db.restore();
+    }
+  });
+});
+
+describe('two writes to one chat', () => {
+  beforeEach(() => {
+    seed();
+    chatsTable.put.mockClear();
+  });
+
+  it('both land, when the second starts before the first is written', async () => {
+    const db = holdingChatWrites();
+    try {
+      const titling = useChats.getState().updateChat('c1', { title: 'Titled' });
+      const pinning = useChats.getState().updateChat('c1', { pinned: true });
+      await vi.waitFor(() => expect(db.pending()).toBeGreaterThan(0));
+      db.releaseAll();
+      await Promise.all([titling, pinning]);
+
+      expect(useChats.getState().chats.find((entry) => entry.id === 'c1')).toMatchObject({
+        title: 'Titled',
+        pinned: true,
+      });
+      expect(db.stored.get('c1'), 'the table').toMatchObject({ title: 'Titled', pinned: true });
+    } finally {
+      db.restore();
+    }
+  });
+});
+
+/* ── The answer a running turn holds ─────────────────────────────────── */
+
+const { ChatterangEngine } = await import('@/ai/engine');
+const { toolRegistry } = await import('@/ai/tools/registry');
+const { CALL, SECRET, leakyTool, probeResolver, recordingBackend, sent } = await import('./support/egress-probe');
+
+describe('an answer the running turn holds about a connection', () => {
+  /*
+   * `decided` in the engine's `stream` keeps an answer for the rest of the turn.
+   * Switching a connection off drops its grants, and switching it back on
+   * registers the same id again — so without something that says the grants
+   * were withdrawn, the answer the turn is holding sends the next request's
+   * tool output to that connection unasked.
+   *
+   * Driven through the real store, the real `toggleConnection` and the real
+   * engine; recorded at the adapter. Switching the connection back on is
+   * stood in for by registering the same adapter under the same id, which is
+   * what `connectProvider` does, without loading a provider SDK.
+   */
+  beforeEach(() => {
+    seed();
+    chatsTable.put.mockClear();
+  });
+
+  it.each(['turn', 'conversation'] as const)(
+    'ends when the connection is switched off, though it is back before the next request (“%s”)',
+    async (first) => {
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      const cloud = recordingBackend([CALL, CALL, CALL, 'Done.']);
+      engine.router.register('conn_openai', cloud.adapter);
+
+      let runs = 0;
+      toolRegistry.register({
+        ...leakyTool,
+        execute: async () => {
+          runs += 1;
+          if (runs === 2) {
+            await useApp.getState().toggleConnection('conn_openai', false);
+            engine.router.register('conn_openai', cloud.adapter);
+          }
+          return leakyTool.execute();
+        },
+      });
+
+      const asked: string[] = [];
+      const answers: ('turn' | 'conversation' | 'no')[] = [first, 'no'];
+      const original = useApp.getState().requestApproval;
+      useApp.setState({
+        engine: engine as never,
+        connections: [{ ...OPENAI }],
+        requestApproval: async (action: string, prompt?: ApprovalPrompt) => {
+          asked.push(action);
+          const answer = answers.shift() ?? 'no';
+          if (answer === 'conversation') prompt?.onExtended?.();
+          return answer !== 'no';
+        },
+      });
+      useChats.setState({
+        loaded: true,
+        generating: false,
+        controller: null,
+        messages: [],
+        activeChatId: 'c1',
+        chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
+      });
+
+      try {
+        await useChats.getState().send('what is in my chats?');
+      } finally {
+        toolRegistry.unregister('leaky');
+        useApp.setState({ engine: null, connections: [], requestApproval: original });
+      }
+
+      const requests = sent(cloud.seen);
+      expect(requests.length).toBeGreaterThanOrEqual(3);
+      // The answer was honoured while it stood — otherwise this passes for a
+      // gate that never let anything through.
+      expect(requests[1]).toContain(SECRET);
+      // And asked again once the connection had been switched off.
+      expect(asked).toHaveLength(2);
+      for (const later of requests.slice(2)) expect(later).not.toContain(SECRET);
+      expect(connectionsOf('c1')).toEqual([]);
+    },
+  );
+});

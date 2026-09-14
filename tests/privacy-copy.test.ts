@@ -824,6 +824,21 @@ describe('the privacy command', () => {
     toolRegistry.unregister('leaky');
   });
 
+  it('says every grant is dropped when the provider it named is removed or switched off', async () => {
+    // Nothing pinned this sentence. It is measured in
+    // `tests/egress-grants.test.ts`, through the real `useApp` and chat store:
+    // removing or switching off a connection drops exactly the grants that
+    // named it; a grant whose write was still in flight when the revocation
+    // ran does not land after it; a rename, or a grant for another connection,
+    // written while the revocation was does not write the dropped grant back;
+    // and an answer the running turn holds ends with it, through the real
+    // engine, although the connection is back under the same id before the
+    // next request. The engine half is also in `tests/privacy.test.ts`.
+    expect(await privacyOutput({})).toContain(
+      'Every grant is dropped when the provider it named is removed or switched off — `provider disable <id>`.',
+    );
+  });
+
   it('says a declined grant withholds, and it does', async () => {
     expect(await privacyOutput({})).toContain('withholds it if you decline');
 

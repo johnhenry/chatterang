@@ -397,6 +397,90 @@ describe('tool output does not leave the device without a grant', () => {
     toolRegistry.unregister('leaky');
   });
 
+  /**
+   * Three tool-calling requests in one turn; the second tool run withdraws the
+   * grants of `withdraws`, as switching a connection off does.
+   *
+   * `granted` makes the first yes come from a grant the conversation holds
+   * (and loses once withdrawn) instead of from the sheet.
+   */
+  async function withdrawnMidTurn(options: {
+    withdraws: string;
+    answers?: ('turn' | 'conversation' | 'deny')[];
+    granted?: boolean;
+  }) {
+    let runs = 0;
+    let withdrawals = 0;
+    toolRegistry.register({
+      ...leakyTool,
+      execute: async () => {
+        runs += 1;
+        if (runs === 2) withdrawals += 1;
+        return leakyTool.execute();
+      },
+    });
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const cloud = recordingBackend([CALL, CALL, CALL, 'Done.']);
+    engine.router.register('cloud', cloud.adapter);
+    const answers = [...(options.answers ?? [])];
+    const request = vi.fn(async (_: ToolEgressRequest) => answers.shift() ?? 'deny');
+    const policy: ToolEgressPolicy = {
+      isGranted: () => options.granted === true && withdrawals === 0,
+      request: options.granted ? undefined : request,
+      revocations: (id) => (id === options.withdraws ? withdrawals : 0),
+    };
+    try {
+      await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'go' }],
+          target: cloudTarget,
+          toolIds: ['leaky'],
+          egress: policy,
+        }),
+      );
+    } finally {
+      toolRegistry.unregister('leaky');
+    }
+    return { request, requests: sent(cloud.seen) };
+  }
+
+  it.each(['turn', 'conversation'] as const)(
+    'does not keep a “%s” yes for the rest of the turn once that destination’s grants are withdrawn',
+    async (first) => {
+      // Switching a connection off and on again registers the same id, so the
+      // target alone cannot tell the loop the answer it holds is stale.
+      const { request, requests } = await withdrawnMidTurn({ withdraws: 'cloud', answers: [first, 'deny'] });
+
+      expect(requests[1]).toContain(SECRET);
+      expect(request).toHaveBeenCalledTimes(2);
+      for (const later of requests.slice(2)) expect(later).not.toContain(SECRET);
+    },
+  );
+
+  it('does not keep a yes that came from a held grant once it is withdrawn', async () => {
+    const { requests } = await withdrawnMidTurn({ withdraws: 'cloud', granted: true });
+
+    expect(requests[1]).toContain(SECRET);
+    for (const later of requests.slice(2)) expect(later).not.toContain(SECRET);
+  });
+
+  it('keeps a yes when another destination’s grants are withdrawn', async () => {
+    // The control. A count shared by every destination would ask again here.
+    const { request, requests } = await withdrawnMidTurn({ withdraws: 'elsewhere', answers: ['turn'] });
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(requests[2]).toContain(SECRET);
+  });
+
+  it('keeps a no when that destination’s grants are withdrawn, without asking again', async () => {
+    // Withdrawing can only take permission away. Re-asking over a no would be a
+    // second sheet about something the person already refused.
+    const { request, requests } = await withdrawnMidTurn({ withdraws: 'cloud', answers: ['deny', 'turn'] });
+
+    expect(request).toHaveBeenCalledTimes(1);
+    for (const payload of requests) expect(payload).not.toContain(SECRET);
+  });
+
   it('withholds on a fallback without asking — the user is already waiting', async () => {
     // The case no dialog covers well, and the one that does not require the
     // user to have chosen a remote model at all: they picked a local one, the
