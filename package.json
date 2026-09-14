@@ -51,6 +51,7 @@
     "@johnhenry/aimatey-types": "0.5.0",
     "@johnhenry/aimatey-utils": "0.4.0",
     "@johnhenry/mcp-query": "^0.0.0",
+    "@johnhenry/oat-qr-fountain": "0.1.0",
     "@modelcontextprotocol/client": "^2.0.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",

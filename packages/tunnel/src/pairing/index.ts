@@ -218,11 +218,28 @@ export const TOKEN_BYTES = 32;
  * wants a 4-module quiet zone each side, so an 80-column terminal fits version
  * 13 (69 + 8 = 77 columns) and no more.
  *
- * DERIVED, NOT MEASURED, and the difference matters. 300 characters is chosen
- * against the byte-mode capacity of a version-13 code at level M with margin,
- * from the module arithmetic above. Nothing here has rendered a QR or scanned
- * one. A real scan test belongs to #127, which draws it; this cap is what
- * stops the payload growing past the point where that test could succeed.
+ * DERIVED, THEN MEASURED AGAINST THE FRAME #127 DRAWS — and the measurement
+ * moved the edge. 300 characters was chosen against the byte-mode capacity of a
+ * version-13 code at level M with margin, from the module arithmetic above,
+ * for a QR holding the URI alone. #127's ruling draws the URI as an OAT frame
+ * instead (`src/lib/pairing-frames.ts`), which adds a 34-byte header, and
+ * `tests/pairing-frames.test.ts` draws payloads built with this encoder, reads
+ * the pixels back through the phone's decoder, and pins the version of each:
+ *
+ *     payload                                     URI   frame   QR at M
+ *     desktop, one IPv4, short name               130    164    v9
+ *     desktop, three addresses, 64-byte name      258    292    v13
+ *     server, four addresses incl. DNS, 64 bytes  291    325    v13
+ *     server, five addresses, 57-byte name        296    330    v13
+ *     server, five addresses, 60-byte name        300    334    v14
+ *
+ * So the derivation holds up to 296 characters and NOT for the three longer
+ * URIs this cap admits: 298, 299 and 300 characters draw at version 14, which
+ * with the quiet zone above is 73 + 8 = 81 columns and does not fit 80. The cap
+ * is deliberately left at 300. The largest realistic payload measured is 291
+ * characters; whether to lower the cap to 296 belongs with the terminal
+ * renderer (#124), not to a change that only measured it. Nothing has been
+ * scanned by a camera yet — that is still #127's screen.
  */
 export const MAX_PAIRING_URI_LENGTH = 300;
 

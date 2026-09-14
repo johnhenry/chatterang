@@ -13,17 +13,52 @@
  * frame grabber, the decoder, the clock and the scheduler), because jsdom has
  * no 2D canvas and no camera, and a loop that can only be tested on a phone is
  * a loop whose stop paths are never tested.
+ *
+ * ## A pairing code is OAT frames, collected (#127)
+ *
+ * The desktop draws the pairing URI as `@johnhenry/oat-qr-fountain` frames
+ * (`src/lib/pairing-frames.ts`). `decodeFrame` turns a frame into a packet;
+ * this loop feeds packets to OAT's `FountainDecoder` until the URI can be
+ * reconstructed, then parses the text with `decodePairingUri` exactly as it
+ * parsed a scanned string before. A pairing code's frames each carry the whole
+ * URI, so in practice the first packet read completes it — but the loop does
+ * not assume that, and a code drawn with smaller blocks still completes.
+ *
+ * Four things this adds, each decided rather than inherited:
+ *
+ *   - THE SESSION IS HELD HERE AND DIES WITH THE SCAN. The decoder, and every
+ *     block it has copied, is released on completion — before the result is
+ *     handed up — and in `teardown`, which every other ending (cancel, the
+ *     pane unmounting or going to the background, the track ending, a decoder
+ *     that will not load, a malformed code, the idle timeout) goes through.
+ *   - A PACKET FROM ANOTHER CODE REPLACES THE ONE BEING COLLECTED. A different
+ *     artifact id, block count, block size or length is a different code, and
+ *     OAT's decoder throws on the last three. Ignoring the newcomer would tie
+ *     the phone to a code the desktop may have withdrawn and redrawn with a new
+ *     token until the idle timeout; replacing costs nothing when every frame is
+ *     complete, because the newcomer's first frame finishes it. The cost is
+ *     that two multi-frame codes interleaved would never finish — the pairing
+ *     codec never draws one.
+ *   - A PACKET THAT DOES NOT DESCRIBE A PAIRING-SIZED PAYLOAD NEVER REACHES THE
+ *     DECODER. OAT 0.1.0's `decodePacket` accepts any `uint32` block count and
+ *     its decoder's constructor does work in proportion to it, synchronously:
+ *     one hostile frame is a hang. See {@link classifyPacket}.
+ *   - NOTHING THAT GOES WRONG INSIDE A SESSION ENDS THE SCAN. A decoder that
+ *     throws on a packet, or a reconstruction that fails, drops the session and
+ *     the loop keeps reading. Only a decoder that cannot load ends it.
  */
 
 import {
   DEFAULT_WINDOW_MS,
+  MAX_PAIRING_URI_LENGTH,
   PairingParseError,
   decodePairingUri,
   type PairingError,
   type PairingPayload,
 } from '@chatterang/tunnel/pairing';
 
-import type { QrFrame } from '@/lib/qr-decode';
+import type { FountainDecoder, OatPacket } from '@/lib/oat-fountain';
+import type { FrameRead, QrFrame } from '@/lib/qr-decode';
 
 /**
  * Longest edge of a frame handed to the decoder, in pixels.
@@ -153,6 +188,107 @@ export function createFrameGrabber(
   };
 }
 
+/* ── Collecting a code's packets ────────────────────────────────────── */
+
+/**
+ * What a packet's header describes, before anything is built for it.
+ *
+ *   - `pairing`: a self-consistent payload no longer than a pairing URI may be.
+ *   - `too-large`: a well-formed OAT transfer of something bigger — a real
+ *     artifact, just not a pairing code. The person is told so.
+ *   - `malformed`: a header that contradicts itself — zero lengths, a block
+ *     count that does not follow from the length and block size, a payload of
+ *     the wrong size. Ignored without a word, like a frame with no code.
+ *
+ * CHECKED BEFORE A DECODER EXISTS, and that order is the point. The block
+ * count, block size and length are attacker-written `uint32`s, and OAT 0.1.0's
+ * `FountainDecoder` constructor allocates and computes in proportion to the
+ * block count. Bounding the length and the block size by
+ * `MAX_PAIRING_URI_LENGTH`, and requiring the block count to follow from them,
+ * bounds the block count too.
+ */
+export type PacketVerdict = 'pairing' | 'too-large' | 'malformed';
+
+export function classifyPacket(packet: OatPacket): PacketVerdict {
+  const { sourceBlockCount, blockSize, totalLength, payload, artifactId } = packet;
+  if (artifactId.length !== 16 || payload.length !== blockSize) return 'malformed';
+  if (sourceBlockCount === 0 || blockSize === 0 || totalLength === 0) return 'malformed';
+  if (sourceBlockCount !== Math.ceil(totalLength / blockSize)) return 'malformed';
+  if (totalLength > MAX_PAIRING_URI_LENGTH || blockSize > MAX_PAIRING_URI_LENGTH) return 'too-large';
+  return 'pairing';
+}
+
+/** One code's packets being collected. Owned by the loop; released with it. */
+export interface FrameSession {
+  /** True once the payload can be reconstructed. Ignores a repeated packet. */
+  addPacket(packet: OatPacket): boolean;
+  /** The payload's bytes. Throws before the session is complete. */
+  reconstruct(): Uint8Array;
+  /** Drop the decoder and every block it holds. Idempotent. */
+  release(): void;
+}
+
+/**
+ * OAT's decoder for the code `packet` belongs to, behind a `release`.
+ *
+ * The wrapper exists for the release: a `FountainDecoder` keeps a copy of every
+ * block it has solved and every packet still pending, and has no way to be
+ * emptied. Dropping the only reference is how its buffers are let go, and this
+ * is the only reference.
+ */
+export async function openFountainSession(packet: OatPacket): Promise<FrameSession> {
+  const { FountainDecoder: Decoder } = await import('@/lib/oat-fountain');
+  let decoder: FountainDecoder | null = new Decoder(packet.sourceBlockCount, packet.blockSize, packet.totalLength);
+  const live = (): FountainDecoder => {
+    if (decoder === null) throw new Error('this scan session was released');
+    return decoder;
+  };
+  return {
+    addPacket: (next) => live().addPacket(next),
+    reconstruct: () => live().reconstruct(),
+    release: () => {
+      decoder = null;
+    },
+  };
+}
+
+/**
+ * The reconstructed bytes as a pairing URI, or null if they cannot be one.
+ *
+ * Printable ASCII only, the same rule `pairingUriToBytes` frames with. Anything
+ * else is some other OAT transfer, and is a "not a pairing code" rather than a
+ * malformed one.
+ */
+export function pairingUriFromBytes(bytes: Uint8Array): string | null {
+  let text = '';
+  for (const byte of bytes) {
+    if (byte < 0x21 || byte > 0x7e) return null;
+    text += String.fromCharCode(byte);
+  }
+  return text.length === 0 ? null : text;
+}
+
+/** Is `packet` another packet of the code `held` is collecting? */
+function sameCode(held: HeldSession, packet: OatPacket): boolean {
+  if (
+    held.sourceBlockCount !== packet.sourceBlockCount ||
+    held.blockSize !== packet.blockSize ||
+    held.totalLength !== packet.totalLength ||
+    held.artifactId.length !== packet.artifactId.length
+  ) {
+    return false;
+  }
+  return held.artifactId.every((byte, i) => byte === packet.artifactId[i]);
+}
+
+interface HeldSession {
+  readonly artifactId: Uint8Array;
+  readonly sourceBlockCount: number;
+  readonly blockSize: number;
+  readonly totalLength: number;
+  readonly frames: FrameSession;
+}
+
 /* ── The loop ───────────────────────────────────────────────────────── */
 
 interface TrackLike {
@@ -167,7 +303,7 @@ export type ScanStopReason =
   | 'cancelled'
   /** The OS ended or muted the track — another app, a call, a revoked grant. */
   | 'track-ended'
-  /** The decoder itself failed, e.g. the jsQR chunk would not load. */
+  /** The decoder itself failed, e.g. the jsQR or OAT chunk would not load. */
   | 'decode-failed'
   /** A pairing code, but a malformed one. Named by `error`. */
   | 'invalid-code'
@@ -188,7 +324,9 @@ export interface ScanOptions {
     srcObject: unknown;
   };
   readonly grabber: FrameGrabber;
-  readonly decode: (frame: QrFrame) => Promise<string | null>;
+  readonly decode: (frame: QrFrame) => Promise<FrameRead | null>;
+  /** Where a code's packets are collected. OAT's decoder unless a test says otherwise. */
+  readonly openSession?: (packet: OatPacket) => Promise<FrameSession>;
   readonly onResult: (payload: PairingPayload) => void;
   readonly onEnd: (end: ScanEnd) => void;
   /** A QR code that is not a pairing code — a hint, and scanning continues. */
@@ -215,11 +353,20 @@ export function startQrScan(options: ScanOptions): ScanHandle {
   const now = options.now ?? (() => performance.now());
   const isHidden = options.isHidden ?? (() => typeof document !== 'undefined' && document.hidden);
   const idleMs = options.idleMs ?? DEFAULT_WINDOW_MS;
+  const openSession = options.openSession ?? openFountainSession;
 
   const startedAt = now();
   const tracks = options.stream.getTracks();
   let stopped = false;
   let cancelTimer: (() => void) | null = null;
+  /** The code being collected. Never outlives the scan: see the module header. */
+  let session: HeldSession | null = null;
+
+  const dropSession = (): void => {
+    const held = session;
+    session = null;
+    held?.frames.release();
+  };
 
   /** Everything that turns the camera off. Runs exactly once. */
   const teardown = (): boolean => {
@@ -234,6 +381,7 @@ export function startQrScan(options: ScanOptions): ScanHandle {
     }
     options.video.srcObject = null;
     options.grabber.release();
+    dropSession();
     return true;
   };
 
@@ -248,6 +396,101 @@ export function startQrScan(options: ScanOptions): ScanHandle {
   const next = (ms: number): void => {
     if (stopped) return;
     cancelTimer = schedule(tick, ms);
+  };
+
+  const hint = (delay: number): void => {
+    options.onHint?.('not-a-pairing-code');
+    next(delay);
+  };
+
+  /** Parse reconstructed text as a pairing code, and hand it up or say why not. */
+  const deliver = (text: string, delay: number): void => {
+    let payload: PairingPayload;
+    try {
+      payload = decodePairingUri(text);
+    } catch (error) {
+      if (error instanceof PairingParseError && error.reason === 'not-a-pairing-uri') {
+        hint(delay);
+        return;
+      }
+      finish({
+        reason: 'invalid-code',
+        ...(error instanceof PairingParseError ? { error: error.reason } : {}),
+      });
+      return;
+    }
+    // The camera goes off BEFORE the payload is handed up.
+    if (!teardown()) return;
+    options.onResult(payload);
+    options.onEnd({ reason: 'result' });
+  };
+
+  /** Feed one packet to its code's session, and deliver if that completed it. */
+  const collect = async (packet: OatPacket, delay: number): Promise<void> => {
+    if (session !== null && !sameCode(session, packet)) dropSession();
+
+    let held = session;
+    if (held === null) {
+      let frames: FrameSession;
+      try {
+        frames = await openSession(packet);
+      } catch {
+        finish({ reason: 'decode-failed' });
+        return;
+      }
+      // Stopped while the decoder loaded: nothing may hold what it would keep.
+      if (stopped) {
+        frames.release();
+        return;
+      }
+      held = {
+        artifactId: packet.artifactId,
+        sourceBlockCount: packet.sourceBlockCount,
+        blockSize: packet.blockSize,
+        totalLength: packet.totalLength,
+        frames,
+      };
+      session = held;
+    }
+
+    let bytes: Uint8Array | null = null;
+    try {
+      if (held.frames.addPacket(packet)) bytes = held.frames.reconstruct();
+    } catch {
+      // A session that throws is not one to keep feeding. Drop it and read on.
+      dropSession();
+      next(delay);
+      return;
+    }
+    if (bytes === null) {
+      next(delay);
+      return;
+    }
+
+    // Released BEFORE the text is parsed or anything is handed up.
+    dropSession();
+    const text = pairingUriFromBytes(bytes);
+    bytes.fill(0);
+    if (text === null) {
+      hint(delay);
+      return;
+    }
+    deliver(text, delay);
+  };
+
+  const onRead = (read: FrameRead | null, began: number): Promise<void> | void => {
+    // A read that lands after stop is dropped. Load-bearing for the HINT path
+    // in particular: a late pairing result is also stopped by the latch in
+    // `deliver`, but a late non-pairing code would otherwise call onHint on a
+    // scan the person already ended.
+    if (stopped) return undefined;
+    const delay = Math.max(MIN_SCAN_GAP_MS, now() - began);
+    if (read === null) return next(delay);
+    if (read.kind === 'other') return hint(delay);
+    const verdict = classifyPacket(read.packet);
+    if (verdict === 'malformed') return next(delay);
+    if (verdict === 'too-large') return hint(delay);
+    return collect(read.packet, delay);
   };
 
   function tick(): void {
@@ -272,39 +515,10 @@ export function startQrScan(options: ScanOptions): ScanHandle {
     }
 
     const began = now();
-    // Never overlapping: the next tick is scheduled only once this settles.
+    // Never overlapping: the next tick is scheduled only once this settles,
+    // including a session that is still loading its decoder.
     options.decode(frame).then(
-      (text) => {
-        // A result that lands after stop is dropped. Load-bearing for the HINT
-        // path in particular: a late pairing result is also stopped by the
-        // latch below, but a late non-pairing code would otherwise call onHint
-        // on a scan the person already ended.
-        if (stopped) return;
-        const delay = Math.max(MIN_SCAN_GAP_MS, now() - began);
-        if (text === null) {
-          next(delay);
-          return;
-        }
-        let payload: PairingPayload;
-        try {
-          payload = decodePairingUri(text);
-        } catch (error) {
-          if (error instanceof PairingParseError && error.reason === 'not-a-pairing-uri') {
-            options.onHint?.('not-a-pairing-code');
-            next(delay);
-            return;
-          }
-          finish({
-            reason: 'invalid-code',
-            ...(error instanceof PairingParseError ? { error: error.reason } : {}),
-          });
-          return;
-        }
-        // The camera goes off BEFORE the payload is handed up.
-        if (!teardown()) return;
-        options.onResult(payload);
-        options.onEnd({ reason: 'result' });
-      },
+      (read) => onRead(read, began),
       () => {
         finish({ reason: 'decode-failed' });
       },
