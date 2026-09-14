@@ -1,4 +1,4 @@
-import { fork } from 'node:child_process';
+import { execFileSync, fork } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -38,13 +38,41 @@ import type { EngineSpec, HostHandle, SupervisorPolicy } from '@chatterang/deskt
 const HOST_SCRIPT = resolve(process.cwd(), 'tests/fixtures/inference-host-double.mjs');
 if (!existsSync(HOST_SCRIPT)) throw new Error(`missing inference host double: ${HOST_SCRIPT}`);
 
+/**
+ * THE PING WINDOW, AND WHY IT IS NOT SHORT.
+ *
+ * The supervisor's ping clock starts at SPAWN, not at boot: `#attach` stamps
+ * the last ping as "now", the first ping goes out `pingIntervalMs` later, and
+ * the host is condemned if it has not answered `pingTimeoutMs` after that. So
+ * every real fork below has `pingIntervalMs + pingTimeoutMs` to be scheduled,
+ * start Node, run the double and read its IPC channel — before and during
+ * whatever the test itself is waiting for.
+ *
+ * That window used to be 60 + 120 = 180 ms. A fork boots in ~25 ms on an idle
+ * machine, and on one running several suites at once it did not: the first
+ * `getCapabilities` in the `dispose()` test rejected with "no answer to a
+ * liveness ping in 123ms" — before `dispose()` was ever called, and not
+ * because anything was wedged. The supervisor was right to condemn a host
+ * that did not answer inside its policy; the policy was too tight for a real
+ * process on a shared machine. The slow-start test below holds the double's
+ * event loop for `SLOW_START_MS` and fails with exactly that error under the
+ * old window.
+ *
+ * The cost is paid only where the ping is the thing under test: detecting the
+ * wedged host takes about two seconds instead of about two hundred ms.
+ */
+const PING_INTERVAL_MS = 60;
+const PING_TIMEOUT_MS = 2_000;
+/** How long the slow-start double stays deaf: well past the old 180 ms window, well inside this one. */
+const SLOW_START_MS = 500;
+
 /** Short enough for a test, structured exactly like the shipped defaults. */
 const FAST: Partial<SupervisorPolicy> = {
   tickMs: 10,
   callTimeoutMs: 4_000,
   generateIdleTimeoutMs: 4_000,
-  pingIntervalMs: 60,
-  pingTimeoutMs: 120,
+  pingIntervalMs: PING_INTERVAL_MS,
+  pingTimeoutMs: PING_TIMEOUT_MS,
   restartDelayMs: 30,
 };
 
@@ -86,7 +114,12 @@ function sidecar(supervisor: Supervisor): Facade {
 interface Spawned {
   readonly supervisor: Supervisor;
   readonly children: ChildProcess[];
+  /** Posts the OS refused because the child was already gone, by error code. */
+  readonly refusedPosts: string[];
 }
+
+/** What a write to a child that has already died fails with. Nothing else is expected. */
+const FAR_SIDE_GONE = new Set(['EPIPE', 'ECONNRESET', 'ERR_IPC_CHANNEL_CLOSED']);
 
 const running: Supervisor[] = [];
 const forked: ChildProcess[] = [];
@@ -98,17 +131,37 @@ afterEach(() => {
   }
 });
 
-function spawnSupervised(policy: Partial<SupervisorPolicy> = FAST): Spawned {
+function spawnSupervised(
+  policy: Partial<SupervisorPolicy> = FAST,
+  host: { readonly startupBlockMs?: number } = {},
+): Spawned {
   const children: ChildProcess[] = [];
+  const refusedPosts: string[] = [];
   const supervisor = new Supervisor({
     spawn: (): HostHandle => {
-      const child = fork(HOST_SCRIPT, [], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+      const child = fork(HOST_SCRIPT, [], {
+        stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+        env: { ...process.env, INFERENCE_HOST_DOUBLE_STARTUP_BLOCK_MS: String(host.startupBlockMs ?? 0) },
+      });
       children.push(child);
       forked.push(child);
       return {
         link: {
           postMessage: (message) => {
-            if (child.connected) child.send(message as object);
+            if (!child.connected) return;
+            // A child killed a moment ago still reads as `connected` until Node
+            // has read its exit, so this write can fail with EPIPE. Without a
+            // callback Node emits that as `error` on the ChildProcess, which
+            // nothing listens for: it escaped as an uncaught exception and
+            // failed a run under load with every test green. The loss itself is
+            // reported by `exit`, which is all `MessageLink` promises; a failure
+            // that is not a dead child is thrown.
+            child.send(message as object, (error: Error | null) => {
+              if (error === null) return;
+              const code = (error as NodeJS.ErrnoException).code ?? '';
+              if (!FAR_SIDE_GONE.has(code)) throw error;
+              refusedPosts.push(code);
+            });
           },
           onMessage: (listener) => {
             child.on('message', (message: unknown) => listener(message));
@@ -131,7 +184,7 @@ function spawnSupervised(policy: Partial<SupervisorPolicy> = FAST): Spawned {
     policy,
   });
   running.push(supervisor);
-  return { supervisor, children };
+  return { supervisor, children, refusedPosts };
 }
 
 /** True while the OS still has this pid. Signal 0 checks without delivering. */
@@ -142,6 +195,43 @@ function alive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Hold THIS thread until the OS has torn `pid` down — a zombie, every
+ * descriptor closed — without letting the event loop turn, so Node has not yet
+ * read the exit or the socket closing. Polls `ps` rather than sleeping a
+ * guessed interval, so a loaded machine only makes it wait longer.
+ *
+ * Only `ps` RUNNING and reporting no such pid (exit status 1, no spawn error
+ * code) counts as gone. A `ps` that could not be started at all used to count
+ * too, and then this returned at once and the test below passed or failed on
+ * however long the failed spawn happened to take. FAULT INJECTED: pointing
+ * this at a binary that does not exist passed 5 runs of 5 that way, while
+ * dropping the hold entirely failed 4 of 5. A spawn the machine is too busy
+ * for (EAGAIN) is retried, and any other spawn failure is thrown.
+ */
+function blockUntilTornDown(pid: number, ms = 5_000): void {
+  const deadline = Date.now() + ms;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  let lastSpawnError: unknown;
+  while (Date.now() < deadline) {
+    let state: string | null = null;
+    try {
+      state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch (error) {
+      const failure = error as NodeJS.ErrnoException & { status?: number | null };
+      if (failure.code === undefined && failure.status === 1) return;
+      if (failure.code !== 'EAGAIN') throw error;
+      lastSpawnError = error;
+    }
+    if (state !== null && state.startsWith('Z')) return;
+    Atomics.wait(pause, 0, 0, 10);
+  }
+  throw new Error(`timed out waiting for the OS to tear down pid ${String(pid)}`, { cause: lastSpawnError });
 }
 
 async function until(what: string, predicate: () => boolean, ms = 5_000): Promise<void> {
@@ -183,6 +273,38 @@ describe('the inference host, killed for real', () => {
   );
 
   it(
+    'settles a call posted to a host that is dead but not yet reaped, and keeps the refused write inside the link',
+    async () => {
+      // The second way this file failed under load: a ping posted in the gap
+      // between SIGKILL and Node reading the exit hit a closed socket, and the
+      // EPIPE escaped the run as an uncaught exception with every test green.
+      // Made deterministic by holding the gap open from this side: the child
+      // is killed and torn down while this thread is held, so the call below
+      // is written to a socket nobody will read before Node can notice.
+      // FAULT INJECTED: posting with a bare `child.send(message)`, as the
+      // adapter did, made 3 runs of 3 exit 1 with "Uncaught Exception: Error:
+      // write EPIPE" and fail `refusedPosts` below with "expected 0 to be
+      // greater than 0".
+      const { supervisor, refusedPosts } = spawnSupervised();
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
+
+      process.kill(first.pid, 'SIGKILL');
+      blockUntilTornDown(first.pid);
+      const lost = llama(supervisor).getCapabilities().catch((error: unknown) => error);
+
+      // The call is not lost with the write: the exit that follows settles it.
+      expect(((await lost) as { code?: string }).code).toBe('HANDLE_LOST');
+      // And the race was really hit, rather than this passing because it was not.
+      expect(refusedPosts.length).toBeGreaterThan(0);
+
+      await until('a replacement host', () => supervisor.spawnCount === 2);
+      const second = (await llama(supervisor).getCapabilities()) as { pid: number };
+      expect(second.pid).not.toBe(first.pid);
+    },
+    15_000,
+  );
+
+  it(
     'replaces a host that is ALIVE and no longer answering, and terminates it',
     async () => {
       // DEFECT [4], the half no `exit` can report. The fixture stops answering
@@ -197,7 +319,12 @@ describe('the inference host, killed for real', () => {
       // Still there. This is the state the exit-based paths cannot see.
       expect(alive(first.pid)).toBe(true);
 
-      await until('the wedged host to be replaced', () => supervisor.spawnCount === 2);
+      // Up to one interval plus one timeout after its last pong, and then some.
+      await until(
+        'the wedged host to be replaced',
+        () => supervisor.spawnCount === 2,
+        PING_INTERVAL_MS + PING_TIMEOUT_MS + 5_000,
+      );
       // Terminated by the supervisor — it was never going to exit on its own.
       await until('the wedged host to be terminated', () => !alive(first.pid));
 
@@ -214,7 +341,15 @@ describe('the inference host, killed for real', () => {
       // answered by the fixture, but pings are — a 6 GB model load looks
       // exactly like this, and a liveness check that could not tell the two
       // apart would kill the host mid-load every time.
-      const { supervisor } = spawnSupervised({ ...FAST, callTimeoutMs: 400 });
+      //
+      // The call has to outlive a WHOLE ping window, or the host still being
+      // alive when it times out would say nothing about the ping: a supervisor
+      // that condemned any host with a call outstanding for `pingTimeoutMs`
+      // would pass a call that gave up first.
+      const { supervisor } = spawnSupervised({
+        ...FAST,
+        callTimeoutMs: PING_INTERVAL_MS + PING_TIMEOUT_MS + 500,
+      });
       const first = (await llama(supervisor).getCapabilities()) as { pid: number };
 
       const stuck = llama(supervisor).listLoaded().catch((error: unknown) => error);
@@ -225,6 +360,30 @@ describe('the inference host, killed for real', () => {
       expect(supervisor.spawnCount).toBe(1);
       // And the host is still usable afterwards: one dead call is not a dead
       // host.
+      expect(((await llama(supervisor).getCapabilities()) as { pid: number }).pid).toBe(first.pid);
+    },
+    15_000,
+  );
+
+  it(
+    'does not condemn a host that is slow to START, as a fork on a loaded machine is',
+    async () => {
+      // The flake this file had, made deterministic. The double holds its
+      // event loop for `SLOW_START_MS` before it can read a message, so the
+      // first ping (sent `PING_INTERVAL_MS` after spawn) and the first call
+      // both wait in its IPC channel. FAULT INJECTED: restoring the old window
+      // (`pingIntervalMs: 60`, `pingTimeoutMs: 120`) made this call reject in
+      // 5 runs of 5 with "The inference process stopped unexpectedly (no
+      // answer to a liveness ping in 120ms..132ms; the process may be
+      // wedged)." — the error the `dispose()` test below failed with under
+      // load, raised from the same `#pingTick`, and no other test failed.
+      const { supervisor } = spawnSupervised(FAST, { startupBlockMs: SLOW_START_MS });
+      const first = (await llama(supervisor).getCapabilities()) as { pid: number };
+
+      expect(alive(first.pid)).toBe(true);
+      expect(supervisor.spawnCount).toBe(1);
+      // And it keeps answering once it is up: the same process, not a
+      // replacement that happened to boot faster.
       expect(((await llama(supervisor).getCapabilities()) as { pid: number }).pid).toBe(first.pid);
     },
     15_000,
