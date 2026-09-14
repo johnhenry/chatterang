@@ -16,12 +16,12 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { pairingController } from '@/lib/pairing';
 import { PairingEntry } from '@/features/pairing/PairingEntry';
 
-import { button, dialog, reads, render, type Mounted } from './support/pairing-dom';
+import { button, dialog, reads, render, settle, type Mounted } from './support/pairing-dom';
 
 const mounted: Mounted[] = [];
 afterEach(async () => {
@@ -35,16 +35,29 @@ const code = (path: string): string =>
     .replace(/(^|\s)\/\/.*$/gm, '$1');
 
 describe('the pairing entry on this build', () => {
-  it('renders nothing: no section, no button, no dialog', async () => {
+  afterEach(() => {
+    delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+  });
+
+  it('renders nothing: no section, no button, no dialog, and no camera request', async () => {
     expect(pairingController().available, 'this file measures the unavailable build').toBe(false);
+    const getUserMedia = vi.fn(async () => ({ getTracks: () => [] }));
+    Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia }, configurable: true });
 
     const mount = await render(<PairingEntry />);
     mounted.push(mount);
+    await settle();
 
     expect(mount.host.innerHTML).toBe('');
     expect(button('Pair with a computer')).toBeNull();
+    expect(button('Scan with camera')).toBeNull();
     expect(dialog()).toBeNull();
     expect(reads(document.body)).not.toMatch(/\bpair/i);
+    expect(getUserMedia).not.toHaveBeenCalled();
+
+    // The spy is wired: a call made through the same object registers.
+    await navigator.mediaDevices.getUserMedia({ video: true });
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
   });
 });
 

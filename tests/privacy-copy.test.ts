@@ -1844,7 +1844,9 @@ describe('the camera usage string', () => {
   it('makes a promise about the frames that the app must then keep', () => {
     // The second sentence is the one #128 says "has to be true": frames never
     // touch the blob store and never reach a model. This pins the CLAIM; the
-    // conduct is pinned where the scanner lands.
+    // conduct is pinned where the scanner landed, in
+    // tests/pairing-scan-persists-nothing.test.tsx, which drives a scan through
+    // the real sheet to Cancel and to Pair and watches every store and route.
     expect(CAMERA_USAGE_DESCRIPTION).toMatch(/stored or sent anywhere/i);
   });
 });
@@ -2255,6 +2257,7 @@ describe('the pairing sheet admits what typing a code does not check', () => {
       createElement(PairingSheet, { controller: { available: true, pair }, onClose: () => {}, onOutcome: () => {} }),
     );
     try {
+      await click(mustButton('Type'));
       await typeInto(byLabel('Computer address'), host);
       await typeInto(byLabel('Six-digit code'), code);
       await click(mustButton('Chatterang desktop app'));

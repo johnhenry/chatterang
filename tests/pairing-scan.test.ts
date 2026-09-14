@@ -327,20 +327,62 @@ describe('grabbing a frame', () => {
 });
 
 describe('a scan persists nothing', () => {
-  it('names nothing that could store, send or log a frame', () => {
-    /*
-     * STRUCTURAL, like the decoder's guard: reading the imports and names
-     * proves there is no path, where watching one run proves one path clean.
-     */
-    for (const path of ['src/lib/qr-scan.ts', 'src/lib/pairing.ts']) {
-      const source = readFileSync(resolve(process.cwd(), path), 'utf8');
-      const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  /*
+   * STRUCTURAL, like the decoder's guard: reading the imports and names
+   * proves there is no path, where watching one run proves one path clean.
+   * `tests/pairing-scan-persists-nothing.test.tsx` watches the run.
+   *
+   * PER FILE, because the sheet and its scan pane import more than the loop
+   * does, and one shared list would let the loop import what only the sheet
+   * needs. No `@/ui/*` wildcard: `src/ui/Rail.tsx` imports three stores.
+   */
+  const ALLOWED: Readonly<Record<string, readonly string[]>> = {
+    'src/lib/qr-scan.ts': ['@chatterang/tunnel/pairing', '@/lib/qr-decode'],
+    'src/lib/pairing.ts': ['@chatterang/tunnel/pairing'],
+    'src/features/pairing/ScanPane.tsx': [
+      'react',
+      '@chatterang/tunnel/pairing',
+      '@/lib/qr-scan',
+      '@/lib/qr-decode',
+      '@/features/pairing/wording',
+    ],
+    'src/features/pairing/PairingSheet.tsx': [
+      'react',
+      '@chatterang/tunnel/pairing',
+      '@/ui/primitives',
+      '@/lib/platform',
+      '@/lib/pairing',
+      '@/features/pairing/ScanPane',
+      '@/features/pairing/wording',
+    ],
+    'src/features/pairing/wording.ts': ['@chatterang/tunnel/pairing', '@/lib/pairing', '@/lib/qr-scan'],
+  };
+  const BANNED = [
+    'fetch', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'indexedDB', 'localStorage', 'sessionStorage',
+    'Dexie', 'db', 'Preferences', 'Filesystem', 'Worker', 'toBlob', 'toDataURL', 'createObjectURL',
+    'putBlob', 'clipboard', 'console',
+  ];
+
+  const codeOf = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  /** Static `from '…'` and dynamic `import('…')`, type-only imports included. */
+  const importsOf = (code: string): string[] =>
+    [...code.matchAll(/(?:\bfrom\s+|\bimport\s*\(\s*)'([^']+)'/g)].map((m) => m[1]!);
+
+  it('reads dynamic and type-only imports as well as static ones', () => {
+    expect(importsOf("const m = await import('@/db');")).toEqual(['@/db']);
+    expect(importsOf("import type { X } from '@/lib/blobs';")).toEqual(['@/lib/blobs']);
+    expect(importsOf("export { y } from '@/lib/export';")).toEqual(['@/lib/export']);
+    expect(importsOf("// import('@/db')".replace(/^\s*\/\/.*$/gm, ''))).toEqual([]);
+  });
+
+  it('each file imports only its own list, and names nothing that could store, send or log a frame', () => {
+    for (const [path, allowed] of Object.entries(ALLOWED)) {
+      const code = codeOf(readFileSync(resolve(process.cwd(), path), 'utf8'));
       expect(code, `${path}: comment strip ate the code`).toMatch(/export (async )?function/);
-      const imports = [...code.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]);
-      for (const specifier of imports) {
-        expect(['@chatterang/tunnel/pairing', '@/lib/qr-decode'], `${path} imports ${specifier}`).toContain(specifier);
+      for (const specifier of importsOf(code)) {
+        expect(allowed, `${path} imports ${specifier}`).toContain(specifier);
       }
-      for (const name of ['fetch', 'XMLHttpRequest', 'indexedDB', 'localStorage', 'sessionStorage', 'Dexie', 'Worker', 'toBlob', 'toDataURL', 'createObjectURL', 'putBlob', 'clipboard', 'console']) {
+      for (const name of BANNED) {
         expect(code, `${path} names ${name}`).not.toMatch(new RegExp(`\\b${name}\\b`));
       }
     }

@@ -48,11 +48,15 @@ afterEach(async () => {
   for (const mount of mounted.splice(0)) await mount.unmount();
 });
 
-/** Settle until the lazy sheet has loaded, or fail naming it. */
+/**
+ * Settle until the lazy sheet has loaded, or fail naming it. Then select Type:
+ * every test here pairs by typing, and under jsdom the sheet opens on Scan.
+ */
 async function sheetLoaded(): Promise<HTMLElement> {
   for (let i = 0; i < 50 && dialog() === null; i += 1) await settle();
   const found = dialog();
   expect(found, 'the lazy sheet never loaded').not.toBeNull();
+  await click(mustButton('Type'));
   return found!;
 }
 

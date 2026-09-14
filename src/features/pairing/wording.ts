@@ -13,7 +13,73 @@
  */
 
 import type { TypedEntryReason } from '@chatterang/tunnel/pairing';
-import type { PairingRefusal } from '@/lib/pairing';
+import type { PairingRefusal, ScannedPayloadProblem } from '@/lib/pairing';
+import type { ScanStopReason } from '@/lib/qr-scan';
+
+/* ── Scanning ──────────────────────────────────────────────────────────── */
+
+/** Before the camera is asked for. */
+export const SCAN_INTRO = 'Point the camera at the pairing code on the other screen.';
+
+/** While the camera is on. */
+export const SCAN_LOOKING = 'Looking for a pairing code…';
+
+/** A QR code was read, and it is not a pairing code. Scanning goes on. */
+export const NOT_A_PAIRING_CODE = 'That QR code is not a pairing code. Point the camera at the one on the other screen.';
+
+/**
+ * The camera cannot be used here, and the sheet has moved to Type.
+ *
+ * ONE SENTENCE for unsupported, refused, absent and failed, and none of them
+ * says "you denied". The phone cannot always tell them apart — Android refuses
+ * without prompting when the manifest lacks the permission — and declining a
+ * camera is a choice this app is for, not a mistake to report.
+ */
+export const CAMERA_UNAVAILABLE = 'The camera is not available here. You can type the code instead.';
+
+/** Something else holds the camera. The pane offers "Try again". */
+export const CAMERA_BUSY = 'The camera is in use by something else right now.';
+
+/**
+ * Why a scan stopped without a code, each followed by "Scan again".
+ *
+ * `result` and `cancelled` have no sentence: a result goes on to Confirm, and
+ * a cancel is the person closing the sheet. `hidden` is the pane's own cause,
+ * recorded because `handle.stop()` reports every stop it asks for as
+ * `cancelled`.
+ */
+export const SCAN_END_WORDING: Readonly<Record<Exclude<ScanStopReason, 'result' | 'cancelled'> | 'hidden', string>> =
+  Object.freeze({
+    'track-ended': 'The camera stopped. Another app or a call may have taken it.',
+    'decode-failed': 'The code reader could not run, so scanning stopped.',
+    'invalid-code': 'That pairing code could not be read. Show a new one and scan again.',
+    'idle-timeout': 'No code was found in time, and any code shown when scanning began has expired.',
+    hidden: 'Scanning stopped when Chatterang went to the background.',
+  });
+
+/** A pairing code that was read and refused before any confirm step. */
+export const SCANNED_PROBLEM_WORDING: Readonly<Record<ScannedPayloadProblem, string>> = Object.freeze({
+  'unsupported-trust-mode': 'That code asks this phone to check the other machine in a way this version cannot.',
+  expired: 'That code has expired. Show a new one and scan again.',
+  unreachable: 'That code names only .local addresses, which this phone cannot reach yet.',
+});
+
+/* ── Confirm (D11) ─────────────────────────────────────────────────────── */
+
+export const CONFIRM_TITLE = 'Pair with this computer?';
+export const CONFIRM_BODY = 'Pair only if this code came from the screen in front of you.';
+
+/**
+ * The name, attributed to the code rather than asserted about the machine.
+ *
+ * Whoever composed the code wrote it, and a code on a shared screen or a
+ * photograph can call itself "John’s MacBook" as easily as John's can.
+ */
+export function confirmDetail(name: string): readonly string[] {
+  return [`It calls itself “${name}”.`, 'That name comes from the code, so whoever made the code chose it.'];
+}
+
+/* ── Typing ────────────────────────────────────────────────────────────── */
 
 /** What is wrong with the typed address or code, in the person's terms. */
 export const TYPED_ENTRY_WORDING: Readonly<Record<TypedEntryReason, string>> = Object.freeze({

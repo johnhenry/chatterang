@@ -111,13 +111,20 @@ async function open(controller: PairingController) {
   const onClose = vi.fn();
   mounted.push(await render(<Harness controller={controller} onOutcome={onOutcome} onClose={onClose} />));
   expect(dialog(), 'the sheet opened').not.toBeNull();
+  await typePane();
   return { onOutcome, onClose, mount: mounted[mounted.length - 1]! };
+}
+
+/** Select the Type pane. Under jsdom the platform row is `web`, which can scan, so Scan opens first. */
+async function typePane() {
+  await click(mustButton('Type'));
 }
 
 const DESKTOP = 'Chatterang desktop app';
 const SERVER = 'Chatterang server';
 
 async function fill(fields: { host: string; code: string; kind?: typeof DESKTOP | typeof SERVER }) {
+  await typePane();
   await typeInto(byLabel('Computer address'), fields.host);
   await typeInto(byLabel('Six-digit code'), fields.code);
   if (fields.kind) await click(mustButton(fields.kind));

@@ -7,19 +7,34 @@ import {
   normalizeTypedCode,
   parseTypedEndpoint,
   type HostKind,
+  type PairingPayload,
   type TypedEntryReason,
 } from '@chatterang/tunnel/pairing';
-import { Segmented, Sheet } from '@/ui/primitives';
-import type { PairingController, PairingOutcome, PairingRequest } from '@/lib/pairing';
+import { Confirm, Segmented, Sheet } from '@/ui/primitives';
+import { capabilities } from '@/lib/platform';
 import {
+  validateScannedPayload,
+  type PairingController,
+  type PairingOutcome,
+  type PairingRequest,
+} from '@/lib/pairing';
+import { ScanPane } from '@/features/pairing/ScanPane';
+import {
+  CAMERA_UNAVAILABLE,
+  CONFIRM_BODY,
+  CONFIRM_TITLE,
   GENERIC_REFUSAL,
   HOST_KIND_PROMPT,
   REFUSAL_WORDING,
+  SCANNED_PROBLEM_WORDING,
+  SCAN_END_WORDING,
   TYPED_ENTRY_WORDING,
+  confirmDetail,
+  hasDisguisingCharacter,
 } from '@/features/pairing/wording';
 
 /**
- * The pairing sheet: type a host and six digits, and hand one request to the
+ * The pairing sheet: scan a code or type one, and hand one request to the
  * controller (#128, #130).
  *
  * REACHED ONLY THROUGH `PairingEntry`, which renders nothing while
@@ -28,11 +43,23 @@ import {
  * asking the accessor, so the gate is read in exactly one place, and it imports
  * no store, so whatever it holds lives and dies with the sheet.
  *
+ * TWO PANES, BOTH VISIBLE FROM THE START (D4). Scan is offered only where the
+ * platform row says a camera can scan, and it asks for the camera only when
+ * the person presses "Scan with camera"; Type is one segment away. Where no
+ * camera row exists there is no Scan segment and no text about a camera.
+ *
+ * A SCANNED CODE IS CHECKED, THEN ATTRIBUTED (D11). `validateScannedPayload`
+ * refuses it before any confirm step, and Confirm quotes the name as the one
+ * the code gives, rather than stating who the machine is. The parser admits
+ * any well-formed UTF-8, so a name that can disguise itself is refused as an
+ * unreadable code.
+ *
  * NO `<form>`. A form around a host field and a code field is what password
  * managers offer to save, and a pairing code is a secret that is spent once.
  */
 
 type HostChoice = 'desktop' | 'server';
+type Pane = 'scan' | 'type';
 
 /** The person's choice, mapped to the byte the binding carries. There is no default. */
 const HOST_KINDS: Readonly<Record<HostChoice, HostKind>> = Object.freeze({
@@ -77,12 +104,19 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
   const codeId = useId();
   const kindId = useId();
 
+  // A platform row, read once: it does not change while the sheet is open.
+  const [cameraScan] = useState(() => capabilities().cameraScan);
+  const [pane, setPane] = useState<Pane>(cameraScan ? 'scan' : 'type');
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<PairingPayload | null>(null);
+
   const [host, setHost] = useState('');
   const [code, setCode] = useState('');
   const [choice, setChoice] = useState<HostChoice | null>(null);
   const [problems, setProblems] = useState<Problems>(NO_PROBLEMS);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [closed, setClosed] = useState(false);
 
   /** The request in flight, so closing can ask it to stop. */
   const inFlight = useRef<AbortController | null>(null);
@@ -91,36 +125,21 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
   // request running that nobody asked to stop.
   useEffect(() => () => inFlight.current?.abort(), []);
 
+  /**
+   * Closing is closing, whatever the parent does next: the request is asked to
+   * stop, and the sheet — the camera with it — leaves the screen even if the
+   * parent keeps this component mounted.
+   */
   const close = (): void => {
     inFlight.current?.abort();
+    setClosed(true);
     onClose();
   };
 
-  async function submit(): Promise<void> {
-    // Every field is checked on every submit, so the person sees all of what
-    // is wrong at once rather than one refusal per press.
-    const endpoint = attempt(() => parseTypedEndpoint(host));
-    const digits = attempt(() => normalizeTypedCode(code));
-    setProblems({
-      host: endpoint.ok ? null : endpoint.reason,
-      code: digits.ok ? null : digits.reason,
-      hostKind: choice === null,
-    });
-    setRefusal(null);
-    if (!endpoint.ok || !digits.ok || choice === null) return;
-
-    // Exactly the typed shape. No trust field exists to fill: six typed digits
-    // carry no fingerprint, which is what the Type pane admits.
-    const request: PairingRequest = {
-      route: 'typed',
-      address: endpoint.value.address,
-      port: endpoint.value.port,
-      code: digits.value,
-      hostKind: HOST_KINDS[choice],
-    };
-
+  async function run(request: PairingRequest): Promise<void> {
     const abort = new AbortController();
     inFlight.current = abort;
+    setRefusal(null);
     setBusy(true);
     let outcome: PairingOutcome | null;
     try {
@@ -133,7 +152,10 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
     if (outcome?.kind === 'paired') {
       // Closed first, so nothing the parent does with the news can leave the
       // sheet on screen and busy.
-      if (!abort.signal.aborted) onClose();
+      if (!abort.signal.aborted) {
+        setClosed(true);
+        onClose();
+      }
       // Surfaced whether or not the person already closed the sheet (D9). A
       // name that is not text is handed up as no name: the controller says the
       // host holds a pairing, and that is reported either way.
@@ -150,98 +172,187 @@ export function PairingSheet({ controller, onClose, onOutcome }: PairingSheetPro
     setRefusal(reason !== null && Object.hasOwn(REFUSAL_WORDING, reason) ? REFUSAL_WORDING[reason] : GENERIC_REFUSAL);
   }
 
+  async function submitTyped(): Promise<void> {
+    // Every field is checked on every submit, so the person sees all of what
+    // is wrong at once rather than one refusal per press.
+    const endpoint = attempt(() => parseTypedEndpoint(host));
+    const digits = attempt(() => normalizeTypedCode(code));
+    setProblems({
+      host: endpoint.ok ? null : endpoint.reason,
+      code: digits.ok ? null : digits.reason,
+      hostKind: choice === null,
+    });
+    setRefusal(null);
+    if (!endpoint.ok || !digits.ok || choice === null) return;
+
+    // Exactly the typed shape. No trust field exists to fill: six typed digits
+    // carry no fingerprint, which is what the Type pane admits.
+    await run({
+      route: 'typed',
+      address: endpoint.value.address,
+      port: endpoint.value.port,
+      code: digits.value,
+      hostKind: HOST_KINDS[choice],
+    });
+  }
+
+  /** A scanned payload, the camera already off: refuse it here, or ask the person. */
+  function scanned(payload: PairingPayload): string | null {
+    const checked = validateScannedPayload(payload, Math.floor(Date.now() / 1000));
+    if (!checked.ok) return SCANNED_PROBLEM_WORDING[checked.problem];
+    // A name that can reorder or hide what is drawn around it cannot be
+    // attributed honestly, so the code is refused as unreadable (D11).
+    if (hasDisguisingCharacter(payload.name)) return SCAN_END_WORDING['invalid-code'];
+    setRefusal(null);
+    setConfirming(payload);
+    return null;
+  }
+
   const described = (hint: string, problem: unknown, error: string): string =>
     problem ? `${hint} ${error}` : hint;
 
+  if (closed) return null;
+
   return (
-    <Sheet open title="Pair with a computer" onClose={close}>
-      <p className="section__hint">
-        Typing a code is weaker than scanning one. A scanned code carries the computer's certificate
-        fingerprint; six typed digits do not.
-      </p>
+    <>
+      <Sheet open title="Pair with a computer" onClose={close}>
+        {cameraScan ? (
+          <Segmented<Pane>
+            label="How to pair"
+            value={pane}
+            options={[
+              { value: 'scan', label: 'Scan' },
+              { value: 'type', label: 'Type' },
+            ]}
+            onChange={(next) => {
+              setNotice(null);
+              setPane(next);
+            }}
+          />
+        ) : null}
 
-      <div className="field">
-        <label className="field__label" htmlFor={hostId}>
-          Computer address
-        </label>
-        <input
-          id={hostId}
-          className="input"
-          value={host}
-          placeholder="192.168.1.4:51234"
-          inputMode="url"
-          spellCheck={false}
-          autoCapitalize="none"
-          autoCorrect="off"
-          autoComplete="off"
-          aria-invalid={problems.host !== null}
-          aria-describedby={described(`${hostId}-hint`, problems.host, `${hostId}-error`)}
-          onChange={(event) => setHost(event.target.value)}
-        />
-        <span className="field__hint" id={`${hostId}-hint`}>
-          The address the other screen shows. For the desktop app, include the port after a colon.
-        </span>
-        {problems.host ? (
-          <p className="field__error" id={`${hostId}-error`}>
-            {TYPED_ENTRY_WORDING[problems.host]}
+        {pane === 'scan' ? (
+          <ScanPane
+            busy={busy}
+            onResult={scanned}
+            onUnavailable={() => {
+              setNotice(CAMERA_UNAVAILABLE);
+              setPane('type');
+            }}
+          />
+        ) : (
+          <>
+            {notice ? (
+              <p className="section__hint" role="status">
+                {notice}
+              </p>
+            ) : null}
+
+            <p className="section__hint">
+              Typing a code is weaker than scanning one. A scanned code carries the computer's
+              certificate fingerprint; six typed digits do not.
+            </p>
+
+            <div className="field">
+              <label className="field__label" htmlFor={hostId}>
+                Computer address
+              </label>
+              <input
+                id={hostId}
+                className="input"
+                value={host}
+                placeholder="192.168.1.4:51234"
+                inputMode="url"
+                spellCheck={false}
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoComplete="off"
+                aria-invalid={problems.host !== null}
+                aria-describedby={described(`${hostId}-hint`, problems.host, `${hostId}-error`)}
+                onChange={(event) => setHost(event.target.value)}
+              />
+              <span className="field__hint" id={`${hostId}-hint`}>
+                The address the other screen shows. For the desktop app, include the port after a colon.
+              </span>
+              {problems.host ? (
+                <p className="field__error" id={`${hostId}-error`}>
+                  {TYPED_ENTRY_WORDING[problems.host]}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="field">
+              <span className="field__label" id={kindId}>
+                Pairing with
+              </span>
+              <Segmented<HostChoice | ''>
+                label="Pairing with"
+                value={choice ?? ''}
+                options={[
+                  { value: 'desktop', label: 'Chatterang desktop app' },
+                  { value: 'server', label: 'Chatterang server' },
+                ]}
+                onChange={(next) => setChoice(next === '' ? null : next)}
+              />
+              {problems.hostKind ? (
+                <p className="field__error" id={`${kindId}-error`}>
+                  {HOST_KIND_PROMPT}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="field">
+              <label className="field__label" htmlFor={codeId}>
+                Six-digit code
+              </label>
+              <input
+                id={codeId}
+                className="input"
+                value={code}
+                placeholder="123 456"
+                inputMode="numeric"
+                spellCheck={false}
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoComplete="off"
+                aria-invalid={problems.code !== null}
+                aria-describedby={problems.code ? `${codeId}-error` : undefined}
+                onChange={(event) => setCode(event.target.value)}
+              />
+              {problems.code ? (
+                <p className="field__error" id={`${codeId}-error`}>
+                  {TYPED_ENTRY_WORDING[problems.code]}
+                </p>
+              ) : null}
+            </div>
+
+            <button type="button" className="btn" disabled={busy} onClick={() => void submitTyped()}>
+              {busy ? 'Pairing…' : 'Pair'}
+            </button>
+          </>
+        )}
+
+        {refusal ? (
+          <p className="field__error" role="alert">
+            {refusal}
           </p>
         ) : null}
-      </div>
+      </Sheet>
 
-      <div className="field">
-        <span className="field__label" id={kindId}>
-          Pairing with
-        </span>
-        <Segmented<HostChoice | ''>
-          label="Pairing with"
-          value={choice ?? ''}
-          options={[
-            { value: 'desktop', label: 'Chatterang desktop app' },
-            { value: 'server', label: 'Chatterang server' },
-          ]}
-          onChange={(next) => setChoice(next === '' ? null : next)}
-        />
-        {problems.hostKind ? (
-          <p className="field__error" id={`${kindId}-error`}>
-            {HOST_KIND_PROMPT}
-          </p>
-        ) : null}
-      </div>
-
-      <div className="field">
-        <label className="field__label" htmlFor={codeId}>
-          Six-digit code
-        </label>
-        <input
-          id={codeId}
-          className="input"
-          value={code}
-          placeholder="123 456"
-          inputMode="numeric"
-          spellCheck={false}
-          autoCapitalize="none"
-          autoCorrect="off"
-          autoComplete="off"
-          aria-invalid={problems.code !== null}
-          aria-describedby={problems.code ? `${codeId}-error` : undefined}
-          onChange={(event) => setCode(event.target.value)}
-        />
-        {problems.code ? (
-          <p className="field__error" id={`${codeId}-error`}>
-            {TYPED_ENTRY_WORDING[problems.code]}
-          </p>
-        ) : null}
-      </div>
-
-      {refusal ? (
-        <p className="field__error" role="alert">
-          {refusal}
-        </p>
-      ) : null}
-
-      <button type="button" className="btn" disabled={busy} onClick={() => void submit()}>
-        {busy ? 'Pairing…' : 'Pair'}
-      </button>
-    </Sheet>
+      <Confirm
+        open={confirming !== null}
+        title={CONFIRM_TITLE}
+        body={CONFIRM_BODY}
+        detail={confirming ? confirmDetail(confirming.name) : undefined}
+        confirmLabel="Pair"
+        onCancel={() => setConfirming(null)}
+        onConfirm={() => {
+          const payload = confirming;
+          setConfirming(null);
+          // The payload exactly as it was read. Nothing from the camera rides along.
+          if (payload !== null) void run({ route: 'scanned', payload });
+        }}
+      />
+    </>
   );
 }
