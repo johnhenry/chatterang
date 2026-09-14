@@ -22,8 +22,28 @@ import {
   IOS_INFO_PLIST,
   NATIVE_PATCHES,
 } from '../scripts/patch-native.mjs';
+import { createElement } from 'react';
+
+import {
+  ADDRESS_DNS,
+  ADDRESS_IPV4,
+  HOST_DESKTOP,
+  TOKEN_BYTES,
+  TRUST_BYTES,
+  TRUST_SPKI_PIN,
+  TRUST_STATIC_KEY,
+  decodePairingUri,
+  encodePairingUri,
+  parseTypedEndpoint,
+} from '@chatterang/tunnel/pairing';
 import { isLocalEngine } from '@/domain/manifest';
-import { pairingController } from '@/lib/pairing';
+import { PairingSheet } from '@/features/pairing/PairingSheet';
+import {
+  pairingController,
+  validateScannedPayload,
+  type PairingOutcome,
+  type PairingRequest,
+} from '@/lib/pairing';
 import type { IRMessage } from '@johnhenry/aimatey-types';
 import {
   chatterangCommands,
@@ -45,6 +65,7 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
+import { byLabel, click, mustButton, render, settle, typeInto } from './support/pairing-dom';
 import {
   SPECIFIER,
   codeOf,
@@ -2072,5 +2093,108 @@ describe('a paired device is named exactly where pairing is available', () => {
         'revoke or keep is not one to ship: the panel (#137), the table (#133) and its id (#125) ' +
         'land with the controller.',
     ).toBe(available);
+  });
+});
+
+/* ── What the pairing sheet admits about the typed route (#256, #130) ─── */
+
+/**
+ * WHERE THE WEAKER ROUTE IS TYPED, IT SAYS SO.
+ *
+ * #256 asks for the admission that the typed route is weaker to live in the
+ * pairing UI, and the owner ruled the sentence (#124, D2) and the entry's hint
+ * (D10). Both live in `src/features/pairing/`, which no build can reach while
+ * `pairingController().available` is false — the biconditional above keeps
+ * pairing words out of the six privacy bodies until then, and these sentences
+ * do not appear in any of them.
+ *
+ * Each claim is measured by what the sheet itself BUILDS, not by what a future
+ * controller will do with it. No sentence here says where a conversation goes
+ * once paired: that waits for a controller to measure against.
+ */
+describe('the pairing sheet admits what typing a code does not check', () => {
+  const TYPED_FIELDS = ['address', 'code', 'hostKind', 'port', 'route'];
+
+  /** The request the real sheet hands `pair()` for what was typed. */
+  async function typedRequestFromSheet(host: string, code: string): Promise<PairingRequest> {
+    const pair = vi.fn(async (): Promise<PairingOutcome> => ({ kind: 'refused', reason: 'unreachable' }));
+    const mount = await render(
+      createElement(PairingSheet, { controller: { available: true, pair }, onClose: () => {}, onOutcome: () => {} }),
+    );
+    try {
+      await typeInto(byLabel('Computer address'), host);
+      await typeInto(byLabel('Six-digit code'), code);
+      await click(mustButton('Chatterang desktop app'));
+      await click(mustButton('Pair'));
+      await settle();
+    } finally {
+      await mount.unmount();
+    }
+    expect(pair, `the sheet sent nothing for ${host}`).toHaveBeenCalledTimes(1);
+    return (pair.mock.calls[0] as unknown as [PairingRequest])[0];
+  }
+
+  it("Type pane: \"Typing a code is weaker than scanning one. A scanned code carries the computer's certificate fingerprint; six typed digits do not.\"", async () => {
+    expect(shipped('features/pairing/PairingSheet.tsx')).toContain(
+      "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
+        'fingerprint; six typed digits do not.',
+    );
+
+    // Six typed digits do not: the typed request has no trust field, and no
+    // payload that could carry one.
+    const typed = await typedRequestFromSheet('192.168.1.4:51234', '123456');
+    expect(Object.keys(typed).sort()).toEqual(TYPED_FIELDS);
+    expect(typed).not.toHaveProperty('trust');
+    expect(typed).not.toHaveProperty('payload');
+
+    // A scanned code does: what a code decodes to carries TRUST_BYTES of
+    // fingerprint under TRUST_SPKI_PIN, and a code in any other trust mode is
+    // refused before it could reach a confirm step.
+    const trust = Uint8Array.from({ length: TRUST_BYTES }, (_, i) => i + 1);
+    const scanned = decodePairingUri(
+      encodePairingUri({
+        version: 1,
+        hostKind: HOST_DESKTOP,
+        trustMode: TRUST_SPKI_PIN,
+        trust,
+        token: new Uint8Array(TOKEN_BYTES).fill(2),
+        expiresAt: 2_000,
+        port: 8973,
+        addresses: [{ kind: ADDRESS_IPV4, value: Uint8Array.of(192, 168, 1, 4) }],
+        name: 'Desk',
+      }),
+    );
+    expect(scanned.trustMode).toBe(TRUST_SPKI_PIN);
+    expect(scanned.trust).toStrictEqual(trust);
+    expect(validateScannedPayload(scanned, 1_000)).toEqual({ ok: true });
+    expect(validateScannedPayload({ ...scanned, trustMode: TRUST_STATIC_KEY }, 1_000)).toEqual({
+      ok: false,
+      problem: 'unsupported-trust-mode',
+    });
+  });
+
+  it('Settings entry: "Pair this phone with Chatterang on a computer or a server. The address you type can be anywhere, and nothing here checks that it is on your network or whose machine it is."', async () => {
+    expect(shipped('features/pairing/PairingEntry.tsx')).toContain(
+      'Pair this phone with Chatterang on a computer or a server. The address you type can be ' +
+        'anywhere, and nothing here checks that it is on your network or whose machine it is.',
+    );
+
+    // "Can be anywhere": the grammar takes a public address and a DNS name,
+    // with no private-range check…
+    expect(parseTypedEndpoint('203.0.113.7')).toStrictEqual({
+      address: { kind: ADDRESS_IPV4, value: Uint8Array.of(203, 0, 113, 7) },
+      port: 8973,
+    });
+    expect(parseTypedEndpoint('chat.example.com').address.kind).toBe(ADDRESS_DNS);
+
+    // …and the sheet hands them to pair() as typed, refusing neither.
+    const publicAddress = await typedRequestFromSheet('203.0.113.7', '123456');
+    expect(publicAddress).toMatchObject({ address: { kind: ADDRESS_IPV4, value: Uint8Array.of(203, 0, 113, 7) } });
+    const named = await typedRequestFromSheet('chat.example.com', '123456');
+    expect(named).toMatchObject({ address: { kind: ADDRESS_DNS } });
+
+    // "Or whose machine it is": nothing in what is sent identifies the machine
+    // expected to answer.
+    expect(Object.keys(named).sort()).toEqual(TYPED_FIELDS);
   });
 });
