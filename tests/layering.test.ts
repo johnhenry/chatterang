@@ -1139,11 +1139,23 @@ describe('the desktop bridge stays platform-free', () => {
  * hands to the system camera, or a native plugin — passes, so neither this nor
  * `src/lib/pairing.ts` claims more than that name.
  *
- * When the sheet lands under `src/features/pairing/`, ALLOWED widens to it in
- * that change, alongside a rule that only `SettingsScreen.tsx` imports it.
+ * THE FEATURE IS INSIDE THE RULE, BEHIND ONE DOOR. `src/features/pairing/`
+ * holds the sheet and its entry, so ALLOWED includes it. That would be a second
+ * way in if anything could import it, so the rules after the matcher's own
+ * test hold the door: only `SettingsScreen.tsx` imports the feature, only its
+ * `PairingEntry`, and only `PairingEntry` reads `pairingController()`. The one
+ * component that renders nothing while `available` is false is the only way
+ * onto a screen, and `tests/pairing-entry.test.tsx` renders it to show it.
  */
 describe('only the pairing seam reaches the pairing building blocks', () => {
-  const ALLOWED = new Set(['lib/pairing.ts', 'lib/qr-scan.ts', 'lib/qr-decode.ts']);
+  const FEATURE = 'features/pairing/';
+  const ALLOWED = new Set([
+    'lib/pairing.ts',
+    'lib/qr-scan.ts',
+    'lib/qr-decode.ts',
+    // The sheet and its entry, safe only because of the door rule below.
+    ...files.map(rel).filter((file) => file.startsWith(FEATURE)),
+  ]);
   const BLOCKS = new Set(['lib/pairing', 'lib/qr-scan', 'lib/qr-decode']);
   const TUNNEL_PAIRING =
     /^@chatterang\/tunnel\/(?:pairing|pake|binding)(?:\/|$)|(?:^|\/)packages\/tunnel\/(?:src\/)?(?:pairing|pake|binding)(?:\/|$)/;
@@ -1220,6 +1232,62 @@ describe('only the pairing seam reaches the pairing building blocks', () => {
       "import { x } from './pairing';",
     ]) {
       expect(reaches(at, allowed), allowed).toEqual([]);
+    }
+  });
+
+  /** Each module under the pairing feature a file imports, as a path under `src/`. */
+  const entries = (file: string, source: string): string[] =>
+    [...codeOf(source).matchAll(new RegExp(SPECIFIER.source, 'g'))]
+      .map((match) => inSrc(file, match[1] ?? ''))
+      .filter((target): target is string => target !== null && `${target}/`.startsWith(FEATURE));
+
+  const DOOR = 'features/settings/SettingsScreen.tsx -> features/pairing/PairingEntry';
+
+  it('the pairing feature has one door: SettingsScreen imports PairingEntry, and nothing else comes in', () => {
+    const doors = scanned
+      .filter((file) => !rel(file).startsWith(FEATURE))
+      .flatMap((file) => entries(file, readFileSync(file, 'utf8')).map((target) => `${rel(file)} -> ${target}`));
+    expect(doors, 'SettingsScreen no longer mounts the entry, so the rule below checks nothing').toContain(DOOR);
+    expect(
+      doors.filter((door) => door !== DOOR),
+      'Something reached the pairing feature past its entry. PairingEntry renders nothing while ' +
+        '`pairingController().available` is false; any other import of the feature is a way onto a ' +
+        'screen that never asks.',
+    ).toEqual([]);
+  });
+
+  it('inside the feature, only PairingEntry reads the accessor', () => {
+    // The sheet takes the controller as a prop. A second reader would be a
+    // second gate, and two gates drift.
+    const readers = scanned
+      .filter((file) => rel(file).startsWith(FEATURE))
+      .filter((file) => /\bpairingController\b/.test(codeOf(readFileSync(file, 'utf8'))))
+      .map(rel);
+    expect(readers).toEqual(['features/pairing/PairingEntry.tsx']);
+  });
+
+  it('the door matcher resolves the feature however it is named, and ignores a comment', () => {
+    const settings = resolve(SRC, 'features/settings/SettingsScreen.tsx');
+    const chat = resolve(SRC, 'features/chat/X.tsx');
+    expect(entries(settings, "import { PairingEntry } from '@/features/pairing/PairingEntry';")).toEqual([
+      'features/pairing/PairingEntry',
+    ]);
+    for (const [at, door] of [
+      [settings, "import { PairingSheet } from '@/features/pairing/PairingSheet';"],
+      [settings, "const Sheet = lazy(() => import('../pairing/PairingSheet'));"],
+      [chat, "import { PairingEntry } from '@/features/pairing/PairingEntry';"],
+      [chat, "export * from '@/features/pairing';"],
+      [chat, "import { pairedMessage } from '../pairing/wording.ts';"],
+    ] as const) {
+      expect(entries(at, door), door).not.toEqual([]);
+    }
+    for (const [at, allowed] of [
+      // Resolved: from features/chat this is features/chat/pairing.
+      [chat, "import { x } from './pairing/PairingSheet';"],
+      [chat, "// import { PairingSheet } from '@/features/pairing/PairingSheet';"],
+      [settings, "import { x } from '@/features/pairings';"],
+    ] as const) {
+      expect(entries(at, allowed), allowed).toEqual([]);
     }
   });
 });

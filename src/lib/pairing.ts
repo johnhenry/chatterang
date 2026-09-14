@@ -10,13 +10,14 @@
  *
  * So this file ships the SHAPE and an honest refusal, modelled on how
  * `MountHostWeb` refuses rather than pretends. `pairingController()` returns a
- * controller whose `available` is false. No screen offers pairing yet, and
- * `tests/layering.test.ts` refuses any file in `src/` other than this one,
- * `qr-scan.ts` and `qr-decode.ts` that imports the pairing half or the scanner,
- * or names `getUserMedia` — so the entry point, when it is built, arrives as an
- * edit to that allowlist rather than as an import nobody reviewed. That is a
- * rule about names: a camera reached another way, such as a file input with
- * `capture`, is not something it sees.
+ * controller whose `available` is false. The one entry point,
+ * `src/features/pairing/PairingEntry.tsx`, renders nothing while it is, so no
+ * screen offers pairing. `tests/layering.test.ts` refuses any file in `src/`
+ * outside this one, `qr-scan.ts`, `qr-decode.ts` and `src/features/pairing/`
+ * that imports the pairing half or the scanner, or names `getUserMedia`; it
+ * lets only `SettingsScreen.tsx` import that feature, and only through
+ * `PairingEntry`. That is a rule about names: a camera reached another way,
+ * such as a file input with `capture`, is not something it sees.
  *
  * The day `available` becomes true, `tests/privacy-copy.test.ts` fails until
  * every privacy surface's copy names a paired device, a paired-device panel is
@@ -78,6 +79,16 @@ export interface PairingController {
    * cannot work.
    */
   readonly available: boolean;
+  /**
+   * Run one pairing to its outcome.
+   *
+   * ABORT IS A REQUEST, NOT A ROLLBACK (D9, #124). Aborting `signal` asks the
+   * controller to stop; it does not promise nothing happened. An exchange the
+   * host already committed may have paired, so the promise still settles with
+   * what DID happen, and a caller that aborted keeps awaiting it. The sheet
+   * surfaces a late `paired` rather than dropping it: a host holding a pairing
+   * the phone never mentioned is the failure that fails open.
+   */
   pair(request: PairingRequest, signal?: AbortSignal): Promise<PairingOutcome>;
 }
 

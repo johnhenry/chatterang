@@ -11,6 +11,7 @@ import { useApp, type ThemeChoice, type VoiceMode } from '@/state/app';
 import { useModels, modelsWith } from '@/state/models';
 import { ProvidersPanel } from '@/features/settings/ProvidersPanel';
 import { McpPanel } from '@/features/settings/McpPanel';
+import { PairingEntry } from '@/features/pairing/PairingEntry';
 import { useMcp } from '@/state/mcp';
 import { ShellSheet } from '@/features/shell/ShellSheet';
 
@@ -286,6 +287,9 @@ export function SettingsScreen(): ReactNode {
                 Manage servers
               </button>
             </div>
+
+            {/* ── Pairing: renders nothing unless the build can pair ─── */}
+            <PairingEntry />
 
             {/* ── Downloads ──────────────────────────────────────────── */}
             <div className="section">
