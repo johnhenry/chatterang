@@ -316,8 +316,30 @@ export async function runToolCalls(
     options.signal,
   );
 
+  /*
+   * A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was asked
+   * about. An earlier call in the batch can run for as long as its server
+   * takes, and switching this server off and on again meanwhile withdraws the
+   * grant but brings back the same record at the same address, so the live
+   * check in `state/mcp.ts` passes. Without this the call went anyway, after
+   * the privacy command's "Every grant to a server is dropped when it is
+   * removed or switched off" had become true. A grant is withdrawn only when
+   * its server is removed or switched off, so the record says the server
+   * changed (#92, owner ruling on a server changed while a call waited).
+   */
+  const withdrawn = (index: number): Refusal | undefined => {
+    const destination = tools[index]?.destination;
+    if (!destination || !onHeldGrant.has(index) || options.destinations.isGranted(destination)) {
+      return undefined;
+    }
+    return {
+      output: `This call’s arguments were not sent to ${destination.host}: this conversation’s permission for that server was withdrawn before it went.`,
+      why: 'server-changed',
+    };
+  };
+
   for (const [index, call] of calls.entries()) {
-    const refusal = refused.get(index);
+    const refusal = refused.get(index) ?? withdrawn(index);
     // Nothing runs once the turn is stopped. A refused call is still written
     // down below, whatever refused it: a refusal sends nothing, and a call the
     // person declined before Stop came is as much not sent as one Stop held
@@ -356,16 +378,6 @@ export async function runToolCalls(
           at: Date.now(),
         };
       }
-    } else if (tool.destination && onHeldGrant.has(index) && !options.destinations.isGranted(tool.destination)) {
-      // A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was
-      // asked about. An earlier call in the batch can run for as long as its
-      // server takes, and switching this server off and on again meanwhile
-      // withdraws the grant but brings back the same record at the same
-      // address, so the live check in `state/mcp.ts` passes. Without this the
-      // call went anyway, after the privacy command's "Every grant to a server
-      // is dropped when it is removed or switched off" had become true.
-      output = `This call’s arguments were not sent to ${tool.destination.host}: this conversation’s permission for that server was withdrawn before it went.`;
-      isError = true;
     } else {
       try {
         const result = await tool.execute(call.input, {

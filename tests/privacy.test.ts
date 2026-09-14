@@ -1163,8 +1163,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
     // off and on meanwhile withdraws the grant and brings back the same record
     // at the same address, so only reading the grant again at the call stops it.
     const archiveCall = `<tool_call>{"name":"archive.note","arguments":{"text":"${SECRET}"}}</tool_call>`;
-    const withdrawing = async (withdraw: boolean) => {
-      const { probe, run } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
+    const withdrawing = async (withdraw: boolean, stop = false) => {
+      const { engine, probe } = setUp([MCP_CALL_CLEAN + archiveCall, 'Done.']);
       const archive = mcpProbe({
         serverName: 'archive',
         serverId: 'mcp_archive',
@@ -1172,15 +1172,22 @@ describe('MCP arguments do not leave the device without a grant', () => {
       });
       toolRegistry.register(archive.tool);
       const held = new Set([PROBE_SERVER.serverId, 'mcp_archive']);
+      const controller = new AbortController();
       probe.call.mockImplementation(async () => {
         if (withdraw) held.delete('mcp_archive');
+        if (stop) controller.abort();
         return { content: [{ type: 'text', text: 'filed' }] };
       });
       const request = ask('conversation');
 
-      const events = await run(
-        { isGranted: (destination) => held.has(destination.serverId), request },
-        { toolIds: [probe.tool.id, archive.tool.id] },
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file my note' }],
+          target: local(),
+          toolIds: [probe.tool.id, archive.tool.id],
+          mcpEgress: { isGranted: (destination) => held.has(destination.serverId), request },
+          signal: controller.signal,
+        }),
       );
       toolRegistry.unregister(archive.tool.id);
       toolRegistry.unregister(probe.tool.id);
@@ -1188,10 +1195,11 @@ describe('MCP arguments do not leave the device without a grant', () => {
       return { probe, archive, request, tools };
     };
 
-    // The control: nothing withdrawn, both go, nobody asked.
+    // The control: nothing withdrawn, both go, nobody asked, both recorded as sent.
     const kept = await withdrawing(false);
     expect(kept.probe.call).toHaveBeenCalledOnce();
     expect(kept.archive.call).toHaveBeenCalledOnce();
+    expect(kept.tools.map((tool) => tool.receipt?.outcome)).toEqual(['sent', 'sent']);
 
     const withdrawn = await withdrawing(true);
     expect(withdrawn.probe.call).toHaveBeenCalledOnce();
@@ -1203,6 +1211,24 @@ describe('MCP arguments do not leave the device without a grant', () => {
       'filed',
       'This call’s arguments were not sent to archive.example: this conversation’s permission for that server was withdrawn before it went.',
     ]);
+    // Recorded as not sent (#92): a grant is withdrawn only when its server is
+    // removed or switched off, so the record says the server changed.
+    const notSent = {
+      outcome: 'withheld',
+      why: 'server-changed',
+      serverId: 'mcp_archive',
+      serverName: 'archive',
+      host: 'archive.example',
+      toolName: 'archive.note',
+      bytes: new TextEncoder().encode(JSON.stringify({ text: SECRET })).length,
+    };
+    expect(withdrawn.tools[1]!.receipt).toMatchObject(notSent);
+
+    // Stop landing after the withdrawal still leaves the record behind.
+    const thenStopped = await withdrawing(true, true);
+    expect(thenStopped.archive.call).not.toHaveBeenCalled();
+    expect(thenStopped.tools.map((tool) => tool.name)).toEqual(['notes.note', 'archive.note']);
+    expect(thenStopped.tools[1]!.receipt).toMatchObject(notSent);
   });
 
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {
