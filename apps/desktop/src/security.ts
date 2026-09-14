@@ -217,6 +217,88 @@ const EXTERNAL_SCHEMES: readonly string[] = ['http:', 'https:'];
  * firing a real OS handler; `shell.openExternal` is not something a test suite
  * should be able to reach.
  */
+/**
+ * THE PERMISSIONS THE DESKTOP GRANTS, AND IT IS ONE.
+ *
+ * Electron approves every permission request automatically when no handler is
+ * installed (its security tutorial, "Handle session permission requests from
+ * remote content"), and until this existed the shell installed none. So every
+ * camera, microphone, location and notification request from the renderer was
+ * granted with no prompt from the app — macOS still showed its own one-time
+ * system prompt; Windows and Linux showed nothing.
+ *
+ * DENY BY DEFAULT, because Electron forwards EVERY permission type Chromium
+ * requests and that list grows with Chromium. An allowlist stays correct when a
+ * new permission appears; a blocklist silently grants it.
+ *
+ * MEASURED, not inferred — a hidden Electron 44.0.0 / Chrome 152 window on the
+ * real `chatterang-desktop://app` scheme, focused, with a simulated user
+ * gesture, under this allowlist and under deny-all:
+ *
+ *     navigator.clipboard.writeText   allowlist: works    deny-all: NotAllowedError
+ *     navigator.clipboard.readText    allowlist: denied   deny-all: denied
+ *     getUserMedia / Notification /   denied under both, each reaching the
+ *       geolocation                     request handler with the page's URL
+ *     fetch to 127.0.0.1              never reaches the handler at all
+ *
+ * So `clipboard-sanitized-write` is load-bearing: deny-all breaks every copy
+ * button in the app (`CopyButton` in src/ui/primitives.tsx, "Copy prompt" in
+ * the studio). And denying Local Network Access cannot break a self-hosted
+ * provider, because Electron never asks.
+ *
+ * NOT GRANTED, each deliberately: `media` (the desktop serves ONNX speech
+ * through its native bridge and draws pairing codes rather than scanning them —
+ * `cameraScan` is false there), `clipboard-read` (nothing in the app reads the
+ * clipboard, and reading it is how a page learns what you copied elsewhere),
+ * `notifications`, `geolocation`, `display-capture`, `fullscreen`,
+ * `openExternal` (links leave through `isAllowedExternalUrl` in the main
+ * process, which needs no renderer permission).
+ */
+export const DESKTOP_GRANTED_PERMISSIONS: ReadonlySet<string> = new Set(['clipboard-sanitized-write']);
+
+export interface PermissionQuery {
+  readonly permission: string;
+  /** The URL of the frame asking, or `''` when Electron could not say. */
+  readonly requestingUrl: string;
+  readonly isMainFrame: boolean;
+}
+
+/**
+ * Should the desktop grant this permission request or check?
+ *
+ * Three conditions, all required: the permission is on the allowlist, it comes
+ * from the MAIN frame, and that frame is the app's own origin. A subframe never
+ * qualifies — the only frames the app creates are `sandbox=""` model-HTML
+ * previews, and nothing inside one should ever hold a permission.
+ */
+export function isPermissionGranted(query: PermissionQuery, devServerUrl: string): boolean {
+  if (!DESKTOP_GRANTED_PERMISSIONS.has(query.permission)) return false;
+  if (!query.isMainFrame) return false;
+  return isTrustedOrigin(query.requestingUrl, devServerUrl);
+}
+
+/**
+ * The URL a permission request or check is about, from Electron's details —
+ * which are only partly filled in, and MEASURABLY so.
+ *
+ * Checks for `media`, `geolocation` and `web-app-installation` arrived with no
+ * `requestingUrl` and an EMPTY `requestingOrigin`, before the page's URL was
+ * committed. Reading only `requestingUrl` would treat those as having no origin
+ * — correct for them, and wrong for anything the app legitimately needs that is
+ * checked the same way. So: the requesting URL, then the requesting origin,
+ * then — for the MAIN frame only — the URL the window itself has loaded. A
+ * subframe with nothing to go on gets `''`, which no origin test accepts.
+ */
+export function permissionRequestUrl(
+  details: { readonly requestingUrl?: string; readonly isMainFrame?: boolean },
+  requestingOrigin: string,
+  webContentsUrl: string,
+): string {
+  if (details.requestingUrl) return details.requestingUrl;
+  if (requestingOrigin) return requestingOrigin;
+  return details.isMainFrame === true ? webContentsUrl : '';
+}
+
 export function isAllowedExternalUrl(url: string): boolean {
   try {
     return EXTERNAL_SCHEMES.includes(new URL(url).protocol);
