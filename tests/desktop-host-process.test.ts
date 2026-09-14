@@ -202,21 +202,36 @@ function alive(pid: number): boolean {
  * descriptor closed — without letting the event loop turn, so Node has not yet
  * read the exit or the socket closing. Polls `ps` rather than sleeping a
  * guessed interval, so a loaded machine only makes it wait longer.
+ *
+ * Only `ps` RUNNING and reporting no such pid (exit status 1, no spawn error
+ * code) counts as gone. A `ps` that could not be started at all used to count
+ * too, and then this returned at once and the test below passed or failed on
+ * however long the failed spawn happened to take. FAULT INJECTED: pointing
+ * this at a binary that does not exist passed 5 runs of 5 that way, while
+ * dropping the hold entirely failed 4 of 5. A spawn the machine is too busy
+ * for (EAGAIN) is retried, and any other spawn failure is thrown.
  */
 function blockUntilTornDown(pid: number, ms = 5_000): void {
   const deadline = Date.now() + ms;
   const pause = new Int32Array(new SharedArrayBuffer(4));
+  let lastSpawnError: unknown;
   while (Date.now() < deadline) {
-    let state = '';
+    let state: string | null = null;
     try {
-      state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim();
-    } catch {
-      // `ps` exits non-zero once the pid is gone altogether.
+      state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch (error) {
+      const failure = error as NodeJS.ErrnoException & { status?: number | null };
+      if (failure.code === undefined && failure.status === 1) return;
+      if (failure.code !== 'EAGAIN') throw error;
+      lastSpawnError = error;
     }
-    if (state === '' || state.startsWith('Z')) return;
+    if (state !== null && state.startsWith('Z')) return;
     Atomics.wait(pause, 0, 0, 10);
   }
-  throw new Error(`timed out waiting for the OS to tear down pid ${String(pid)}`);
+  throw new Error(`timed out waiting for the OS to tear down pid ${String(pid)}`, { cause: lastSpawnError });
 }
 
 async function until(what: string, predicate: () => boolean, ms = 5_000): Promise<void> {
