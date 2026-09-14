@@ -40,6 +40,7 @@ import {
 import { isLocalEngine } from '@/domain/manifest';
 import { validateServerUrl } from '@/domain/mcp';
 import { PairingSheet } from '@/features/pairing/PairingSheet';
+import { ProvidersPanel } from '@/features/settings/ProvidersPanel';
 import { capabilities } from '@/lib/platform';
 import {
   pairingController,
@@ -1354,10 +1355,10 @@ describe('the provider panel hints', () => {
         .join('') ?? null;
 
     expect(words('chatterang-desktop://app')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
     );
     expect(words('capacitor://localhost')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
     );
     // Ollama splits the setting on commas and keeps spaces. Measured: a space
     // after the comma left the entry unmatched (403), and a space before
@@ -1383,6 +1384,70 @@ describe('the provider panel hints', () => {
       expect(provider.originNote, provider.id).toBeUndefined();
     }
     expect(PROVIDERS_PANEL).not.toContain('OLLAMA_ORIGINS');
+  });
+
+  it('says the iOS value is shared, and to quote a value, where the panel renders one', () => {
+    // Two owner rulings on #284, pinned against the real panel at the origin it
+    // reads when it renders, not against the catalog alone.
+    //
+    // iOS: every default-configured Capacitor iOS app sends `capacitor://localhost`,
+    // so its value (the middle form, `capacitor:*//localhost`) cannot admit this
+    // app alone. The note shows the value and says so; no other origin says it.
+    //
+    // Quoting: the value is typed exactly, and `*` unquoted in zsh fails with "no
+    // matches found". Shown with every value, and only with a value.
+    const shared =
+      'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+    const quote = 'If you set it from a shell, put the value in quotes.';
+    const ollamaAt = (origin: string): { text: string; codes: string[] } => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      vi.stubGlobal('location', { origin, href: `${origin}/` });
+      const host = document.createElement('div');
+      document.body.append(host);
+      const root = createRoot(host);
+      try {
+        act(() => {
+          root.render(createElement(ProvidersPanel));
+        });
+        const item = [...host.querySelectorAll<HTMLElement>('button.list__item')].find(
+          (button) => button.querySelector('.list__title')?.textContent === 'Ollama',
+        );
+        if (!item) throw new Error(`no Ollama item at ${origin}`);
+        return {
+          text: reads(item.textContent ?? ''),
+          codes: [...item.querySelectorAll('code')].map((code) => code.textContent ?? ''),
+        };
+      } finally {
+        act(() => root.unmount());
+        host.remove();
+        vi.unstubAllGlobals();
+      }
+    };
+
+    const ios = ollamaAt('capacitor://localhost');
+    expect(ios.codes).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
+    expect(ios.text).toContain(`Add capacitor:*//localhost to that setting. ${shared}`);
+    expect(ios.text).toContain(quote);
+
+    const desktop = ollamaAt('chatterang-desktop://app');
+    expect(desktop.codes).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
+    expect(desktop.text).not.toContain(shared);
+    expect(desktop.text).not.toContain('Other iOS apps');
+    expect(desktop.text).toContain(quote);
+
+    // A value with no `*` is still a value to type exactly.
+    const lan = ollamaAt('http://192.168.1.10:5273');
+    expect(lan.codes).toEqual(['OLLAMA_ORIGINS', 'http://192.168.1.10:5273']);
+    expect(lan.text).toContain(quote);
+    expect(lan.text).not.toContain('Other iOS apps');
+
+    // No value shown: Ollama already allows the origin, or the app cannot tell.
+    for (const origin of ['https://localhost', 'http://localhost:5273', 'null']) {
+      const page = ollamaAt(origin);
+      expect(page.codes.length, origin).toBeLessThan(2);
+      expect(page.text, origin).not.toContain('in quotes');
+      expect(page.text, origin).not.toContain('Other iOS apps');
+    }
   });
 
   it('does not make allowing it the precondition for tool output leaving', () => {

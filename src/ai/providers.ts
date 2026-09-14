@@ -75,7 +75,16 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
         { code: 'OLLAMA_ORIGINS' },
         ' setting allows it. Add ',
         { code: setting.value },
-        ' to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
+        ' to that setting.',
+        // Ruled on #284: iOS shows the value and says it is shared. Every
+        // default-configured Capacitor iOS app sends this same origin, so no
+        // value admits this app there alone. Only that exact origin says so.
+        ...(origin === CAPACITOR_IOS_DEFAULT_ORIGIN ? [` ${OLLAMA_SHARED_ORIGIN_SENTENCE}`] : []),
+        ' If it already has a value, put a comma between them, with no spaces.',
+        // Ruled on #284: a value holding `*` typed unquoted into zsh stops the
+        // command with "no matches found", so every shown value says to quote it.
+        ` ${OLLAMA_QUOTE_SENTENCE}`,
+        ' Restart Ollama for the change to take effect.',
       ];
     },
     needsKey: false,
@@ -294,6 +303,27 @@ export type OllamaOriginsSetting =
   | { readonly kind: 'none-needed' }
   | { readonly kind: 'add'; readonly value: string }
   | { readonly kind: 'unknown' };
+
+/**
+ * The origin every Capacitor iOS app is served from unless it sets its own
+ * `server.iosScheme` or `server.hostname`, and this app sets neither
+ * (`capacitor.config.ts`). The value it needs is the middle form (`capacitor:`,
+ * then `*`, then `//localhost`, written as one word). It admits this app and
+ * refused every look-alike measured, but it cannot tell this app from another
+ * default-configured Capacitor iOS app.
+ */
+const CAPACITOR_IOS_DEFAULT_ORIGIN = 'capacitor://localhost';
+
+/** Said beside the value only at `CAPACITOR_IOS_DEFAULT_ORIGIN` (#284). */
+const OLLAMA_SHARED_ORIGIN_SENTENCE =
+  'Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on.';
+
+/**
+ * Said with every value shown (#284). Platform-neutral: the value contains `*`
+ * wherever the origin is not http(s), and unquoted in zsh, macOS's default
+ * shell, that fails with "no matches found".
+ */
+const OLLAMA_QUOTE_SENTENCE = 'If you set it from a shell, put the value in quotes.';
 
 /**
  * Ollama 0.34.0's defaults, as its `server config` log line lists them with

@@ -287,6 +287,18 @@ function codes(element: Element): string[] {
   return [...element.querySelectorAll('code')].map((code) => code.textContent ?? '');
 }
 
+/** The Ollama list item's words and code values at one origin, rendered and torn down. */
+function ollamaAt(origin: string): { text: string; codes: string[] } {
+  const page = renderPanelAt(origin);
+  try {
+    const ollama = providerItem(page.body, 'Ollama');
+    return { text: ollama.textContent ?? '', codes: codes(ollama) };
+  } finally {
+    page.unmount();
+    vi.unstubAllGlobals();
+  }
+}
+
 describe('the Ollama note in the Providers panel', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -298,7 +310,7 @@ describe('the Ollama note in the Providers panel', () => {
     const ollamaOnDesktop = providerItem(desktop.body, 'Ollama');
     expect(codes(ollamaOnDesktop)).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
     expect(ollamaOnDesktop.textContent).toContain(
-      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
+      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
     );
     desktop.unmount();
 
@@ -307,6 +319,9 @@ describe('the Ollama note in the Providers panel', () => {
     const ollamaOnIos = providerItem(ios.body, 'Ollama');
     expect(codes(ollamaOnIos)).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
     expect(ollamaOnIos.textContent).not.toContain('chatterang-desktop');
+    expect(ollamaOnIos.textContent).toContain(
+      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. Other iOS apps built on the same framework send the same origin as this app by default, so this value also lets them reach Ollama if they can reach the machine it runs on. If it already has a value, put a comma between them, with no spaces. If you set it from a shell, put the value in quotes. Restart Ollama for the change to take effect.',
+    );
     ios.unmount();
 
     const lan = renderPanelAt('http://192.168.1.10:5273');
@@ -315,6 +330,51 @@ describe('the Ollama note in the Providers panel', () => {
       'http://192.168.1.10:5273',
     ]);
     lan.unmount();
+  });
+
+  it('says the value is shared only at the default Capacitor iOS origin', () => {
+    // `capacitor://localhost` is every default-configured Capacitor iOS app's
+    // origin, so its value (`capacitor:*//localhost`) admits them all. Any other
+    // origin that gets a value, look-alikes on the same scheme included, does
+    // not get that sentence: its value admits that origin alone.
+    const shared = 'Other iOS apps built on the same framework';
+    expect(ollamaAt('capacitor://localhost').text).toContain(shared);
+    for (const origin of [
+      'chatterang-desktop://app',
+      'http://192.168.1.10:5273',
+      'https://chat.example.com',
+      'capacitor://evil',
+      'capacitor://localhost:8080',
+      'xcapacitor://localhost',
+      'ionic://localhost',
+      'null',
+      'https://localhost',
+    ]) {
+      const { text } = ollamaAt(origin);
+      expect(text, origin).not.toContain(shared);
+      expect(text, origin).not.toContain('iOS');
+    }
+  });
+
+  it('says to quote the value exactly when it shows one', () => {
+    // A value holding `*` unquoted in zsh fails with "no matches found".
+    const quote = 'If you set it from a shell, put the value in quotes.';
+    for (const origin of [
+      'chatterang-desktop://app',
+      'capacitor://localhost',
+      'http://192.168.1.10:5273',
+      'http://[::1]:5273',
+    ]) {
+      const page = ollamaAt(origin);
+      expect(page.codes, origin).toHaveLength(2);
+      expect(page.text, origin).toContain(quote);
+    }
+    // No value: Ollama already allows the origin, or the app cannot tell.
+    for (const origin of ['https://localhost', 'http://localhost:5273', 'vscode-file://vscode-app', 'null']) {
+      const page = ollamaAt(origin);
+      expect(page.codes.length, origin).toBeLessThan(2);
+      expect(page.text, origin).not.toContain('quotes');
+    }
   });
 
   it('asks for no setting where Ollama already allows the origin', () => {
@@ -373,6 +433,9 @@ describe('the Ollama note in the Providers panel', () => {
     const meaning = sheet?.querySelector('.card--remote');
     expect(meaning?.textContent).toContain('What this means');
     expect(codes(meaning!)).toEqual(['OLLAMA_ORIGINS', 'capacitor:*//localhost']);
+    // The sheet is where the connection is made, so it carries both rulings too.
+    expect(meaning?.textContent).toContain('Other iOS apps built on the same framework');
+    expect(meaning?.textContent).toContain('If you set it from a shell, put the value in quotes.');
     page.unmount();
   });
 });
