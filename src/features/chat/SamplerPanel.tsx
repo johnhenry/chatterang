@@ -25,8 +25,11 @@ export function SamplerPanel({ chat }: { chat: Chat }): ReactNode {
   const effective: SamplerSettings = { ...base, ...chat.sampler };
   const overrides = chat.sampler ?? {};
 
+  // Merged into the overrides AS THEY STAND WHEN THIS IS WRITTEN, not the ones
+  // this panel rendered: two changes made before the first had landed kept only
+  // the second. See `ChatPatch`.
   const set = (patch: Partial<SamplerSettings>): void => {
-    void update(chat.id, { sampler: { ...overrides, ...patch } });
+    void update(chat.id, (current) => ({ sampler: { ...current.sampler, ...patch } }));
   };
 
   const overridden = (key: keyof SamplerSettings): boolean => key in overrides;
