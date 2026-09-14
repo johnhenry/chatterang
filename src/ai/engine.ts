@@ -535,6 +535,10 @@ export class ChatterangEngine {
     stack.push(
       createResilienceMiddleware({
         resolveFallback: () => this.#resolveFallback(),
+        // NO `mayDivert`, and leaving it out is the refusal. This middleware
+        // returns early on streamed requests, so the only request it acts on is
+        // `complete()`'s, and `complete()` must not divert (see there). It still
+        // reads the device and passes a failure through untouched.
         onFallback: (event) => {
           this.#lastFallback = event;
           this.#options.onFallback?.(event);
@@ -918,7 +922,10 @@ export class ChatterangEngine {
       if (failure) {
         if (request.signal?.aborted) break;
 
-        // A local failure can still divert, exactly as the middleware would.
+        // A local failure can still divert: announced just below, then through
+        // the egress gate at the top of the loop. This used to say "exactly as
+        // the middleware would". The middleware no longer does this, because the
+        // one request it acts on, `complete()`'s, can do neither.
         const fallback = runsOnThisDevice(target) ? this.#resolveFallback() : null;
         if (!fallback) {
           const retryable = noBackendRetryable(failure);
@@ -1142,7 +1149,12 @@ export class ChatterangEngine {
   }
 
   /**
-   * Non-streaming completion, used by tools, titling, and benchmarks.
+   * Non-streaming completion.
+   *
+   * Nothing under `src/` calls it today; only tests do. This used to say it was
+   * used by tools, titling, and benchmarks, none of which reach it. The caller
+   * that is planned is #197's queue, which drains a turn through here with
+   * nobody watching, and that is who the refusal below is for.
    *
    * It went through the taint gate only once `#toIR` started demanding a
    * `ClearedMessage[]`: before that it handed `request.messages` straight to
@@ -1156,13 +1168,13 @@ export class ChatterangEngine {
      * The same backstop `stream` has, for the same sentence.
      *
      * Not for the same reason, though, and the difference is worth stating so
-     * nobody later "simplifies" one into the other: there is no fallback on
-     * this path, so nothing here can divert a local turn to the cloud. What
-     * was live here was only the string. Measured before this check, calling
-     * `complete` with the reported target: "Requested backend 'onnx-runtime'
-     * is not registered. Registered backends: llama-cpp" — aimatey's
-     * vocabulary about its own registration table, reaching the user through
-     * the other public door.
+     * nobody later "simplifies" one into the other. In `stream` the backstop is
+     * what keeps a missing runtime from being diverted to the cloud. Here
+     * nothing is diverted at all (see below), so what was live was only the
+     * string. Measured before this check, calling `complete` with the reported
+     * target: "Requested backend 'onnx-runtime' is not registered. Registered
+     * backends: llama-cpp" — aimatey's vocabulary about its own registration
+     * table, reaching the user through the other public door.
      *
      * It throws rather than returning, because that is already how this method
      * fails: `bridge.chat` threw that exact error, and every caller is written
@@ -1171,6 +1183,32 @@ export class ChatterangEngine {
     if (!this.router.has(request.target.backendId)) {
       throw new Error(unregisteredBackendMessage(request.target));
     }
+
+    /*
+     * NO DIVERT ON THIS PATH, from either branch of the resilience middleware.
+     *
+     * The backstop's note above used to say there was no fallback here. There
+     * was. This request is not streamed, so the middleware does not take its
+     * early return, and on main it handed the request to the nominated fallback
+     * on a hot device, and on ANY failure, remote and paired turns included.
+     * Nobody was told before it went, and no gate ran for the new destination.
+     * The request it forwarded had been cleared for `request.target`, so for a
+     * local target tainted history reached the cloud still carrying this app's
+     * taint mark. Measured in tests/complete-divert.test.ts.
+     *
+     * `stream()` diverts only a turn that runs here, announces the divert as an
+     * event before anything is sent, and runs the egress gate again for the new
+     * destination. This path has no event to announce it with and no sheet to
+     * raise, and a grant in `request.egress` was given for `request.target`,
+     * not for whichever backend a failure picks. So it refuses. The middleware
+     * is built without `mayDivert` (see `#middleware`): a failure surfaces as
+     * the error, and on a hot device the local backend serves the turn, which
+     * is what both already did with nothing nominated.
+     *
+     * Whether an unattended caller should EVER divert, for instance under a
+     * stored conversation grant for the fallback, is a ruling nobody has made
+     * (#197). Until it is made, the answer here is no.
+     */
 
     const allowed =
       !leavesThisDevice(request.target) ||
@@ -1200,8 +1238,10 @@ export class ChatterangEngine {
      *
      * So the divert the engine performed itself is converted here, and the two
      * paths describe it identically instead of one saying it in metadata and
-     * the other in an event nobody reads. `mergeWarnings` deduplicates, for
-     * the non-streaming case where both sources describe the same divert.
+     * the other in an event nobody reads. `mergeWarnings` deduplicates, should
+     * a response's own warnings ever describe the same divert. (This used to
+     * name a non-streaming case where both do. There is none: `stream` is the
+     * only caller of this, and `complete()` does not divert.)
      */
     const diverted = fallback ? fallbackWarning(fallback.reason, fallback.from) : null;
     const warnings = mergeWarnings(this.#responseWarnings, diverted ? [diverted] : []);

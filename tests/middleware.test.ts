@@ -278,6 +278,80 @@ describe('resilience middleware', () => {
     );
   });
 
+  /*
+   * A NOMINATED FALLBACK IS NOT ENOUGH. The only request this middleware acts on
+   * is `engine.complete()`'s, since it returns early on every streamed one, and
+   * `complete()` has none of what makes the streamed divert consented: no
+   * announcement before anything is sent, no egress gate for the new
+   * destination. On main these branches diverted from nomination alone.
+   * `tests/complete-divert.test.ts` measures that through the real engine.
+   */
+  it('does not divert without `mayDivert`, even with a fallback nominated', async () => {
+    const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
+    const onFallback = vi.fn();
+    const middleware = createResilienceMiddleware({
+      resolveFallback: () => ({ name: 'openai-1', adapter, modelId: 'gpt-4o-mini' }),
+      onFallback,
+    });
+
+    await expect(
+      middleware(
+        context({ backendName: 'llama-cpp' }),
+        vi.fn(async () => {
+          throw new Error('not enough memory');
+        }),
+      ),
+    ).rejects.toThrow('not enough memory');
+
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(onFallback).not.toHaveBeenCalled();
+  });
+
+  it('does not divert when `mayDivert` answers anything but true', async () => {
+    const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
+    const middleware = createResilienceMiddleware({
+      resolveFallback: () => ({ name: 'openai-1', adapter }),
+      mayDivert: () => false,
+    });
+
+    await expect(
+      middleware(
+        context({ backendName: 'llama-cpp' }),
+        vi.fn(async () => {
+          throw new Error('boom');
+        }),
+      ),
+    ).rejects.toThrow('boom');
+    expect(adapter.execute).not.toHaveBeenCalled();
+  });
+
+  it('does not divert a remote failure, even where diverting is allowed', async () => {
+    // On main the failure handler had no reach check at all: the pre-flight asked
+    // `isLocal` and the catch did not, so a remote turn that failed went to the
+    // fallback. Only a turn that runs on this device is eligible, which is the rule
+    // `stream()` follows (`runsOnThisDevice`).
+    const adapter = { execute: vi.fn(async () => response('remote answer')) } as unknown as BackendAdapter;
+    const middleware = createResilienceMiddleware({
+      resolveFallback: () => ({ name: 'openai-1', adapter }),
+      mayDivert: () => true,
+    });
+
+    await expect(
+      middleware(
+        context({
+          backendName: 'conn_primary',
+          request: request({
+            metadata: { requestId: 'req_1', timestamp: 0, custom: { local: false, toolIds: [] } },
+          }),
+        }),
+        vi.fn(async () => {
+          throw new Error('provider 500');
+        }),
+      ),
+    ).rejects.toThrow('provider 500');
+    expect(adapter.execute).not.toHaveBeenCalled();
+  });
+
   it('diverts to the nominated backend and records why', async () => {
     const adapter = {
       execute: vi.fn(async () => response('remote answer')),
@@ -286,6 +360,7 @@ describe('resilience middleware', () => {
     const onFallback = vi.fn();
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter, modelId: 'gpt-4o-mini' }),
+      mayDivert: () => true,
       onFallback,
     });
 
@@ -311,6 +386,7 @@ describe('resilience middleware', () => {
 
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter, modelId: 'gpt-4o-mini' }),
+      mayDivert: () => true,
     });
 
     await middleware(
@@ -328,8 +404,10 @@ describe('resilience middleware', () => {
 
   it('does not divert a cancelled request', async () => {
     const adapter = { execute: vi.fn() } as unknown as BackendAdapter;
+    // Allowed to divert, so the abort is the only thing that stops it.
     const middleware = createResilienceMiddleware({
       resolveFallback: () => ({ name: 'openai-1', adapter }),
+      mayDivert: () => true,
     });
 
     const controller = new AbortController();

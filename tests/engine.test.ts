@@ -1046,10 +1046,16 @@ describe('ChatterangEngine.stream', () => {
    *   "Requested backend 'conn_openai' is not registered. Registered
    *    backends: llama-cpp"
    *
-   * It has no callers under `src/` today and it does not divert to the cloud,
-   * so this is not the reported bug — it is the same string reaching the user
-   * through the other door. Titling, tools, and benchmarks all go through
-   * here, and a caller added later inherits whichever sentence is in place.
+   * It has no callers under `src/` today, so this is not the reported bug — it
+   * is the same string reaching the user through the other door, and a caller
+   * added later (#197's queue is the one planned) inherits whichever sentence
+   * is in place.
+   *
+   * This note used to add that `complete()` "does not divert to the cloud",
+   * and that titling, tools, and benchmarks go through it. Neither was true:
+   * none of those call it, and it diverted from both branches of the
+   * resilience middleware. The refusal is pinned in
+   * tests/complete-divert.test.ts.
    */
   describe('complete() on a backend the router does not have', () => {
     async function rejection(target: Parameters<typeof engine.complete>[0]['target']) {

@@ -10,6 +10,15 @@
  * provider means sending the conversation off-device, so it never happens
  * unless the user has explicitly nominated a fallback backend, and every
  * fallback is recorded in the message's provenance.
+ *
+ * In the middleware below a nomination is necessary and not sufficient. It
+ * diverts a request only when its caller says that request may go
+ * (`mayDivert`), and only a turn that runs on this device is eligible. The
+ * engine never says so: this middleware returns early on streamed requests, so
+ * the one request it acts on is `complete()`'s, and `complete()` has nothing to
+ * announce a divert with and no gate for the new destination. The divert a chat
+ * turn gets is `ChatterangEngine.stream`'s own, built from the exports above
+ * the middleware.
  */
 
 import type {
@@ -49,6 +58,16 @@ export interface FallbackTarget {
 export interface ResilienceOptions {
   /** The backend to divert to, or null when the user has nominated none. */
   resolveFallback: () => FallbackTarget | null;
+  /**
+   * Whether THIS request may be sent to the fallback. Leaving it out is a
+   * refusal, and so is any answer but `true`.
+   *
+   * A nomination names the backend a divert would use. It does not say that a
+   * given request may leave without the person being told first, or without
+   * the egress gate running for the new destination. `stream()` does both of
+   * those itself. A caller that can do neither leaves this out.
+   */
+  mayDivert?: (context: MiddlewareContext) => boolean;
   /** Refuse to start a local generation above this thermal level (0–1). */
   thermalCeiling?: number;
   /** Refuse to start when free memory drops below this many bytes. */
@@ -158,6 +177,19 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
         backendName.startsWith('litert') ||
         backendName.startsWith('chrome'));
 
+    /*
+     * Where a divert is decided, for both branches below.
+     *
+     * The caller must say THIS request may go, and that is asked before the
+     * fallback is resolved, so a refusal never depends on what happens to be
+     * nominated. Only a turn that runs on this device is eligible, which is the
+     * rule `stream()` follows (`runsOnThisDevice`). The failure handler used to
+     * skip both checks: it diverted on nomination alone, and a remote or paired
+     * turn that failed went to the fallback too (tests/complete-divert.test.ts).
+     */
+    const divertTarget = (): FallbackTarget | null =>
+      isLocal && options.mayDivert?.(context) === true ? options.resolveFallback() : null;
+
     // Pre-flight: only local engines are subject to device pressure.
     if (isLocal) {
       const pressure = await checkDevicePressure({
@@ -167,7 +199,8 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
       });
 
       if (pressure) {
-        const fallback = options.resolveFallback();
+        // Refused, the local backend takes the turn, as it does with nothing nominated.
+        const fallback = divertTarget();
         if (fallback) {
           options.onFallback?.({
             reason: pressure.reason,
@@ -189,10 +222,10 @@ export function createResilienceMiddleware(options: ResilienceOptions): Middlewa
     } catch (error) {
       if (context.signal?.aborted) throw error;
 
-      const { reason, detail } = classifyFailure(error);
-      const fallback = options.resolveFallback();
+      const fallback = divertTarget();
       if (!fallback) throw error;
 
+      const { reason, detail } = classifyFailure(error);
       options.onFallback?.({ reason, from: backendName, to: fallback.name, detail });
       const response = await fallback.adapter.execute(
         retarget(context.request, fallback),
