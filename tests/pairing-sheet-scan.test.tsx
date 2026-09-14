@@ -56,7 +56,18 @@ import {
   confirmDetail,
 } from '@/features/pairing/wording';
 
-import { button, byLabel, click, dialog, mustButton, reads, render, settle, type Mounted } from './support/pairing-dom';
+import {
+  button,
+  byLabel,
+  click,
+  dialog,
+  mustButton,
+  reads,
+  readsShown,
+  render,
+  settle,
+  type Mounted,
+} from './support/pairing-dom';
 
 /* ── The platform's edges ───────────────────────────────────────────── */
 
@@ -231,7 +242,8 @@ describe('the camera is asked for only when the person presses Scan with camera 
     expect(mustButton('Type').getAttribute('aria-pressed')).toBe('true');
     expect(mustButton('Scan').getAttribute('aria-pressed')).toBe('false');
     expect(byLabel('Computer address')).toBeInstanceOf(HTMLInputElement);
-    expect(reads(dialog())).toContain(TYPED_ADMISSION);
+    // Seen, not merely present: textContent would count a hidden paragraph.
+    expect(readsShown(dialog())).toContain(TYPED_ADMISSION);
     expect(button('Scan with camera')).toBeNull();
     await settle();
     expect(getUserMedia).not.toHaveBeenCalled();
@@ -267,11 +279,44 @@ describe('the camera is asked for only when the person presses Scan with camera 
     expect(button('Type')).toBeNull();
     expect(button('Scan with camera')).toBeNull();
     expect(byLabel('Computer address')).toBeInstanceOf(HTMLInputElement);
-    expect(reads(dialog())).toContain(TYPED_ADMISSION);
+    expect(readsShown(dialog())).toContain(TYPED_ADMISSION);
     expect(document.querySelector('.field__error')).toBeNull();
     expect(status()).toEqual([]);
     expect(reads(dialog())).not.toMatch(/camera/i);
     expect(getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it('control: readsShown drops every way these tests know of hiding a sentence, and keeps a shown one', () => {
+    // Without this, a readsShown that returned textContent would let the
+    // "on screen" checks above pass on a hidden admission.
+    const fixture = document.createElement('div');
+    fixture.innerHTML = [
+      '<p>shown</p>',
+      '<p hidden>by-hidden</p>',
+      '<div aria-hidden="true"><p>by-aria-hidden</p></div>',
+      '<div inert><p>by-inert</p></div>',
+      '<div style="display: none"><p>by-display</p></div>',
+      '<div style="visibility: hidden"><p>by-visibility</p></div>',
+      '<details><summary>why</summary><p>by-closed-details</p>loose-in-details</details>',
+      '<details open><summary>open</summary><p>in-open-details</p></details>',
+    ].join('');
+    document.body.append(fixture);
+    try {
+      const hidden = ['by-hidden', 'by-aria-hidden', 'by-inert', 'by-display', 'by-visibility', 'by-closed-details', 'loose-in-details'];
+      for (const word of hidden) expect(reads(fixture), `textContent counts ${word}`).toContain(word);
+      const seen = readsShown(fixture);
+      for (const word of hidden) expect(seen, word).not.toContain(word);
+      expect(seen).toContain('shown');
+      expect(seen).toContain('why');
+      expect(seen).toContain('in-open-details');
+
+      // A node whose ancestor hides it reads as nothing, even asked directly.
+      expect(readsShown(fixture.querySelector('[aria-hidden] p'))).toBe('');
+      expect(readsShown(fixture.querySelector('details:not([open]) p'))).toBe('');
+      expect(readsShown(fixture.querySelector('p'))).toBe('shown');
+    } finally {
+      fixture.remove();
+    }
   });
 });
 
@@ -290,6 +335,8 @@ describe('what the camera answers', () => {
       await until(() => button('Type')?.getAttribute('aria-pressed') === 'true', `${label}: Type selected`);
       expect(byLabel('Computer address'), label).toBeInstanceOf(HTMLInputElement);
       expect(status(), label).toEqual([CAMERA_UNAVAILABLE]);
+      // The Type pane a refused camera lands on is the same pane, admission and all (D2).
+      expect(readsShown(dialog()), label).toContain(TYPED_ADMISSION);
       expect(document.querySelector('.field__error'), label).toBeNull();
       expect(reads(dialog()), label).not.toMatch(/den(y|ied)/i);
       await mount.unmount();

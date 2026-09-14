@@ -71,7 +71,7 @@ import {
   recordingBackend,
   sent,
 } from './support/egress-probe';
-import { byLabel, click, dialog, mustButton, render, settle, typeInto } from './support/pairing-dom';
+import { byLabel, click, dialog, mustButton, readsShown, render, settle, typeInto } from './support/pairing-dom';
 import {
   SPECIFIER,
   codeOf,
@@ -2278,7 +2278,8 @@ describe('the pairing sheet admits what typing a code does not check', () => {
 
     // On screen from the start (#124): the sheet opens on Type even on a row
     // that can scan, so the sentence is read before a route is picked, not only
-    // by someone who went looking for Type. Nothing is pressed first.
+    // by someone who went looking for Type. Nothing is pressed first. Read as
+    // shown, not as textContent, which would count a hidden paragraph.
     expect(capabilities().cameraScan, 'jsdom runs the web row, which can scan').toBe(true);
     const opened = await render(
       createElement(PairingSheet, {
@@ -2288,7 +2289,7 @@ describe('the pairing sheet admits what typing a code does not check', () => {
       }),
     );
     try {
-      expect(reads(dialog()?.textContent ?? '')).toContain(
+      expect(readsShown(dialog())).toContain(
         "Typing a code is weaker than scanning one. A scanned code carries the computer's certificate " +
           'fingerprint; six typed digits do not.',
       );
