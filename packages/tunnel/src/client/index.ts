@@ -36,7 +36,7 @@
  * day someone pours it into the wrong half.
  */
 
-import { assertSendable, createSequenceGuard, faultMessage } from '../stream/index.js';
+import { createProtocolGate, faultMessage } from '../stream/index.js';
 import {
   TUNNEL_CAP_CLOSE_CODE,
   TUNNEL_CREDENTIAL_HEADER,
@@ -45,7 +45,12 @@ import {
   TUNNEL_WIRE_VERSION,
   decodeFrame,
   encodeFrame,
+  refusalOf,
+  type PromptId,
+  type RefusalKind,
+  type RelayedPrompt,
   type TunnelFrame,
+  type TurnId,
 } from '../wire/index.js';
 
 /**
@@ -91,6 +96,106 @@ export function randomChallenge(byteLength = 32): Uint8Array {
     throw new RangeError(`challenge length must be a positive integer, got ${byteLength}`);
   }
   return crypto.getRandomValues(new Uint8Array(byteLength));
+}
+
+/**
+ * What one frame means to the end that asked for a turn — which is what an app
+ * renders from (#7).
+ *
+ * `completed`, `failed` and `refused` are three different outcomes and are kept
+ * three: a reply that finished, a reply the far side's model or backend ended
+ * with an error chunk, and a turn the far side would not take or could not
+ * finish. A refusal says which kind (busy, quitting, suspended, refused, …) and
+ * whether the turn it names is over.
+ */
+export type TurnUpdate =
+  /** Nothing to render: a control frame, or one only an asker sends. */
+  | { readonly kind: 'other' }
+  /** Admitted, and waiting for the one slot. `position` 1 is next. */
+  | { readonly kind: 'waiting'; readonly turn: TurnId; readonly position: number }
+  /** A tool needs an answer before its call may go (#170). */
+  | {
+      readonly kind: 'prompt';
+      readonly turn: TurnId;
+      readonly prompt: PromptId;
+      readonly body: RelayedPrompt;
+    }
+  /** Part of the reply. */
+  | { readonly kind: 'streaming'; readonly turn: TurnId }
+  /** The reply's `done` chunk. */
+  | { readonly kind: 'completed'; readonly turn: TurnId }
+  /** An `error` chunk: the far side's model or backend failed the turn. */
+  | { readonly kind: 'failed'; readonly turn: TurnId }
+  /**
+   * An `error` frame. A refusal names no turn when it refuses the connection,
+   * and then, if it ends turns, it ends every turn its sender was running.
+   */
+  | {
+      readonly kind: 'refused';
+      readonly refusal: RefusalKind;
+      readonly endsTurn: boolean;
+      readonly code: string;
+      readonly message: string;
+      readonly turn?: TurnId;
+      readonly prompt?: PromptId;
+    };
+
+/**
+ * Classify one frame for the end that asked for its turn.
+ *
+ * AN UNKNOWN CODE IS A FAILURE. A refusal this build has no row for is
+ * `unrecognised` and ends the turn it names (`UNRECOGNISED_REFUSAL`): read as
+ * anything gentler, a newer desktop's refusal would leave the phone showing a
+ * turn as running, or finished, that the desktop has already given up on. A
+ * chunk is `completed` only for a `done` type, never for a type this build
+ * does not know.
+ *
+ * THIS DOES NOT CHECK STATE; `createProtocolGate` does, and `createTunnelClient`
+ * runs it on every frame before an app can read one. A frame outside its turn's
+ * state never reaches an app, and neither does a refusal of a turn that already
+ * had its terminal, so what an app classifies is one terminal per turn it asked
+ * for: `completed`, `failed`, or a refusal that ends it. A frame handed to this
+ * function from anywhere else has had none of those checks.
+ */
+export function classifyFrame(frame: TunnelFrame): TurnUpdate {
+  switch (frame.kind) {
+    case 'waiting':
+      return { kind: 'waiting', turn: frame.turn, position: frame.body.position };
+    case 'prompt':
+      return { kind: 'prompt', turn: frame.turn, prompt: frame.prompt, body: frame.body };
+    case 'chunk': {
+      const type =
+        typeof frame.body === 'object' && frame.body !== null
+          ? (frame.body as { readonly type?: unknown }).type
+          : undefined;
+      if (type === 'done') return { kind: 'completed', turn: frame.turn };
+      if (type === 'error') return { kind: 'failed', turn: frame.turn };
+      return { kind: 'streaming', turn: frame.turn };
+    }
+    case 'error': {
+      const refusal = refusalOf(frame.body.code);
+      return {
+        kind: 'refused',
+        refusal: refusal.kind,
+        endsTurn: refusal.endsTurn,
+        code: frame.body.code,
+        message: frame.body.message,
+        ...(frame.turn === undefined ? {} : { turn: frame.turn }),
+        ...(frame.prompt === undefined ? {} : { prompt: frame.prompt }),
+      };
+    }
+    case 'turn':
+    case 'cancel':
+    case 'answer':
+    case 'attach':
+    case 'ack':
+    case 'hello':
+    case 'ping':
+    case 'pong':
+    case 'bye':
+    case 'pair':
+      return { kind: 'other' };
+  }
 }
 
 /** How a tunnel ended. Mirrors the host's, deliberately — one vocabulary. */
@@ -178,7 +283,8 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
   const closed = new Promise<void>((resolve) => {
     settle = resolve;
   });
-  const guard = createSequenceGuard();
+  // This tunnel's turn state and sequence counts. See the host's.
+  const gate = createProtocolGate();
 
   /** First caller wins. See the host's, which carries the argument. */
   const finish = (close: TunnelClose): void => {
@@ -208,6 +314,23 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
       return;
     }
     /*
+     * THE SAME STATE CHECK AS THE HOST'S (#7), because a phone must not render
+     * a prompt for a turn it never asked for, or a `waiting` for a reply that
+     * is already streaming. Dropped unread and answered `FRAME_UNEXPECTED`.
+     */
+    const verdict = gate.receive(frame);
+    if (verdict.verdict === 'refuse') {
+      if (socket.readyState === WebSocket.OPEN) socket.send(gate.send(verdict.reply));
+      return;
+    }
+    /*
+     * A SECOND TERMINAL NEVER REACHES THE APP. A refusal of a turn that already
+     * ended here — the desktop's named repeat of a refusal of every turn, or a
+     * desktop settling one turn twice — is dropped and not answered, so a phone
+     * never renders "completed" and then "quitting" for one reply.
+     */
+    if (verdict.verdict === 'stale') return;
+    /*
      * CONTIGUITY, ENFORCED (#260). The IR calls `sequence` "the only
      * loss-detection primitive the IR has" once a stream crosses a wire and
      * says a consumer that sees a gap "should fail the turn rather than render
@@ -215,9 +338,8 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
      * a gap are not the stream that was sent, so rendering them and warning
      * afterwards shows the user something and then takes it back.
      */
-    const fault = guard.check(frame);
-    if (fault) {
-      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(fault) });
+    if (verdict.verdict === 'fault') {
+      finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(verdict.fault) });
       socket.close();
       return;
     }
@@ -281,10 +403,11 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
 
   return {
     async send(frame) {
-      // The obligation is symmetric: a client streams a reply back when the
-      // desktop asks the phone for a turn. See `assertSendable`.
-      assertSendable(frame);
-      socket.send(encodeFrame(frame));
+      // The obligations are symmetric: a client streams a reply back when the
+      // desktop asks the phone for a turn, and a client that sends an answer
+      // to a prompt nobody raised has a bug the gate throws on. See
+      // `createProtocolGate`.
+      socket.send(gate.send(frame));
     },
     async *receive() {
       for (;;) {

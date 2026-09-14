@@ -66,10 +66,10 @@ const HELLO: TunnelFrame = {
 
 const BYE: TunnelFrame = { v: TUNNEL_WIRE_VERSION, kind: 'bye' };
 
-const chunk = (sequence: number, delta: string): TunnelFrame => ({
+const chunk = (sequence: number, delta: string, turn = 't1'): TunnelFrame => ({
   v: TUNNEL_WIRE_VERSION,
   kind: 'chunk',
-  turn: 't1',
+  turn,
   body: { type: 'content', sequence, delta },
 });
 
@@ -140,8 +140,13 @@ describe('one listener, many tunnels', () => {
 
     // Each send reaches its own peer. The old host sent to whichever peer
     // connected LAST, so both of these would have landed on `b`.
-    await tunnelA.send(chunk(0, 'to a'));
-    await tunnelB.send(chunk(0, 'to b'));
+    //
+    // Under its own turn id, `down`, and not `t1`: a turn's reply streams one
+    // way (#7), so a listener streaming `t1` down and a peer streaming `t1` up
+    // on one tunnel is a frame out of state at one end, which the gate refuses.
+    // Before the wire kept turn state, this test used one id for both.
+    await tunnelA.send(chunk(0, 'to a', 'down'));
+    await tunnelB.send(chunk(0, 'to b', 'down'));
     await eventually(() => a.frames.length + b.frames.length === 2);
     expect(a.frames.map(deltaOf)).toEqual(['to a']);
     expect(b.frames.map(deltaOf)).toEqual(['to b']);

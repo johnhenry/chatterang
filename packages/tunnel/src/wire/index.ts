@@ -54,6 +54,37 @@
  * this envelope ships. Renaming a wire field for terseness is a breaking change
  * across two independently-updated binaries in exchange for three bytes a
  * frame, against payloads where base64 images dominate. Not worth it.
+ *
+ * ── #7's VOCABULARY: WAITING, PROMPTS, REFUSALS, AND COLLECTING A RESULT ──
+ *
+ * The owner's rulings on #7 put five things on this wire that the frames above
+ * cannot say. Each is here as a frame or a code, and nothing in this file
+ * decides the policy behind it — the wait list, the prompt timeout and the
+ * held results are the desktop's work broker's (#7, S2 and S8), not the wire's.
+ *
+ * - `waiting {position}`. One slot, one first-come-first-served wait list, and
+ *   whoever waits is told (#169, #7 ruling 3). A silent wait "is
+ *   indistinguishable from a hung app".
+ * - `prompt` and `answer`, bound to a turn AND to a prompt id (#170). A turn
+ *   can raise more than one prompt, so an answer names the prompt it answers:
+ *   a late answer to the first must never approve the second. How long a
+ *   prompt waits is the broker's named constant; what the wire carries is the
+ *   refusal when it runs out, `PROMPT_EXPIRED`, after which that call is
+ *   recorded as not sent on both sides and never sent later.
+ * - Refusal codes in the `error` frame's vocabulary, as data
+ *   ({@link REFUSALS}), so the halves and the app read one table.
+ * - `attach` and `ack`, for a result the desktop finished and held while the
+ *   phone's socket was gone (#7 ruling 4, #162). `attach` names only a turn:
+ *   WHICH DEVICE is asking is the credential that authenticated the socket
+ *   (#135), never a field a frame could forge. {@link resolveAttach} is the
+ *   rule for looking a held result up.
+ * - `HOST_DOES_NOT_RUN_TURNS`, defined here so a host that will not run a
+ *   phone's turn has a code the app can render. Which host sends it is not
+ *   this file's to say.
+ *
+ * None of them carries an IR escape hatch, so `FIELD_POLICY` gains no row:
+ * every field below is a string, a boolean or a safe integer, checked on the
+ * way out as well as on the way in.
  */
 
 /**
@@ -63,6 +94,11 @@
  * binaries meet: the phone updates through an app store and the desktop
  * through a download, so they are routinely different builds. Version-on-every
  * frame is cheap and makes the mismatch a decode error with a number in it.
+ *
+ * STILL 1 AFTER #7's FRAMES WERE ADDED, deliberately: no app starts a listener
+ * and no build has carried a tunnel to anyone, so there is no deployed version
+ * 1 for a new kind to be incompatible with. The first build that ships a
+ * tunnel is the one whose frames are version 1.
  */
 export const TUNNEL_WIRE_VERSION = 1;
 
@@ -75,6 +111,22 @@ export const TUNNEL_WIRE_VERSION = 1;
 export type TurnId = string;
 
 /**
+ * The id that ties an `answer` to the one `prompt` it answers (#170).
+ *
+ * Minted by the end that runs the turn, unique within that turn. Opaque.
+ */
+export type PromptId = string;
+
+/**
+ * The paired device a socket belongs to: #135's per-device credential id.
+ *
+ * It comes from the credential that authenticated the socket and is NEVER read
+ * out of a frame. A frame is bytes from the network; a device id in one would
+ * be a claim nobody verified.
+ */
+export type DeviceId = string;
+
+/**
  * The largest frame this build will decode.
  *
  * Sized the way `apps/server/src/wire.ts:117` sizes its own: against the one
@@ -85,6 +137,19 @@ export type TurnId = string;
  * model weights do not cross a tunnel; turns do.
  */
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The longest turn or prompt id this build will read or write.
+ *
+ * Each end now keeps state keyed by these ids for as long as a tunnel is open
+ * (`createTurnLedger` in `stream/`), and the desktop will hold results keyed by
+ * them (#7). Without a bound, an id is limited only by {@link MAX_FRAME_BYTES},
+ * so one frame could make a key 8 MiB long. 128 characters is more than three
+ * times a UUID, and more than five times the `prefix_` plus twelve characters
+ * `newId` mints (`src/domain/chat.ts`), so no id scheme this app uses comes
+ * near it.
+ */
+export const MAX_ID_LENGTH = 128;
 
 /**
  * The WebSocket close code a listener refuses a connection with when it is
@@ -134,6 +199,29 @@ export const TUNNEL_PAIRING_CLOSED_CLOSE_CODE = 4410;
  */
 export const TUNNEL_CREDENTIAL_HEADER = 'chatterang-device-credential';
 
+/**
+ * A tool's prompt, as the end that runs a turn relays it to the end that asked
+ * for it (#170).
+ *
+ * The desktop's approval sheet (`ApprovalPrompt` in `src/state/app.ts`) minus
+ * everything that cannot cross or that the phone cannot honour: no callback,
+ * and no `extendedLabel`. A broader yes changes a grant on the desktop, and
+ * what a paired phone may grant is the phone policy's to decide (#7 ruling 2),
+ * so until it does the answer is yes or no and the phone is never shown a
+ * button whose effect nobody has ruled on.
+ *
+ * `action` is required: it is the one line every prompt has, including the bash
+ * confirm, which passes nothing else (`src/shell/register.ts`).
+ */
+export interface RelayedPrompt {
+  readonly action: string;
+  readonly title?: string;
+  readonly body?: string;
+  readonly detail?: readonly string[];
+  readonly confirmLabel?: string;
+  readonly cancelLabel?: string;
+}
+
 /** Frames that belong to one turn, and carry its id. */
 export type TurnFrame =
   /** A turn going up. `body` is the request; the codec decides what may cross. */
@@ -141,7 +229,44 @@ export type TurnFrame =
   /** One `IRStreamChunk` coming down, as a payload rather than as the frame. */
   | { readonly v: number; readonly kind: 'chunk'; readonly turn: TurnId; readonly body: unknown }
   /** Stop this turn. Mid-stream, which is why it needs the id. */
-  | { readonly v: number; readonly kind: 'cancel'; readonly turn: TurnId };
+  | { readonly v: number; readonly kind: 'cancel'; readonly turn: TurnId }
+  /**
+   * This turn is admitted and waiting for the slot (#169, #7 ruling 3).
+   *
+   * `position` is its place in the wait list: 1 is next once the slot frees.
+   * Sent again whenever it changes, and never once the turn's first chunk has
+   * gone — a turn that is streaming is not waiting.
+   */
+  | {
+      readonly v: number;
+      readonly kind: 'waiting';
+      readonly turn: TurnId;
+      readonly body: { readonly position: number };
+    }
+  /** A tool in this turn needs an answer before its call may go (#170). */
+  | {
+      readonly v: number;
+      readonly kind: 'prompt';
+      readonly turn: TurnId;
+      readonly prompt: PromptId;
+      readonly body: RelayedPrompt;
+    }
+  /** The answer to one prompt. Only a yes lets that call go. */
+  | {
+      readonly v: number;
+      readonly kind: 'answer';
+      readonly turn: TurnId;
+      readonly prompt: PromptId;
+      readonly body: { readonly approved: boolean };
+    }
+  /**
+   * Collect the result of a turn this device asked for on an earlier socket
+   * (#7 ruling 4). What comes back is that turn's held terminal chunk — or, if
+   * it is still running, its terminal when it finishes — or `RESULT_UNKNOWN`.
+   */
+  | { readonly v: number; readonly kind: 'attach'; readonly turn: TurnId }
+  /** This turn's terminal chunk arrived whole: whatever holds it may let it go. */
+  | { readonly v: number; readonly kind: 'ack'; readonly turn: TurnId };
 
 /**
  * One message of the pairing exchange (#130, #136).
@@ -171,18 +296,20 @@ export type ControlFrame =
   /** Going away on purpose, so the far side can tell it from a dropped link. */
   | { readonly v: number; readonly kind: 'bye'; readonly body?: { readonly reason?: string } }
   /**
-   * A TRANSPORT-level failure.
+   * A TRANSPORT-level failure, or a refusal (see {@link REFUSALS}).
    *
    * Deliberately distinct from `StreamErrorChunk`, which is a model-level error
    * the far side produced and which travels inside a `chunk` frame. Collapsing
    * the two is exactly how a transport failure gets reported to the user as a
    * model failure — the defect #148 was ruled on. `turn` is present when the
-   * failure belongs to one.
+   * failure belongs to one, and `prompt` when it belongs to one of that turn's
+   * prompts; a `prompt` without a `turn` is refused.
    */
   | {
       readonly v: number;
       readonly kind: 'error';
       readonly turn?: TurnId;
+      readonly prompt?: PromptId;
       readonly body: { readonly code: string; readonly message: string };
     };
 
@@ -194,6 +321,11 @@ export const FRAME_KINDS = [
   'turn',
   'chunk',
   'cancel',
+  'waiting',
+  'prompt',
+  'answer',
+  'attach',
+  'ack',
   'hello',
   'ping',
   'pong',
@@ -204,6 +336,9 @@ export const FRAME_KINDS = [
 
 export type FrameKind = (typeof FRAME_KINDS)[number];
 
+/** The kinds that belong to a turn and must carry its id. */
+export type TurnScopedKind = TurnFrame['kind'];
+
 /**
  * The kinds that must carry a {@link TurnId}.
  *
@@ -211,8 +346,197 @@ export type FrameKind = (typeof FRAME_KINDS)[number];
  * boolean and narrows nothing — the decoder below would then be building a
  * union member from a `kind` the compiler still believes could be `ping`.
  */
-function isTurnScoped(kind: FrameKind): kind is 'turn' | 'chunk' | 'cancel' {
-  return kind === 'turn' || kind === 'chunk' || kind === 'cancel';
+export function isTurnScoped(kind: FrameKind): kind is TurnScopedKind {
+  return (
+    kind === 'turn' ||
+    kind === 'chunk' ||
+    kind === 'cancel' ||
+    kind === 'waiting' ||
+    kind === 'prompt' ||
+    kind === 'answer' ||
+    kind === 'attach' ||
+    kind === 'ack'
+  );
+}
+
+/**
+ * What a refusal means to the end that receives it, as one table (#7).
+ *
+ * - `kind` is what an app renders: busy, quitting, suspended and refused are
+ *   four different sentences, and "the connection closed" is none of them.
+ * - `scope` is what the `error` frame must name: a `turn`; a turn that came by
+ *   `attach`; a turn AND a `prompt`; either a turn or nothing (a refusal of the
+ *   whole connection); or anything. The decoder enforces what a frame can show
+ *   by itself — that a turn, or a prompt, is named — so a refusal cannot arrive
+ *   attached to the wrong thing. Whether the turn came by `attach` is state,
+ *   and `createTurnLedger` in `stream/` holds it.
+ * - `endsTurn` is whether the turn it names is over. A refusal that names no
+ *   turn and ends turns ends every turn its sender was running on the tunnel,
+ *   and is final for that tunnel (see `createTurnLedger`).
+ * - `beforeStart` is whether the code may only be sent before the turn it names
+ *   has started: before any prompt or chunk for it. `WAIT_LIST_FULL` and
+ *   `HOST_DOES_NOT_RUN_TURNS` say nothing in the turn ran, which is what makes
+ *   asking again safe, so the ledger refuses either once something could have;
+ *   `RESULT_UNKNOWN` says nothing of that turn is here to send.
+ */
+export type RefusalKind =
+  /** `WAIT_LIST_FULL`: nothing ran, and the host may take it later. */
+  | 'busy'
+  /** `DESKTOP_QUITTING`: the desktop is quitting or its tunnel was switched off. */
+  | 'quitting'
+  /** `HOST_SUSPENDED`: the host is going to sleep and does not keep itself awake (#7 ruling 7). */
+  | 'suspended'
+  /** `HOST_DOES_NOT_RUN_TURNS`: this host does not run a paired device's turns. */
+  | 'refused'
+  /** `PROMPT_EXPIRED`: that call was refused and recorded as not sent; the turn goes on (#170). */
+  | 'prompt-expired'
+  /** `RESULT_UNKNOWN`: nothing is held for this device under that turn. */
+  | 'result-unknown'
+  /** `FRAME_UNEXPECTED`: the far side dropped one of this end's frames unread. */
+  | 'unexpected'
+  /** A code this build does not know. Read as a failure, never as success. */
+  | 'unrecognised';
+
+export type RefusalScope = 'turn' | 'attach' | 'turn-or-connection' | 'prompt' | 'any';
+
+export interface Refusal {
+  readonly kind: RefusalKind;
+  readonly scope: RefusalScope;
+  readonly endsTurn: boolean;
+  readonly beforeStart: boolean;
+}
+
+/**
+ * Every refusal code this build defines. Policy as data, for the reason
+ * `FIELD_POLICY` in `codec/` is: a code added as a branch somewhere is a code
+ * one of the two halves does not know about.
+ *
+ * `FRAME_UNEXPECTED` is what an end answers a frame with when that frame is
+ * outside its turn's state — a `waiting` for a turn nobody asked for, an
+ * `answer` to a prompt that already expired, a second `attach`. The frame is
+ * dropped unread and the turn it names goes on; see `createTurnLedger`. It is a
+ * report about one frame, and it changes no turn and no prompt at either end.
+ * It is also one of only two refusals the tunnel halves send by themselves; the
+ * other is the repeat of a refusal of every turn, for a turn that crossed it
+ * (`createTurnLedger`). Every other code here is the app's to send.
+ *
+ * `RESULT_UNKNOWN` is ONE answer for four situations on purpose: nothing was
+ * ever held, it expired, it was already acknowledged, or it belongs to another
+ * device. Telling those apart would let one paired device find out which turn
+ * ids another has used, the way a cancel from anyone but the owner looks the
+ * same as "not running" in `apps/desktop/src/bridge/supervisor.ts`.
+ */
+export const REFUSALS = Object.freeze({
+  WAIT_LIST_FULL: Object.freeze({ kind: 'busy', scope: 'turn', endsTurn: true, beforeStart: true }),
+  DESKTOP_QUITTING: Object.freeze({
+    kind: 'quitting',
+    scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: false,
+  }),
+  HOST_SUSPENDED: Object.freeze({
+    kind: 'suspended',
+    scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: false,
+  }),
+  HOST_DOES_NOT_RUN_TURNS: Object.freeze({
+    kind: 'refused',
+    scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: true,
+  }),
+  PROMPT_EXPIRED: Object.freeze({
+    kind: 'prompt-expired',
+    scope: 'prompt',
+    endsTurn: false,
+    beforeStart: false,
+  }),
+  RESULT_UNKNOWN: Object.freeze({
+    kind: 'result-unknown',
+    scope: 'attach',
+    endsTurn: true,
+    beforeStart: true,
+  }),
+  FRAME_UNEXPECTED: Object.freeze({
+    kind: 'unexpected',
+    scope: 'any',
+    endsTurn: false,
+    beforeStart: false,
+  }),
+} as const satisfies Readonly<Record<string, Refusal>>);
+
+export type RefusalCode = keyof typeof REFUSALS;
+
+/**
+ * What a code this build does not know is read as: a failure that ends the turn.
+ *
+ * FAILS CLOSED. A newer peer's refusal read as anything else would leave a
+ * phone showing a turn as still running that the far side has already given
+ * up on — or, worse, one rendered as finished. And it never claims the turn
+ * had not started, so nothing reads an unknown code as "nothing ran".
+ */
+export const UNRECOGNISED_REFUSAL: Refusal = Object.freeze({
+  kind: 'unrecognised',
+  scope: 'any',
+  endsTurn: true,
+  beforeStart: false,
+});
+
+/**
+ * The refusal a code names. `Object.hasOwn`, not `in`: `'toString' in REFUSALS`
+ * is true, and a peer that sent `toString` as a code would otherwise be read
+ * as a function.
+ */
+export function refusalOf(code: string): Refusal {
+  return Object.hasOwn(REFUSALS, code) ? REFUSALS[code as RefusalCode] : UNRECOGNISED_REFUSAL;
+}
+
+/**
+ * A result a host is holding for a device, as far as the attach rule needs it.
+ * Whatever holds results (#7, S8) may keep more; this is the part the rule reads.
+ */
+export interface HeldResult {
+  readonly device: DeviceId;
+  readonly turn: TurnId;
+}
+
+export type AttachAnswer<H extends HeldResult> =
+  | { readonly ok: true; readonly held: H }
+  | { readonly ok: false; readonly code: 'RESULT_UNKNOWN' };
+
+/**
+ * THE ATTACH RULE (#7 ruling 4): which held result an `attach` collects.
+ *
+ * - `device` is the credential that authenticated the socket the `attach`
+ *   arrived on (#135), never anything in the frame.
+ * - A held result is collected only by the device it was held for. Another
+ *   device's result under the same turn id is `RESULT_UNKNOWN`, exactly as if
+ *   nothing were held — see {@link REFUSALS} on why the answers are one.
+ * - An unauthenticated socket (an empty device) collects nothing.
+ * - Two held results for one device and turn is the holder's bug, and neither
+ *   is delivered: handing over one of two would be guessing which reply is
+ *   this turn's.
+ *
+ * A SECOND `attach` for the same turn on the same socket never reaches this
+ * function: each end refuses it as `FRAME_UNEXPECTED` before it is read (see
+ * `createTurnLedger`). An `attach` on a NEW socket is not a duplicate — it is
+ * how a reconnecting device collects — and replacing that device's stale socket
+ * with the new one is the holder's work, not the wire's.
+ */
+export function resolveAttach<H extends HeldResult>(
+  held: Iterable<H>,
+  device: DeviceId,
+  turn: TurnId,
+): AttachAnswer<H> {
+  if (typeof device !== 'string' || device === '') return { ok: false, code: 'RESULT_UNKNOWN' };
+  let found: H | null = null;
+  for (const entry of held) {
+    if (entry.device !== device || entry.turn !== turn) continue;
+    if (found) return { ok: false, code: 'RESULT_UNKNOWN' };
+    found = entry;
+  }
+  return found ? { ok: true, held: found } : { ok: false, code: 'RESULT_UNKNOWN' };
 }
 
 /** Raised when bytes on the wire are not a frame this build can read. */
@@ -223,15 +547,264 @@ export class TunnelWireError extends Error {
 const TEXT = { encode: new TextEncoder(), decode: new TextDecoder('utf-8', { fatal: true }) };
 
 /**
- * A frame, as bytes.
+ * Which way a frame is being read.
+ *
+ * `decode` is bytes from a peer: a field this build does not know is dropped,
+ * as a `ping` given a body is. `encode` is a frame this end is about to write,
+ * and for #7's frames a field that is not part of the frame is REFUSED rather
+ * than dropped — the codec's asymmetry (`codec/`): what we write and would lose
+ * on the way is our bug, and a relayed prompt that silently lost a field would
+ * show the phone a different sheet from the one the desktop meant.
+ */
+type Reading = 'decode' | 'encode';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** An id, or a thrown refusal naming which id and which frame. */
+function readId(value: unknown, what: 'turn' | 'prompt', kind: FrameKind): string {
+  if (typeof value !== 'string' || value === '') {
+    throw new TunnelWireError(`${kind} frame has no ${what} id`);
+  }
+  if (value.length > MAX_ID_LENGTH) {
+    throw new TunnelWireError(
+      `${kind} frame's ${what} id is ${String(value.length)} characters, over the ${String(MAX_ID_LENGTH)} limit`,
+    );
+  }
+  return value;
+}
+
+/** For a frame this end writes: nothing beyond the named fields. */
+function onlyKeys(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  where: string,
+  reading: Reading,
+): void {
+  if (reading !== 'encode') return;
+  const extra = Reflect.ownKeys(record).filter(
+    (key) => typeof key !== 'string' || !allowed.includes(key),
+  );
+  if (extra.length > 0) {
+    throw new TunnelWireError(
+      `${where} carries ${extra.map((key) => String(key)).join(', ')}, which is not part of it and would not arrive as written`,
+    );
+  }
+}
+
+const PROMPT_TEXT_FIELDS = ['title', 'body', 'confirmLabel', 'cancelLabel'] as const;
+const PROMPT_FIELDS = ['action', ...PROMPT_TEXT_FIELDS, 'detail'] as const;
+
+function readPrompt(value: unknown, reading: Reading): RelayedPrompt {
+  if (!isRecord(value)) throw new TunnelWireError('prompt frame has no body');
+  onlyKeys(value, PROMPT_FIELDS, 'prompt body', reading);
+  const action = value.action;
+  if (typeof action !== 'string' || action === '') {
+    throw new TunnelWireError('prompt frame has no action');
+  }
+  const prompt: { -readonly [K in keyof RelayedPrompt]: RelayedPrompt[K] } = { action };
+  for (const field of PROMPT_TEXT_FIELDS) {
+    const text = value[field];
+    if (text === undefined) continue;
+    if (typeof text !== 'string') throw new TunnelWireError(`prompt frame's ${field} is not a string`);
+    prompt[field] = text;
+  }
+  const detail = value.detail;
+  if (detail !== undefined) {
+    if (!Array.isArray(detail)) throw new TunnelWireError("prompt frame's detail is not a list");
+    const lines: string[] = [];
+    // Indexed, not `every`: `every` skips the holes of a sparse array, and a
+    // hole is a line JSON would write as `null`.
+    for (let index = 0; index < detail.length; index += 1) {
+      const line: unknown = detail[index];
+      if (typeof line !== 'string') {
+        throw new TunnelWireError(`prompt frame's detail line ${String(index)} is not a string`);
+      }
+      lines.push(line);
+    }
+    prompt.detail = lines;
+  }
+  return prompt;
+}
+
+/**
+ * The per-arm check both {@link decodeFrame} and {@link encodeFrame} run.
+ *
+ * ONE VALIDATOR, BOTH DIRECTIONS. A frame this end writes is checked against
+ * the same rules the far end will decode it with, so a field JSON would change
+ * — a `NaN` position that arrives as `null`, a `detail` line that is a number —
+ * is refused here, at the send, rather than at the far end as an invalid frame
+ * that closes the tunnel.
+ */
+function readFrame(frame: Record<string, unknown>, reading: Reading): TunnelFrame {
+  if (frame.v !== TUNNEL_WIRE_VERSION) {
+    throw new TunnelWireError(
+      `frame version ${String(frame.v)} is not ${String(TUNNEL_WIRE_VERSION)}`,
+    );
+  }
+
+  const kind = frame.kind;
+  if (typeof kind !== 'string' || !FRAME_KINDS.includes(kind as FrameKind)) {
+    // Naming what arrived, because the common cause is a peer on a build that
+    // knows a kind this one does not — and the number alone does not say which.
+    throw new TunnelWireError(`unknown frame kind ${JSON.stringify(kind)}`);
+  }
+  const k = kind as FrameKind;
+  const v = TUNNEL_WIRE_VERSION;
+
+  /*
+   * Per-arm validation, not a cast.
+   *
+   * The previous version checked `kind` was a non-empty string and returned
+   * `body` unexamined, which is fine for an open envelope and wrong for a
+   * union: downstream code that switches on `kind` would then be trusting a
+   * shape nothing checked. Bytes here have been on a network and are from
+   * another build.
+   */
+  if (isTurnScoped(k)) {
+    const turn = readId(frame.turn, 'turn', k);
+    switch (k) {
+      case 'cancel':
+        return { v, kind: k, turn };
+      case 'turn':
+      case 'chunk':
+        return { v, kind: k, turn, body: frame.body };
+      case 'attach':
+      case 'ack':
+        onlyKeys(frame, ['v', 'kind', 'turn'], `${k} frame`, reading);
+        return { v, kind: k, turn };
+      case 'waiting': {
+        onlyKeys(frame, ['v', 'kind', 'turn', 'body'], 'waiting frame', reading);
+        const body = frame.body;
+        if (!isRecord(body)) throw new TunnelWireError('waiting frame has no body');
+        onlyKeys(body, ['position'], 'waiting body', reading);
+        const position = body.position;
+        // A safe integer, because past 2^53 JSON silently rounds it; at least
+        // 1, because 0 is "running", which a waiting frame is not.
+        if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 1) {
+          throw new TunnelWireError(
+            `waiting frame's position ${JSON.stringify(position) ?? String(position)} is not a whole number from 1`,
+          );
+        }
+        return { v, kind: k, turn, body: { position } };
+      }
+      case 'prompt': {
+        onlyKeys(frame, ['v', 'kind', 'turn', 'prompt', 'body'], 'prompt frame', reading);
+        const prompt = readId(frame.prompt, 'prompt', k);
+        return { v, kind: k, turn, prompt, body: readPrompt(frame.body, reading) };
+      }
+      case 'answer': {
+        onlyKeys(frame, ['v', 'kind', 'turn', 'prompt', 'body'], 'answer frame', reading);
+        const prompt = readId(frame.prompt, 'prompt', k);
+        const body = frame.body;
+        if (!isRecord(body)) throw new TunnelWireError('answer frame has no body');
+        onlyKeys(body, ['approved'], 'answer body', reading);
+        // A boolean, not truthiness: `"no"` is truthy, and a yes is the one
+        // answer that lets a call leave.
+        if (typeof body.approved !== 'boolean') {
+          throw new TunnelWireError('answer frame has no yes or no');
+        }
+        return { v, kind: k, turn, prompt, body: { approved: body.approved } };
+      }
+    }
+  }
+
+  if (k === 'hello') {
+    const body = frame.body;
+    if (typeof body !== 'object' || body === null) {
+      throw new TunnelWireError('hello frame has no body');
+    }
+    const { protocol, build } = body as Record<string, unknown>;
+    if (typeof protocol !== 'number' || !Number.isInteger(protocol)) {
+      throw new TunnelWireError('hello frame has no protocol number');
+    }
+    return {
+      v,
+      kind: 'hello',
+      body: typeof build === 'string' ? { protocol, build } : { protocol },
+    };
+  }
+
+  if (k === 'error') {
+    const body = frame.body;
+    if (typeof body !== 'object' || body === null) {
+      throw new TunnelWireError('error frame has no body');
+    }
+    const { code, message } = body as Record<string, unknown>;
+    if (typeof code !== 'string' || typeof message !== 'string') {
+      throw new TunnelWireError('error frame has no code and message');
+    }
+    /*
+     * PRESENT MEANS VALID. An id that is there but malformed used to be dropped
+     * quietly, which turned a refusal of one turn into a refusal that named
+     * none — and a refusal naming no turn ends every turn its sender runs.
+     */
+    const turn = frame.turn === undefined ? undefined : readId(frame.turn, 'turn', k);
+    const prompt = frame.prompt === undefined ? undefined : readId(frame.prompt, 'prompt', k);
+    if (prompt !== undefined && turn === undefined) {
+      throw new TunnelWireError('error frame names a prompt but no turn');
+    }
+    // A code this build defines is held to its scope. One it does not know is
+    // carried as it came, and read as a failure (see UNRECOGNISED_REFUSAL).
+    if (Object.hasOwn(REFUSALS, code)) {
+      const { scope } = REFUSALS[code as RefusalCode];
+      if ((scope === 'turn' || scope === 'attach' || scope === 'prompt') && turn === undefined) {
+        throw new TunnelWireError(`${code} must name the turn it refuses`);
+      }
+      if (scope === 'prompt' && prompt === undefined) {
+        throw new TunnelWireError(`${code} must name the prompt it refuses`);
+      }
+      if ((scope === 'turn' || scope === 'attach' || scope === 'turn-or-connection') && prompt !== undefined) {
+        throw new TunnelWireError(`${code} refuses a turn, not a prompt`);
+      }
+    }
+    return {
+      v,
+      kind: 'error',
+      ...(turn === undefined ? {} : { turn }),
+      ...(prompt === undefined ? {} : { prompt }),
+      body: { code, message },
+    };
+  }
+
+  if (k === 'pair') {
+    // Carried, not interpreted: see `PairFrame`. Required, because a pairing
+    // step with nothing in it is not a step.
+    if (!('body' in frame)) throw new TunnelWireError('pair frame has no body');
+    return { v, kind: 'pair', body: frame.body };
+  }
+
+  if (k === 'bye') {
+    const body = frame.body;
+    const reason =
+      typeof body === 'object' && body !== null
+        ? (body as Record<string, unknown>).reason
+        : undefined;
+    return typeof reason === 'string' ? { v, kind: 'bye', body: { reason } } : { v, kind: 'bye' };
+  }
+
+  // ping and pong carry nothing, and must not be given anything on the way out.
+  return { v, kind: k };
+}
+
+/**
+ * A frame, as bytes — or a thrown {@link TunnelWireError} if it is not one the
+ * far end could read back as written.
  *
  * `TextEncoder` rather than `Buffer`: this runs on the phone as well as on the
  * desktop, and `Buffer` is the Node half of a boundary this package exists to
  * keep. The same reason there is no `JSON.stringify` shortcut taken over a
  * `Uint8Array` return — the caller on either side hands bytes to a socket.
+ *
+ * WHAT IS WRITTEN IS THE CHECKED FRAME, not the object handed in. A field the
+ * frame does not have never reaches the socket; for #7's frames it is refused
+ * rather than dropped (see `Reading`). A `turn` or `chunk` body is still
+ * written as given: what may cross inside one is the codec's to decide.
  */
 export function encodeFrame(frame: TunnelFrame): Uint8Array {
-  return TEXT.encode.encode(JSON.stringify({ ...frame, v: TUNNEL_WIRE_VERSION }));
+  const checked = readFrame({ ...frame, v: TUNNEL_WIRE_VERSION }, 'encode');
+  return TEXT.encode.encode(JSON.stringify(checked));
 }
 
 /**
@@ -258,94 +831,10 @@ export function decodeFrame(bytes: Uint8Array): TunnelFrame {
   } catch (cause) {
     throw new TunnelWireError('frame is not UTF-8 JSON', { cause });
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  if (!isRecord(parsed)) {
     throw new TunnelWireError('frame is not an object');
   }
-
-  const frame = parsed as Record<string, unknown>;
-  if (frame.v !== TUNNEL_WIRE_VERSION) {
-    throw new TunnelWireError(
-      `frame version ${String(frame.v)} is not ${String(TUNNEL_WIRE_VERSION)}`,
-    );
-  }
-
-  const kind = frame.kind;
-  if (typeof kind !== 'string' || !FRAME_KINDS.includes(kind as FrameKind)) {
-    // Naming what arrived, because the common cause is a peer on a build that
-    // knows a kind this one does not — and the number alone does not say which.
-    throw new TunnelWireError(`unknown frame kind ${JSON.stringify(kind)}`);
-  }
-  const k = kind as FrameKind;
-
-  /*
-   * Per-arm validation, not a cast.
-   *
-   * The previous version checked `kind` was a non-empty string and returned
-   * `body` unexamined, which is fine for an open envelope and wrong for a
-   * union: downstream code that switches on `kind` would then be trusting a
-   * shape nothing checked. Bytes here have been on a network and are from
-   * another build.
-   */
-  if (isTurnScoped(k)) {
-    const turn = frame.turn;
-    if (typeof turn !== 'string' || turn === '') {
-      throw new TunnelWireError(`${k} frame has no turn id`);
-    }
-    if (k === 'cancel') return { v: TUNNEL_WIRE_VERSION, kind: k, turn };
-    return { v: TUNNEL_WIRE_VERSION, kind: k, turn, body: frame.body };
-  }
-
-  if (k === 'hello') {
-    const body = frame.body;
-    if (typeof body !== 'object' || body === null) {
-      throw new TunnelWireError('hello frame has no body');
-    }
-    const { protocol, build } = body as Record<string, unknown>;
-    if (typeof protocol !== 'number' || !Number.isInteger(protocol)) {
-      throw new TunnelWireError('hello frame has no protocol number');
-    }
-    return {
-      v: TUNNEL_WIRE_VERSION,
-      kind: 'hello',
-      body: typeof build === 'string' ? { protocol, build } : { protocol },
-    };
-  }
-
-  if (k === 'error') {
-    const body = frame.body;
-    if (typeof body !== 'object' || body === null) {
-      throw new TunnelWireError('error frame has no body');
-    }
-    const { code, message } = body as Record<string, unknown>;
-    if (typeof code !== 'string' || typeof message !== 'string') {
-      throw new TunnelWireError('error frame has no code and message');
-    }
-    const turn = frame.turn;
-    return typeof turn === 'string' && turn !== ''
-      ? { v: TUNNEL_WIRE_VERSION, kind: 'error', turn, body: { code, message } }
-      : { v: TUNNEL_WIRE_VERSION, kind: 'error', body: { code, message } };
-  }
-
-  if (k === 'pair') {
-    // Carried, not interpreted: see `PairFrame`. Required, because a pairing
-    // step with nothing in it is not a step.
-    if (!('body' in frame)) throw new TunnelWireError('pair frame has no body');
-    return { v: TUNNEL_WIRE_VERSION, kind: 'pair', body: frame.body };
-  }
-
-  if (k === 'bye') {
-    const body = frame.body;
-    const reason =
-      typeof body === 'object' && body !== null
-        ? (body as Record<string, unknown>).reason
-        : undefined;
-    return typeof reason === 'string'
-      ? { v: TUNNEL_WIRE_VERSION, kind: 'bye', body: { reason } }
-      : { v: TUNNEL_WIRE_VERSION, kind: 'bye' };
-  }
-
-  // ping and pong carry nothing, and must not be given anything on the way out.
-  return { v: TUNNEL_WIRE_VERSION, kind: k };
+  return readFrame(parsed, 'decode');
 }
 
 /**

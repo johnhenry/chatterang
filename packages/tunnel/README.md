@@ -62,11 +62,11 @@ reports it as `TUNNEL_FULL` rather than `PEER_GONE`. A slot frees when a socket
 closes, not when its tunnel is classified: a peer that said `bye` and kept its
 socket open still holds a connection.
 
-#169's items are recommendations, not rulings. Two are built here: several
-concurrent connections, and a cap enforced at accept time. The third, replacing
-a device's stale socket with its new one, is not built. It needed device
-identity, which now exists (a tunnel's `admission.deviceId`), so it is
-buildable; nobody has built it.
+#169's items were recommendations. Two are built here: several concurrent
+connections, and a cap enforced at accept time. The third, replacing a device's
+stale socket with its new one, is now the owner's ruling on #7 (ruling 4). It is
+not built. It needed device identity, which now exists (a tunnel's
+`admission.deviceId`), so it is buildable; nobody has built it.
 
 `createTunnelHost` is rung 0's single tunnel on top of the listener: capped at
 one, and it stops accepting once that tunnel ends. A late peer is refused at
@@ -213,6 +213,88 @@ re-issued from the same key serves the same one.
   `O_EXCL` name, checked, synced, hard-linked into place, and the directory is
   synced before `created: true` is returned.
 
+## #7's vocabulary: waiting, prompts, refusals, and collecting a result
+
+The owner's rulings on #7 need five things the original frames could not say.
+They are on the wire now, in `wire/`:
+
+| Frame or code | Direction (per turn) | What it says |
+|---|---|---|
+| `waiting {position}` | runner → asker | Admitted, waiting for the one slot; 1 is next (#169, ruling 3). |
+| `prompt` (turn, prompt id, sheet) | runner → asker | A tool needs an answer before its call may go (#170). |
+| `answer` (turn, prompt id, yes/no) | asker → runner | The answer to that one prompt. |
+| `attach` (turn) | asker → runner | Collect a result held while this device's socket was gone (ruling 4). |
+| `ack` (turn) | asker → runner | That turn's terminal arrived whole; whatever holds it may let it go. |
+| `error` codes in `REFUSALS` | runner → asker | `WAIT_LIST_FULL`, `DESKTOP_QUITTING`, `HOST_SUSPENDED`, `HOST_DOES_NOT_RUN_TURNS`, `PROMPT_EXPIRED`, `RESULT_UNKNOWN`. |
+| `error` `FRAME_UNEXPECTED` | either | One of your frames was dropped unread. Changes no turn and no prompt. |
+
+Roles are per turn. The end that sends a turn's `turn`, or its `attach`, asks
+for it; the other end runs it. Under #7 the phone asks and the desktop runs, but
+the wire does not say which device is which.
+
+- **Every field is checked both ways.** `encodeFrame` runs the decoder's own
+  per-arm rules on the frame it writes. A position JSON would turn into `null`,
+  or a prompt field this build does not know, is refused at the send. Coming in,
+  an unknown prompt field is dropped, so a newer desktop's sheet shows up on an
+  older phone as a narrower yes. Turn and prompt ids are capped at
+  `MAX_ID_LENGTH` (128 characters), because both ends now keep state keyed by
+  them.
+- **Every frame is checked against its turn's state.** `createProtocolGate` in
+  `stream/` runs on both halves.
+  - It refuses a `waiting` once the turn has started, which a prompt or a chunk
+    does.
+  - It refuses an `answer` to a prompt that is not open, including one that
+    already got `PROMPT_EXPIRED`.
+  - After the asker's `cancel`, it refuses an `answer`, a `prompt`, a `waiting`
+    and a second `cancel` for that turn (#170). The runner still finishes it.
+  - It refuses an `ack` before a terminal chunk, or a second `ack`.
+  - It refuses a second `attach` for a turn on the same socket.
+  - A turn that arrived by `attach` may be sent only its terminal chunk.
+  - It refuses a refusal of a turn that is already over, so an app is handed
+    one terminal per turn.
+  - It refuses `WAIT_LIST_FULL` and `HOST_DOES_NOT_RUN_TURNS` once a turn has
+    started, because both say nothing ran. It refuses `RESULT_UNKNOWN` for a
+    turn that did not come by `attach`, and any code in `REFUSALS` other than
+    `FRAME_UNEXPECTED` from the end that asked for the turn.
+
+  A frame from the peer that breaks one of these is dropped unread and answered
+  `FRAME_UNEXPECTED`, and the tunnel stays open. The exception is a refusal of a
+  turn that is already over, which is dropped and not answered: two refusals of
+  one turn crossing on the wire look exactly like that. A frame this end tries
+  to send in the wrong state throws `TunnelProtocolError`.
+- **Memory per tunnel is bounded.** A tunnel holds at most `MAX_OPEN_TURNS` (64)
+  open turns for each end that asks; past that, a peer's `turn`, `attach` or
+  unasked-for `chunk` is refused and not recorded, and this end's own throws.
+  It remembers the last `MAX_ENDED_TURNS_REMEMBERED` (64) ended turns, and
+  forgets a result that is still waiting for its `ack` last.
+- **A refusal of every turn is final for the tunnel.** An `error` that names no
+  turn, with a code that ends turns, ends every turn its sender runs. The end
+  that receives it may ask for nothing more on that tunnel, and a `turn` or
+  `attach` that crossed it on the wire is answered with the same code and never
+  read, so both ends agree the turn never ran. A host that means to take turns
+  on the same tunnel again, after a suspend for example, refuses its running
+  turns one at a time instead.
+- **One sequence count per turn, not per tunnel.** A second turn on the same
+  socket numbers its reply from 0, as an IR stream does. The guard used to read
+  that as a repeat. An `attach` resumes a turn's count at the held terminal's
+  own number.
+- **`resolveAttach` is the rule for collecting.** The device is whatever
+  credential authenticated the socket (#135), never a field in the frame.
+  Another device's held result, an expired one and one that was never held all
+  get the same answer, `RESULT_UNKNOWN`.
+- **The client reads each frame for an app.** `classifyFrame` returns
+  `waiting`, `prompt`, `streaming`, `completed`, `failed` or `refused`. A
+  refusal says which kind it is (busy, quitting, suspended, refused, …) and
+  whether it ends the turn. A code this build does not know is `unrecognised`
+  and ends the turn: it is a failure, never a success.
+
+One exception is carried for now: a `chunk` for a turn this tunnel has no record
+of is still read, and makes the receiver that turn's asker. Rung 0 streams
+through a greeting nobody asked for, and #156's and #158's tests stream up the
+wire the same way. Such a turn can never receive a `waiting` or a `prompt`, and
+it counts against `MAX_OPEN_TURNS` like any other, so a peer cannot open them
+without bound.
+
 ## What is deliberately not here
 
 - **A production transport.** #181 chose a native socket plugin on both
@@ -239,10 +321,26 @@ re-issued from the same key serves the same one.
   queue, which waits on #7. On the headless server, revoking the operator
   token must invalidate every credential minted under it (#135), and nothing
   ties the two together yet.
-- **What a tunnelled turn may use and how its prompts reach the phone** (#170),
-  and the surface declaration asserted before binding.
+- **What a tunnelled turn may use** (#170), and the surface declaration
+  asserted before binding. The frames a relayed prompt travels in are on the
+  wire (see #7's vocabulary above); the turn runner that relays one is not.
 - **Frame kinds.** `TunnelFrame['kind']` became a union in #159. `pair` joined
   it for #136's gate.
+- **#7's policy.** The wire says a turn is waiting, a prompt expired, or the
+  host is quitting or suspended. It does not decide any of those. None of the
+  following exists yet:
+  - the wait list and its limits;
+  - the prompt timeout;
+  - the held results and their time and count bounds;
+  - replacing a device's stale socket;
+  - settling turns on quit and on suspend.
+
+  They all belong to the desktop's work broker (#7). The package sends two
+  refusals by itself: `FRAME_UNEXPECTED` for a frame outside its turn's state,
+  and the repeat of a refusal of every turn for a `turn` or `attach` that
+  crossed it. Every other code is the app's to send, and no app sends one yet.
+  `HOST_DOES_NOT_RUN_TURNS` is defined for the headless server (#7's eighth
+  ruling), and nothing here sends it.
 
 ### Why plaintext `ws://` lost
 
