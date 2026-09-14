@@ -1228,6 +1228,11 @@ describe('the desktop bridge stays platform-free', () => {
  * of the same exchange (the CPace step, and the binding that joins it to the
  * parser), and neither has a use in `src/` outside a pairing controller.
  *
+ * WHAT IT CANNOT SEE: the camera half is a NAME, `getUserMedia`. A camera
+ * reached another way — `<input type="file" capture>`, which a phone's WebView
+ * hands to the system camera, or a native plugin — passes, so neither this nor
+ * `src/lib/pairing.ts` claims more than that name.
+ *
  * When the sheet lands under `src/features/pairing/`, ALLOWED widens to it in
  * that change, alongside a rule that only `SettingsScreen.tsx` imports it.
  */
@@ -1269,7 +1274,7 @@ describe('only the pairing seam reaches the pairing building blocks', () => {
     expect(reachers).toEqual(expect.arrayContaining(['lib/pairing.ts', 'lib/qr-scan.ts']));
   });
 
-  it('no other file in src/ imports the pairing half, the scanner, or the camera', () => {
+  it('no other file in src/ imports the pairing half or the scanner, or names getUserMedia', () => {
     const offenders = scanned
       .filter((file) => !ALLOWED.has(rel(file)))
       .flatMap((file) => reaches(file, readFileSync(file, 'utf8')).map((door) => `${rel(file)} -> ${door}`));

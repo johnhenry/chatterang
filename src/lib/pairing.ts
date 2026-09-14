@@ -12,12 +12,14 @@
  * `MountHostWeb` refuses rather than pretends. `pairingController()` returns a
  * controller whose `available` is false. No screen offers pairing yet, and
  * `tests/layering.test.ts` refuses any file in `src/` other than this one,
- * `qr-scan.ts` and `qr-decode.ts` that reaches the pairing half, the scanner
- * or the camera — so the entry point, when it is built, arrives as an edit to
- * that allowlist rather than as an import nobody reviewed.
+ * `qr-scan.ts` and `qr-decode.ts` that imports the pairing half or the scanner,
+ * or names `getUserMedia` — so the entry point, when it is built, arrives as an
+ * edit to that allowlist rather than as an import nobody reviewed. That is a
+ * rule about names: a camera reached another way, such as a file input with
+ * `capture`, is not something it sees.
  *
  * The day `available` becomes true, `tests/privacy-copy.test.ts` fails until
- * every privacy surface names a paired device, a paired-device panel is
+ * every privacy surface's copy names a paired device, a paired-device panel is
  * mounted, and a table holds the devices. That forces the copy to be revisited
  * in the same change. It does not choose the sentence.
  *
