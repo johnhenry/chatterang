@@ -812,24 +812,42 @@ describe('MCP arguments do not leave the device without a grant', () => {
    * covered is recorded as not sent.
    */
 
-  /** `running`, or a failure if it is still waiting on a sheet nobody will answer. */
-  function settled<T>(running: Promise<T>): Promise<T> {
-    return Promise.race([
-      running,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('the turn is still waiting on a sheet nobody answered')), 1000),
-      ),
-    ]);
+  /**
+   * `running`, or a failure if it is still waiting on a sheet nobody will answer.
+   *
+   * The bound tells a hang from a slow runner and nothing more: a turn waiting
+   * on a sheet nobody answers never ends. The turns here also wait on their own
+   * 5ms and 50ms timers, and a runner that stalls between starting this clock
+   * and starting those can overrun a short bound with a turn about to end. So
+   * it is generous, and inside the test's own 5s, so a hang still says why.
+   */
+  async function settled<T>(running: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        running,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('the turn is still waiting on a sheet nobody answered')), 4000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   it('sends nothing after Stop while the send sheet is open, and keeps nothing answered after', async () => {
     const { engine, probe } = setUp([MCP_CALL + MCP_CALL_CLEAN, 'Done.']);
     const controller = new AbortController();
     let answer: (decision: DestinationDecision) => void = () => {};
+    let raised = () => {};
+    const sheetUp = new Promise<void>((resolve) => {
+      raised = resolve;
+    });
     const request = vi.fn(
       (_asked: DestinationRequest, _signal?: AbortSignal) =>
         new Promise<DestinationDecision>((resolve) => {
           answer = resolve;
+          raised();
         }),
     );
     const onGranted = vi.fn();
@@ -843,7 +861,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
         signal: controller.signal,
       }),
     );
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    await sheetUp;
+    expect(request).toHaveBeenCalledOnce();
     expect(request.mock.calls[0]![1], 'the sheet is handed the turn’s signal').toBe(controller.signal);
 
     controller.abort();
@@ -1128,10 +1147,15 @@ describe('MCP arguments do not leave the device without a grant', () => {
     // after Stop, so the other sheet a call waits on is held to it too.
     const probe = mcpProbe({ readOnly: false });
     let yes: (approved: boolean) => void = () => {};
+    let raised = () => {};
+    const confirmUp = new Promise<void>((resolve) => {
+      raised = resolve;
+    });
     probe.confirm.mockImplementation(
       (_action: string, _signal?: AbortSignal) =>
         new Promise<boolean>((resolve) => {
           yes = resolve;
+          raised();
         }),
     );
     toolRegistry.register(probe.tool);
@@ -1148,7 +1172,8 @@ describe('MCP arguments do not leave the device without a grant', () => {
         signal: controller.signal,
       }),
     );
-    await vi.waitFor(() => expect(probe.confirm).toHaveBeenCalledOnce());
+    await confirmUp;
+    expect(probe.confirm).toHaveBeenCalledOnce();
     expect(probe.confirm.mock.calls[0]![1], 'the confirm is handed the turn’s signal').toBe(controller.signal);
 
     controller.abort();

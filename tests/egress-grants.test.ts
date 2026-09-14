@@ -351,27 +351,43 @@ const OPENAI = {
  * applies overlapping readwrite transactions in, so `stored` is what the table
  * holds once they have all committed. Each put then waits until it is released,
  * which is how a test starts one write while another is still in flight.
+ *
+ * A test names the chat whose put it means. `held` resolves when that put has
+ * started, rather than polling a count of puts: a count can be met by another
+ * chat's put, and a poll has a budget a loaded runner can spend.
  */
 function holdingChatWrites() {
   const stored = new Map<string, Chat>();
-  const waiting: (() => void)[] = [];
+  const holds: { chatId: string; finish: () => void }[] = [];
+  const arrivals: { chatId: string; arrived: () => void }[] = [];
   let holding = true;
   const releaseAll = (): void => {
     holding = false;
-    for (const resolve of waiting.splice(0)) resolve();
+    for (const put of holds.splice(0)) put.finish();
   };
   chatsTable.put.mockImplementation((async (chat: Chat) => {
     stored.set(chat.id, structuredClone(chat));
-    if (holding) await new Promise<void>((resolve) => waiting.push(resolve));
+    if (!holding) return;
+    await new Promise<void>((finish) => {
+      holds.push({ chatId: chat.id, finish });
+      for (let at = arrivals.length - 1; at >= 0; at -= 1) {
+        if (arrivals[at]!.chatId === chat.id) arrivals.splice(at, 1)[0]!.arrived();
+      }
+    });
   }) as never);
   return {
     stored,
-    /** Puts started and not yet released. */
-    pending: () => waiting.length,
-    /** Let the oldest put still waiting finish. */
-    releaseFirst: () => waiting.shift()?.(),
-    /** Let the newest put still waiting finish. */
-    releaseLast: () => waiting.pop()?.(),
+    /** Resolves once a put of `chatId` is held: at once if one already is, otherwise when it starts. */
+    held: (chatId: string): Promise<void> =>
+      holds.some((put) => put.chatId === chatId)
+        ? Promise.resolve()
+        : new Promise<void>((arrived) => arrivals.push({ chatId, arrived })),
+    /** Let the oldest held put of `chatId` finish. Throws if none is held. */
+    release: (chatId: string): void => {
+      const at = holds.findIndex((put) => put.chatId === chatId);
+      if (at === -1) throw new Error(`no put of ${chatId} is being held`);
+      holds.splice(at, 1)[0]!.finish();
+    },
     /** Let every put finish, and every later one go straight through. */
     releaseAll,
     restore: () => {
@@ -385,7 +401,52 @@ function holdingChatWrites() {
 const storedConnections = (stored: Map<string, Chat>, id: string): string[] =>
   (stored.get(id)?.egressGrants ?? []).flatMap((grant) => (grant.kind === 'mcp' ? [] : [grant.connectionId]));
 
+/**
+ * Every microtask already queued has run, and every one those queued. Writes
+ * here are promises and nothing on their path sets a timer, so this orders two
+ * steps exactly. It is never a wait for something that may take longer.
+ */
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Resolves once `holds()` is true: at once if it already is, otherwise on the store change that makes it so. */
+function whenChats(holds: () => boolean): Promise<void> {
+  if (holds()) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const unsubscribe = useChats.subscribe(() => {
+      if (!holds()) return;
+      unsubscribe();
+      resolve();
+    });
+  });
+}
+
+/**
+ * Every provider grant the store starts from here on, so a test can wait for
+ * each to settle — its post-write re-check included — before it says what was
+ * kept. The policy writes a grant with `void`, so nothing else holds that
+ * promise, and a macrotask only covers a grant that happens to land within one.
+ */
+function recordingGrantWrites() {
+  const original = useChats.getState().grantEgress;
+  const started: Promise<void>[] = [];
+  useChats.setState({
+    grantEgress: (chatId, connectionId) => {
+      const granting = original(chatId, connectionId);
+      started.push(granting);
+      return granting;
+    },
+  });
+  return {
+    /** Every grant started so far has settled, and any started while waiting. */
+    async settled(): Promise<void> {
+      for (let seen = -1; seen !== started.length; ) {
+        seen = started.length;
+        await Promise.all(started);
+      }
+    },
+    restore: () => useChats.setState({ grantEgress: original }),
+  };
+}
 
 describe('a provider grant, written while something else writes the same chat', () => {
   beforeEach(() => {
@@ -405,11 +466,12 @@ describe('a provider grant, written while something else writes the same chat', 
     try {
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
       const revoking = useChats.getState().revokeEgress('conn_openai');
-      await vi.waitFor(() => expect(db.pending()).toBe(2));
+      await db.held('c1');
+      await db.held('c2');
       // c1's grant lands while the revocation's write to c2 is still held, so
       // whatever the grant checks after its write, it checks before the
       // revocation has awaited anything of its own.
-      db.releaseFirst();
+      db.release('c1');
       await macrotask();
       db.releaseAll();
       await Promise.all([granting, revoking]);
@@ -434,7 +496,7 @@ describe('a provider grant, written while something else writes the same chat', 
     const db = holdingChatWrites();
     try {
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       await useChats.getState().revokeEgress('conn_ollama');
       db.releaseAll();
       await granting;
@@ -454,10 +516,10 @@ describe('a provider grant, written while something else writes the same chat', 
     const db = holdingChatWrites();
     try {
       const switchingOff = useApp.getState().toggleConnection('conn_openai', false);
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       const renaming = useChats.getState().renameChat('c1', 'Renamed');
       await macrotask();
-      db.releaseFirst();
+      db.release('c1');
       await switchingOff;
       db.releaseAll();
       await renaming;
@@ -480,10 +542,10 @@ describe('a provider grant, written while something else writes the same chat', 
     const db = holdingChatWrites();
     try {
       const revoking = useChats.getState().revokeEgress('conn_ollama');
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
       await macrotask();
-      db.releaseFirst();
+      db.release('c1');
       await revoking;
       db.releaseAll();
       await granting;
@@ -504,7 +566,7 @@ describe('a provider grant, written while something else writes the same chat', 
     const db = holdingChatWrites();
     try {
       const renaming = useChats.getState().renameChat('c1', 'Renamed');
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
       const revoking = useChats.getState().revokeEgress('conn_ollama');
       await macrotask();
@@ -539,10 +601,10 @@ describe('an MCP grant, written while something else writes the same chat', () =
     try {
       // What Settings does when the server is switched off.
       const switchingOff = useMcp.getState().toggle('mcp_notes', false);
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       const renaming = useChats.getState().renameChat('c1', 'Renamed');
       await macrotask();
-      db.releaseFirst();
+      db.release('c1');
       await switchingOff;
       db.releaseAll();
       await renaming;
@@ -569,7 +631,7 @@ describe('two writes to one chat', () => {
     try {
       const titling = useChats.getState().updateChat('c1', { title: 'Titled' });
       const pinning = useChats.getState().updateChat('c1', { pinned: true });
-      await vi.waitFor(() => expect(db.pending()).toBeGreaterThan(0));
+      await db.held('c1');
       db.releaseAll();
       await Promise.all([titling, pinning]);
 
@@ -695,7 +757,7 @@ describe('an answer the running turn holds about a connection', () => {
         if (runs === 2) {
           holding = holdingChatWrites();
           switchingOff = useApp.getState().toggleConnection('conn_openai', false);
-          await vi.waitFor(() => expect(holding!.pending()).toBeGreaterThan(0));
+          await holding!.held('c1');
           engine.router.register('conn_openai', cloud.adapter);
         }
         if (runs === 3) {
@@ -728,10 +790,16 @@ describe('an answer the running turn holds about a connection', () => {
       chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
     });
 
+    const grants = recordingGrantWrites();
     try {
       await useChats.getState().send('what is in my chats?');
-      await macrotask();
+      // A conversation answer is written with `void`. Nothing is held open from
+      // here, and every grant the turn gave has settled — withdrawn again, if
+      // it had to be — before anything is said about what was kept.
+      (holding as ReturnType<typeof holdingChatWrites> | null)?.releaseAll();
+      await grants.settled();
     } finally {
+      grants.restore();
       toolRegistry.unregister('leaky');
       (holding as ReturnType<typeof holdingChatWrites> | null)?.restore();
       useApp.setState({ engine: null, connections: [], requestApproval: original });
@@ -807,10 +875,13 @@ describe('an answer the running turn holds about a connection', () => {
       chats: useChats.getState().chats.map((chat) => (chat.id === 'c1' ? { ...chat, tools: ['leaky'] } : chat)),
     });
 
+    const grants = recordingGrantWrites();
     try {
       await useChats.getState().send('what is in my chats?');
-      await macrotask();
+      // Any grant the turn gave has settled, as in `switchedOffWhileWritten`.
+      await grants.settled();
     } finally {
+      grants.restore();
       toolRegistry.unregister('leaky');
       useApp.setState({ engine: null, connections: [], requestApproval: original });
       db.restore();
@@ -963,7 +1034,7 @@ describe('the store’s provider policy, while a grant is being withdrawn', () =
     const db = holdingChatWrites();
     try {
       const switchingOff = useApp.getState().toggleConnection('conn_openai', false);
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       expect(connectionsOf('c1'), 'the store still holds it').toContain('conn_openai');
       expect(policy.isGranted('conn_openai')).toBe(false);
       expect(policy.isGranted('conn_ollama'), 'another connection’s grant').toBe(true);
@@ -994,7 +1065,7 @@ describe('the store’s provider policy, while a grant is being withdrawn', () =
     });
     try {
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
       await useChats.getState().revokeEgress('conn_openai');
       db.releaseAll();
       await granting;
@@ -1012,20 +1083,37 @@ describe('the store’s provider policy, while a grant is being withdrawn', () =
   it('does not keep a grant given while its connection’s revocation is still being written', async () => {
     // c1's revocation has landed and c2's is still held, so the revocation is
     // under way when the grant for c1 is given, written, and checked.
-    await useChats.getState().grantEgress('c1', 'conn_openai');
-    await useChats.getState().grantEgress('c2', 'conn_openai');
+    //
+    // Both chats hold the grant as the store would once c1's was written last.
+    // A revocation writes chats in the store's order, newest first, and two
+    // grants written one after the other put that order on the clock: a
+    // millisecond between them put c2 first, and c1's revocation could not
+    // start until c2's was released — which this test does only after it.
+    const grant = { connectionId: 'conn_openai', grantedAt: 1 };
+    useChats.setState({
+      chats: useChats
+        .getState()
+        .chats.map((chat) => ({ ...chat, updatedAt: chat.id === 'c1' ? 3 : 2, egressGrants: [grant] })),
+    });
+    expect(useChats.getState().chats.map((chat) => chat.id), 'the order a revocation writes them in').toEqual([
+      'c1',
+      'c2',
+    ]);
     const db = holdingChatWrites();
     try {
       const revoking = useChats.getState().revokeEgress('conn_openai');
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
-      db.releaseFirst();
-      await vi.waitFor(() => expect(connectionsOf('c1')).toEqual([]));
-      await vi.waitFor(() => expect(db.pending()).toBe(1));
+      await db.held('c1');
+      db.release('c1');
+      // The revocation starts c2's write only once c1's has landed, in the table
+      // and the store.
+      await db.held('c2');
+      expect(connectionsOf('c1')).toEqual([]);
 
       const granting = useChats.getState().grantEgress('c1', 'conn_openai');
-      await vi.waitFor(() => expect(db.pending()).toBe(2));
-      db.releaseLast();
-      await vi.waitFor(() => expect(connectionsOf('c1')).toEqual(['conn_openai']));
+      await db.held('c1');
+      db.release('c1');
+      await whenChats(() => connectionsOf('c1').length > 0);
+      expect(connectionsOf('c1')).toEqual(['conn_openai']);
       // Its own check runs while c2's revocation is still held.
       await macrotask();
       db.releaseAll();

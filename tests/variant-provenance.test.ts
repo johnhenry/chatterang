@@ -832,13 +832,31 @@ function storedRows(): Message[] {
   return (tables.messages.put.mock.calls as unknown as [Message][]).map(([row]) => row);
 }
 
-/** Yield to the event loop until `condition` holds, or fail. */
+/**
+ * Yield to the event loop until `condition` holds, or fail.
+ *
+ * Bounded by turns of the event loop, not by time, so a loaded runner makes it
+ * slower and never makes it fail. Where the thing waited for has a moment of
+ * its own — a turn's `onToolHandled`, a store change — a test awaits that.
+ */
 async function until(condition: () => boolean): Promise<void> {
   for (let tries = 0; tries < 200; tries += 1) {
     if (condition()) return;
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   throw new Error('the condition never held');
+}
+
+/** Resolves once `holds()` is true: at once if it already is, otherwise on the store change that makes it so. */
+function whenStore(store: { subscribe: (listener: () => void) => () => void }, holds: () => boolean): Promise<void> {
+  if (holds()) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const unsubscribe = store.subscribe(() => {
+      if (!holds()) return;
+      unsubscribe();
+      resolve();
+    });
+  });
 }
 
 /** A turn that stays open after its tool event until `release` is called. */
@@ -908,11 +926,13 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     // The kill, measured the only way a test can: the turn cannot end while the
     // assertion runs, so anything that waits for `done` or `error` to write has
     // written nothing yet.
+    const handled = heldOpen();
     const turn = heldOpen();
-    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, onToolHandled: handled.release, hang: turn.hang }];
     const sending = useChats.getState().send('hello');
     try {
-      await until(() => storedRows().some((row) => row.streaming === true));
+      // The store has finished with the tool event; the turn is still held open.
+      await handled.hang;
       expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
       const inFlight = storedRows().find((row) => row.streaming === true);
       expect(inFlight?.toolCalls?.[0]?.receipt).toEqual(RECEIPT);
@@ -987,12 +1007,14 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
   });
 
   it('leaves the running generation’s own row streaming', async () => {
+    const handled = heldOpen();
     const turn = heldOpen();
-    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    script = [{ text: 'Found it.', provenance: ON_DEVICE, tool: SENT, onToolHandled: handled.release, hang: turn.hang }];
     const sending = useChats.getState().send('hello');
     try {
-      await until(() => storedRows().some((row) => row.streaming === true));
+      await handled.hang;
       const live = storedRows().find((row) => row.streaming === true)!;
+      expect(live, 'the running row was written mid-turn').toBeDefined();
       const stale: Message = { ...live, id: 'msg_stale', createdAt: live.createdAt + 1 };
       tables.messages.put.mockClear();
 
@@ -1154,19 +1176,22 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
     // the same held-open turn, with a receipt that says something left. The
     // ruling that keeps a not-sent record through regeneration does not move it
     // into this write: it is kept with the row the turn ends on.
+    const handled = heldOpen();
     const turn = heldOpen();
     const withheld: ToolInvocation = { ...SENT, receipt: { ...RECEIPT, outcome: 'withheld', why: 'not-allowed' } };
-    script = [{ text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, hang: turn.hang }];
+    script = [
+      { text: 'Could not file it.', provenance: ON_DEVICE, tool: withheld, onToolHandled: handled.release, hang: turn.hang },
+    ];
     const sending = useChats.getState().send('hello');
     try {
-      // Polled off the store: the placeholder does not exist until `send` has
-      // written the user's turn.
-      await until(() =>
-        useChats
-          .getState()
-          .messages.some((row) => row.role === 'assistant' && (row.toolCalls?.length ?? 0) > 0),
-      );
-      for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      // Not a window of ticks: the store has finished with the tool event, so
+      // any write it makes for that event has been made, and the turn is still
+      // held open.
+      await handled.hang;
+      expect(
+        useChats.getState().messages.some((row) => row.role === 'assistant' && (row.toolCalls?.length ?? 0) > 0),
+        'the tool event reached the row',
+      ).toBe(true);
       expect(useChats.getState().generating, 'the turn is still in flight').toBe(true);
       expect(storedRows().some((row) => row.streaming === true)).toBe(false);
     } finally {
@@ -1284,10 +1309,11 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
         { id: 'msg_old', chatId: 'c1', role: 'assistant', content: 'OLD ANSWER', createdAt: 2, provenance: ON_DEVICE },
       ],
     });
-    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: SENT, hang: turn.hang }];
+    const handled = heldOpen();
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: SENT, onToolHandled: handled.release, hang: turn.hang }];
     const regenerating = useChats.getState().regenerate('msg_old');
     try {
-      await until(() => storedRows().some((row) => row.streaming === true));
+      await handled.hang;
       const inFlight = storedRows().find((row) => row.streaming === true);
       expect(inFlight?.variants?.map((variant) => variant.content)).toEqual(['OLD ANSWER']);
       expect(tables.messages.delete).toHaveBeenCalledWith('msg_old');
@@ -1307,11 +1333,13 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
         { id: 'msg_old', chatId: 'c1', role: 'assistant', content: 'OLD ANSWER', createdAt: 2, provenance: ON_DEVICE },
       ],
     });
-    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: TOOL, hang: turn.hang }];
+    const handled = heldOpen();
+    script = [{ text: 'NEW ANSWER', provenance: ON_DEVICE, tool: TOOL, onToolHandled: handled.release, hang: turn.hang }];
     const regenerating = useChats.getState().regenerate('msg_old');
     try {
-      await until(() => (assistantRow().toolCalls?.length ?? 0) > 0);
-      for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      // The store has finished with the tool event, as above.
+      await handled.hang;
+      expect(assistantRow().toolCalls?.length ?? 0, 'the tool event reached the row').toBeGreaterThan(0);
       expect(tables.messages.delete).not.toHaveBeenCalledWith('msg_old');
     } finally {
       turn.release();
@@ -1422,6 +1450,34 @@ describe('the MCP send sheet, through the store’s own policy', () => {
   const grants = () => useChats.getState().chats.find((chat) => chat.id === 'c1')?.egressGrants ?? [];
 
   /**
+   * Every MCP grant the store starts from here on, so a test can wait for each
+   * to settle — its post-write re-check included — before it says what was
+   * kept. The policy writes a grant with `void`, so nothing else holds that
+   * promise, and a macrotask only covers a grant that happens to land within one.
+   */
+  function recordingGrantWrites() {
+    const original = useChats.getState().grantMcpEgress;
+    const started: Promise<void>[] = [];
+    useChats.setState({
+      grantMcpEgress: (chatId, server) => {
+        const granting = original(chatId, server);
+        started.push(granting);
+        return granting;
+      },
+    });
+    return {
+      /** Every grant started so far has settled, and any started while waiting. */
+      async settled(): Promise<void> {
+        for (let seen = -1; seen !== started.length; ) {
+          seen = started.length;
+          await Promise.all(started);
+        }
+      },
+      restore: () => useChats.setState({ grantMcpEgress: original }),
+    };
+  }
+
+  /**
    * Hold open every write of a chat that carries a grant, until released.
    *
    * Without it, whether a grant's write has landed by the next line depends on
@@ -1451,12 +1507,13 @@ describe('the MCP send sheet, through the store’s own policy', () => {
     mcpAnswers = [];
     script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
     const sending = useChats.getState().send('file it');
-    await vi.waitFor(() => expect(useApp.getState().approvals).toHaveLength(1));
+    await whenStore(useApp, () => useApp.getState().approvals.length > 0);
+    expect(useApp.getState().approvals).toHaveLength(1);
     expect(useApp.getState().approvals[0]?.title).toBe(mcpSendSheet(ASK).title);
 
     useChats.getState().stop();
 
-    await vi.waitFor(() => expect(useApp.getState().approvals).toEqual([]));
+    await whenStore(useApp, () => useApp.getState().approvals.length === 0);
     await sending;
     // Stop's no is the policy's answer; the dispatcher reads it off the signal.
     expect(mcpAnswers).toEqual([{ decision: 'deny', granted: false }]);
@@ -1497,15 +1554,19 @@ describe('the MCP send sheet, through the store’s own policy', () => {
   });
 
   it('keeps a conversation answer for this chat and this server, and honours it at once', async () => {
-    await answering('conversation');
+    const writes = recordingGrantWrites();
+    try {
+      await answering('conversation');
+      // Held before the write lands, so a call made straight after is not asked again.
+      expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: true }]);
+      await writes.settled();
+    } finally {
+      writes.restore();
+    }
 
-    // Held before the write lands, so a call made straight after is not asked again.
-    expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: true }]);
-    await vi.waitFor(() =>
-      expect(grants()).toEqual([
-        { kind: 'mcp', serverId: 'mcp_notes', url: 'https://notes.example/mcp', grantedAt: expect.any(Number) },
-      ]),
-    );
+    expect(grants()).toEqual([
+      { kind: 'mcp', serverId: 'mcp_notes', url: 'https://notes.example/mcp', grantedAt: expect.any(Number) },
+    ]);
   });
 
   it('stops honouring a conversation answer once the server’s grants are withdrawn, within the same turn', async () => {
@@ -1525,7 +1586,8 @@ describe('the MCP send sheet, through the store’s own policy', () => {
         granted.push(policy.isGranted(ASK.destination));
 
         write.release();
-        await vi.waitFor(() => expect(grants()).toHaveLength(1));
+        await whenStore(useChats, () => grants().length > 0);
+        expect(grants()).toHaveLength(1);
         // What `useMcp.toggle('mcp_notes', false)` and `remove` call.
         await revokeMcpGrantsFor('mcp_notes');
         granted.push(policy.isGranted(ASK.destination));
@@ -1543,6 +1605,7 @@ describe('the MCP send sheet, through the store’s own policy', () => {
     // The revocation runs while the grant is still being written, so it finds
     // nothing stored to drop; the write then lands after it.
     const granted: boolean[] = [];
+    const writes = recordingGrantWrites();
     const write = holdingGrantWrites();
     try {
       await answering('conversation', async (policy) => {
@@ -1550,12 +1613,15 @@ describe('the MCP send sheet, through the store’s own policy', () => {
         granted.push(policy.isGranted(ASK.destination));
         write.release();
       });
+      // The grant landed after the revocation. It has settled, and withdrawn
+      // itself, before anything is said about what was kept.
+      await writes.settled();
     } finally {
       write.restore();
+      writes.restore();
     }
 
     expect(granted).toEqual([false]);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(grants()).toEqual([]);
   });
 
@@ -1584,12 +1650,19 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       release = resolve;
     });
     let started = 0;
+    const arrivals: { count: number; arrived: () => void }[] = [];
     tables.chats.put.mockImplementation((async () => {
       started += 1;
+      for (let at = arrivals.length - 1; at >= 0; at -= 1) {
+        if (arrivals[at]!.count <= started) arrivals.splice(at, 1)[0]!.arrived();
+      }
       await held;
     }) as never);
     return {
       started: () => started,
+      /** Resolves once `count` writes have started: at once, if they have. */
+      startedAt: (count: number): Promise<void> =>
+        started >= count ? Promise.resolve() : new Promise<void>((arrived) => arrivals.push({ count, arrived })),
       release: () => release(),
       restore: () => {
         release();
@@ -1613,13 +1686,16 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       },
     });
     mcpAnswers = [];
+    const writes = recordingGrantWrites();
     try {
       script = [{ text: 'Filed.', provenance: ON_DEVICE, asksMcp: ASK }];
       await useChats.getState().send('file it');
+      // Any grant the policy started has settled before anything is said about it.
+      await writes.settled();
     } finally {
       useApp.setState({ requestApproval: original });
+      writes.restore();
     }
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mcpAnswers).toEqual([{ decision: 'conversation', granted: false }]);
     expect(grants()).toEqual([]);
@@ -1638,7 +1714,8 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       await answering('no', async (policy) => {
         write = holdingEveryChatWrite();
         const revoking = revokeMcpGrantsFor('mcp_notes');
-        await vi.waitFor(() => expect(write!.started()).toBe(1));
+        await write!.startedAt(1);
+        expect(write!.started()).toBe(1);
         seen.push({ notes: policy.isGranted(ASK.destination), other: policy.isGranted(OTHER), stored: holdsNotes() });
         write.release();
         await revoking;
@@ -1667,7 +1744,8 @@ describe('the MCP send sheet, through the store’s own policy', () => {
       await answering('no', async (policy) => {
         write = holdingEveryChatWrite();
         const granting = useChats.getState().grantMcpEgress('c1', { serverId: 'mcp_notes', url: ASK.destination.url });
-        await vi.waitFor(() => expect(write!.started()).toBe(1));
+        await write!.startedAt(1);
+        expect(write!.started()).toBe(1);
         await useChats.getState().revokeMcpEgress('mcp_notes');
         unsubscribe = useChats.subscribe(() => {
           if (holdsNotes()) seen.push(policy.isGranted(ASK.destination));
