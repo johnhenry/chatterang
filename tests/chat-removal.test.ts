@@ -674,6 +674,76 @@ describe('a chat deleted while a turn is running in it', () => {
     },
   );
 
+  it.each(['fails', 'lands'] as const)(
+    'keeps the record that a call went when the delete asked for while it was out %s',
+    async (how) => {
+      // The real engine and a real MCP tool whose server is a spy. The chat is
+      // deleted while the call is out, and the delete is held until the turn
+      // has ended. A delete that fails — a full disk — leaves the chat, and the
+      // thread on screen shows the call went. The rows refused while the delete
+      // ran were dropped for good, so the table had no record of it: reopening
+      // or exporting the chat said nothing had been sent. The control is the
+      // same delete landing, which leaves no row.
+      const id = how === 'fails' ? 'record_refused' : 'record_deleted';
+      const probe = mcpProbe();
+      given({ ...chat(id, 1), tools: [probe.tool.id] });
+      useChats.setState({ activeChatId: id });
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      const deleting = held();
+      fake.deleteChat.mockImplementationOnce(async (chatId: string) => {
+        await deleting.promise;
+        if (how === 'fails') throw new Error('The disk is full.');
+        for (const row of [...fake.messages.values()]) if (row.chatId === chatId) fake.messages.delete(row.id);
+        fake.chats.delete(chatId);
+      });
+      let removing: Promise<void> = Promise.resolve();
+      probe.call.mockImplementationOnce(async () => {
+        removing = useChats.getState().removeChat(id);
+        return { content: [{ type: 'text', text: 'filed' }] };
+      });
+      const original = useApp.getState().requestApproval;
+      let sending: Promise<void> = Promise.resolve();
+      try {
+        toolRegistry.register(probe.tool);
+        engine.router.replace(QWEN.engine, recordingBackend([MCP_CALL, 'Done.']).adapter);
+        useApp.setState({ engine: engine as never, requestApproval: async () => true });
+        sending = useChats.getState().send('file my bank details');
+        await until(() =>
+          useChats.getState().messages.some((message) => message.role === 'assistant' && message.streaming === false),
+        );
+        deleting.release();
+        if (how === 'fails') await expect(removing).rejects.toThrow('The disk is full.');
+        else await removing;
+        await sending;
+      } finally {
+        deleting.release();
+        toolRegistry.unregister(probe.tool.id);
+        useApp.setState({ requestApproval: original });
+      }
+
+      expect(probe.call, 'the arguments went').toHaveBeenCalledOnce();
+      if (how === 'lands') {
+        expect(rowsFor(id)).toEqual([]);
+        expect(await relaunch()).toEqual([]);
+        return;
+      }
+      expect(inStore(id), 'the chat is still there').toBe(true);
+      const outcomes = (thread: readonly Message[]): (string | undefined)[] =>
+        thread.flatMap((message) => message.toolCalls ?? []).map((call) => call.receipt?.outcome);
+      expect(outcomes(useChats.getState().messages), 'the thread on screen shows the call').toContain('sent');
+      const onDisk = (rowsFor(id) as Message[]).sort((a, b) => a.createdAt - b.createdAt);
+      expect(outcomes(onDisk), 'and the table keeps its record').toContain('sent');
+      expect(
+        onDisk.map((row) => ({ id: row.id, streaming: row.streaming ?? false, error: row.error })),
+        'the rows on disk are the thread on screen',
+      ).toEqual(
+        useChats
+          .getState()
+          .messages.map((row) => ({ id: row.id, streaming: row.streaming ?? false, error: row.error })),
+      );
+    },
+  );
+
   it('does not hand the turn to the engine when the delete is asked for while its prompt is being built', async () => {
     // An image in the thread is read back from its payload while the prompt is
     // built. A stopped signal handed to the engine still lets it raise a sheet
@@ -865,6 +935,46 @@ describe('a chat deleted while something is written to its thread', () => {
     expect(inStore('kept_image')).toBe(true);
     expect(fake.messages.has('kept_image_user')).toBe(true);
     expect(fake.blobs.has('att_kept'), 'its image').toBe(true);
+  });
+
+  it('does not write back, when the delete fails, a refused row the person deleted meanwhile', async () => {
+    // A delete that fails writes the rows it refused while it ran. A row the
+    // person then deleted is not one of them: here a flip is refused, and the
+    // reply it flipped is deleted before the delete fails.
+    given(chat('dropped_row', 1));
+    const thread: Message[] = [
+      { id: 'dropped_row_user', chatId: 'dropped_row', role: 'user', content: 'hello', createdAt: 1 },
+      {
+        id: 'dropped_row_reply',
+        chatId: 'dropped_row',
+        role: 'assistant',
+        content: 'Second.',
+        createdAt: 2,
+        variants: [{ content: 'First.' }, { content: 'Second.' }],
+        variantIndex: 1,
+      },
+    ];
+    for (const row of thread) fake.messages.set(row.id, structuredClone(row));
+    useChats.setState({ activeChatId: 'dropped_row', messages: thread });
+    const refusing = held();
+    fake.deleteChat.mockImplementationOnce(async () => {
+      await refusing.promise;
+      throw new Error('The disk is full.');
+    });
+
+    const removing = useChats.getState().removeChat('dropped_row');
+    try {
+      await until(() => fake.deleteChat.mock.calls.length === 1);
+      await useChats.getState().cycleVariant('dropped_row_reply', -1);
+      await useChats.getState().deleteMessage('dropped_row_reply');
+    } finally {
+      refusing.release();
+    }
+    await expect(removing).rejects.toThrow('The disk is full.');
+
+    expect(inStore('dropped_row')).toBe(true);
+    expect(fake.messages.has('dropped_row_reply'), 'the reply deleted meanwhile').toBe(false);
+    expect(rowsFor('dropped_row').map((row) => row.id)).toEqual(['dropped_row_user']);
   });
 
   it('does not start a turn asked for after the delete, while an earlier write still holds its turn', async () => {

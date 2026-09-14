@@ -240,9 +240,24 @@ function writeInTurn(chatId: string, write: () => Promise<void>): Promise<void> 
  * starts none in a chat in here, nor hands one to the engine.
  *
  * Taken out again if the delete fails — the chat is still there then, and so
- * should be what is written to it from then on.
+ * should be what is written to it from then on, and what was refused while the
+ * delete ran is written then. See `refusedRows`.
  */
 const removedChats = new Set<string>();
+
+/**
+ * Rows `putMessage` refused while a chat's delete was under way, by chat, the
+ * latest version of each row by message id. Present from the moment the delete
+ * is asked for until it has landed or failed.
+ *
+ * A delete can fail — a full disk — and the chat is then still there. Dropping
+ * a refused row outright lost it for good: the row recording that a call's
+ * arguments went to an MCP server, a finished turn carrying a not-sent record, a
+ * regenerated turn holding the generations of the row it replaced (which was
+ * deleted). The thread on screen showed them; reopening or exporting the chat
+ * showed nothing. So they are kept here, and written if the delete fails.
+ */
+const refusedRows = new Map<string, Map<string, Message>>();
 
 /**
  * Every generation still running, with the chat it belongs to and what stops it.
@@ -260,11 +275,14 @@ const liveTurns = new Set<{ readonly chatId: string; readonly controller: AbortC
  * Write a message row, unless its chat's delete has been asked for. See
  * `removedChats`.
  *
+ * Refused while the delete is under way, the row is kept in `refusedRows`:
+ * `removeChat` writes it if the delete fails.
+ *
  * A row refused that way can name attachment payloads nothing else does: the
  * composer writes an image's payload when it is attached, and the delete takes
- * only the payloads the rows it found name. So those go too — in the chat's
- * turn, once the delete has landed, and only if it did: a chat whose delete
- * failed may still show them.
+ * only the payloads the rows it found name. So those go too — once the delete
+ * has landed, and only if it did: a chat whose delete failed may still show
+ * them.
  */
 async function putMessage(message: Message): Promise<void> {
   // Asked in the same step the put is made. A delete asked for after this makes
@@ -274,11 +292,28 @@ async function putMessage(message: Message): Promise<void> {
     await db.messages.put(message);
     return;
   }
+  const refused = refusedRows.get(message.chatId);
+  if (refused) {
+    refused.set(message.id, message);
+    return;
+  }
+  // The delete has landed: nothing will write this row, and nothing else names
+  // its payloads.
   const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
   if (payloads.length === 0) return;
   await writeInTurn(message.chatId, async () => {
     if (removedChats.has(message.chatId)) await deleteBlobs(payloads);
   });
+}
+
+/**
+ * Delete a message row. A version of it refused while its chat's delete is under
+ * way goes too, or a delete that then failed would write back a row the person
+ * had deleted meanwhile. See `refusedRows`.
+ */
+async function deleteMessageRow(messageId: string): Promise<void> {
+  for (const refused of refusedRows.values()) refused.delete(messageId);
+  await db.messages.delete(messageId);
 }
 
 /**
@@ -538,14 +573,30 @@ export const useChats = create<ChatState>((set, get) => ({
     // turn. What that turn would send next is sent for a conversation the person
     // has just deleted.
     removedChats.add(chatId);
+    if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
     for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
     return writeInTurn(chatId, async () => {
       try {
         await deleteChat(chatId);
       } catch (error) {
+        // The chat is still there, and so is what the thread on screen shows:
+        // the rows refused while this ran are written. Each put is MADE before
+        // the mark comes off, so a write to the chat made after that is applied
+        // after it, and wins.
+        const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+        refusedRows.delete(chatId);
+        const writing = refused.map((message) => db.messages.put(message));
         removedChats.delete(chatId);
+        await Promise.allSettled(writing);
         throw error;
       }
+      // Landed. The rows refused meanwhile are never written, and their payloads
+      // are named by nothing else.
+      const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
+        (message.attachments ?? []).map((attachment) => attachment.id),
+      );
+      refusedRows.delete(chatId);
+      if (payloads.length > 0) await deleteBlobs(payloads);
       set({
         chats: get().chats.filter((chat) => chat.id !== chatId),
         ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
@@ -719,7 +770,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // Everything after this assistant turn is discarded; the turn itself is
     // kept so its previous text becomes a variant the user can flip back to.
     const removed = messages.slice(index + 1);
-    for (const message of removed) await db.messages.delete(message.id);
+    for (const message of removed) await deleteMessageRow(message.id);
 
     const chatId = get().activeChatId;
     if (!chatId) return;
@@ -735,7 +786,7 @@ export const useChats = create<ChatState>((set, get) => ({
       previousVariants: generationsSoFar(target),
       replaceMessageId: target.id,
     });
-    await db.messages.delete(target.id);
+    await deleteMessageRow(target.id);
   },
 
   async editMessage(messageId, text) {
@@ -752,7 +803,7 @@ export const useChats = create<ChatState>((set, get) => ({
     // Editing a user turn invalidates everything after it.
     const after = messages.slice(index + 1);
     if (message.role === 'user' && after.length > 0) {
-      for (const stale of after) await db.messages.delete(stale.id);
+      for (const stale of after) await deleteMessageRow(stale.id);
       set({ messages: [...messages.slice(0, index), updated] });
       const chatId = get().activeChatId;
       if (chatId) await runGeneration(set, get, { chatId });
@@ -763,7 +814,7 @@ export const useChats = create<ChatState>((set, get) => ({
   },
 
   async deleteMessage(messageId) {
-    await db.messages.delete(messageId);
+    await deleteMessageRow(messageId);
     set({ messages: get().messages.filter((message) => message.id !== messageId) });
   },
 
@@ -1054,7 +1105,7 @@ async function runGeneration(
             // it replaces, so that row goes now rather than after the turn.
             // Otherwise a kill from here on leaves both, and the reopened
             // thread shows the turn twice.
-            if (options.replaceMessageId) await db.messages.delete(options.replaceMessageId);
+            if (options.replaceMessageId) await deleteMessageRow(options.replaceMessageId);
           }
           break;
         }
