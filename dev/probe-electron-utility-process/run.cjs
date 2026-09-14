@@ -9,7 +9,9 @@
 // spawns the Electron binary directly (the path `require('electron')` answers,
 // which is what node_modules/.bin/electron launches), so a signal is seen as a
 // signal rather than as the wrapper's exit code 1.
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
 const { join, resolve } = require('node:path');
 
 const REPO = resolve(__dirname, '..', '..');
@@ -21,8 +23,17 @@ const only = (extra.find((a) => a.startsWith('--match=')) ?? '').slice('--match=
 // adds a table of how often main survived. A crash that depends on a race is
 // only honestly described as a rate.
 const repeat = Math.max(1, Number((extra.find((a) => a.startsWith('--repeat=')) ?? '--repeat=1').slice('--repeat='.length)) || 1);
-const passThrough = extra.filter((a) => !a.startsWith('--match=') && !a.startsWith('--repeat='));
-const SCENARIO_LIMIT_MS = 60_000;
+const passThrough = extra.filter(
+  (a) => !a.startsWith('--match=') && !a.startsWith('--repeat=') && !a.startsWith('--limit='),
+);
+// --limit=MS shortens how long a stalled scenario is given before it is sampled
+// and SIGKILLed.
+const SCENARIO_LIMIT_MS = Number((extra.find((a) => a.startsWith('--limit=')) ?? '--limit=60000').slice('--limit='.length)) || 60_000;
+// Frames that say WHY a stalled main is stalled, looked for in a `sample` of it
+// taken before it is killed. A modal alert blocks main's thread: Electron's
+// default uncaughtException handler shows one (`dialog.showErrorBox`), and so
+// does macOS's reopen-windows prompt after a crash.
+const STALL_FRAMES = ['ShowErrorBox', 'runModal', 'promptToIgnorePersistentStateWithCrashHistory', 'NSAlert'];
 // Scenarios in this probe crash Electron on purpose. After a crash, macOS shows
 // the next launch of the same app a modal alert offering to reopen its windows
 // (`NSPersistentUIRestorer promptToIgnorePersistentStateWithCrashHistory`,
@@ -33,16 +44,38 @@ const MACOS_NO_RESTORE = process.platform === 'darwin' ? ['-ApplePersistenceIgno
 
 const line = (out, tag) => out.split('\n').find((l) => l.startsWith(tag));
 
+// Each running Electron and the temporary root it writes under. Interrupted,
+// the runner takes both with it.
+const live = new Map();
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    for (const [child, tempRoot] of live) {
+      child.kill('SIGKILL');
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
+
 /**
  * One Electron main, its pipes drained as it runs, SIGKILLed at the limit.
  *
  * The limit exists because launches stalled. Every stall sampled was the macOS
  * reopen-windows alert described above, not the API under test. A scenario
  * that still stalls is recorded as timed out instead of stalling the run.
+ *
+ * Everything the launch writes goes under a temporary root this runner makes,
+ * passes as --temp-root, and removes once the process has closed. main.cjs
+ * cannot be trusted to: a process SIGKILLed at the limit never reaches its
+ * clean-up, and Chromium writes into userData as it quits, after it.
  */
 function electron(args) {
   return new Promise((done) => {
-    const child = spawn(ELECTRON, [...args, ...MACOS_NO_RESTORE], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const tempRoot = mkdtempSync(join(tmpdir(), 'probe-utilproc-'));
+    const child = spawn(ELECTRON, [...args, `--temp-root=${tempRoot}`, ...MACOS_NO_RESTORE], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    live.set(child, tempRoot);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -52,13 +85,23 @@ function electron(args) {
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
+    let stallFrames;
     const limit = setTimeout(() => {
       timedOut = true;
+      if (process.platform === 'darwin') {
+        // `sample` reads the stalled process's stacks for a second; it changes
+        // nothing in it.
+        const sampled = spawnSync('sample', [String(child.pid), '1'], { encoding: 'utf8', timeout: 30_000 });
+        const text = `${sampled.stdout ?? ''}`;
+        stallFrames = STALL_FRAMES.filter((frame) => text.includes(frame));
+      }
       child.kill('SIGKILL');
     }, SCENARIO_LIMIT_MS);
     child.on('close', (status, signal) => {
       clearTimeout(limit);
-      done({ status, signal, stdout, stderr, timedOut });
+      live.delete(child);
+      rmSync(tempRoot, { recursive: true, force: true });
+      done({ status, signal, stdout, stderr, timedOut, stallFrames });
     });
   });
 }
@@ -97,7 +140,10 @@ async function main() {
     }
     const summary = scenario ? JSON.parse(scenario.slice('PROBE_SCENARIO '.length)) : undefined;
     let mainExit = result.signal ? `killed by ${result.signal}` : `exit ${result.status}`;
-    if (result.timedOut) mainExit = `stalled; SIGKILLed by the runner at ${SCENARIO_LIMIT_MS} ms`;
+    if (result.timedOut) {
+      const frames = result.stallFrames?.length ? `, sampled in ${result.stallFrames.join(' / ')}` : '';
+      mainExit = `stalled${frames}; SIGKILLed by the runner at ${SCENARIO_LIMIT_MS} ms`;
+    }
     const row = {
       name,
       mainExit,

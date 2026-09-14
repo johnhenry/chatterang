@@ -8,11 +8,16 @@
  *   - `postMessage` never throws, whether the process is alive or dead;
  *   - a post to a process that has died is silently dropped;
  *   - a post made from INSIDE the `'exit'` dispatch killed Electron's main
- *     process with SIGSEGV.
+ *     process with SIGSEGV;
+ *   - a V8 fatal error in the child reaches main as the experimental `'error'`
+ *     event, `('FatalError', location, report)`, emitted through
+ *     `EventEmitter#emit`, and `'exit'` follows it. With no listener that emit
+ *     throws `ERR_UNHANDLED_ERROR` out of Electron's native callback and into
+ *     main's `uncaughtException`.
  *
  * A fake cannot segfault. So it records the phase each post arrived in, and
- * the tests assert that no post ever arrives inside the exit dispatch or after
- * it. That is the post that would have taken the whole app down.
+ * the tests assert that no post ever arrives inside the error or exit dispatch
+ * or after either. That is the post that would have taken the whole app down.
  */
 
 import { EventEmitter } from 'node:events';
@@ -24,7 +29,22 @@ import { DEFAULT_POLICY, HANDLE_LOST, LLAMA_PLUGIN, Supervisor } from '@chattera
 import type { SupervisorTimers } from '@chatterang/desktop/bridge';
 import { HOST_EXITED, utilityHostHandle } from '@chatterang/desktop/utility-host';
 
-type Phase = 'alive' | 'dead, not yet reaped' | 'inside the exit dispatch' | 'after exit';
+type Phase =
+  | 'alive'
+  | 'dead, not yet reaped'
+  | 'inside the error dispatch'
+  | 'fatal, exit not yet dispatched'
+  | 'inside the exit dispatch'
+  | 'after exit';
+
+/**
+ * What a `FatalError`'s third argument carries: a Node diagnostic report, with
+ * the child's environment, working directory and command line. This stands in
+ * for the private part of it. It must never reach a message the supervisor
+ * hands to a renderer.
+ */
+const REPORT_SECRET = '/Users/someone/Library/Application Support/Chatterang/models';
+const FATAL_REPORT = JSON.stringify({ header: { cwd: REPORT_SECRET, commandLine: ['host.mjs', REPORT_SECRET] } });
 
 interface Post {
   readonly message: unknown;
@@ -36,6 +56,7 @@ class FakeUtilityProcess extends EventEmitter {
   readonly posted: Post[] = [];
   kills = 0;
   #phase: Phase = 'alive';
+  #exitDispatched = false;
 
   /** Where in its life the process is, as a post arriving now would find it. */
   get phase(): Phase {
@@ -49,7 +70,9 @@ class FakeUtilityProcess extends EventEmitter {
 
   kill(): boolean {
     this.kills += 1;
-    return this.#phase === 'alive';
+    // Measured: true for a live child and from inside the 'error' dispatch,
+    // false from inside the exit dispatch and after it.
+    return !this.#exitDispatched;
   }
 
   /** The process is gone, but Electron has not dispatched `'exit'` yet. */
@@ -57,17 +80,37 @@ class FakeUtilityProcess extends EventEmitter {
     if (this.#phase === 'alive') this.#phase = 'dead, not yet reaped';
   }
 
+  /**
+   * The child hit a non-continuable V8 error and is about to crash.
+   *
+   * Emitted the way Electron 44 emits it: `UtilityProcessWrapper::OnV8FatalError`
+   * calls `EmitWithoutEvent("error", "FatalError", location, report)`, and
+   * `ForkUtilityProcess` forwards that to `EventEmitter#emit`. So this is a
+   * real `'error'` emit, and with no listener it throws, as Electron's does.
+   * `'exit'` is a separate dispatch, which a test calls `exit` for. Measured,
+   * it follows; Electron's source does not rule out the other order.
+   */
+  fatal(): void {
+    this.#phase = 'inside the error dispatch';
+    try {
+      this.emit('error', 'FatalError', 'v8::ToLocalChecked Empty MaybeLocal', FATAL_REPORT);
+    } finally {
+      this.#phase = this.#exitDispatched ? 'after exit' : 'fatal, exit not yet dispatched';
+    }
+  }
+
   /** Electron dispatches `'exit'` to every listener, in registration order. */
   exit(code: number): void {
+    this.#exitDispatched = true;
     this.#phase = 'inside the exit dispatch';
     this.emit('exit', code);
     this.#phase = 'after exit';
   }
 
-  /** Posts that reached the process once its exit had been dispatched. */
+  /** Posts that reached the process once its fatal error or its exit had been dispatched. */
   get postsToAnExitedProcess(): Post[] {
     return this.posted.filter(
-      (post) => post.phase === 'inside the exit dispatch' || post.phase === 'after exit',
+      (post) => post.phase !== 'alive' && post.phase !== 'dead, not yet reaped',
     );
   }
 }
@@ -133,13 +176,20 @@ async function outcome(promise: Promise<unknown>): Promise<unknown> {
 function supervise(
   child: FakeUtilityProcess,
   between?: (supervisor: () => Supervisor) => void,
-): { supervisor: Supervisor; llama: LlamaFacade; clock: ReturnType<typeof heldClock> } {
+): {
+  supervisor: Supervisor;
+  llama: LlamaFacade;
+  clock: ReturnType<typeof heldClock>;
+  /** Every process the supervisor has spawned, `child` first. */
+  spawned: FakeUtilityProcess[];
+} {
   const clock = heldClock();
-  let spawned = 0;
+  const spawned: FakeUtilityProcess[] = [];
   const supervisor: Supervisor = new Supervisor({
     spawn: () => {
-      spawned += 1;
-      const handle = utilityHostHandle(spawned === 1 ? child : new FakeUtilityProcess());
+      const next = spawned.length === 0 ? child : new FakeUtilityProcess();
+      spawned.push(next);
+      const handle = utilityHostHandle(next);
       between?.(() => supervisor);
       return handle;
     },
@@ -150,6 +200,7 @@ function supervise(
     supervisor,
     llama: supervisor.plugin(LLAMA_PLUGIN.name) as unknown as LlamaFacade,
     clock,
+    spawned,
   };
 }
 
@@ -356,6 +407,186 @@ describe('a post that does not go settles as HANDLE_LOST, and never hangs', () =
   });
 });
 
+describe("a V8 fatal error (UtilityProcess 'error') is a lost host, and nothing escapes into main", () => {
+  it('Electron emits it through EventEmitter, so a process nobody listens to throws', () => {
+    // The premise, with no adapter: this is the throw that, in Electron, leaves
+    // the native callback and reaches main's `uncaughtException`, where
+    // Electron's default handler shows a modal error box.
+    // dev/probe-electron-utility-process measures the real one.
+    const child = new FakeUtilityProcess();
+    let thrown: unknown;
+    try {
+      child.fatal();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ code: 'ERR_UNHANDLED_ERROR', message: expect.stringContaining('FatalError') });
+    expect((thrown as Error).message).not.toContain(REPORT_SECRET);
+  });
+
+  it('the adapter latches on it: onClose fires once, and posts are refused from inside its dispatch and after', () => {
+    // FAULT INJECTED: without the adapter's 'error' listener `child.fatal()`
+    // threw ERR_UNHANDLED_ERROR. With a listener that reported the close but did
+    // not latch, the post from inside the close reached the process. With
+    // `once('error')` the second emit threw again. With each listener told
+    // again, the exit added a second close. With `kill` guarded by the fatal
+    // latch instead of the exit, the host that reported the error was never
+    // terminated.
+    const child = new FakeUtilityProcess();
+    const handle = utilityHostHandle(child);
+    const closed: string[] = [];
+    const attempts: string[] = [];
+    handle.link.onClose((reason) => {
+      closed.push(reason);
+      try {
+        handle.link.postMessage({ k: 'ping', id: 5 });
+        attempts.push('posted');
+      } catch (error) {
+        attempts.push((error as Error).message);
+      }
+    });
+
+    expect(() => child.fatal()).not.toThrow();
+    expect(closed).toEqual(['fatal V8 error']);
+    expect(attempts).toEqual([expect.stringContaining(HOST_EXITED)]);
+    expect(() => handle.link.postMessage({ k: 'ping', id: 6 })).toThrow(HOST_EXITED);
+
+    // Until its exit there may be a process left to terminate.
+    handle.kill();
+    expect(child.kills).toBe(1);
+
+    // A second emit must not find the listener gone, and the exit that follows
+    // is the same loss, not a second one.
+    expect(() => child.fatal()).not.toThrow();
+    expect(() => child.exit(11)).not.toThrow();
+    expect(closed).toEqual(['fatal V8 error']);
+    expect(child.posted).toEqual([]);
+    handle.kill();
+    expect(child.kills).toBe(1);
+  });
+
+  const endings = [
+    {
+      name: "'error' then 'exit'",
+      end: (child: FakeUtilityProcess) => {
+        child.fatal();
+        child.exit(11);
+      },
+      reason: 'fatal V8 error',
+      // `#retire` terminates the host inside the 'error' dispatch; the exit
+      // then adds no second kill.
+      kills: 1,
+    },
+    { name: "'error' alone", end: (child: FakeUtilityProcess) => child.fatal(), reason: 'fatal V8 error', kills: 1 },
+    { name: "'exit' alone", end: (child: FakeUtilityProcess) => child.exit(0), reason: 'exit code 0', kills: 0 },
+    {
+      // Not measured, and not ruled out: Electron's `OnV8FatalError` emits
+      // without checking whether the process has already terminated, and its
+      // JavaScript wrapper forwards 'error' whatever came before. The listener
+      // must still be there, and the exit has already reported the loss.
+      name: "'exit' then 'error'",
+      end: (child: FakeUtilityProcess) => {
+        child.exit(0);
+        child.fatal();
+      },
+      reason: 'exit code 0',
+      kills: 0,
+    },
+  ];
+
+  it.each(endings)(
+    '$name: nothing throws, every pending call settles as HANDLE_LOST, and nothing more is posted',
+    async ({ end, reason, kills }) => {
+      // The clock is held, so no ping and no deadline can settle these calls.
+      // Only the adapter reporting the loss can. With 'error' alone that is the
+      // only report there will be.
+      // FAULT INJECTED: a listener that latched but did not report the close
+      // left the calls "still pending" for 'error' alone, and let them be
+      // settled by the exit, not the fatal error, for 'error' then 'exit'.
+      // Removing the listener made the ending itself throw ERR_UNHANDLED_ERROR.
+      // Removing it once 'exit' had fired made 'exit' then 'error' throw it,
+      // and no other test noticed.
+      const child = new FakeUtilityProcess();
+      const { llama } = supervise(child);
+      const capabilities = llama.getCapabilities();
+      const turn = llama.generate(1, { handle: 'h', prompt: 'p', requestId: 'r1' });
+      expect(child.posted.map((post) => post.phase)).toEqual(['alive', 'alive']);
+
+      expect(() => end(child)).not.toThrow();
+
+      for (const call of [capabilities, turn]) {
+        const settled = await outcome(call);
+        expect(settled).toMatchObject({
+          rejected: { code: HANDLE_LOST, message: expect.stringContaining(reason) },
+        });
+        expect((settled as { rejected: Error }).rejected.message).not.toContain(REPORT_SECRET);
+      }
+      expect(await outcome(llama.getCapabilities())).toMatchObject({ rejected: { code: HANDLE_LOST } });
+      expect(child.postsToAnExitedProcess).toEqual([]);
+      expect(child.posted).toHaveLength(2);
+      expect(child.kills).toBe(kills);
+    },
+  );
+
+  it('a notify listener that releases its renderer inside the fatal error posts nothing into the process', async () => {
+    // The same one-callback-away post as the exit case above, from inside the
+    // 'error' dispatch instead.
+    const child = new FakeUtilityProcess();
+    const attempts: Post[] = [];
+    const supervisor: Supervisor = new Supervisor({
+      spawn: () => {
+        const handle = utilityHostHandle(child);
+        return {
+          ...handle,
+          link: {
+            ...handle.link,
+            postMessage: (message) => {
+              attempts.push({ message, phase: child.phase });
+              handle.link.postMessage(message);
+            },
+          },
+        };
+      },
+      notify: (_plugin, eventName, _data, ownerId) => {
+        if (eventName === 'llamaEnd' && ownerId !== undefined) {
+          supervisor.releaseRenderer(ownerId, 'the window closed when its turn ended');
+        }
+      },
+      timers: heldClock(),
+    });
+    const llama = supervisor.plugin(LLAMA_PLUGIN.name) as unknown as LlamaFacade;
+    const turn = llama.generate(1, { handle: 'h', prompt: 'p', requestId: 'r1' });
+
+    expect(() => child.fatal()).not.toThrow();
+
+    const insideTheDispatch = attempts
+      .filter((attempt) => attempt.phase === 'inside the error dispatch')
+      .map((attempt) => (attempt.message as { method?: string }).method);
+    expect(insideTheDispatch).toEqual(['cancel']);
+    expect(child.postsToAnExitedProcess).toEqual([]);
+    expect(await outcome(turn)).toMatchObject({ rejected: { code: 'RENDERER_GONE' } });
+    expect(() => child.exit(11)).not.toThrow();
+  });
+
+  it('the fatal error and its exit are one loss: one replacement, which the late exit does not close', async () => {
+    const child = new FakeUtilityProcess();
+    const { llama, clock, spawned } = supervise(child);
+    child.fatal();
+    clock.advance(DEFAULT_POLICY.restartDelayMs);
+    expect(spawned).toHaveLength(2);
+
+    // Electron's exit for the first process arrives after its replacement is up.
+    expect(() => child.exit(11)).not.toThrow();
+    clock.advance(DEFAULT_POLICY.restartDelayMs);
+    expect(spawned).toHaveLength(2);
+
+    const replacement = spawned[1] as FakeUtilityProcess;
+    const call = llama.getCapabilities();
+    expect(replacement.posted.map((post) => post.phase)).toContain('alive');
+    expect(await outcome(call)).toBe('still pending');
+  });
+});
+
 describe('main.ts builds every inference host handle through it', () => {
   // main.ts cannot be imported by a test (protocol and app calls run at module
   // scope), so its wiring is pinned as source text, comments stripped.
@@ -374,14 +605,26 @@ describe('main.ts builds every inference host handle through it', () => {
     const wrap = code.indexOf('return utilityHostHandle(child);');
     expect(fork).toBeGreaterThan(-1);
     expect(wrap).toBeGreaterThan(fork);
-    // Nothing between the fork and the handle may listen for exit first.
-    expect(code.slice(fork, wrap)).not.toMatch(/\.(on|once|addListener|prependListener)\(\s*'exit'/);
+    // Nothing between the fork and the handle may listen for exit or for a
+    // fatal error first: the adapter's latch is only first if it is registered
+    // first.
+    // Any quote style: nothing in the repo enforces one.
+    expect(code.slice(fork, wrap)).not.toMatch(
+      /\.(on|once|addListener|prependListener)\(\s*['"\x60](exit|error)['"\x60]/,
+    );
   });
 
-  it('never posts to, kills or listens for the exit of a utility process itself', () => {
+  it('never posts to, kills, or listens for the exit or fatal error of a utility process itself', () => {
+    // FAULT INJECTED (see the commit): adding
+    // `child.on('error', () => undefined);` after the fork failed this test and
+    // the one above. So did the same listener in double quotes or backticks,
+    // and `child.once("exit", () => undefined);`. When these matched single
+    // quotes only, the double-quoted listener passed both. A listener there runs
+    // before the adapter's latch, so anything it posted would reach Electron.
     expect(code).not.toMatch(/\.postMessage\(/);
     expect(code).not.toMatch(/child\.kill\(/);
-    expect(code).not.toMatch(/'exit'/);
+    expect(code).not.toMatch(/['"\x60]exit['"\x60]/);
+    expect(code).not.toMatch(/['"\x60]error['"\x60]/);
   });
 
   it('utility-host.ts imports no Electron, so this file drives the real handle', () => {
