@@ -1354,11 +1354,17 @@ describe('the provider panel hints', () => {
         .join('') ?? null;
 
     expect(words('chatterang-desktop://app')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
     );
     expect(words('capacitor://localhost')).toBe(
-      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add capacitor:*//localhost to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
     );
+    // Ollama splits the setting on commas and keeps spaces. Measured: a space
+    // after the comma left the entry unmatched (403), and a space before
+    // `http://`, or a comma with nothing on one side, stopped Ollama starting.
+    // So the note may not invite either.
+    expect(words('chatterang-desktop://app')).toContain('with no spaces');
+    expect(words('chatterang-desktop://app')).not.toContain('anything already there');
     // Android and the web dev server: measured 200 with nothing set.
     expect(words('https://localhost')).toBeNull();
     expect(words('http://localhost:5273')).toBeNull();

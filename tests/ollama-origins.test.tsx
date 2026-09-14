@@ -298,7 +298,7 @@ describe('the Ollama note in the Providers panel', () => {
     const ollamaOnDesktop = providerItem(desktop.body, 'Ollama');
     expect(codes(ollamaOnDesktop)).toEqual(['OLLAMA_ORIGINS', 'chatterang-desktop:*//app']);
     expect(ollamaOnDesktop.textContent).toContain(
-      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+      'Requests go to the address you give. Nothing here checks that it is on your network. Ollama refuses this app until its OLLAMA_ORIGINS setting allows it. Add chatterang-desktop:*//app to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
     );
     desktop.unmount();
 

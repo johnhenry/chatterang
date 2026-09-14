@@ -75,7 +75,7 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
         { code: 'OLLAMA_ORIGINS' },
         ' setting allows it. Add ',
         { code: setting.value },
-        ' to that setting, with a comma between it and anything already there. Restart Ollama for the change to take effect.',
+        ' to that setting. If it already has a value, put a comma between them, with no spaces. Restart Ollama for the change to take effect.',
       ];
     },
     needsKey: false,
