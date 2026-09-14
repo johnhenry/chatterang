@@ -1,8 +1,6 @@
 // @vitest-environment node
 import { X509Certificate, createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
-import { resolve } from 'node:path';
 import { connect, createServer } from 'node:tls';
 import type { Server } from 'node:tls';
 
@@ -70,9 +68,10 @@ function spkiDerOf(certificate: Uint8Array): Uint8Array {
   return certificate.slice(cursor, field.end);
 }
 
-/** The DER encodings of two extension OIDs: 2.5.29.19 and 2.5.29.15. */
+/** The DER encodings of three extension OIDs: 2.5.29.19, 2.5.29.15 and 2.5.29.14. */
 const BASIC_CONSTRAINTS = [0x06, 0x03, 0x55, 0x1d, 0x13] as const;
 const KEY_USAGE = [0x06, 0x03, 0x55, 0x1d, 0x0f] as const;
+const SUBJECT_KEY_IDENTIFIER = [0x06, 0x03, 0x55, 0x1d, 0x0e] as const;
 
 /**
  * One extension, found by its encoded OID: whether it is marked critical, and
@@ -277,6 +276,48 @@ describe('a certificate issued from the key', () => {
     expect(parsed.keyUsage).toEqual(['1.3.6.1.5.5.7.3.1']);
     expect(cert.serialNumber).toMatch(/^[4-7][0-9a-f]{31}$/);
     expect(parsed.serialNumber.toLowerCase()).toBe(cert.serialNumber);
+
+    // The subject key identifier the doc comment promises: non-critical, and
+    // RFC 5280 §4.2.1.2 method (1) — SHA-1 of the subjectPublicKey BIT STRING's
+    // bits, which for P-256 are the 65-octet uncompressed point closing the SPKI.
+    const point = spkiDerOf(der).slice(-65);
+    expect(point[0], 'an uncompressed EC point').toBe(0x04);
+    const identifier = [...createHash('sha1').update(point).digest()];
+    expect(extensionOf(der, SUBJECT_KEY_IDENTIFIER)).toEqual({ critical: false, value: [0x04, 0x14, ...identifier] });
+  });
+
+  it('gives every certificate a positive 16-octet serial with no leading zero octet', async () => {
+    // Many issues, not one: a random first octet passes a single `^[4-7]`
+    // check one time in four, which is how dropping the masking survived.
+    const key = generateTunnelKey();
+    const serials = new Set<string>();
+    for (let issued = 0; issued < 32; issued += 1) {
+      const { certPem, serialNumber } = await issueTunnelCertificate(key, { validDays: 1 });
+      expect(serialNumber).toMatch(/^[4-7][0-9a-f]{31}$/);
+      expect(new X509Certificate(certPem).serialNumber.toLowerCase()).toBe(serialNumber);
+      serials.add(serialNumber);
+    }
+    expect(serials.size).toBe(32);
+  });
+
+  it('forgets a library load that failed, so the next issue loads it again', async () => {
+    // A fresh copy of the module, so its cached load starts empty, whose first
+    // import of the library fails.
+    vi.resetModules();
+    vi.doMock('@peculiar/x509', () => {
+      throw new Error('the library failed to load');
+    });
+    try {
+      const fresh = await import('@chatterang/tunnel/host');
+      const key = fresh.generateTunnelKey();
+      await expect(fresh.issueTunnelCertificate(key, { validDays: 1 })).rejects.toThrow();
+      vi.doUnmock('@peculiar/x509');
+      const cert = await fresh.issueTunnelCertificate(key, { validDays: 1 });
+      expect(pinByNode(cert.certPem)).toBe(key.pin.spkiSha256);
+    } finally {
+      vi.doUnmock('@peculiar/x509');
+      vi.resetModules();
+    }
   });
 
   it('carries no names unless it is given some, and then exactly those (#180, #295)', async () => {
@@ -405,33 +446,6 @@ describe('a TLS server built from the material, over loopback', () => {
   });
 });
 
-describe('the X.509 library reaches the desktop and the server, never the app bundle (#179)', () => {
-  it('is pinned in packages/tunnel, undeclared at the root, and loaded only on first issue', () => {
-    const manifest = (path: string) =>
-      JSON.parse(readFileSync(resolve(process.cwd(), path), 'utf8')) as {
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
-      };
-    const root = manifest('package.json');
-    const tunnel = manifest('packages/tunnel/package.json');
-    // Undeclared at the root is what makes `tests/layering.test.ts`'s derived
-    // rule ("src/ imports only what this app declares") refuse them in `src/`.
-    for (const name of ['@peculiar/x509', 'reflect-metadata']) {
-      expect(root.dependencies?.[name], name).toBeUndefined();
-      expect(root.devDependencies?.[name], name).toBeUndefined();
-    }
-    // Exact versions, per the ruling.
-    expect(tunnel.dependencies?.['@peculiar/x509']).toBe('2.1.0');
-    expect(tunnel.dependencies?.['reflect-metadata']).toBe('0.2.2');
-
-    // No static import of either, so importing the host entry patches no global.
-    const source = readFileSync(resolve(process.cwd(), 'packages/tunnel/src/host/identity.ts'), 'utf8');
-    const staticImport = /^\s*import\s[^;]*?['"](?:@peculiar\/x509|reflect-metadata)['"]/m;
-    expect(source).not.toMatch(staticImport);
-    expect(source).toContain("await import('reflect-metadata')");
-    expect(source).toContain("import('@peculiar/x509')");
-    // The matcher sees the imports it exists to catch.
-    expect("import 'reflect-metadata';").toMatch(staticImport);
-    expect("import * as x509 from '@peculiar/x509';").toMatch(staticImport);
-  });
-});
+// Where the library may be imported, and that importing the host loads none of
+// it, is `tests/tunnel-identity-library.test.ts`: the runtime half of that needs
+// a worker in which nothing has issued a certificate yet, and this file issues many.
