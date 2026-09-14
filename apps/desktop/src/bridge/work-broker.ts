@@ -18,20 +18,32 @@
  *      by anything below the bridge (measured in
  *      `tests/desktop-background-measurements.test.ts`).
  *   4. A DROPPED PHONE SOCKET DOES NOT END THE TURN. The work runs to its end,
- *      and the result is HELD, bounded by `RETAIN_RESULT_MS` and
- *      `RETAIN_RESULT_COUNT`, until the phone attaches and acknowledges it, the
- *      hold expires, the device is revoked, or the desktop sleeps or quits. A
- *      device's new socket replaces its stale one.
+ *      and the result is HELD, bounded by `RETAIN_RESULT_MS`,
+ *      `RETAIN_RESULT_PER_DEVICE` and `RETAIN_RESULT_COUNT`, until the phone
+ *      attaches and acknowledges it, the hold expires, the device is revoked,
+ *      or the desktop sleeps or quits. A device's new socket replaces its stale
+ *      one.
  *   5. IN MEMORY. The wait list and held results end on quit and on sleep.
  *   7. NO KEEP-AWAKE. `suspend()` stops admitting, settles running and waiting
  *      work with `HOST_SUSPENDED`, tells whoever is connected, and drops held
  *      results (ruling 5's "end on sleep"). It closes nothing: the listening
- *      socket is not the broker's, and it stays bound.
+ *      socket is not the broker's, and it stays bound. A phone that was not
+ *      connected hears nothing about a unit the sleep ended: an attach replays
+ *      only what is live or held, so a unit it does not mention has ended, and
+ *      the phone's own record of the turn (S8) is what fails it visibly.
  *
  * And #170: a prompt relayed to the phone that is not answered within
- * `PROMPT_ANSWER_TIMEOUT_MS`, whose socket drops, or whose unit ends while it
- * waits, is REFUSED. The outcome says `notSent: true`; the record of that is
- * the caller's (S4), and a late answer is never accepted.
+ * `PROMPT_ANSWER_TIMEOUT_MS`, whose socket drops or is replaced, or whose unit
+ * ends while it waits, is REFUSED. The outcome says `notSent: true`; the record
+ * of that is the caller's (S4), and a late answer is never accepted.
+ *
+ * DEADLINES ARE ENFORCED WHERE THEY ARE USED, not only on the tick. The tick
+ * runs every `BROKER_TICK_MS` at best; an interval lags behind a stalled event
+ * loop, and across a sleep with no suspend event it can lag without limit. So
+ * an answer, a progress report, a held result's replay or acknowledgement,
+ * and a new prompt each check the deadline that governs them against the
+ * clock first. A deadline that has passed is past, whether or not the tick
+ * has noticed.
  *
  * ONE SETTLE, FOUR PATHS. Every unit ends through `#settle`, which is
  * idempotent, by exactly one of:
@@ -53,7 +65,12 @@
  * aborts its work, but the slot stays taken until the work's promise settles
  * (or its executor is declared lost). Releasing on the decision would start
  * the next turn while the previous one may still be decoding on the same
- * sequence, which is the corruption the slot exists to prevent.
+ * sequence, which is the corruption the slot exists to prevent: one owner's
+ * reply decoded over another owner's context. Work that ignores its abort for
+ * `UNIT_DRAIN_TIMEOUT_MS` is handed to `condemnExecutor`; only an executor
+ * that is confirmed dead frees the slot early. One that cannot be killed
+ * keeps it until the work returns: a stuck slot is visible and ends at quit,
+ * two decodes on one sequence are neither.
  *
  * OWNERS ARE REAL IDENTITIES, keyed by (kind, id): a paired device's credential
  * id (#135), or a window's `webContents.id`. Never a made-up sender id: the
@@ -128,11 +145,23 @@ export const PROMPT_ANSWER_TIMEOUT_MS = 60_000;
 export const RETAIN_RESULT_MS = 5 * 60_000;
 
 /**
- * Held results in total, across every device. The oldest goes first.
+ * Held results for ONE device. Its oldest goes first.
  *
- * Eight, the size of the wait list: enough for every unit waiting when a phone
- * dropped to finish and be held, and a hard memory bound regardless of how
- * many devices are paired.
+ * Four: the most units one device can have live at once, one running and
+ * `MAX_WAITING_PER_DEVICE` waiting, so every unit live when its socket dropped
+ * can finish and be held. It is also what stops one device's unacknowledged
+ * backlog from evicting another device's only result: past four, the device
+ * that did not acknowledge is the one that loses.
+ */
+export const RETAIN_RESULT_PER_DEVICE = 4;
+
+/**
+ * Held results in total, across every device.
+ *
+ * Eight, the size of the wait list: a hard memory bound regardless of how many
+ * devices are paired. When it is exceeded, the oldest result of the device
+ * holding the MOST goes first, so a device holding one result keeps it while
+ * another holds several.
  */
 export const RETAIN_RESULT_COUNT = 8;
 
@@ -140,13 +169,27 @@ export const RETAIN_RESULT_COUNT = 8;
  * A running unit's INACTIVITY deadline. Progress resets it; a pending prompt
  * pauses it (a person reading is not a wedge).
  *
- * 150 s, deliberately LONGER than the Supervisor's `generateIdleTimeoutMs`
- * (120 s). For a desktop generation the Supervisor's deadline is the one that
- * can cancel inside the host and synthesise the right terminal; this one is
- * the backstop for work that has no such deadline of its own. A test pins the
- * ordering.
+ * 150 s, deliberately LONGER than the Supervisor's `generateIdleTimeoutMs` and
+ * `callTimeoutMs` (120 s each). For a desktop generation, or any other call the
+ * Supervisor serves, the Supervisor's deadline is the one that can cancel
+ * inside the host and synthesise the right terminal; this one is the backstop
+ * for work that has no such deadline of its own. A test pins the ordering. Work that also ignores
+ * the abort this deadline sends is `UNIT_DRAIN_TIMEOUT_MS`'s.
  */
 export const UNIT_IDLE_TIMEOUT_MS = 150_000;
+
+/**
+ * How long work whose end has been DECIDED (a deadline, an owner's loss, a
+ * revocation, a suspend, a quit) has to stop after its abort before its
+ * executor is handed to `condemnExecutor`.
+ *
+ * Thirty seconds. A decode told to stop stops within a token; work still
+ * running half a minute after its abort is not stopping, and everyone behind
+ * it is waiting on it. What happens next is the executor's owner's call: a
+ * condemned executor that is confirmed dead frees the slot; one that cannot be
+ * killed from here keeps the slot until its work returns.
+ */
+export const UNIT_DRAIN_TIMEOUT_MS = 30_000;
 
 /** How often deadlines and held-result expiry are looked at. */
 export const BROKER_TICK_MS = 1_000;
@@ -181,7 +224,11 @@ export type UnitEnd =
 
 /** Why a unit was not admitted. */
 export type AdmitRefusal =
-  /** The owner already has a live unit with this id. */
+  /**
+   * The owner already has a live unit with this id, or, for a device, a result
+   * held under it that it has not acknowledged. One acknowledgement must never
+   * be able to purge two results.
+   */
   | 'DUPLICATE_UNIT'
   /** The device was revoked. */
   | 'OWNER_REVOKED'
@@ -189,6 +236,8 @@ export type AdmitRefusal =
   | 'OWNER_WAIT_LIST_FULL'
   /** `MAX_WAITING_TOTAL` units are waiting. */
   | 'WAIT_LIST_FULL'
+  /** The unit asked not to wait (`wait: false`), and it could not start now. */
+  | 'SLOT_BUSY'
   /** The machine is suspending; nothing is admitted until `resume()`. */
   | 'HOST_SUSPENDED'
   /** The app is quitting; nothing is admitted again. */
@@ -254,6 +303,12 @@ export interface UnitRequest {
    * end is decided another way.
    */
   readonly start: (signal: AbortSignal) => Promise<unknown>;
+  /**
+   * False for work that must start now or not at all, and has nobody to tell
+   * that it is waiting: it is refused `SLOT_BUSY` instead of taking a place in
+   * the list. Default true.
+   */
+  readonly wait?: boolean;
 }
 
 export type AdmitResult =
@@ -269,6 +324,15 @@ export type AdmitResult =
 export interface WorkBrokerOptions {
   /** Tell a window about one of its units. False if it did not go out. */
   readonly notifyWindow: (windowId: number, notice: BrokerNotice) => boolean;
+  /**
+   * Kill an executor whose work did not stop within `UNIT_DRAIN_TIMEOUT_MS` of
+   * its abort. Return true ONLY once it is dead, so nothing it was running can
+   * still decode: the broker then ends every unit on it as `workerLost` does
+   * and frees the slot. Return false, or leave this out, for an executor that
+   * cannot be killed from here; its slot stays held until its work returns.
+   * A throw counts as false.
+   */
+  readonly condemnExecutor?: (executor: string) => boolean;
   readonly timers?: SupervisorTimers;
   /** Anomalies. Never a payload. */
   readonly warn?: (message: string) => void;
@@ -300,6 +364,10 @@ interface Unit {
   /** The last position this unit's owner was told; 0 when never told. */
   told: number;
   deadlineAt: number;
+  /** When a draining unit's work has had `UNIT_DRAIN_TIMEOUT_MS` to stop. */
+  drainDeadlineAt: number;
+  /** Its drain deadline has been acted on; it is acted on once. */
+  drainExpired: boolean;
   prompt: PendingPrompt | null;
   controller: AbortController | null;
   terminal: UnitTerminal | null;
@@ -336,6 +404,7 @@ function refused(refusal: PromptRefusal): PromptOutcome {
 
 export class WorkBroker {
   readonly #notifyWindow: (windowId: number, notice: BrokerNotice) => boolean;
+  readonly #condemnExecutor: ((executor: string) => boolean) | undefined;
   readonly #timers: SupervisorTimers;
   readonly #warn: (message: string) => void;
 
@@ -357,6 +426,7 @@ export class WorkBroker {
 
   constructor(options: WorkBrokerOptions) {
     this.#notifyWindow = options.notifyWindow;
+    this.#condemnExecutor = options.condemnExecutor;
     this.#timers = options.timers ?? systemTimers();
     this.#warn = options.warn ?? ((): void => undefined);
     this.#cancelTick = this.#timers.every(BROKER_TICK_MS, () => this.#tick());
@@ -378,7 +448,9 @@ export class WorkBroker {
     return this.#queue.length;
   }
 
+  /** Results held and not yet expired. */
   get heldCount(): number {
+    this.#purgeExpired(this.#timers.now());
     return this.#held.length;
   }
 
@@ -395,8 +467,23 @@ export class WorkBroker {
     return 0;
   }
 
-  /** The unit ids a device has results held for, oldest first. */
+  /**
+   * Whether the unit holds the slot with its end still undecided: the only
+   * state in which work may be done under it.
+   *
+   * Its deadlines are enforced first, so a unit whose idle deadline has passed
+   * is not running here even if the tick has not yet ended it; asking ends it.
+   */
+  isRunning(owner: Owner, unitId: string): boolean {
+    const unit = this.#owners.get(ownerKey(owner))?.get(unitId);
+    if (unit === undefined) return false;
+    this.#enforceDeadlines(unit, this.#timers.now());
+    return unit.state === 'running';
+  }
+
+  /** The unit ids a device has results held for, oldest first. Expired ones are gone. */
   heldFor(deviceId: string): readonly string[] {
+    this.#purgeExpired(this.#timers.now());
     return this.#held.filter((held) => held.deviceId === deviceId).map((held) => held.unitId);
   }
 
@@ -420,10 +507,19 @@ export class WorkBroker {
     // (the llama host keys generations by requestId), so two live units sharing
     // one would be ambiguous all the way down. Same rule as the Supervisor's.
     if (units?.has(request.unitId) === true) return { admitted: false, refusal: 'DUPLICATE_UNIT' };
+    // And a device's id is not reusable while a result is held under it: an
+    // `ack` names a unit id, and one ack must never purge two results.
+    if (owner.kind === 'device') {
+      this.#purgeExpired(this.#timers.now());
+      if (this.#held.some((held) => held.deviceId === owner.id && held.unitId === request.unitId)) {
+        return { admitted: false, refusal: 'DUPLICATE_UNIT' };
+      }
+    }
 
     // FIFO: a new unit never starts ahead of one already waiting.
     const startsNow = this.#slot.size < MAX_CONCURRENT_TURNS && this.#queue.length === 0;
     if (!startsNow) {
+      if (request.wait === false) return { admitted: false, refusal: 'SLOT_BUSY' };
       const cap = owner.kind === 'device' ? MAX_WAITING_PER_DEVICE : MAX_WAITING_PER_WINDOW;
       let waiting = 0;
       for (const unit of units?.values() ?? []) if (unit.state === 'waiting') waiting += 1;
@@ -446,6 +542,8 @@ export class WorkBroker {
       returned: false,
       told: 0,
       deadlineAt: 0,
+      drainDeadlineAt: 0,
+      drainExpired: false,
       prompt: null,
       controller: null,
       terminal: null,
@@ -478,11 +576,20 @@ export class WorkBroker {
     else if (unit.state === 'running') unit.controller?.abort();
   }
 
-  /** Proof of progress: resets a running unit's idle deadline. */
+  /**
+   * Proof of progress: resets a running unit's idle deadline.
+   *
+   * Not after the deadline has passed. Progress that arrives late, before the
+   * tick has looked, does not rescue a unit that missed its deadline; it ends
+   * it, as the tick would have.
+   */
   progress(owner: Owner, unitId: string): void {
     const unit = this.#owners.get(ownerKey(owner))?.get(unitId);
-    if (unit === undefined || unit.state !== 'running' || unit.prompt !== null) return;
-    unit.deadlineAt = this.#timers.now() + UNIT_IDLE_TIMEOUT_MS;
+    if (unit === undefined || unit.state !== 'running') return;
+    const now = this.#timers.now();
+    this.#enforceDeadlines(unit, now);
+    if (unit.state !== 'running' || unit.prompt !== null) return;
+    unit.deadlineAt = now + UNIT_IDLE_TIMEOUT_MS;
   }
 
   /* ── Relayed prompts (#170) ─────────────────────────────────────────── */
@@ -495,6 +602,7 @@ export class WorkBroker {
    */
   requestPrompt(owner: Owner, unitId: string, prompt: unknown): Promise<PromptOutcome> {
     const unit = this.#owners.get(ownerKey(owner))?.get(unitId);
+    if (unit !== undefined) this.#enforceDeadlines(unit, this.#timers.now());
     if (unit === undefined || unit.state !== 'running') return Promise.resolve(refused('NOT_RUNNING'));
     if (unit.prompt !== null) return Promise.resolve(refused('PROMPT_PENDING'));
     if (owner.kind === 'device' && !this.#channels.has(owner.id)) {
@@ -509,15 +617,26 @@ export class WorkBroker {
     });
   }
 
-  /** The owner answers. False when nothing is waiting for this answer any more. */
+  /**
+   * The owner answers. False when nothing is waiting for this answer any more.
+   *
+   * An answer that arrives after `PROMPT_ANSWER_TIMEOUT_MS` is refused here,
+   * at the moment it arrives, and the prompt is refused `PROMPT_TIMEOUT`: the
+   * tick not having run yet does not make a late answer on time.
+   */
   answerPrompt(owner: Owner, unitId: string, promptId: string, answer: unknown): boolean {
     const unit = this.#owners.get(ownerKey(owner))?.get(unitId);
     const pending = unit?.prompt;
     if (unit === undefined || pending === null || pending === undefined || pending.promptId !== promptId) {
       return false;
     }
+    const now = this.#timers.now();
+    if (pending.deadlineAt <= now) {
+      this.#refusePrompt(unit, 'PROMPT_TIMEOUT');
+      return false;
+    }
     unit.prompt = null;
-    unit.deadlineAt = this.#timers.now() + UNIT_IDLE_TIMEOUT_MS;
+    unit.deadlineAt = now + UNIT_IDLE_TIMEOUT_MS;
     pending.resolve({ answered: true, answer });
     return true;
   }
@@ -529,9 +648,17 @@ export class WorkBroker {
    * closed (#169: last writer wins, because the old socket is usually a corpse
    * after a network change).
    *
+   * Replacement is the stale socket's tunnel dropping, so a prompt that was
+   * sent on it is REFUSED `OWNER_DETACHED` (#170), exactly as a drop refuses
+   * it: nobody can see it on the corpse, it is not re-sent on the new socket,
+   * and its answer is never accepted. The caller asks again if it still needs
+   * one, which the phone then sees on the new socket.
+   *
    * Then the device is brought up to date: running units say started, waiting
-   * units say where they are, and every held result is sent again until it is
-   * acknowledged.
+   * units say where they are, and every held result that has not expired is
+   * sent again until it is acknowledged. A unit it does not mention has ended
+   * and holds nothing (a sleep, a quit, an expiry): S8's phone treats that as
+   * lost.
    *
    * @returns false for a revoked device or a quitting app; the caller closes it.
    */
@@ -540,21 +667,28 @@ export class WorkBroker {
     if (this.#mode === 'quit' || this.#revoked.has(deviceId)) return false;
     const stale = this.#channels.get(deviceId);
     this.#channels.set(deviceId, channel);
+    const units = this.#owners.get(ownerKey({ kind: 'device', id: deviceId }));
     if (stale !== undefined && stale !== channel) {
       try {
         stale.close('SOCKET_REPLACED');
       } catch (error) {
         this.#warn(`work broker: closing a replaced socket threw (${errorKind(error)}).`);
       }
+      for (const unit of units?.values() ?? []) {
+        if (unit.prompt !== null) this.#refusePrompt(unit, 'OWNER_DETACHED');
+      }
     }
 
-    for (const unit of this.#owners.get(ownerKey({ kind: 'device', id: deviceId }))?.values() ?? []) {
+    const now = this.#timers.now();
+    for (const unit of [...(units?.values() ?? [])]) {
+      this.#enforceDeadlines(unit, now);
       if (unit.state === 'running') this.#send(channel, { kind: 'started', unitId: unit.unitId });
       if (unit.state === 'waiting') {
         const position = this.#queue.indexOf(unit) + 1;
         if (this.#send(channel, { kind: 'waiting', unitId: unit.unitId, position })) unit.told = position;
       }
     }
+    this.#purgeExpired(now);
     for (const held of this.#held) {
       if (held.deviceId === deviceId) this.#send(channel, { kind: 'terminal', terminal: held.terminal });
     }
@@ -577,8 +711,9 @@ export class WorkBroker {
     }
   }
 
-  /** The device has its result; stop holding it. */
+  /** The device has its result; stop holding it. False for one not held, or held past its limit. */
   ack(deviceId: string, unitId: string): boolean {
+    this.#purgeExpired(this.#timers.now());
     const before = this.#held.length;
     this.#held = this.#held.filter((held) => !(held.deviceId === deviceId && held.unitId === unitId));
     return this.#held.length !== before;
@@ -697,6 +832,7 @@ export class WorkBroker {
       this.#forget(unit);
     } else if (unit.state === 'running') {
       unit.state = 'draining';
+      unit.drainDeadlineAt = this.#timers.now() + UNIT_DRAIN_TIMEOUT_MS;
       if (!unit.returned) unit.controller?.abort();
     }
 
@@ -724,10 +860,34 @@ export class WorkBroker {
   }
 
   #hold(deviceId: string, unitId: string, terminal: UnitTerminal): void {
-    this.#held.push({ deviceId, unitId, terminal, expiresAt: this.#timers.now() + RETAIN_RESULT_MS });
+    const now = this.#timers.now();
+    this.#purgeExpired(now);
+    this.#held.push({ deviceId, unitId, terminal, expiresAt: now + RETAIN_RESULT_MS });
+
+    // Per device first: one device's unacknowledged backlog costs that device
+    // its oldest result, never another device its only one.
+    let mine = this.#held.filter((held) => held.deviceId === deviceId).length;
+    while (mine > RETAIN_RESULT_PER_DEVICE) {
+      const oldest = this.#held.findIndex((held) => held.deviceId === deviceId);
+      this.#held.splice(oldest, 1);
+      mine -= 1;
+      this.#warn('work broker: dropped a device’s oldest held result; it held more than RETAIN_RESULT_PER_DEVICE.');
+    }
+
+    // Then the total: the oldest result of whichever device holds the most.
     while (this.#held.length > RETAIN_RESULT_COUNT) {
-      this.#held.shift();
-      this.#warn('work broker: dropped the oldest held result; more than RETAIN_RESULT_COUNT were held.');
+      const counts = new Map<string, number>();
+      for (const held of this.#held) counts.set(held.deviceId, (counts.get(held.deviceId) ?? 0) + 1);
+      const most = Math.max(...counts.values());
+      const victim = this.#held.findIndex((held) => counts.get(held.deviceId) === most);
+      this.#held.splice(victim, 1);
+      this.#warn('work broker: dropped the oldest held result of the device holding the most; more than RETAIN_RESULT_COUNT were held.');
+    }
+  }
+
+  #purgeExpired(now: number): void {
+    if (this.#held.some((held) => held.expiresAt <= now)) {
+      this.#held = this.#held.filter((held) => held.expiresAt > now);
     }
   }
 
@@ -737,6 +897,20 @@ export class WorkBroker {
     unit.prompt = null;
     unit.deadlineAt = this.#timers.now() + UNIT_IDLE_TIMEOUT_MS;
     pending.resolve(refused(refusal));
+  }
+
+  /**
+   * A running unit's deadlines, checked against `now`: the prompt's if one is
+   * pending (refused on expiry, which restarts the idle deadline), otherwise
+   * the idle deadline (the unit ends `DEADLINE`).
+   */
+  #enforceDeadlines(unit: Unit, now: number): void {
+    if (unit.state !== 'running') return;
+    if (unit.prompt !== null) {
+      if (unit.prompt.deadlineAt <= now) this.#refusePrompt(unit, 'PROMPT_TIMEOUT');
+      return;
+    }
+    if (unit.deadlineAt <= now) this.#settle(unit, 'DEADLINE');
   }
 
   /* ── Running work ───────────────────────────────────────────────────── */
@@ -776,6 +950,33 @@ export class WorkBroker {
     this.#pump();
   }
 
+  /**
+   * A draining unit's work has not stopped within `UNIT_DRAIN_TIMEOUT_MS` of
+   * its abort. Acted on once.
+   */
+  #drainExpired(unit: Unit): void {
+    unit.drainExpired = true;
+    let killed = false;
+    if (this.#condemnExecutor !== undefined) {
+      try {
+        killed = this.#condemnExecutor(unit.executor) === true;
+      } catch (error) {
+        this.#warn(`work broker: condemning an executor threw (${errorKind(error)}).`);
+      }
+    }
+    if (!killed) {
+      // FAIL CLOSED. The work may still be decoding; freeing the slot would put
+      // the next owner's turn on the same sequence.
+      this.#warn(
+        'work broker: a unit’s work has not stopped UNIT_DRAIN_TIMEOUT_MS after its end, and its executor ' +
+          'was not condemned; the slot stays held until the work returns.',
+      );
+      return;
+    }
+    this.#warn('work broker: condemned an executor whose work did not stop within UNIT_DRAIN_TIMEOUT_MS of its end.');
+    this.workerLost(unit.executor);
+  }
+
   #forget(unit: Unit): void {
     unit.state = 'done';
     const units = this.#owners.get(unit.key);
@@ -803,16 +1004,13 @@ export class WorkBroker {
   #tick(): void {
     const now = this.#timers.now();
     for (const unit of [...this.#slot]) {
-      if (unit.state !== 'running') continue;
-      if (unit.prompt !== null) {
-        if (unit.prompt.deadlineAt <= now) this.#refusePrompt(unit, 'PROMPT_TIMEOUT');
+      if (unit.state === 'draining') {
+        if (!unit.returned && !unit.drainExpired && unit.drainDeadlineAt <= now) this.#drainExpired(unit);
         continue;
       }
-      if (unit.deadlineAt <= now) this.#settle(unit, 'DEADLINE');
+      this.#enforceDeadlines(unit, now);
     }
-    if (this.#held.some((held) => held.expiresAt <= now)) {
-      this.#held = this.#held.filter((held) => held.expiresAt > now);
-    }
+    this.#purgeExpired(now);
   }
 
   /* ── Delivery ───────────────────────────────────────────────────────── */

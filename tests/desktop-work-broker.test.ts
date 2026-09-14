@@ -10,9 +10,12 @@ import {
   PROMPT_ANSWER_TIMEOUT_MS,
   RETAIN_RESULT_COUNT,
   RETAIN_RESULT_MS,
+  RETAIN_RESULT_PER_DEVICE,
+  UNIT_DRAIN_TIMEOUT_MS,
   UNIT_IDLE_TIMEOUT_MS,
   WorkBroker,
 } from '@chatterang/desktop/bridge';
+import { MAX_OPEN_TURNS } from '@chatterang/tunnel/stream';
 import type {
   AdmitResult,
   BrokerNotice,
@@ -22,6 +25,7 @@ import type {
   SupervisorTimers,
   UnitEnd,
   UnitTerminal,
+  WorkBrokerOptions,
 } from '@chatterang/desktop/bridge';
 
 /**
@@ -43,6 +47,11 @@ import type {
 interface ManualClock extends SupervisorTimers {
   /** Move the clock forward in one step, then run one tick. */
   advance(ms: number): Promise<void>;
+  /**
+   * Move the clock WITHOUT running the tick: an interval lagging behind a
+   * stalled event loop, or a wake before any tick has fired.
+   */
+  jump(ms: number): void;
 }
 
 function manualClock(): ManualClock {
@@ -71,6 +80,9 @@ function manualClock(): ManualClock {
       // same as one every BROKER_TICK_MS across it.
       for (const fn of [...ticks]) fn();
       await flush();
+    },
+    jump(ms: number): void {
+      now += ms;
     },
   };
 }
@@ -146,7 +158,7 @@ interface Rig {
   run(owner: Owner, unitId: string, job: Work, executor?: string): Promise<UnitTerminal> & { position: number };
 }
 
-function rig(): Rig {
+function rig(options: Pick<WorkBrokerOptions, 'condemnExecutor'> = {}): Rig {
   const clock = manualClock();
   const warnings: string[] = [];
   const windows = new Map<number, BrokerNotice[]>();
@@ -159,6 +171,7 @@ function rig(): Rig {
     },
     timers: clock,
     warn: (message) => warnings.push(message),
+    ...options,
   });
   return {
     broker,
@@ -229,8 +242,10 @@ describe('the limits are named constants, and these are their values', () => {
       MAX_WAITING_TOTAL,
       PROMPT_ANSWER_TIMEOUT_MS,
       RETAIN_RESULT_MS,
+      RETAIN_RESULT_PER_DEVICE,
       RETAIN_RESULT_COUNT,
       UNIT_IDLE_TIMEOUT_MS,
+      UNIT_DRAIN_TIMEOUT_MS,
       BROKER_TICK_MS,
     }).toEqual({
       MAX_CONCURRENT_TURNS: 1,
@@ -239,8 +254,10 @@ describe('the limits are named constants, and these are their values', () => {
       MAX_WAITING_TOTAL: 8,
       PROMPT_ANSWER_TIMEOUT_MS: 60_000,
       RETAIN_RESULT_MS: 300_000,
+      RETAIN_RESULT_PER_DEVICE: 4,
       RETAIN_RESULT_COUNT: 8,
       UNIT_IDLE_TIMEOUT_MS: 150_000,
+      UNIT_DRAIN_TIMEOUT_MS: 30_000,
       BROKER_TICK_MS: 1_000,
     });
   });
@@ -252,6 +269,27 @@ describe('the limits are named constants, and these are their values', () => {
     expect(UNIT_IDLE_TIMEOUT_MS).toBeGreaterThan(
       DEFAULT_POLICY.generateIdleTimeoutMs + DEFAULT_POLICY.tickMs + BROKER_TICK_MS,
     );
+    // And behind its call timeout, which bounds a non-streamed call such as a
+    // benchmark that reports no progress while it runs.
+    expect(UNIT_IDLE_TIMEOUT_MS).toBeGreaterThan(DEFAULT_POLICY.callTimeoutMs + DEFAULT_POLICY.tickMs + BROKER_TICK_MS);
+  });
+
+  it('a device can hold a result for every unit it can have live at once, and fewer than the total', () => {
+    expect(RETAIN_RESULT_PER_DEVICE).toBe(MAX_CONCURRENT_TURNS + MAX_WAITING_PER_DEVICE);
+    expect(RETAIN_RESULT_PER_DEVICE).toBeLessThan(RETAIN_RESULT_COUNT);
+  });
+
+  it('one device can never have as many turns open on its tunnel as the tunnel allows, so the broker refuses first', () => {
+    // #308's turn ledger refuses a peer's `turn` or `attach` past
+    // MAX_OPEN_TURNS open turns on one tunnel, with FRAME_UNEXPECTED, and a
+    // tunnel is one device. The most one device can have open there at once is
+    // its unit in the slot, its units waiting, and the held results it attaches
+    // to collect. Kept below the tunnel's bound, a phone meets the broker's own
+    // refusal, which says nothing ran, before the tunnel's, which says nothing.
+    const mostOpenForOneDevice = MAX_CONCURRENT_TURNS + MAX_WAITING_PER_DEVICE + RETAIN_RESULT_PER_DEVICE;
+    expect(mostOpenForOneDevice).toBeLessThan(MAX_OPEN_TURNS);
+    // And the totals, which bound every device together, are no looser.
+    expect(MAX_CONCURRENT_TURNS + MAX_WAITING_TOTAL + RETAIN_RESULT_COUNT).toBeLessThan(MAX_OPEN_TURNS);
   });
 });
 
@@ -442,16 +480,252 @@ describe('every limit is enforced, not merely documented', () => {
     expect(r.broker.heldFor(`d${String(RETAIN_RESULT_COUNT)}`)).toEqual(['turn']);
     expect(r.warnings.some((warning) => warning.includes('RETAIN_RESULT_COUNT'))).toBe(true);
   });
+
+  it(`RETAIN_RESULT_PER_DEVICE: one device holds at most ${String(RETAIN_RESULT_PER_DEVICE)}, and its backlog costs it its own oldest, never another device's result`, async () => {
+    // Review repro: device A, attached, finishes RETAIN_RESULT_COUNT turns and
+    // acknowledges none; device B's one result, well inside RETAIN_RESULT_MS,
+    // used to be evicted as the oldest overall.
+    // FAULT INJECTED: removing the per-device loop from `#hold` left A holding
+    // seven and failed the second assertion.
+    const r = rig();
+    const b = work();
+    r.run(device('B'), 'b1', b);
+    b.resolve('B’s only reply');
+    await flush();
+
+    r.broker.attachDevice('A', channel());
+    for (let i = 0; i < RETAIN_RESULT_COUNT; i += 1) {
+      const job = work();
+      r.run(device('A'), `a${String(i)}`, job);
+      job.resolve(`A reply ${String(i)}`);
+      await flush();
+    }
+    expect(r.broker.heldFor('B')).toEqual(['b1']);
+    expect(r.broker.heldFor('A')).toEqual(
+      Array.from({ length: RETAIN_RESULT_PER_DEVICE }, (_, i) => `a${String(RETAIN_RESULT_COUNT - RETAIN_RESULT_PER_DEVICE + i)}`),
+    );
+    expect(r.warnings.some((warning) => warning.includes('RETAIN_RESULT_PER_DEVICE'))).toBe(true);
+  });
+
+  it('RETAIN_RESULT_COUNT across devices: the device holding the most gives up its oldest, not a device holding one', async () => {
+    // FAULT INJECTED: evicting the oldest result overall (`this.#held.shift()`)
+    // dropped `lone`'s, the first held, while A and B held four each.
+    const r = rig();
+    const hold = async (deviceId: string, unitId: string): Promise<void> => {
+      const job = work();
+      r.run(device(deviceId), unitId, job);
+      job.resolve('reply');
+      await flush();
+    };
+    await hold('lone', 'l1');
+    for (let i = 0; i < RETAIN_RESULT_PER_DEVICE; i += 1) await hold('A', `a${String(i)}`);
+    for (let i = 0; i < RETAIN_RESULT_PER_DEVICE - 1; i += 1) await hold('B', `b${String(i)}`);
+    expect(r.broker.heldCount).toBe(RETAIN_RESULT_COUNT);
+
+    // One more for B: A and B now hold four each, and A's oldest is the older.
+    await hold('B', 'b-last');
+    expect(r.broker.heldCount).toBe(RETAIN_RESULT_COUNT);
+    expect(r.broker.heldFor('lone')).toEqual(['l1']);
+    expect(r.broker.heldFor('A')).toEqual(['a1', 'a2', 'a3']);
+    expect(r.broker.heldFor('B')).toHaveLength(RETAIN_RESULT_PER_DEVICE);
+  });
+
+  it('UNIT_DRAIN_TIMEOUT_MS: work that ignores its abort keeps the slot until then, and an executor confirmed dead frees it', async () => {
+    // Review repro: a unit whose work never settles ended DEADLINE, and the
+    // unit behind it had still not started a simulated day later.
+    // FAULT INJECTED: removing the drain check from `#tick` left `next` unstarted.
+    const condemned: string[] = [];
+    const r = rig({
+      condemnExecutor: (executor) => {
+        condemned.push(executor);
+        return true;
+      },
+    });
+    const stuck = work();
+    const next = work();
+    const stuckEnd = r.run(win(1), 'stuck', stuck, 'worker');
+    r.run(win(2), 'next', next);
+
+    await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+    expect((await stuckEnd).end).toBe('DEADLINE');
+    expect(stuck.signal?.aborted).toBe(true);
+
+    await r.clock.advance(UNIT_DRAIN_TIMEOUT_MS - 1);
+    expect(condemned).toEqual([]);
+    expect(next.starts).toBe(0);
+
+    await r.clock.advance(1);
+    expect(condemned).toEqual(['worker']);
+    expect(next.starts).toBe(1);
+    expect(r.broker.slotCount).toBe(1);
+
+    // Still one terminal, whatever the condemned work does afterwards, and it
+    // is condemned once.
+    stuck.resolve('far too late');
+    await flush();
+    await r.clock.advance(UNIT_DRAIN_TIMEOUT_MS);
+    expect(condemned).toEqual(['worker']);
+    expect(terminalsIn(r.inbox(1), 'stuck')).toHaveLength(1);
+  });
+
+  it('UNIT_DRAIN_TIMEOUT_MS: an executor that is not condemned keeps the slot until its work returns, however long, and it is said once', async () => {
+    // Fail closed. The work may still be decoding; freeing the slot would put
+    // the next owner's turn on the same sequence.
+    // FAULT INJECTED: freeing the slot (`this.workerLost(unit.executor)`) when
+    // the executor was not confirmed dead started `next` at the drain deadline.
+    const hooks: (Pick<WorkBrokerOptions, 'condemnExecutor'> & { name: string })[] = [
+      { name: 'no hook' },
+      { name: 'false', condemnExecutor: () => false },
+      {
+        name: 'throws',
+        condemnExecutor: () => {
+          throw new Error('SECRET-EXECUTOR-DETAIL');
+        },
+      },
+    ];
+    for (const { name, ...options } of hooks) {
+      const r = rig(options);
+      const stuck = work();
+      const next = work();
+      r.run(win(1), 'stuck', stuck);
+      r.run(win(2), 'next', next);
+      await r.clock.advance(UNIT_IDLE_TIMEOUT_MS);
+      for (let hour = 1; hour <= 24; hour += 1) await r.clock.advance(3_600_000);
+      expect(next.starts, name).toBe(0);
+      expect(r.broker.slotCount, name).toBe(1);
+      expect(r.warnings.filter((warning) => warning.includes('UNIT_DRAIN_TIMEOUT_MS')), name).toHaveLength(1);
+      expect(r.warnings.join('\n'), name).not.toContain('SECRET');
+
+      stuck.resolve('stopped at last');
+      await flush();
+      expect(next.starts, name).toBe(1);
+    }
+  });
+});
+
+/* ══ Deadlines where they are used ══════════════════════════════════════ */
+
+describe('a deadline that has passed is past, whether or not the tick has run', () => {
+  // Every test here moves the clock with `jump`, which runs no tick. The tick
+  // is at best BROKER_TICK_MS away; behind a stalled event loop, or across a
+  // sleep with no suspend event, it is as far away as it likes.
+
+  it('a prompt answer after PROMPT_ANSWER_TIMEOUT_MS is refused on arrival, and the prompt is refused as not sent (#170)', async () => {
+    // Review repro: the answer was accepted and the outcome `answered: true`.
+    // FAULT INJECTED: removing the deadline check from `answerPrompt` failed
+    // the first assertion.
+    const r = rig();
+    const late = channel();
+    const onTime = channel();
+    r.broker.attachDevice('late', late);
+    r.broker.attachDevice('on-time', onTime);
+    const blocker = work();
+    r.run(device('late'), 'turn', blocker);
+    const lateOutcome = r.broker.requestPrompt(device('late'), 'turn', 'send?');
+    const lateId = (late.sent.find((notice) => notice.kind === 'prompt') as { promptId: string }).promptId;
+
+    r.clock.jump(PROMPT_ANSWER_TIMEOUT_MS);
+    expect(r.broker.answerPrompt(device('late'), 'turn', lateId, true)).toBe(false);
+    expect(await lateOutcome).toEqual({ answered: false, refusal: 'PROMPT_TIMEOUT', notSent: true });
+
+    // One millisecond inside the deadline is on time.
+    blocker.resolve('done');
+    await flush();
+    r.run(device('on-time'), 'turn', work());
+    const onTimeOutcome = r.broker.requestPrompt(device('on-time'), 'turn', 'send?');
+    const onTimeId = (onTime.sent.find((notice) => notice.kind === 'prompt') as { promptId: string }).promptId;
+    r.clock.jump(PROMPT_ANSWER_TIMEOUT_MS - 1);
+    expect(r.broker.answerPrompt(device('on-time'), 'turn', onTimeId, true)).toBe(true);
+    expect(await onTimeOutcome).toEqual({ answered: true, answer: true });
+  });
+
+  it('progress that arrives after UNIT_IDLE_TIMEOUT_MS ends the unit instead of rescuing it', async () => {
+    // Review repro: the late progress reset the deadline and the unit ran on.
+    // FAULT INJECTED: removing `#enforceDeadlines` from `progress` failed this test.
+    const r = rig();
+    const job = work();
+    const settled = r.run(win(1), 'u', job);
+    r.clock.jump(UNIT_IDLE_TIMEOUT_MS);
+    r.broker.progress(win(1), 'u');
+    expect((await settled).end).toBe('DEADLINE');
+    expect(job.signal?.aborted).toBe(true);
+  });
+
+  it('a prompt asked for after a missed deadline is refused NOT_RUNNING and never sent, and isRunning agrees', async () => {
+    const r = rig();
+    const phone = channel();
+    r.broker.attachDevice('p', phone);
+    const settled = r.run(device('p'), 'turn', work());
+    r.run(win(2), 'waiting', work());
+    expect(r.broker.isRunning(device('p'), 'turn')).toBe(true);
+    // Not running: waiting, unknown, or someone else's.
+    expect(r.broker.isRunning(win(2), 'waiting')).toBe(false);
+    expect(r.broker.isRunning(win(2), 'turn')).toBe(false);
+    expect(r.broker.isRunning(device('q'), 'turn')).toBe(false);
+
+    r.clock.jump(UNIT_IDLE_TIMEOUT_MS);
+    expect(await r.broker.requestPrompt(device('p'), 'turn', 'late?')).toEqual({
+      answered: false,
+      refusal: 'NOT_RUNNING',
+      notSent: true,
+    });
+    expect(phone.sent.some((notice) => notice.kind === 'prompt')).toBe(false);
+    expect((await settled).end).toBe('DEADLINE');
+    expect(r.broker.isRunning(device('p'), 'turn')).toBe(false);
+  });
+
+  it('isRunning enforces the deadline itself: a unit past it is not running, and asking ends it', async () => {
+    // FAULT INJECTED: `isRunning` returning `unit.state === 'running'` without
+    // `#enforceDeadlines` answered true for a unit a minute past its deadline.
+    const r = rig();
+    const job = work();
+    const settled = watch(r.run(win(1), 'u', job));
+    r.clock.jump(UNIT_IDLE_TIMEOUT_MS + 60_000);
+    expect(r.broker.isRunning(win(1), 'u')).toBe(false);
+    await flush();
+    expect(settled.end).toBe('DEADLINE');
+    // Ended, and still holding the slot until its work returns.
+    expect(r.broker.positionOf(win(1), 'u')).toBe(0);
+  });
+
+  it('a held result past RETAIN_RESULT_MS is not replayed on attach, not acknowledged, and not listed', async () => {
+    // Review repro: an attach before the tick replayed the expired result, and
+    // ack still found it.
+    // FAULT INJECTED: removing `#purgeExpired` from `attachDevice` replayed
+    // `p`'s terminal; removing it from `ack` returned true for `q`.
+    const r = rig();
+    const first = work();
+    r.run(device('p'), 'turn', first);
+    first.resolve('p’s reply');
+    await flush();
+    r.clock.jump(100_000);
+    const second = work();
+    r.run(device('q'), 'turn', second);
+    second.resolve('q’s reply');
+    await flush();
+
+    r.clock.jump(RETAIN_RESULT_MS - 100_000);
+    const back = channel();
+    r.broker.attachDevice('p', back);
+    expect(terminalsIn(back.sent, 'turn')).toEqual([]);
+
+    r.clock.jump(100_000);
+    expect(r.broker.ack('q', 'turn')).toBe(false);
+    expect(r.broker.heldFor('p')).toEqual([]);
+    expect(r.broker.heldFor('q')).toEqual([]);
+    expect(r.broker.heldCount).toBe(0);
+  });
 });
 
 /* ══ Exactly once ═══════════════════════════════════════════════════════ */
 
 describe('one settle: exactly one terminal per unit, on every path', () => {
   // FAULT INJECTED for the whole block: deleting `if (unit.terminal !== null)
-  // return;` from `#settle` failed the four tests whose end is decided BEFORE
-  // the work returns (worker loss, both owner losses, the deadline), each on a
-  // second terminal or a held result produced by the late report in
-  // `everyOtherPath`. The two path-1 tests did not fail, and are not meant to:
+  // return;` from `#settle` failed the four tests here whose end is decided
+  // BEFORE the work returns (worker loss, both owner losses, the deadline),
+  // each on a second terminal or a held result produced by the late report in
+  // `everyOtherPath`; outside this block it also failed the drain test and the
+  // suspended-phone test, six in all. The two path-1 tests did not fail, and are not meant to:
   // a report removes the unit from every table, so nothing that runs later can
   // reach it. They drive every other path anyway, to show that.
 
@@ -725,6 +999,51 @@ describe('a dropped phone socket does not end the turn: the result is held until
     expect(stale.sent.some((notice) => notice.kind === 'prompt')).toBe(false);
   });
 
+  it('a prompt sent on a socket that is then replaced is refused as not sent, is never re-sent, and its answer is refused (#170)', async () => {
+    // Review repro: after a new socket replaced the stale one, the prompt stayed
+    // pending, was never sent on the new socket, was still answerable with the
+    // old id, and held the slot for PROMPT_ANSWER_TIMEOUT_MS.
+    // FAULT INJECTED: removing the prompt refusal from `attachDevice` failed
+    // the first assertion (the outcome did not settle).
+    const r = rig();
+    const stale = channel();
+    r.broker.attachDevice('p', stale);
+    const settled = watch(r.run(device('p'), 'turn', work()));
+    let outcome: unknown = null;
+    void r.broker.requestPrompt(device('p'), 'turn', 'send this?').then((result) => {
+      outcome = result;
+    });
+    const { promptId } = stale.sent.find((notice) => notice.kind === 'prompt') as { promptId: string };
+
+    const fresh = channel();
+    r.broker.attachDevice('p', fresh);
+    r.broker.detachDevice('p', stale);
+    await flush();
+    expect(outcome).toEqual({ answered: false, refusal: 'OWNER_DETACHED', notSent: true });
+    expect(fresh.sent).toEqual([{ kind: 'started', unitId: 'turn' }]);
+    expect(r.broker.answerPrompt(device('p'), 'turn', promptId, true)).toBe(false);
+
+    // The call is refused, not the turn; asked again, the prompt goes to the new socket.
+    expect(settled.done).toBe(false);
+    void r.broker.requestPrompt(device('p'), 'turn', 'ask again');
+    expect(fresh.sent.at(-1)).toMatchObject({ kind: 'prompt', unitId: 'turn', prompt: 'ask again' });
+  });
+
+  it('the same socket attaching again is not a replacement: nothing is closed and its prompt stays pending', async () => {
+    const r = rig();
+    const phone = channel();
+    r.broker.attachDevice('p', phone);
+    r.run(device('p'), 'turn', work());
+    let outcome: unknown = null;
+    void r.broker.requestPrompt(device('p'), 'turn', 'x').then((result) => {
+      outcome = result;
+    });
+    r.broker.attachDevice('p', phone);
+    await flush();
+    expect(outcome).toBeNull();
+    expect(phone.closed).toEqual([]);
+  });
+
   it('a prompt is refused, as not sent, when the socket drops, when no socket is attached, and when the unit ends', async () => {
     const r = rig();
     const phone = channel();
@@ -808,6 +1127,31 @@ describe('suspend and quit end everything, with a reason, and hold nothing', () 
     expect(after.starts).toBe(1);
   });
 
+  it('a phone that was not connected when the desktop slept hears nothing about the unit on attach: absent from the replay means ended', async () => {
+    // Ruling 5 ends held results on sleep, so there is nothing to replay; the
+    // contract S3/S8 build on is that an attach mentions every unit that is
+    // live or held, and a turn it does not mention has ended.
+    const r = rig();
+    const phone = channel();
+    r.broker.attachDevice('p', phone);
+    const job = work();
+    const running = r.run(device('p'), 'turn', job);
+    r.broker.detachDevice('p', phone);
+
+    r.broker.suspend();
+    expect((await running).end).toBe('HOST_SUSPENDED');
+    expect(terminalsIn(phone.sent, 'turn')).toEqual([]);
+    r.broker.resume();
+    job.resolve('stopped');
+    await flush();
+
+    const back = channel();
+    expect(r.broker.attachDevice('p', back)).toBe(true);
+    expect(back.sent).toEqual([]);
+    expect(r.broker.heldFor('p')).toEqual([]);
+    expect(r.broker.positionOf(device('p'), 'turn')).toBeUndefined();
+  });
+
   it('quit: everything ends DESKTOP_QUITTING, nothing is admitted or attached again, and resume does not reopen it', async () => {
     const r = rig();
     const phone = channel();
@@ -870,6 +1214,49 @@ describe('owners are keyed by kind and id, and only the owner hears about a unit
     job.resolve('stopped');
     await flush();
     expect(r.run(win(1), 'u', work()).position).toBe(0);
+  });
+
+  it('a device may not reuse a unit id while a result is held under it, so one ack can never purge two results', async () => {
+    // Review repro: `same` was held twice for one device and one ack purged both.
+    // FAULT INJECTED: removing the held check from `admit` admitted `same` again.
+    const r = rig();
+    const first = work();
+    r.run(device('p'), 'same', first);
+    first.resolve('first');
+    await flush();
+    expect(r.broker.admit({ owner: device('p'), unitId: 'same', executor: 'llama', start: work().start })).toEqual({
+      admitted: false,
+      refusal: 'DUPLICATE_UNIT',
+    });
+    // Another owner's id is its own.
+    expect(r.run(device('q'), 'same', work()).position).toBe(0);
+    // Acknowledged, the id is free again.
+    expect(r.broker.ack('p', 'same')).toBe(true);
+    expect(r.run(device('p'), 'same', work()).position).toBe(1);
+  });
+
+  it('a unit that may not wait is refused SLOT_BUSY while anything holds the slot, takes no place in line, and starts at once when it is free', async () => {
+    // FAULT INJECTED: ignoring `wait: false` in `admit` queued the unit at position 1.
+    const r = rig();
+    const holder = work();
+    r.run(win(1), 'turn', holder);
+    const eager = work();
+    expect(r.broker.admit({ owner: win(2), unitId: 'bench', executor: 'llama', start: eager.start, wait: false })).toEqual({
+      admitted: false,
+      refusal: 'SLOT_BUSY',
+    });
+    expect(r.broker.waitingCount).toBe(0);
+    expect(r.inbox(2)).toEqual([]);
+
+    holder.resolve('done');
+    await flush();
+    expect(r.broker.admit({ owner: win(2), unitId: 'bench', executor: 'llama', start: eager.start, wait: false })).toMatchObject({
+      admitted: true,
+      position: 0,
+    });
+    expect(eager.starts).toBe(1);
+    // While it runs, everyone else waits behind it.
+    expect(r.run(device('p'), 'turn', work()).position).toBe(1);
   });
 
   it('refuses an owner that is not a real identity', () => {
