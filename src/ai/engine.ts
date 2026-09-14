@@ -94,6 +94,13 @@ export interface ToolEgressPolicy {
   request?(request: ToolEgressRequest): Promise<ToolEgressDecision>;
   /** Persist a `conversation` decision. */
   onGranted?(backendId: string): void;
+  /**
+   * How many times this destination's grants have been withdrawn — its
+   * connection removed or switched off. A yes the turn is holding is honoured
+   * only while this stands; see `decided` in `stream`. Absent means nothing
+   * withdraws this policy's grants, and a yes is held for the turn.
+   */
+  revocations?(backendId: string): number;
 }
 
 /**
@@ -779,7 +786,23 @@ export class ChatterangEngine {
     // that immediately re-runs the same command hits the same answer instead
     // of a second sheet — a sheet that can be raised repeatedly is a sheet
     // people learn to tap through.
-    const decided = new Map<string, boolean>();
+    //
+    // A YES IS HELD WITH THE DESTINATION'S REVOCATION COUNT AS IT STOOD BEFORE
+    // IT WAS DECIDED, and honoured only while that count stands. Switching a
+    // connection off drops its grants, and switching it back on registers the
+    // same id again, so nothing about `target` says the answer is stale:
+    // without the count, the rest of the turn sent tool output there unasked,
+    // and the privacy command's "Every grant is dropped when the provider it
+    // named is removed or switched off" was false until the turn ended. That
+    // goes for a "this turn" answer too, which fails closed. The count taken
+    // BEFORE, not once the answer is known: a revocation that ran while the
+    // sheet was up would otherwise be part of the count the answer is held
+    // with, and never end it. A NO IS KEPT: withdrawing grants only takes
+    // permission away, and asking again over a refusal is a second sheet about
+    // something already refused.
+    const decided = new Map<string, { readonly allowed: boolean; readonly revocations?: number }>();
+    const revocationsOf = (backendId: string): number | undefined =>
+      request.egress?.revocations?.(backendId);
     let toolEgress: 'granted' | 'withheld' | undefined;
 
     for (let iteration = 0; iteration <= TOOL_ITERATIONS; iteration += 1) {
@@ -799,7 +822,10 @@ export class ChatterangEngine {
 
       if (leavesThisDevice(target) && carriesTaint(messages)) {
         const characters = taintedCharacters(messages);
-        let allowed = decided.get(target.backendId);
+        const held = decided.get(target.backendId);
+        const revocations = revocationsOf(target.backendId);
+        let allowed =
+          held !== undefined && (!held.allowed || held.revocations === revocations) ? held.allowed : undefined;
 
         if (allowed === undefined) {
           if (request.egress?.isGranted(target.backendId)) {
@@ -823,9 +849,17 @@ export class ChatterangEngine {
               characters,
             });
             allowed = decision !== 'deny';
-            if (decision === 'conversation') request.egress.onGranted?.(target.backendId);
+            // An answer given while this destination's grants were being
+            // withdrawn covers the request it was asked about, and nothing
+            // more: it is not kept for the conversation, and — held with the
+            // count from before it was asked — not for the rest of the turn.
+            // Otherwise a connection switched off while its sheet was up came
+            // back on holding a grant nobody gave it after that.
+            if (decision === 'conversation' && revocationsOf(target.backendId) === revocations) {
+              request.egress.onGranted?.(target.backendId);
+            }
           }
-          decided.set(target.backendId, allowed);
+          decided.set(target.backendId, { allowed, revocations });
         }
 
         if (!allowed) {
