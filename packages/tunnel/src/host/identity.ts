@@ -58,7 +58,10 @@ import {
 import type { KeyObject } from 'node:crypto';
 
 export type TunnelIdentityErrorReason =
-  /** Owner-only cannot be checked here: no mode bits (Windows), or no uid. */
+  /**
+   * Owner-only cannot be checked here: a platform whose permissions this store
+   * has not been taught to read (anything but Linux and macOS), or no uid.
+   */
   | 'unsupported-platform'
   /** The directory the key's directory is made in is not this account's alone to write. */
   | 'data-directory-unsafe'
@@ -70,9 +73,13 @@ export type TunnelIdentityErrorReason =
   | 'key-file-malformed'
   /** The key file is sealed, and this process has nothing to unseal it with. */
   | 'encryption-unavailable'
+  /** The key file is plain, and this process can seal: a key kept in the clear where it need not be. */
+  | 'protection-downgrade'
+  /** The desktop asked before Electron's `ready`, when `safeStorage` cannot yet say whether it can seal. */
+  | 'not-ready'
   /** The sealed key did not unseal. */
   | 'unseal-failed'
-  /** The key is not an EC P-256 private key. */
+  /** The key is not an EC P-256 private key in PKCS#8 PEM. */
   | 'key-unsupported'
   /** A key is not the one its pin records, or a certificate does not carry its key. */
   | 'pin-mismatch';
@@ -133,13 +140,27 @@ export function generateTunnelKey(): TunnelKey {
 }
 
 /**
- * A stored key, read back — refused unless it is an EC P-256 private key.
+ * One unencrypted PKCS#8 PEM block and nothing else: what {@link tunnelKeyPkcs8Pem}
+ * writes. Line lengths are not pinned, so a runtime that wraps base64 differently
+ * still reads its own file.
+ */
+const PKCS8_PEM = /^-----BEGIN PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END PRIVATE KEY-----\n?$/;
+
+/**
+ * A stored key, read back — refused unless it is an EC P-256 private key, as
+ * exactly one unencrypted PKCS#8 PEM block.
  *
  * A key of any other kind is not converted or accepted "for now": its pin would
  * be a different value, and the certificate it signed would fail the handshake
- * on at least one runtime (see the header).
+ * on at least one runtime (see the header). The PEM is checked before
+ * `createPrivateKey` sees it because that parser is more forgiving than the
+ * name of this function: it takes a SEC1 `EC PRIVATE KEY` block, and it reads
+ * the first block of a file and ignores whatever follows it.
  */
 export function tunnelKeyFromPkcs8Pem(pem: string): TunnelKey {
+  if (!PKCS8_PEM.test(pem)) {
+    throw new TunnelIdentityError('key-unsupported', 'the stored key is not one unencrypted PKCS#8 PEM block');
+  }
   let privateKey: KeyObject;
   try {
     privateKey = createPrivateKey({ key: pem, format: 'pem' });
@@ -225,9 +246,9 @@ function assertSubjectAltName(name: TunnelSubjectAltName): void {
     } catch {
       hostname = '';
     }
-    const canonical = v6
-      ? hostname === `[${name.value.toLowerCase()}]`
-      : IPV4.test(name.value) && hostname === name.value;
+    // Compared as written, not lower-cased first: `FE80::1` serialises as
+    // `fe80::1`, and a spelling the parser would change is refused.
+    const canonical = v6 ? hostname === `[${name.value}]` : IPV4.test(name.value) && hostname === name.value;
     if (!canonical) throw new RangeError(`not a canonical IP address: ${JSON.stringify(name.value)}`);
     return;
   }

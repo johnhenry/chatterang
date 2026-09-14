@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { X509Certificate, createHash, createPublicKey, generateKeyPairSync } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { resolve } from 'node:path';
@@ -208,9 +208,10 @@ describe('the tunnel key and its pin (#179, #180)', () => {
     expect(tunnelKeyFromPkcs8Pem(pem).pin.spkiSha256).toBe(key.pin.spkiSha256);
   });
 
-  it('refuses a key that is not EC P-256, and never echoes it', () => {
+  it('refuses a key that is not EC P-256 in one unencrypted PKCS#8 PEM block, and never echoes it', () => {
     const pem = { privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } } as const;
     const p256 = generateKeyPairSync('ec', { namedCurve: 'P-256', ...pem });
+    const p256Key = createPrivateKey(p256.privateKey);
     const cases: readonly (readonly [string, string])[] = [
       ['Ed25519', generateKeyPairSync('ed25519', pem).privateKey],
       ['P-384', generateKeyPairSync('ec', { namedCurve: 'P-384', ...pem }).privateKey],
@@ -218,6 +219,13 @@ describe('the tunnel key and its pin (#179, #180)', () => {
       ['a public key', p256.publicKey],
       ['garbage', '-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5IGF0IGFsbCwgbm90IGV2ZW4gY2xvc2U=\n-----END PRIVATE KEY-----\n'],
       ['empty', ''],
+      // The right key in the wrong wrapping. `createPrivateKey` takes every one
+      // of these and returns the P-256 key, so each is refused by its encoding.
+      ['the P-256 key as SEC1', p256Key.export({ type: 'sec1', format: 'pem' }).toString()],
+      ['the P-256 key, then another PEM block', `${p256.privateKey}${generateTunnelKey().privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()}`],
+      ['the P-256 key, then trailing text', `${p256.privateKey}trailing text\n`],
+      ['the P-256 key, with text before it', `a note\n${p256.privateKey}`],
+      ['the P-256 key, encrypted', p256Key.export({ type: 'pkcs8', format: 'pem', cipher: 'aes-256-cbc', passphrase: 'x' }).toString()],
     ];
     for (const [label, text] of cases) {
       let error: unknown;
@@ -307,7 +315,12 @@ describe('a certificate issued from the key', () => {
       { type: 'dns', value: 'trailing.local.' },
       { type: 'dns', value: '-leading.local' },
       { type: 'dns', value: `${'a'.repeat(64)}.local` },
+      { type: 'dns', value: 'trailing-.local' },
+      // 254 octets, every label within 63: refused for its length alone.
+      { type: 'dns', value: ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(62)].join('.') },
       { type: 'ip', value: '999.1.1.1' },
+      // The URL parser serialises it `fe80::1`: a spelling it would change.
+      { type: 'ip', value: 'FE80::1' },
       { type: 'ip', value: '192.168.001.1' },
       { type: 'ip', value: '1.2.3' },
       { type: 'ip', value: 'johns-macbook.local' },
@@ -320,6 +333,12 @@ describe('a certificate issued from the key', () => {
         JSON.stringify(name),
       ).rejects.toThrow(RangeError);
     }
+
+    // The limits are limits, not a stricter rule: 253 octets and a 63-octet label pass.
+    const longest = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(61)].join('.');
+    expect(longest).toHaveLength(253);
+    const named = await issueTunnelCertificate(key, { validDays: 1, subjectAltNames: [{ type: 'dns', value: longest }] });
+    expect(new X509Certificate(named.certPem).subjectAltName).toBe(`DNS:${longest}`);
   });
 
   it('lasts validDays from a back-dated start, and refuses a lifetime nobody chose', async () => {

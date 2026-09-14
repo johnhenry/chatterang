@@ -92,10 +92,24 @@ Neither binds anything, and neither is called by an app yet.
 - **Key rotation is not implemented.** A new key is a new pin, so it is a loud
   re-pair of every device; nothing here makes a key except when none exists.
 - **Owner-only or refused.** `<data>/tunnel-identity/key` is 0600 in a 0700
-  directory, sealed with `safeStorage` on the desktop where it can encrypt. A
-  wider mode, a symlink, another owner, a malformed or tampered file, or a sealed
-  file with nothing to unseal it is refused — never tightened and never replaced.
-  Windows is refused until its ACL story is decided.
+  directory. A wider mode, a symlink, a FIFO, another owner, or a malformed or
+  tampered file is refused — never tightened and never replaced.
+- **Access control lists are read where mode bits do not cover them.** On Linux
+  a POSIX ACL cannot grant past the group bits (they are its mask), so the mode
+  check is the whole answer. On macOS an ACL is independent of the mode, so the
+  store reads it with `/bin/ls -lde`: an allow entry on the key or its directory,
+  or an entry on the data directory that grants more than reading (inheritance
+  included), is refused, as is a listing it cannot read. Every other platform,
+  Windows included, is refused until someone teaches the store its permissions.
+- **Sealed exactly where sealing is real.** The desktop asks only after
+  Electron's `ready` (checked, not assumed), and seals with `safeStorage` when it
+  can encrypt — on Linux only into a named secret store, since `basic_text` is a
+  hard-coded password. The file must match the process: a sealed key with nothing
+  to unseal it, and a plain key where sealing is available, are both refused; a
+  plain key is never re-sealed in place, which would keep a planted one.
+- **Durable before it is reported.** The key is written under a private
+  `O_EXCL` name, checked, synced, hard-linked into place, and the directory is
+  synced before `created: true` is returned.
 
 ## What is deliberately not here
 

@@ -71,6 +71,7 @@ export type {
 } from './identity.js';
 export { loadOrCreateTunnelKey } from './identity-store.js';
 export type {
+  AccessControlListing,
   KeyFileHandle,
   KeyFileStat,
   KeyFileSystem,
