@@ -13,12 +13,14 @@
  * two files use: 32 bytes for the binding, standard padded base64 (RFC 4648 §4)
  * for anything that crosses a bridge.
  *
- * KEY ROTATION IS NOT HERE, AND WHEN IT COMES IT IS A LOUD RE-PAIR. A new key is
- * a new pin, and there is no channel to tell a phone (#180): every paired device
- * refuses the desktop until it pairs again. So nothing here or in
- * `identity-store.ts` makes a key except when none exists — a key that fails to
- * load is refused, never quietly replaced — and how long a key lives is not
- * decided (#179 leaves it open).
+ * THE KEY LIVES UNTIL IT IS DELIBERATELY RESET (#180, ruled). A new key is a new
+ * pin, and there is no channel to tell a phone: every paired device refuses the
+ * desktop until it pairs again. So nothing here or in `identity-store.ts` makes
+ * a key except when none exists — a key that fails to load is refused, never
+ * quietly replaced — and there is no scheduled rotation. What is re-issued is
+ * the certificate, from the same key, before it expires:
+ * {@link currentTunnelCertificate} decides when, against a margin that is a
+ * named constant. How long one certificate lasts is still the caller's.
  *
  * NAMES ARE A PARAMETER, EMPTY BY DEFAULT. Whether a client checks the
  * certificate's hostnames or only the pin is its own question (#180, #295). A
@@ -60,7 +62,9 @@ import type { KeyObject } from 'node:crypto';
 export type TunnelIdentityErrorReason =
   /**
    * Owner-only cannot be checked here: a platform whose permissions this store
-   * has not been taught to read (anything but Linux and macOS), or no uid.
+   * has not been taught to read (anything but Linux, macOS and Windows), no uid
+   * on Linux or macOS, or on Windows no account SID or no `%SystemRoot%` to run
+   * the tools that read one.
    */
   | 'unsupported-platform'
   /** The directory the key's directory is made in is not this account's alone to write. */
@@ -370,4 +374,124 @@ export async function issueTunnelCertificate(
     throw new TunnelIdentityError('pin-mismatch', 'the issued certificate does not carry the key it was issued for');
   }
   return { certPem, pin, serialNumber, notBefore, notAfter };
+}
+
+/**
+ * How close to its expiry a certificate is re-issued (#180): thirty days.
+ *
+ * The owner ruled that the key lives until it is deliberately reset and that
+ * its certificates are re-issued from it BEFORE they expire. "Before" needs a
+ * number, and this is it — named, so a listener that checks does not carry its
+ * own. It is slack rather than precision: a certificate is replaced the first
+ * time anything asks inside its last thirty days, so a desktop that was asleep,
+ * or a listener that checks once a day, does not serve one that has run out.
+ * How long a certificate lasts is still the caller's `validDays`, which must be
+ * longer than this; see {@link currentTunnelCertificate}.
+ */
+export const TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS = 30;
+const REISSUE_MARGIN_MS = TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS * MS_PER_DAY;
+
+/** Exactly one PEM certificate block, as `issueTunnelCertificate` writes it. */
+const CERTIFICATE_PEM = /^-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]+\n)+-----END CERTIFICATE-----\n?$/;
+
+/** What a certificate handed to {@link currentTunnelCertificate} turned out to be. */
+export type TunnelCertificateStanding =
+  /** Kept: it carries this key, this key signed it, it is valid now, and it is outside the margin. */
+  | 'current'
+  /** None was given. */
+  | 'missing'
+  /** Not exactly one PEM certificate that Node's X.509 parser reads. */
+  | 'unreadable'
+  /** It carries another key: its SPKI pin is not this key's. */
+  | 'another-key'
+  /** It carries this key's public half, and another key signed it. */
+  | 'not-signed-by-key'
+  /** Its validity starts after now — this machine's clock went back. */
+  | 'not-yet-valid'
+  /** Valid, and inside {@link TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS} of its expiry. */
+  | 'expiring'
+  /** Past its expiry. */
+  | 'expired';
+
+export interface CurrentTunnelCertificate {
+  readonly certificate: TunnelCertificate;
+  /** True when `certificate` was issued by this call, from the key; false when the one given is kept. */
+  readonly issued: boolean;
+  /** What the certificate given was: why it was kept, or why it was replaced. */
+  readonly previous: TunnelCertificateStanding;
+}
+
+/**
+ * The certificate to serve with `key` now: the one given, or a new one issued
+ * from the same key (#180).
+ *
+ * RE-ISSUED FROM THE KEY, NEVER FROM A NEW ONE. The only way this makes a
+ * certificate is {@link issueTunnelCertificate} with the `key` it was passed,
+ * which refuses a certificate that does not carry that key's pin. So whichever
+ * way this goes, the pin a paired phone holds is the pin of what it returns, and
+ * nothing here can make a key.
+ *
+ * A CERTIFICATE IS NOT THE SECRET, SO A BAD ONE IS REPLACED, NOT REFUSED. The key
+ * store refuses rather than repairs because a key may already have been copied
+ * and a pin cannot be revoked. Neither is true of a certificate: it is public,
+ * it is derived from the key, and any number of them can exist without a paired
+ * device noticing. So a certificate that does not parse, carries another key,
+ * was signed by another key, starts in the future, has expired or is inside the
+ * margin is never returned; a new one is issued from the key instead, and
+ * `previous` says which of those it was, so the caller can say so.
+ *
+ * NAMES ARE NOT COMPARED. A kept certificate carries the names it was issued
+ * with, whatever `subjectAltNames` says now: clients check only the pin (#295).
+ *
+ * `validDays` must be longer than the margin. A lifetime inside it would be
+ * "about to expire" the moment it was issued, and every call would issue again.
+ */
+export async function currentTunnelCertificate(
+  key: TunnelKey,
+  certPem: string | null,
+  options: TunnelCertificateOptions,
+): Promise<CurrentTunnelCertificate> {
+  const { validDays } = options;
+  if (!Number.isSafeInteger(validDays) || validDays <= TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS) {
+    throw new RangeError(
+      `validDays must be an integer longer than the ${TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS}-day ` +
+        `re-issue margin, got ${String(validDays)}`,
+    );
+  }
+  // A `now` that is not a date needs no check of its own: every comparison
+  // below fails on it, and the issue that follows refuses it.
+  const now = (options.now ?? new Date()).getTime();
+  const standing = certPem === null ? 'missing' : standingOf(key, certPem, now);
+  if (typeof standing !== 'string') return { certificate: standing, issued: false, previous: 'current' };
+  return { certificate: await issueTunnelCertificate(key, options), issued: true, previous: standing };
+}
+
+/**
+ * The certificate, when it may be kept — or what is wrong with it.
+ *
+ * Every date comparison is written so that a date that is not a number fails
+ * it, and a certificate whose dates cannot be read is replaced rather than kept.
+ */
+function standingOf(
+  key: TunnelKey,
+  certPem: string,
+  now: number,
+): TunnelCertificate | Exclude<TunnelCertificateStanding, 'current' | 'missing'> {
+  if (!CERTIFICATE_PEM.test(certPem)) return 'unreadable';
+  let parsed: X509Certificate;
+  try {
+    parsed = new X509Certificate(certPem);
+  } catch {
+    return 'unreadable';
+  }
+  const pin = tunnelPinOf(parsed.publicKey);
+  if (!sameTunnelPin(pin, key.pin)) return 'another-key';
+  // The pins are equal, so `parsed.publicKey` is this key's public half.
+  if (!parsed.verify(parsed.publicKey)) return 'not-signed-by-key';
+  const notBefore = new Date(parsed.validFrom);
+  const notAfter = new Date(parsed.validTo);
+  if (!(now >= notBefore.getTime())) return 'not-yet-valid';
+  if (!(now < notAfter.getTime())) return 'expired';
+  if (!(notAfter.getTime() - now > REISSUE_MARGIN_MS)) return 'expiring';
+  return { certPem, pin, serialNumber: parsed.serialNumber.toLowerCase(), notBefore, notAfter };
 }

@@ -10,6 +10,12 @@
  * `safeStorage` and no keychain, so it never seals, and a sealed key file is
  * refused here rather than replaced (#179's ruling: a plain owner-only file).
  *
+ * NOT ON WINDOWS. The store keeps a Windows key only sealed with DPAPI (#179's
+ * second ruling, which is about the desktop), and the server has nothing to seal
+ * with, so on Windows it stores no key and is refused (`encryption-unavailable`)
+ * — as it was refused before Windows was supported at all. A headless Windows
+ * host is a question nobody has ruled on.
+ *
  * UNLIKE `token.ts`, a wide file is refused, not tightened; the store's header
  * says why. And unlike the token, nothing here is printed: the key is never
  * shown to anyone, and its pin reaches a phone through pairing (#134).

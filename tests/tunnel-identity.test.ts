@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { X509Certificate, createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, webcrypto } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { connect, createServer } from 'node:tls';
 import type { Server } from 'node:tls';
@@ -10,7 +10,9 @@ import type { NegotiatedPeerCertificate } from '@chatterang/contracts/tunnel-soc
 import { BindingError, channelIdentifierFor } from '@chatterang/tunnel/binding';
 import { HOST_DESKTOP, TRUST_SPKI_PIN, type PairingPayload } from '@chatterang/tunnel/pairing';
 import {
+  TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS,
   TunnelIdentityError,
+  currentTunnelCertificate,
   generateTunnelKey,
   issueTunnelCertificate,
   sameTunnelPin,
@@ -443,6 +445,164 @@ describe('a TLS server built from the material, over loopback', () => {
     const after = await serve(key, (await issueTunnelCertificate(key, { validDays: 365 })).certPem);
     expect((await connectPinned(before.port, key.pin.spkiSha256)).accepted).toBe(true);
     expect((await connectPinned(after.port, key.pin.spkiSha256)).accepted).toBe(true);
+  });
+});
+
+/*
+ * #180, RULED: the key lives until it is deliberately reset, and its
+ * certificates are re-issued from it before they expire. What a paired client
+ * holds is the SPKI pin, so every assertion here that a certificate was replaced
+ * is paired with one that the pin — computed by node:crypto from the new
+ * certificate, not taken from the module — did not move.
+ */
+describe('a certificate is re-issued from the same key before it expires (#180)', () => {
+  const T = new Date('2026-09-14T12:00:00.000Z');
+  const DAY = 86_400_000;
+  const at = (days: number, ms = 0): Date => new Date(T.getTime() + days * DAY + ms);
+
+  it('names the margin: thirty days', () => {
+    expect(TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS).toBe(30);
+  });
+
+  it('keeps a certificate that carries the key, is valid, and has more than the margin left', async () => {
+    const key = generateTunnelKey();
+    const issued = await issueTunnelCertificate(key, { validDays: 90, now: T });
+    // One millisecond short of thirty days left.
+    const kept = await currentTunnelCertificate(key, issued.certPem, { validDays: 90, now: at(60, -1) });
+    expect(kept).toMatchObject({ issued: false, previous: 'current' });
+    expect(kept.certificate).toEqual(issued);
+  });
+
+  it('re-issues inside the margin from the same key: a new certificate, the same SPKI pin', async () => {
+    const key = generateTunnelKey();
+    const issued = await issueTunnelCertificate(key, { validDays: 90, now: T });
+    // Handed back through its PEM, as a store would.
+    const stored = tunnelKeyFromPkcs8Pem(tunnelKeyPkcs8Pem(key));
+    const renewed = await currentTunnelCertificate(stored, issued.certPem, { validDays: 90, now: at(60) });
+    expect(renewed).toMatchObject({ issued: true, previous: 'expiring' });
+    expect(renewed.certificate.certPem).not.toBe(issued.certPem);
+    expect(renewed.certificate.serialNumber).not.toBe(issued.serialNumber);
+    expect(renewed.certificate.notAfter.toISOString()).toBe(at(150).toISOString());
+
+    expect(pinByNode(renewed.certificate.certPem)).toBe(pinByNode(issued.certPem));
+    expect(pinByNode(renewed.certificate.certPem)).toBe(key.pin.spkiSha256);
+    expect(new X509Certificate(renewed.certificate.certPem).checkPrivateKey(key.privateKey)).toBe(true);
+
+    // And the renewal is what is kept from then on.
+    const next = await currentTunnelCertificate(key, renewed.certificate.certPem, { validDays: 90, now: at(61) });
+    expect(next).toMatchObject({ issued: false, previous: 'current' });
+
+    // A client that holds only the pin accepts the renewed certificate.
+    const server = await serve(key, renewed.certificate.certPem);
+    expect((await connectPinned(server.port, key.pin.spkiSha256)).accepted).toBe(true);
+  });
+
+  it.each([
+    ['exactly at its expiry', 90, 'expired'],
+    ['a month after its expiry', 120, 'expired'],
+    ['before its back-dated start', -1, 'not-yet-valid'],
+  ] as const)('re-issues a certificate %s, from the same key', async (_label, days, previous) => {
+    const key = generateTunnelKey();
+    const issued = await issueTunnelCertificate(key, { validDays: 90, now: T });
+    const renewed = await currentTunnelCertificate(key, issued.certPem, { validDays: 90, now: at(days) });
+    expect(renewed).toMatchObject({ issued: true, previous });
+    expect(pinByNode(renewed.certificate.certPem)).toBe(key.pin.spkiSha256);
+  });
+
+  it('issues one from the key when there is none', async () => {
+    const key = generateTunnelKey();
+    const first = await currentTunnelCertificate(key, null, { validDays: 90, now: T });
+    expect(first).toMatchObject({ issued: true, previous: 'missing' });
+    expect(pinByNode(first.certificate.certPem)).toBe(key.pin.spkiSha256);
+  });
+
+  it('never serves a certificate of another key: it issues one from this key instead', async () => {
+    const key = generateTunnelKey();
+    const other = await issueTunnelCertificate(generateTunnelKey(), { validDays: 90, now: T });
+    const renewed = await currentTunnelCertificate(key, other.certPem, { validDays: 90, now: at(1) });
+    expect(renewed).toMatchObject({ issued: true, previous: 'another-key' });
+    expect(pinByNode(renewed.certificate.certPem)).toBe(key.pin.spkiSha256);
+  });
+
+  it('never serves a certificate that carries this key but was signed by another', async () => {
+    const key = generateTunnelKey();
+    const signer = generateTunnelKey();
+    await import('reflect-metadata');
+    const x509 = await import('@peculiar/x509');
+    const crypto = webcrypto as unknown as Crypto;
+    const algorithm = { name: 'ECDSA', namedCurve: 'P-256', hash: 'SHA-256' };
+    const forged = await x509.X509CertificateGenerator.create(
+      {
+        serialNumber: '4a',
+        subject: 'CN=Chatterang tunnel',
+        issuer: 'CN=Chatterang tunnel',
+        notBefore: at(0, -3_600_000),
+        notAfter: at(90),
+        signingAlgorithm: algorithm,
+        publicKey: await crypto.subtle.importKey(
+          'spki',
+          new Uint8Array(createPublicKey(key.privateKey).export({ type: 'spki', format: 'der' })),
+          algorithm,
+          true,
+          ['verify'],
+        ),
+        signingKey: await crypto.subtle.importKey(
+          'pkcs8',
+          new Uint8Array(signer.privateKey.export({ type: 'pkcs8', format: 'der' })),
+          algorithm,
+          false,
+          ['sign'],
+        ),
+      },
+      crypto,
+    );
+    const forgedPem = forged.toString('pem');
+    // The control: it does carry this key, so only the signature tells it apart.
+    expect(pinByNode(forgedPem)).toBe(key.pin.spkiSha256);
+
+    const renewed = await currentTunnelCertificate(key, forgedPem, { validDays: 90, now: at(1) });
+    expect(renewed).toMatchObject({ issued: true, previous: 'not-signed-by-key' });
+    expect(renewed.certificate.certPem).not.toBe(forgedPem);
+    const parsed = new X509Certificate(renewed.certificate.certPem);
+    expect(parsed.verify(createPublicKey(key.privateKey))).toBe(true);
+    expect(pinByNode(renewed.certificate.certPem)).toBe(key.pin.spkiSha256);
+  });
+
+  it('replaces anything that is not exactly one certificate it can read', async () => {
+    const key = generateTunnelKey();
+    const issued = await issueTunnelCertificate(key, { validDays: 90, now: T });
+    const second = await issueTunnelCertificate(key, { validDays: 90, now: T });
+    for (const [label, text] of [
+      ['empty', ''],
+      ['garbage', 'not a certificate'],
+      ['a PEM block that is not DER', '-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n'],
+      ['the private key', tunnelKeyPkcs8Pem(key)],
+      ['two certificates', `${issued.certPem}${second.certPem}`],
+      ['the certificate with text before it', `a note\n${issued.certPem}`],
+      ['the certificate with text after it', `${issued.certPem}trailing\n`],
+    ] as const) {
+      const renewed = await currentTunnelCertificate(key, text, { validDays: 90, now: at(1) });
+      expect(renewed, label).toMatchObject({ issued: true, previous: 'unreadable' });
+      expect(pinByNode(renewed.certificate.certPem), label).toBe(key.pin.spkiSha256);
+    }
+  });
+
+  it('refuses a lifetime inside the margin, which would re-issue on every call, and a clock that is not a date', async () => {
+    const key = generateTunnelKey();
+    for (const validDays of [TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS, 1, 0, -1, 30.5, 45.5, Number.NaN]) {
+      await expect(currentTunnelCertificate(key, null, { validDays }), String(validDays)).rejects.toThrow(RangeError);
+    }
+    await expect(currentTunnelCertificate(key, null, { validDays: 90, now: new Date('not a date') })).rejects.toThrow(
+      RangeError,
+    );
+    // The limit is the margin, not a stricter rule.
+    const shortest = await currentTunnelCertificate(key, null, { validDays: TUNNEL_CERTIFICATE_REISSUE_MARGIN_DAYS + 1, now: T });
+    expect(shortest.issued).toBe(true);
+    expect((await currentTunnelCertificate(key, shortest.certificate.certPem, { validDays: 31, now: T })).issued).toBe(false);
+    // Refused even when a certificate would be kept and nothing issued.
+    await expect(
+      currentTunnelCertificate(key, shortest.certificate.certPem, { validDays: 45.5, now: T }),
+    ).rejects.toThrow(RangeError);
   });
 });
 
