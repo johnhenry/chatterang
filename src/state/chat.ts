@@ -1415,23 +1415,78 @@ function carriesReceipt(variant: MessageVariant): boolean {
 }
 
 /**
- * A tool call still being written: its opening marker, in the shape of a call,
- * with the text ending inside it.
- *
- * `<tool_call>` followed by the end of the text, or by the `{"` a call's JSON
- * opens with. `[TOOL_CALL]` or `[TOOL_CALLS]` followed by the end of the text,
- * by a tool name the text ends in, or by `name(` and the end or a `{`.
- *
- * ANCHORED TO THAT SHAPE, NOT TO THE MARKER. Any `<tool_call>` or
- * `[tool_calls]` was cut to the end of the reply, and a reply can name one in
- * words: "Qwen wraps each call in a `<tool_call>` tag", or a TOML example with
- * a `[tool_calls]` table. Everything after it, which the person had watched
- * arrive, was gone.
+ * A tool call's opening marker with nothing after it: `<tool_call>` followed
+ * by the end of the text or a lone `{`; `[TOOL_CALL]` or `[TOOL_CALLS]`
+ * followed by the end, by a tool name the text ends in, or by `name(`.
+ */
+const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\][ \t]*(?:\w+[ \t]*\(\s*|\w*\s*)$/i;
+
+/**
+ * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
+ * a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and a
+ * `{`. The match ends where the arguments' `{` starts.
  *
  * The quote is spelled `\x22`: the source scans in tests/support/source-scan.ts
  * read a bare one in a regex literal as the start of a string.
  */
-const UNFINISHED_CALL = /<tool_call>\s*(?:\{\s*\x22|\{?\s*$)|\[TOOL_CALLS?\][ \t]*(?:\w+[ \t]*\(\s*(?:\{|$)|\w*\s*$)/i;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\][ \t]*\w+[ \t]*\(\s*(?=\{)/gi;
+
+/**
+ * Where the JSON object opening at `start` ends, just past its closing brace;
+ * -1 if the text ends first. A brace inside a string is not counted.
+ */
+function endOfObject(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let at = start; at < text.length; at += 1) {
+    const char = text[at];
+    if (inString) {
+      if (char === '\\') at += 1;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return at + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Where a tool call still being written starts, or -1: a call's opening shape
+ * with the text ending inside it.
+ *
+ * Its arguments' JSON still open at the end of the text; or closed, with
+ * nothing after them but what is left of the call's own end — some of
+ * `</tool_call>`, or of the `)`. Or an opening marker the text ends on.
+ *
+ * ANCHORED TO THE END OF THE TEXT, NOT TO THE MARKER. Any `<tool_call>` or
+ * `[tool_calls]` was cut to the end of the reply, and a reply can name one in
+ * words: "Qwen wraps each call in a `<tool_call>` tag", or a TOML example with
+ * a `[tool_calls]` table. Then any `<tool_call>{"` was, and a reply can show
+ * one: an example of Qwen's format with no closing tag and the explanation
+ * after it, cut from the example on — finished or stopped, and a reply whose
+ * words began with such an example was stored with none and shown as
+ * "Stopped before its first word". Everything after it, which the person had
+ * watched arrive, was gone.
+ */
+function unfinishedCallAt(text: string): number {
+  let from = 0;
+  for (const match of text.matchAll(CALL_OPENING)) {
+    if (match.index < from) continue;
+    const open = match.index + match[0].length;
+    const close = endOfObject(text, open);
+    if (close === -1) return match.index;
+    const rest = text.slice(close).trimStart().toLowerCase();
+    const end = match[0].startsWith('<') ? '</tool_call>' : ')';
+    if (end.startsWith(rest)) return match.index;
+    from = close;
+  }
+  return text.search(CALL_MARKER_AT_END);
+}
 
 /**
  * A reply's words with its tool calls read out of them, in a chat with tools.
@@ -1459,7 +1514,7 @@ const UNFINISHED_CALL = /<tool_call>\s*(?:\{\s*\x22|\{?\s*$)|\[TOOL_CALLS?\][ \t
  */
 function wordsWithoutCalls(content: string): string {
   const finished = stripToolSyntax(content);
-  const unfinished = finished.search(UNFINISHED_CALL);
+  const unfinished = unfinishedCallAt(finished);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
 }
 

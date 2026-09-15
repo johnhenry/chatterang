@@ -1169,3 +1169,133 @@ describe('a finished reply in a chat with tools', () => {
     expect(assistantRows(id).at(-1)?.content).toBe(example);
   });
 });
+
+/* ── A call's opening shape the reply goes on past ──────────────────── */
+
+/** A reply that documents Qwen's call format: a call's opening shape, with no closing tag, and prose after it. */
+const DOC =
+  'Every Qwen call opens like this:\n\n```\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```\n\n' +
+  'and the model then writes the closing tag. The app reads the JSON, runs the tool, and hands its result back as the next turn.';
+
+describe('a reply that writes a call’s opening shape and goes on past it, in a chat with tools', () => {
+  it('keeps every word when it finished, and sends them back', async () => {
+    const id = 'doc_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([DOC, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does qwen format a call?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(DOC);
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'how does qwen format a call?'],
+      ['assistant', DOC],
+      ['user', 'thanks'],
+    ]);
+  });
+
+  it('keeps every word when it was stopped after the example', async () => {
+    const id = 'doc_stopped';
+    const partial = DOC.slice(0, DOC.indexOf('runs the tool, and ') + 'runs the tool, and'.length);
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'runs the tool, and', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('is not called stopped before its first word when its words began with the example', async () => {
+    const id = 'doc_first';
+    const partial = '<tool_call>{"name": "get_weather"} is how every Qwen call opens, and the app then reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the app then reads', gate.release);
+    });
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: partial,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+  });
+
+  it('still cuts a call whose arguments closed when Stop landed before its closing tag', async () => {
+    const id = 'call_before_close';
+    const partial = 'Filing it.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    const probe = await inToolsChat(id, async () => {
+      await stopAfterSome('second', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Filing it.');
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('still cuts a call whose opening marker and name were all Stop let it write', async () => {
+    const id = 'call_marker_at_end';
+    const partial = 'Reading it.\n[TOOL_CALLS] leaky(';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'leaky(', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Reading it.');
+  });
+
+  it('still cuts an unfinished call whose arguments hold a closing brace in a string', async () => {
+    const id = 'call_brace_in_string';
+    const partial = 'Filing it.\n<tool_call>{"name":"notes.note","arguments":{"text":"a } b } canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Filing it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words after a [TOOL_CALLS] name({…} whose arguments closed and prose followed', async () => {
+    const id = 'mistral_doc';
+    const partial = 'Mistral writes [TOOL_CALLS] get_weather({"city": "Paris"} and then the paren, which the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'which the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
