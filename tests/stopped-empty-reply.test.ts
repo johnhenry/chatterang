@@ -927,7 +927,7 @@ describe('an empty reply nobody stopped', () => {
     expect(emptyAt(local.seen[1]), 'still left out of the next request').toEqual([]);
   });
 
-  it('whose tool ran and whose follow-up wrote nothing keeps today’s row, display and regeneration', async () => {
+  it('whose local tool ran and whose follow-up wrote nothing stores no words, and regenerates like any empty reply with no receipt', async () => {
     const id = 'local_tool_empty';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const local = recordingBackend([CALL, '', 'Again.']);
@@ -940,7 +940,8 @@ describe('an empty reply nobody stopped', () => {
       const last = assistantRows(id).at(-1)!;
       expect(last.error, 'not a failure').toBeUndefined();
       expect(last.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
-      expect(last.stopped, 'nothing stopped it').not.toBe(true);
+      expect(last.content, 'the call it made is not stored as its words').toBe('');
+      expect(last.stopped, 'nothing stopped it').toBe(false);
       expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').not.toContain(
         STOPPED_NOTE,
       );
@@ -955,10 +956,14 @@ describe('an empty reply nobody stopped', () => {
 
     const regenerated = assistantRows(id).at(-1)!;
     expect(regenerated.content).toBe('Again.');
+    // A local tool's call carries no receipt, and an empty generation with no
+    // receipt is not a version anyone can flip back to (#92's rule, pinned in
+    // variant-provenance.test.ts). It was kept only while the call's markup was
+    // stored as its words.
     expect(
-      regenerated.variants?.map((variant) => variant.toolCalls?.map((call) => call.name)),
-      'the generation that ran the tool is kept, with its record',
-    ).toEqual([['leaky'], undefined]);
+      regenerated.variants?.map((variant) => variant.content),
+      'the empty generation is dropped, as any empty one with no receipt',
+    ).toEqual(['Again.']);
   });
 });
 
@@ -1094,5 +1099,73 @@ describe('a reply stopped after some text, in a chat with tools', () => {
 
     expect(assistantRows(id)[1]?.content).toBe('Reading it.');
     expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a finished reply in a chat with tools', () => {
+  it('whose tool ran and whose follow-up wrote nothing sends no tool-call markup back to the model', async () => {
+    const id = 'tool_ran_follow_up_empty';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([CALL, '', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id)[1]!;
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(refusals()).toEqual([]);
+    expect(local.seen, 'the call, the follow-up, the next send').toHaveLength(3);
+    expect(emptyAt(local.seen[2])).toEqual([]);
+    expect(spoken(local.seen[2]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'read my notes'],
+      ['user', 'and then?'],
+    ]);
+  });
+
+  it('cut off in the middle of a call stores and sends none of the call', async () => {
+    const id = 'cut_off_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content).toBe('Checking.');
+    expect(refusals()).toEqual([]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('that was only a JSON example naming a "function" keeps it, as it did', async () => {
+    const id = 'tools_json_only';
+    const example = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([example, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('show me the shape');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content).toBe(example);
   });
 });

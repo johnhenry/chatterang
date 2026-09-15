@@ -1796,17 +1796,28 @@ async function runGeneration(
             });
           }
 
-          // `event.text` has had its tool-call syntax stripped by the engine.
+          // `event.text` has had its finished tool calls stripped by the engine.
           // When it is empty the streamed deltas stand in for it, as they
-          // always have — a turn cut short hands back no text of its own. In a
-          // chat with tools, a STOPPED turn's words are read by
-          // `wordsWithoutCalls`, so a call it was writing or waiting to send is
-          // not stored as its words and sent back to the model. Read once its
-          // reasoning is split off, so a call named in the reasoning takes none
-          // of the answer with it. Any other turn keeps what it kept before.
+          // always have — a turn cut short hands back no text of its own.
+          //
+          // IN A CHAT WITH TOOLS the reply's words are read by
+          // `wordsWithoutCalls`, once its reasoning is split off, so a call named
+          // in the reasoning takes none of the answer with it. Read when:
+          //   - the engine handed back text: its patterns need a closing tag, so
+          //     a call cut off mid-arguments was still in it;
+          //   - the turn was stopped: a call it was writing or waiting to send;
+          //   - a tool ran in it: the engine resets its text after a tool round,
+          //     so a follow-up that wrote nothing left every round's deltas,
+          //     the call that ran included, as the words of the reply.
+          // Otherwise a call was stored as the reply's words and sent back to
+          // the model as history. A turn nobody stopped, in which no tool ran
+          // and the engine handed back no text, keeps its deltas as before: a
+          // reply that was only a fenced JSON example naming a "function",
+          // which the engine strips.
           const aborted = controller.signal.aborted;
           const split = splitThinking(event.text || raw);
-          const readsCalls = !event.text && aborted && chat.tools.length > 0;
+          const readsCalls =
+            chat.tools.length > 0 && (event.text !== '' || aborted || toolCalls.length > 0);
           const content = (readsCalls ? wordsWithoutCalls(split.content) : split.content).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown
