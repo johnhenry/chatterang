@@ -147,6 +147,21 @@ export function callNames(tools: readonly Pick<ChatterangTool, 'id' | 'name'>[])
 }
 
 /**
+ * Where a call opens as this app writes one in a text prompt's history:
+ * `[tool NAME(`, with the arguments' `{` after it. The match ends there, and
+ * its group is the name.
+ *
+ * `messageText` in ai/prompt.ts renders a call that ran as
+ * `[tool NAME({…})]` for a model whose prompt is a text template, so the
+ * follow-up request shows the model its own call that way. A small model asked
+ * for another call copies what its previous turn shows: none of the other
+ * forms read it, so the call never ran, and its arguments — which the first
+ * tool's output could have written — stayed in the stored reply and were sent
+ * back in every later request.
+ */
+const APP_CALL_OPENING = /\[tool\s+([^()[\]{}\n]+?)\s*\(\s*(?=\{)/gi;
+
+/**
  * Recognise a textual tool call. Local models produce these in a handful of
  * shapes; all of them reduce to a name plus a JSON argument object.
  *
@@ -207,6 +222,17 @@ export function extractTextualToolCalls(text: string, offered: readonly string[]
     const name = match[1];
     const body = match[2];
     if (name && body) push(name, body);
+  }
+
+  // [tool name({...})]                                   (this app's own history)
+  // Read through its arguments' JSON, as `stripToolSyntax` reads a call, so a
+  // string holding `)]` does not end it. See `APP_CALL_OPENING`.
+  for (const match of text.matchAll(APP_CALL_OPENING)) {
+    const name = match[1]?.trim();
+    const from = match.index + match[0].length;
+    const end = endOfJson(text, from);
+    if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end))) continue;
+    push(name, text.slice(from, end));
   }
 
   return calls;
@@ -295,6 +321,7 @@ const CALL_END = {
   tag: { token: /<\/tool_call>/iy, text: '</tool_call>' },
   fencedTag: { token: /\x60{3}\s*<\/tool_call>/iy, text: '\x60\x60\x60</tool_call>' },
   paren: { token: /\)/y, text: ')' },
+  bracket: { token: /\)\s*\]/y, text: ')]' },
 } as const;
 
 /**
@@ -306,7 +333,7 @@ const CALL_END = {
  * the accepted limit.
  */
 const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
@@ -316,7 +343,8 @@ const CALL_MARKER_AT_END =
  * the stopped pattern above cut "Mistral models put every call after the
  * special token [TOOL_CALLS]" to "... the special token".
  */
-const CALL_OPENED_AT_END = /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/i;
+const CALL_OPENED_AT_END =
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
@@ -326,13 +354,14 @@ const CALL_OPENED_AT_END = /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[
  * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the same
  * `{"`. Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`.
  * One whose body is a name and its JSON opens `<tool_call>`, the name, and a
- * `(` or `{`: see `taggedCallsEnd`.
+ * `(` or `{`: see `taggedCallsEnd`. This app's own rendering opens `[tool`,
+ * the name, `(` and a `{`: see `APP_CALL_OPENING`.
  *
  * The quote is spelled `\x22`, and a fence's backtick `\x60`: the source scans
  * in tests/support/source-scan.ts read a bare one in a regex literal as the
  * start of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)|<tool_call>\s*(?=[\w.:-]+\s*[({])/gi;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -494,7 +523,16 @@ export function unfinishedCallAt(
       if (end !== -1) from = end;
       continue;
     }
-    const form = CALL_END[!match[0].startsWith('<') ? 'paren' : match[0].includes('\x60') ? 'fencedTag' : 'tag'];
+    const form =
+      CALL_END[
+        /^\[tool\s/i.test(match[0])
+          ? 'bracket'
+          : !match[0].startsWith('<')
+            ? 'paren'
+            : match[0].includes('\x60')
+              ? 'fencedTag'
+              : 'tag'
+      ];
     if (form === CALL_END.tag && text.charAt(open) !== '{') {
       // A name and its JSON inside the tag, read by its structure: see `taggedCallsEnd`.
       const end = taggedCallsEnd(text, match.index, offered);
@@ -509,7 +547,9 @@ export function unfinishedCallAt(
     }
     const close = endOfObject(text, open);
     if (close === -1) {
-      if (writesJson(text, open, { tagged: form !== CALL_END.paren, offered })) return match.index;
+      if (writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered })) {
+        return match.index;
+      }
       continue;
     }
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
@@ -583,6 +623,15 @@ const CALL_SHAPES: readonly {
     fenced: false,
   },
   { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, short: CALL_END.paren.token, fenced: false },
+  // This app's own rendering of a call in a text prompt's history, which a model
+  // copies: see `APP_CALL_OPENING`. Markup whatever its JSON holds, as the
+  // Mistral form is.
+  {
+    open: /\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi,
+    close: /^[\s}\]]*\)\s*\]/,
+    short: CALL_END.bracket.token,
+    fenced: false,
+  },
   { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
 ];
 

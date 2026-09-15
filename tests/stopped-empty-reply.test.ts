@@ -2890,3 +2890,63 @@ describe('a <tool_call> whose body is calls, but not one JSON object', () => {
     expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(words);
   });
 });
+
+const { messageText } = await import('@/ai/prompt');
+
+describe('a follow-up that writes a call as the app writes the call that ran in its history, [tool name({…})]', () => {
+  it('finished: the call runs, and the stored reply keeps none of it and sends none of it back', async () => {
+    const id = 'r4_app_call_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `Reading your notes.\n${CALL}`,
+      'One more file.\n[tool leaky({"path":"canary-7f3a"})]\nReading it now.',
+      'Both read.',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(local.seen[1]!.messages.map(messageText).join('\n'), 'how the follow-up’s history shows the call').toContain(
+      '[tool leaky({})]',
+    );
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.input), 'the calls that ran').toEqual([{}, { path: 'canary-7f3a' }]);
+    expect(ran.content, 'the stored reply').toBe('Reading your notes.\n\nOne more file.\n\nReading it now.\n\nBoth read.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped mid-arguments: keeps the words before it, and sends none of it back', async () => {
+    const id = 'r4_app_call_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Reading your notes.\n${CALL}` },
+      { partial: 'One more file.\n[tool leaky({"path":"canary-7f3a', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'canary-7f3a', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Reading your notes.\nOne more file.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});

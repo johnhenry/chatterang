@@ -11,6 +11,7 @@ import {
   extractTextualToolCalls as extractFrom,
   stripToolSyntax as stripFrom,
 } from '@/ai/middleware/tools';
+import { messageText } from '@/ai/prompt';
 
 /** What a chat with the calculator on offers, as `callNames` gives it. */
 const OFFERED = ['calculator', 'calculate'];
@@ -395,5 +396,50 @@ describe('a <tool_call> whose body is calls, but not one JSON object', () => {
   it('is not cut at a word after a closed object that the text ends on', () => {
     const text = 'It opens <tool_call>{"a": 1} and';
     expect(cut(text, true)).toBe(text);
+  });
+});
+
+describe('a call written as this app writes one in a text prompt’s history: [tool name({…})]', () => {
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+
+  it('is read and stripped, whatever its string arguments hold, as `messageText` writes it', () => {
+    const text = 'Ok.\n[tool calculate({"expression": "(1+2)]"})]\nDone.';
+    expect(extractTextualToolCalls(text).map((call) => [call.name, call.input])).toEqual([
+      ['calculate', { expression: '(1+2)]' }],
+    ]);
+    expect(stripToolSyntax(text)).toBe('Ok.\n\nDone.');
+    const rendered = messageText({
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'call_1', name: 'calculate', input: { expression: '2' } }],
+    });
+    expect(extractTextualToolCalls(rendered).map((call) => call.input), rendered).toEqual([{ expression: '2' }]);
+    expect(stripToolSyntax(rendered), rendered).toBe('');
+  });
+
+  it('is stripped when malformed, or written with a closing bracket too many or too few', () => {
+    expect(stripToolSyntax('Ok [tool calculate({expression: 2})] end')).toBe('Ok  end');
+    expect(stripToolSyntax('Ok [tool calculate({"expression": "2"}})] end')).toBe('Ok  end');
+    expect(stripToolSyntax('Ok [tool calculate({"expression": {"a": "2"})] end')).toBe('Ok  end');
+  });
+
+  it('keeps prose naming the form, and is left alone in a turn that offered nothing and ran nothing', () => {
+    for (const prose of [
+      'The transcript shows a call as [tool name(arguments)], with the arguments as JSON.',
+      'Write [tool calculate({ and then the JSON.',
+    ]) {
+      expect(stripToolSyntax(prose), prose).toBe(prose);
+      expect(cut(prose), prose).toBe(prose);
+      expect(cut(prose, true), `${prose} (stopped)`).toBe(prose);
+    }
+    const call = '[tool calculate({"expression": "2"})]';
+    expect(stripToolSyntax(call, { offered: [] })).toBe(call);
+  });
+
+  it('is cut where it starts when the text ends inside it, or on its opening', () => {
+    expect(cut('Ok.\n[tool calculate({"expression": "one plus')).toBe('Ok.\n');
+    expect(cut('Ok.\n[tool calculate({"expression": "2"})')).toBe('Ok.\n');
+    expect(cut('Ok.\n[tool calculate(', true)).toBe('Ok.\n');
+    expect(cut('Ok.\n[tool calculate(')).toBe('Ok.\n');
+    expect(cut('See the [tool', true), 'a bare opening word').toBe('See the [tool');
   });
 });
