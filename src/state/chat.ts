@@ -1854,7 +1854,16 @@ async function runGeneration(
             const split = splitThinking(raw);
             await putMessage({
               ...placeholder,
-              content: split.content,
+              // With its calls read out as a finished reply's are. Every delta
+              // so far includes the call this receipt is for, and a turn killed
+              // from here on is recovered with these words: Try again kept them
+              // as a version, and flipping back to it sent the call, and the
+              // arguments that went to the server, to the model.
+              content: wordsWithoutCalls(split.content, {
+                readForCalls: chat.tools.length > 0,
+                stopped: false,
+                cutsUnfinished: true,
+              }),
               thinking: split.thinking || undefined,
               toolCalls,
               streaming: true,

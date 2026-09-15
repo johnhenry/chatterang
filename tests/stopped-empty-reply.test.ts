@@ -1750,3 +1750,62 @@ describe('a failed tool turn, tried again and flipped back to', () => {
   });
 });
 
+
+const { SECRET } = await import('./support/egress-probe');
+
+describe('a turn killed after an MCP call left', () => {
+  it('recovers with none of the call as its words, and regenerating and flipping back sends none of it', async () => {
+    const id = 'r1_killed_after_call';
+    const probe = mcpProbe();
+    given(
+      chat(id, {
+        tools: [probe.tool.id],
+        egressGrants: [{ kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 }],
+      }),
+      [user(id, 1, 'hello'), reply(id, 2, 'Hi.')],
+    );
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Filing it.\n${MCP_CALL}` },
+      { stall: gate.promise },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+      const midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true)!);
+      expect(midTurn.content, 'the row written mid-turn').toBe('Filing it.');
+
+      // The app is killed during the follow-up: what is on disk is the row
+      // written mid-turn. The turn is ended here only so the test can go on.
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      fake.messages.set(midTurn.id, structuredClone(midTurn));
+      useChats.setState({ activeChatId: null, messages: [] });
+
+      await useChats.getState().openChat(id);
+      const recovered = useChats.getState().messages.find((message) => message.id === midTurn.id)!;
+      expect(recovered.error).toBe('This reply was interrupted before it finished.');
+      expect(recovered.content, 'the recovered row’s words').toBe('Filing it.');
+
+      await useChats.getState().regenerate(recovered.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      expect(regenerated.variants?.map((variant) => variant.content)).toEqual(['Filing it.', 'Again.']);
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'the call went once').toHaveBeenCalledTimes(1);
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Filing it.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain(SECRET);
+  });
+});
