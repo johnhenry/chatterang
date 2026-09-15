@@ -29,7 +29,80 @@ import { db } from '@/db';
 // tests/layering.test.ts caught — the db owns the shape of its own rows.
 export type { StoredBlob } from '@/db';
 
-export async function putBlob(id: string, data: Blob): Promise<void> {
+/*
+ * ── Other windows ────────────────────────────────────────────────────────
+ *
+ * WHAT A SWEEP CANNOT SEE FROM HERE. The holds below (`holdBlobs`) are this
+ * window's memory. The server profile serves this bundle to ordinary browser
+ * tabs, and every tab of one origin shares one database. So a tab that had just
+ * launched swept away the image a draft in another tab was still showing as a
+ * chip, and the image of a message another tab sent while its sweep was
+ * reading: neither was in the rows it read, and neither hold was in its memory.
+ *
+ * So a sweep runs only in a window that is the only one open. Each window holds
+ * a Web Lock of its own name, under `WINDOW`, for as long as it is open; the
+ * browser lets go of it when the window goes. A window writes no payload until
+ * it holds that lock (`putBlob`). A sweep reads which payloads are on disk
+ * FIRST, then asks which locks are held or asked for, and deletes nothing if
+ * another window's is among them.
+ *
+ * THE ORDER IS WHAT MAKES THAT ENOUGH. Every payload the sweep read was written
+ * before it read, by a window that held its lock before it wrote. So that
+ * window is seen when the sweep asks, unless it has closed, and a window that
+ * has closed writes no row after that: the rows the sweep reads next name
+ * everything it sent. A window that joins after the question writes only
+ * payloads the sweep never read, and it deletes nothing else.
+ *
+ * NOTHING WAITS ON ANOTHER WINDOW. A window's own lock has a name no other
+ * window asks for, so it is granted at once. Joining once waited for a lock
+ * every sweep held exclusively, so no window could join between a sweep's
+ * question and its deletes; a sweep whose database work stalled then left
+ * every other window unable to attach an image, with nothing on screen to say
+ * so, for as long as it stalled.
+ *
+ * Where there are no Web Locks — an origin that is not a secure context — no
+ * other window can be seen, so no sweep runs. A draft let go still deletes its
+ * own payloads (`Composer`).
+ */
+const locks: LockManager | undefined = globalThis.navigator?.locks;
+const WINDOW = 'chatterang:attachment-window:';
+const ownWindow = `${WINDOW}${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}`;
+
+/**
+ * Settles once this window holds its own lock, or once it cannot take one.
+ * Taken as the module loads, so a window is seen from the moment it is open,
+ * whether or not it has written anything yet.
+ */
+const joined: Promise<void> = locks ? join(locks) : Promise.resolve();
+
+function join(manager: LockManager): Promise<void> {
+  return new Promise<void>((settle) => {
+    try {
+      manager
+        .request(ownWindow, () => {
+          settle();
+          // Held until this window goes.
+          return new Promise<never>(() => {});
+        })
+        .catch(() => settle());
+    } catch {
+      settle();
+    }
+  });
+}
+
+/**
+ * Write an attachment's payload.
+ *
+ * `wanted` is asked once this window has joined, in the step the write is made.
+ * A payload let go while the window was still joining — a draft thrown away with
+ * the chat it was being written in — is not written at all, rather than written
+ * and deleted again.
+ */
+export async function putBlob(id: string, data: Blob, wanted: () => boolean = () => true): Promise<void> {
+  // Not before another window's sweep can see this one. See "Other windows".
+  await joined;
+  if (!wanted()) return;
   await db.blobs.put({
     id,
     mediaType: data.type || 'application/octet-stream',
@@ -75,6 +148,91 @@ export async function blobToBase64(id: string): Promise<string | undefined> {
 
 export async function deleteBlobs(ids: readonly string[]): Promise<void> {
   if (ids.length > 0) await db.blobs.bulkDelete([...ids]);
+}
+
+/** How many holds each payload has, by attachment id. See `holdBlobs`. */
+const holds = new Map<string, number>();
+
+/** For each sweep running now, every id held at any moment since it started. See `sweepOrphanBlobs`. */
+const sweeps = new Set<Set<string>>();
+
+/**
+ * Keep payloads from `sweepOrphanBlobs` until the function returned is called.
+ * Calling it twice lets go once.
+ *
+ * A payload is written when its image is ATTACHED, and nothing on disk names it
+ * until the row of the message it is sent in is written. Until then only a hold
+ * says it is wanted: the composer holds a draft's payloads while they are on
+ * screen, and a message row being written holds the payloads it names
+ * (`putMessage` in state/chat.ts) — from the moment `useChats.send` is called,
+ * which is the moment the composer lets go.
+ */
+export function holdBlobs(ids: readonly string[]): () => void {
+  for (const id of ids) {
+    holds.set(id, (holds.get(id) ?? 0) + 1);
+    for (const kept of sweeps) kept.add(id);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const id of ids) {
+      const left = (holds.get(id) ?? 1) - 1;
+      if (left > 0) holds.set(id, left);
+      else holds.delete(id);
+    }
+  };
+}
+
+/**
+ * Delete every payload that no message row names and nothing holds. Run once
+ * the chat list has loaded (`useChats.load`).
+ *
+ * The composer deletes a draft's payloads when the draft lets them go, but not
+ * every draft is let go: the app can be killed with one on screen. And a chat
+ * deleted before its image was sent took only what its rows named. Either way a
+ * payload stayed on the device that nothing named and no screen could show.
+ *
+ * WHAT IS KEPT: a payload a row names in what this read, and one held AT ANY
+ * MOMENT from the start of the sweep until its delete is made — not only one
+ * held when the delete is made. A message sent after the rows were read writes
+ * its row and lets go of its hold before the delete, and its row is not in
+ * what was read. So the sweep is registered before it reads anything, and every
+ * hold taken while it runs is noted against it.
+ *
+ * AND EVERYTHING, WHILE ANOTHER WINDOW IS OPEN. Its holds are not here to be
+ * seen. Nothing is deleted then, nor while a window is joining or another is
+ * sweeping, nor where there are no Web Locks; the next launch of a window that
+ * is alone sweeps. See "Other windows" at the top of this file.
+ *
+ * IN THIS ORDER, and each step only once the one before has answered: the
+ * payloads on disk, then the other windows, then the rows. Payloads read after
+ * the question could be a window's that joined after it; rows read before it
+ * could miss a message a window sent and then closed.
+ *
+ * Every payload in the table is an attachment's (see the top of this file). A
+ * read that fails deletes nothing.
+ */
+export async function sweepOrphanBlobs(): Promise<void> {
+  if (!locks) return;
+  const manager = locks;
+  const kept = new Set(holds.keys());
+  sweeps.add(kept);
+  try {
+    const stored = await db.blobs.toCollection().primaryKeys();
+    const { held = [], pending = [] } = await manager.query();
+    const others = [...held, ...pending].some(
+      ({ name }) => name !== undefined && name.startsWith(WINDOW) && name !== ownWindow,
+    );
+    if (others) return;
+    const named = new Set<string>();
+    await db.messages.each((row) => {
+      for (const attachment of row.attachments ?? []) named.add(attachment.id);
+    });
+    await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
+  } finally {
+    sweeps.delete(kept);
+  }
 }
 
 /** Total bytes held by attachment payloads, for the storage readout. */

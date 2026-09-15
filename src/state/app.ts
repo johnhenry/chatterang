@@ -244,6 +244,83 @@ export async function revokeMcpGrantsFor(serverId: string): Promise<void> {
 }
 
 /**
+ * Tell the chat store a connection, or an MCP server, has been switched on.
+ *
+ * Registered for the reason the hooks above are. At launch the chat store
+ * withdraws every grant on disk that names a connection or server that was
+ * missing or off — left there by a withdrawal the app was killed in — and
+ * counts that withdrawal as under way until its writes have landed, so a yes
+ * given meanwhile to one of those goes with it (`launchWithdrawals` in
+ * state/chat.ts). A person who switched it back on in that time and was then
+ * asked said yes to something that is there, and that yes was withdrawn too.
+ *
+ * The uninstalled defaults do nothing: without the chat store there is no
+ * launch withdrawal to end.
+ */
+let connectionSwitchedOn: (connectionId: string) => void = () => {};
+
+export function installConnectionSwitchedOn(notice: (connectionId: string) => void): void {
+  connectionSwitchedOn = notice;
+}
+
+let mcpServerSwitchedOn: (serverId: string) => void = () => {};
+
+export function installMcpServerSwitchedOn(notice: (serverId: string) => void): void {
+  mcpServerSwitchedOn = notice;
+}
+
+export function noticeMcpServerSwitchedOn(serverId: string): void {
+  mcpServerSwitchedOn(serverId);
+}
+
+/**
+ * Switch a connection, or an MCP server, on ON DISK: `write` is the write that
+ * does it, and it is made here.
+ *
+ * NOT WHILE A GRANT THE LAUNCH READ FROM DISK NAMING IT OFF IS STILL THERE. The
+ * store never holds those grants, but the table does until the launch's write
+ * that drops them lands, and that write can fail — a full disk — or still be
+ * queued, or not be queued yet because the chat list is still being read.
+ * Switched on meanwhile, the connection was on at the next launch, which
+ * honoured the grant: tool output went to it unasked. So the chat store makes
+ * `write` only once the list read beside it has been judged and every one of
+ * those writes has landed, making one that failed again first, in the step it
+ * finds nothing left; and rejects with that write's error when it fails again,
+ * without making `write`, so nothing is switched on (`afterStaleGrantsGo` in
+ * state/chat.ts).
+ *
+ * NOR WHILE THE STORE STILL HOLDS A GRANT NAMING IT, when it is off. A switch-off
+ * whose withdrawal write failed left the grant in the store and on disk, and
+ * switching back on honoured it at once. `isOn` says whether it is on as the
+ * store has it now: a connection already on, switched on again, keeps its
+ * grants.
+ *
+ * The uninstalled defaults make the write: without the chat store there is no
+ * launch, and no grant it read.
+ */
+type SwitchingOn = (id: string, write: () => Promise<void>, isOn: () => boolean) => Promise<void>;
+
+let connectionSwitchingOn: SwitchingOn = (_id, write) => write();
+
+export function installConnectionSwitchingOn(hook: SwitchingOn): void {
+  connectionSwitchingOn = hook;
+}
+
+let mcpServerSwitchingOn: SwitchingOn = (_id, write) => write();
+
+export function installMcpServerSwitchingOn(hook: SwitchingOn): void {
+  mcpServerSwitchingOn = hook;
+}
+
+export function switchMcpServerOn(
+  serverId: string,
+  write: () => Promise<void>,
+  isOn: () => boolean,
+): Promise<void> {
+  return mcpServerSwitchingOn(serverId, write, isOn);
+}
+
+/**
  * What follows disconnecting a connection that was removed or switched off: its
  * grants withdrawn, and the fallback cleared if it was the fallback.
  *
@@ -383,16 +460,37 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async toggleConnection(id, enabled) {
-    const connections = get().connections.map((connection) =>
-      connection.id === id ? { ...connection, enabled } : connection,
-    );
-    const changed = connections.find((connection) => connection.id === id);
+    const listed = () => {
+      const all = get().connections.map((connection) =>
+        connection.id === id ? { ...connection, enabled } : connection,
+      );
+      return { all, changed: all.find((connection) => connection.id === id) };
+    };
+    let { all: connections, changed } = listed();
     if (!changed) return;
 
-    await db.connections.put(changed);
+    if (enabled) {
+      // Switched on only once no grant a launch read from disk naming it off is
+      // left there, nor one a switch-off could not write away, from the list as
+      // it stands then. See `connectionSwitchingOn`.
+      await connectionSwitchingOn(
+        id,
+        async () => {
+          ({ all: connections, changed } = listed());
+          if (changed) await db.connections.put(changed);
+        },
+        () => get().connections.find((connection) => connection.id === id)?.enabled === true,
+      );
+      if (!changed) return;
+    } else {
+      // A switch-off is written as it always was: its withdrawal waits on none
+      // of this, and a turn's held answer is measured against its timing.
+      await db.connections.put(changed);
+    }
     set({ connections });
 
     if (enabled) {
+      connectionSwitchedOn(id);
       await get()
         .engine?.connectProvider(changed)
         .catch((error: unknown) =>

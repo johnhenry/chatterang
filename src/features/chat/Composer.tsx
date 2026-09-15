@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AttachmentImage } from '@/features/chat/AttachmentImage';
 
 import { Icon } from '@/ui/Icon';
-import { putBlob } from '@/lib/blobs';
+import { deleteBlobs, holdBlobs, putBlob } from '@/lib/blobs';
 import { newId, type Attachment } from '@/domain/chat';
 import { useApp } from '@/state/app';
+import { useChats } from '@/state/chat';
 import { useModels, modelsWith } from '@/state/models';
 import { hasFinePointer } from '@/lib/platform';
 import { commandFor, registerCommand } from '@/lib/keys';
@@ -36,6 +37,70 @@ export function Composer({
   const textarea = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const toast = useApp((state) => state.toast);
+
+  /*
+   * EVERY PAYLOAD THIS DRAFT HAS WRITTEN OR IS WRITING, by attachment id, with
+   * the hold that keeps it from the launch sweep (`holdBlobs` in lib/blobs).
+   *
+   * An image's payload is written when it is attached, before any message names
+   * it. So when the draft lets one go — its chip is removed, or this component
+   * unmounts with it unsent, which every switch to another tab does — the draft
+   * deletes it. Nothing else would: no message names it, and deleting a chat
+   * takes only what that chat's messages name. Sending hands it over instead;
+   * see `send`.
+   */
+  const drafted = useRef(new Map<string, () => void>());
+
+  const discard = useCallback((ids: readonly string[]) => {
+    const releases = ids.flatMap((id) => {
+      const release = drafted.current.get(id);
+      drafted.current.delete(id);
+      return release ? [release] : [];
+    });
+    // A delete that fails leaves the payload to the next launch's sweep, which
+    // only a hold would stop.
+    void deleteBlobs(ids)
+      .catch(() => undefined)
+      .finally(() => {
+        for (const release of releases) release();
+      });
+  }, []);
+
+  useEffect(() => {
+    const draft = drafted.current;
+    return () => discard([...draft.keys()]);
+  }, [discard]);
+
+  /*
+   * THROWN AWAY BY THE STORE — text, chips and payloads, in the step it is asked
+   * for — when the chat it is being written in is deleted, or every conversation
+   * is (owner rulings, 2026-09-14; `discardDraft` in state/chat.ts). This
+   * component is not keyed by chat, so the draft carried over into whichever
+   * chat opened next, and its images stayed on the device.
+   *
+   * An image still being written goes like the rest: `addImages` deletes it once
+   * its write lands, and writes nothing if this window had not joined the others
+   * yet. Dictation into the draft is stopped, and whatever it still transcribes
+   * is dropped rather than typed into the next chat.
+   */
+  const draftNumber = useRef(0);
+  const discardDraft = useCallback(() => {
+    draftNumber.current += 1;
+    dictation.current?.stop();
+    dictation.current = null;
+    setDictating(false);
+    discard([...drafted.current.keys()]);
+    setText('');
+    setAttachments([]);
+  }, [discard]);
+
+  useEffect(
+    () =>
+      useChats.subscribe((state, previous) => {
+        if (state.draftDiscards !== previous.draftDiscards) discardDraft();
+      }),
+    [discardDraft],
+  );
 
   /*
    * DICTATION DOES NOT SURVIVE THIS COMPONENT, and neither does its model.
@@ -103,6 +168,14 @@ export function Composer({
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
     onSend(trimmed, attachments);
+    // HANDED OVER, NOT LET GO: these are the message's now, so the draft stops
+    // holding them without deleting them. `useChats.send` writes the row that
+    // names them, and that write holds them from the moment `send` is called,
+    // before this line runs.
+    for (const attachment of attachments) {
+      drafted.current.get(attachment.id)?.();
+      drafted.current.delete(attachment.id);
+    }
     setText('');
     setAttachments([]);
   }, [generating, text, attachments, onSend]);
@@ -135,7 +208,25 @@ export function Composer({
         // is needed to lay it out and label it. A File is already a Blob, so
         // nothing is re-encoded here.
         const id = newId('att');
-        await putBlob(id, file);
+        // Held and noted as this draft's BEFORE it is written, so a sweep that
+        // runs during the write keeps it, and a composer that goes away during
+        // the write deletes it.
+        drafted.current.set(id, holdBlobs([id]));
+        try {
+          // Not written at all if it is let go before this window has joined.
+          await putBlob(id, file, () => drafted.current.has(id));
+        } catch (error) {
+          discard([id]);
+          throw error;
+        }
+        // Let go while it was being written — the composer went away, or the
+        // draft was thrown away — and the delete made then ran before this write
+        // landed. So it is made again, and nothing more is written for a draft
+        // that is gone.
+        if (!drafted.current.has(id)) {
+          await deleteBlobs([id]);
+          return;
+        }
         added.push({ kind: 'image', id, mediaType: file.type, bytes: file.size });
       }
 
@@ -159,23 +250,37 @@ export function Composer({
     }
 
     setDictating(true);
+    // Dictation belongs to the draft it was started in. See `discardDraft`.
+    const started = draftNumber.current;
+    const current = (): boolean => draftNumber.current === started;
     try {
       const session = await ensureSession('stt', speechModel.paths.model, speechModel.paths);
-      dictation.current = await startDictation({
+      if (!current()) return;
+      const handle = await startDictation({
         handle: session.handle,
-        onPartial: (partial) => setText(partial),
+        onPartial: (partial) => {
+          if (current()) setText(partial);
+        },
         onFinal: (final) => {
+          if (!current()) return;
           if (final) setText(final);
           setDictating(false);
           dictation.current = null;
         },
         onError: (message) => {
+          if (!current()) return;
           toast(message, 'crit');
           setDictating(false);
           dictation.current = null;
         },
       });
+      if (!current()) {
+        handle.stop();
+        return;
+      }
+      dictation.current = handle;
     } catch (error) {
+      if (!current()) return;
       toast(error instanceof Error ? error.message : 'Dictation failed to start.', 'crit');
       setDictating(false);
     }
@@ -193,11 +298,12 @@ export function Composer({
                   type="button"
                   className="attachment__remove"
                   aria-label="Remove attachment"
-                  onClick={() =>
+                  onClick={() => {
                     setAttachments((current) =>
                       current.filter((entry) => entry.id !== attachment.id),
-                    )
-                  }
+                    );
+                    discard([attachment.id]);
+                  }}
                 >
                   ×
                 </button>

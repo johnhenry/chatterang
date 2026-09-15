@@ -91,6 +91,9 @@ const fake = vi.hoisted(() => {
       }),
     },
     blobs: {
+      put: vi.fn(async (row: Row) => {
+        blobs.set(row.id, { id: row.id });
+      }),
       get: async (id: string) => {
         const row = blobs.get(id);
         await gate('blobs.get');
@@ -99,11 +102,21 @@ const fake = vi.hoisted(() => {
       bulkDelete: vi.fn(async (ids: string[]) => {
         for (const id of ids) blobs.delete(id);
       }),
+      toCollection: () => ({ primaryKeys: async () => [...blobs.keys()] }),
     },
     models: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
     settings: { get: vi.fn(async () => undefined), put: vi.fn(async () => {}) },
     connections: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+    mcpServers: { toArray: async () => [] },
   };
+  /** Every message row, as a scan of the whole table reads them: its snapshot is taken when it is made. */
+  Object.assign(db.messages, {
+    each: async (callback: (row: Row) => void) => {
+      const snapshot = [...messages.values()].map(clone);
+      await gate('messages.scan');
+      for (const row of snapshot) callback(row);
+    },
+  });
 
   /** The cascade `db/index.ts` runs, attachment payloads included, applied when it is made. */
   const deleteChat = vi.fn(async (chatId: string) => {
@@ -156,6 +169,8 @@ const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { ChatterangEngine } = await import('@/ai/engine');
 const { toolRegistry } = await import('@/ai/tools/registry');
 const { MCP_CALL, mcpProbe, probeResolver, recordingBackend } = await import('./support/egress-probe');
+const { holdBlobs, putBlob, sweepOrphanBlobs } = await import('@/lib/blobs');
+const { anotherWindow, installedLocks } = await import('./support/web-locks');
 
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
@@ -1103,5 +1118,343 @@ describe('loading the chat list', () => {
 
     expect(inStore('listed_gone')).toBe(false);
     expect(inStore('listed_kept')).toBe(true);
+  });
+});
+
+/* ── Attachment payloads ─────────────────────────────────────────────── */
+
+describe('an attachment payload no message names', () => {
+  /*
+   * The composer writes an image's payload as it is attached, before any
+   * message names it, and a chat's delete takes only the payloads its rows
+   * name. So an image attached in a chat deleted before it was sent stayed on
+   * disk, named by nothing: "removed from this device" was not so for it. The
+   * composer now deletes a draft's payload when the draft is dropped
+   * (`tests/composer-drafts.test.tsx`), and each launch deletes the payloads no
+   * message names — except any a draft or a send holds.
+   */
+  const image = (id: string) => ({ kind: 'image' as const, id, mediaType: 'image/png', bytes: 3 });
+
+  it('is gone by the next launch when its chat was deleted before the image was sent', async () => {
+    given(chat('unsent', 1));
+    useChats.setState({ activeChatId: 'unsent' });
+    await putBlob('att_unsent', new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }));
+    expect(fake.blobs.has('att_unsent'), 'the control: attaching wrote it').toBe(true);
+
+    await useChats.getState().removeChat('unsent');
+    await relaunch();
+
+    expect(fake.blobs.has('att_unsent'), 'the next launch').toBe(false);
+  });
+
+  it('is taken at the next launch, and a payload a message names is kept', async () => {
+    given(chat('named', 1));
+    const row: Message = {
+      id: 'named_user',
+      chatId: 'named',
+      role: 'user',
+      content: 'look',
+      attachments: [image('att_named')],
+      createdAt: 1,
+    };
+    fake.messages.set(row.id, structuredClone(row));
+    fake.blobs.set('att_named', { id: 'att_named' });
+    fake.blobs.set('att_loose', { id: 'att_loose' });
+
+    await relaunch();
+
+    expect(fake.blobs.has('att_named'), 'named by a message').toBe(true);
+    expect(fake.blobs.has('att_loose'), 'named by nothing').toBe(false);
+  });
+
+  it('keeps the image of a message sent while the launch’s sweep is reading the threads', async () => {
+    // The sweep reads every row before the message is written, so what it read
+    // names nothing; the image was held by the send from the moment it was
+    // asked for until its row was written.
+    given(chat('sending', 1));
+    useChats.setState({ activeChatId: 'sending' });
+    fake.blobs.set('att_sending', { id: 'att_sending' });
+    script = [{ text: 'A cat.' }];
+    fake.hold('messages.scan');
+
+    const loading = useChats.getState().load();
+    try {
+      await until(() => fake.pending('messages.scan') === 1);
+      await useChats.getState().send('look at this', [image('att_sending')]);
+      expect(
+        (rowsFor('sending') as Message[]).some((row) => row.attachments?.some((entry) => entry.id === 'att_sending')),
+        'the control: its row was written while the sweep read',
+      ).toBe(true);
+    } finally {
+      fake.release('messages.scan');
+    }
+    await loading;
+
+    expect(fake.blobs.has('att_sending'), 'the sent image').toBe(true);
+  });
+
+  it('keeps the image of a message refused while its chat’s delete ran, when the delete fails and writes it back', async () => {
+    given(chat('refused_image', 1));
+    useChats.setState({ activeChatId: 'refused_image' });
+    fake.blobs.set('att_refused', { id: 'att_refused' });
+    script = [{ text: 'A cat.' }];
+    const refusing = held();
+    fake.deleteChat.mockImplementationOnce(async () => {
+      await refusing.promise;
+      throw new Error('The disk is full.');
+    });
+
+    const removing = useChats.getState().removeChat('refused_image');
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      await until(() => fake.deleteChat.mock.calls.length === 1);
+      sending = useChats.getState().send('look at this', [image('att_refused')]);
+      // Refused, and kept to be written if the delete fails. The turn waits behind the delete.
+      await until(() => useChats.getState().messages.some((message) => message.role === 'user'));
+      expect(rowsFor('refused_image'), 'nothing names it on disk').toEqual([]);
+
+      await useChats.getState().load();
+    } finally {
+      refusing.release();
+    }
+    await expect(removing).rejects.toThrow('The disk is full.');
+    await sending;
+
+    const user = (rowsFor('refused_image') as Message[]).find((row) => row.role === 'user');
+    expect(user?.attachments?.map((entry) => entry.id), 'the message is written back').toEqual(['att_refused']);
+    expect(fake.blobs.has('att_refused'), 'with its image').toBe(true);
+  });
+});
+
+describe('a payload whose row is still being written', () => {
+  /*
+   * A row is invisible to a read until its write commits. The fake table above
+   * applies a message row the moment its put is made, so these hold the row back
+   * until the put is let go: the sweep then finds nothing that names the image,
+   * and only the send's hold keeps it.
+   */
+  const image = (id: string) => ({ kind: 'image' as const, id, mediaType: 'image/png', bytes: 3 });
+
+  /** `messages.put` applies a row only once `restore()` is called. */
+  function delayMessagePuts() {
+    const original = fake.db.messages.put.getMockImplementation()!;
+    const waiting: (() => void)[] = [];
+    let open = false;
+    let asked = 0;
+    fake.db.messages.put.mockImplementation(async (row: Row) => {
+      asked += 1;
+      if (!open) await new Promise<void>((resolve) => waiting.push(resolve));
+      fake.messages.set(row.id, structuredClone(row));
+    });
+    return {
+      asked: () => asked,
+      restore: () => {
+        open = true;
+        for (const resolve of waiting.splice(0)) resolve();
+        fake.db.messages.put.mockImplementation(original);
+      },
+    };
+  }
+
+  it('keeps the image of a sent message whose row is being written when the sweep starts', async () => {
+    given(chat('writing', 1));
+    useChats.setState({ activeChatId: 'writing' });
+    fake.blobs.set('att_writing', { id: 'att_writing' });
+    script = [{ text: 'A cat.' }];
+    const puts = delayMessagePuts();
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      sending = useChats.getState().send('look at this', [image('att_writing')]);
+      await until(() => puts.asked() === 1);
+      expect(rowsFor('writing'), 'the control: its row has not landed').toEqual([]);
+
+      await useChats.getState().load();
+
+      expect(fake.blobs.has('att_writing'), 'the image of the row being written').toBe(true);
+    } finally {
+      puts.restore();
+    }
+    await sending;
+  });
+
+  it('keeps an image a draft handed to a send whose row is being written, once the draft has let go', async () => {
+    // What the composer does: hold the payload, hand it to `send`, and let go in
+    // the same step. The send's hold must outlast the draft's.
+    given(chat('handed', 1));
+    useChats.setState({ activeChatId: 'handed' });
+    fake.blobs.set('att_handed', { id: 'att_handed' });
+    script = [{ text: 'A cat.' }];
+    const puts = delayMessagePuts();
+    const letGo = holdBlobs(['att_handed']);
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      sending = useChats.getState().send('look at this', [image('att_handed')]);
+      letGo();
+      await until(() => puts.asked() === 1);
+
+      await useChats.getState().load();
+
+      expect(fake.blobs.has('att_handed'), 'the handed-over image').toBe(true);
+    } finally {
+      puts.restore();
+    }
+    await sending;
+  });
+
+  it('keeps the image of a refused row while it is written back after its chat’s delete failed', async () => {
+    given(chat('back', 1));
+    useChats.setState({ activeChatId: 'back' });
+    fake.blobs.set('att_back', { id: 'att_back' });
+    script = [{ text: 'A cat.' }];
+    const refusing = held();
+    fake.deleteChat.mockImplementationOnce(async () => {
+      await refusing.promise;
+      throw new Error('The disk is full.');
+    });
+
+    const removing = useChats.getState().removeChat('back');
+    const puts = delayMessagePuts();
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      await until(() => fake.deleteChat.mock.calls.length === 1);
+      sending = useChats.getState().send('look at this', [image('att_back')]);
+      await until(() => useChats.getState().messages.some((message) => message.role === 'user'));
+      expect(puts.asked(), 'the control: refused, nothing asked of the table').toBe(0);
+
+      refusing.release();
+      await until(() => puts.asked() >= 1);
+      expect(rowsFor('back'), 'the control: the written-back row has not landed').toEqual([]);
+
+      await useChats.getState().load();
+
+      expect(fake.blobs.has('att_back'), 'the image of the row being written back').toBe(true);
+    } finally {
+      refusing.release();
+      puts.restore();
+    }
+    await expect(removing).rejects.toThrow('The disk is full.');
+    await sending;
+  });
+});
+
+describe('an attachment payload, while another window of the app is open', () => {
+  /*
+   * The server profile serves this bundle to ordinary browser tabs, and every
+   * tab of one origin shares one database. Holds are each window's own memory,
+   * so a launch in a second window swept away what the first was about to
+   * send, or had just sent. A second window here is the same bundle loaded
+   * again (`anotherWindow`): its own module graph and its own locks, over the
+   * same fake table.
+   */
+  const image = (id: string) => ({ kind: 'image' as const, id, mediaType: 'image/png', bytes: 3 });
+  const blobsModule = () => import('@/lib/blobs');
+
+  it('keeps the image of a message this window sends while the other window’s launch sweep is under way', async () => {
+    given(chat('xwin_sending', 1));
+    useChats.setState({ activeChatId: 'xwin_sending' });
+    fake.blobs.set('att_xwin', { id: 'att_xwin' });
+    script = [{ text: 'A cat.' }];
+    const other = await anotherWindow(blobsModule);
+
+    fake.hold('messages.scan');
+    const sweeping = other.loaded.sweepOrphanBlobs();
+    try {
+      // Reading the threads, or already done with deleting nothing.
+      await Promise.race([sweeping, until(() => fake.pending('messages.scan') === 1)]);
+      await useChats.getState().send('look at this', [image('att_xwin')]);
+      expect(
+        (rowsFor('xwin_sending') as Message[]).some((row) => row.attachments?.some((entry) => entry.id === 'att_xwin')),
+        'the control: the sent row names the image on disk',
+      ).toBe(true);
+    } finally {
+      fake.release('messages.scan');
+    }
+    try {
+      await sweeping;
+    } finally {
+      other.close();
+    }
+
+    expect(fake.blobs.has('att_xwin'), 'the sent message’s image').toBe(true);
+  });
+
+  it('takes a payload nothing names at the first launch after the other window has closed', async () => {
+    // The control: kept while the other window is open, not for ever.
+    fake.blobs.set('att_orphan', { id: 'att_orphan' });
+    const other = await anotherWindow(blobsModule);
+    try {
+      await relaunch();
+      expect(fake.blobs.has('att_orphan'), 'while the other window is open').toBe(true);
+    } finally {
+      other.close();
+    }
+
+    await relaunch();
+
+    expect(fake.blobs.has('att_orphan'), 'once it has closed').toBe(false);
+  });
+
+  it('keeps the payload of a window that opens while a sweep is between asking which windows are open and deleting', async () => {
+    // The sweep reads which payloads are on disk, asks which windows hold a lock,
+    // then reads the rows and deletes. A window opened after the question was
+    // not in the answer, and the payload it writes must not be among those the
+    // sweep deletes.
+    fake.blobs.set('att_before', { id: 'att_before' });
+    const locks = installedLocks();
+    locks.holdQueries();
+    const sweeping = sweepOrphanBlobs();
+    let other: Awaited<ReturnType<typeof anotherWindow<typeof import('@/lib/blobs')>>> | null = null;
+    let writing: Promise<void> = Promise.resolve();
+    try {
+      await until(() => locks.pendingQueries() === 1);
+      other = await anotherWindow(blobsModule);
+      writing = other.loaded.putBlob('att_opened', new Blob([new Uint8Array([1])], { type: 'image/png' }));
+      for (let turn = 0; turn < 5; turn += 1) await macrotask();
+    } finally {
+      locks.releaseQueries();
+    }
+    try {
+      await sweeping;
+      await writing;
+    } finally {
+      other?.close();
+    }
+
+    expect(fake.blobs.has('att_before'), 'the control: the sweep ran, and took what nothing named').toBe(false);
+    expect(fake.blobs.has('att_opened'), 'the payload the window that opened wrote').toBe(true);
+  });
+
+  it('deletes nothing while another window has asked for its lock and not yet been granted it', async () => {
+    // A window that has just opened is listed as waiting for its lock before it
+    // holds it. It writes no payload until then, but it is open.
+    fake.blobs.set('att_waiting', { id: 'att_waiting' });
+    const locks = installedLocks();
+    const observer = locks.window();
+    locks.holdGrants();
+    let other: Awaited<ReturnType<typeof anotherWindow<typeof import('@/lib/blobs')>>> | null = null;
+    try {
+      other = await anotherWindow(blobsModule);
+      expect(
+        (await observer.query()).pending!.some((lock) => lock.name?.startsWith('chatterang:attachment-window:')),
+        'the control: the other window is waiting for its lock',
+      ).toBe(true);
+
+      await sweepOrphanBlobs();
+
+      expect(fake.blobs.has('att_waiting')).toBe(true);
+    } finally {
+      locks.releaseGrants();
+      other?.close();
+      locks.close(observer);
+    }
+  });
+
+  it('deletes nothing on an origin with no Web Locks, where no other window can be seen', async () => {
+    fake.blobs.set('att_unseen', { id: 'att_unseen' });
+    const lockless = await anotherWindow(blobsModule, { locks: false });
+
+    await lockless.loaded.sweepOrphanBlobs();
+
+    expect(fake.blobs.has('att_unseen')).toBe(true);
   });
 });

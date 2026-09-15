@@ -8,7 +8,8 @@
 
 import { create } from 'zustand';
 
-import { blobToBase64, deleteBlobs } from '@/lib/blobs';
+import { blobToBase64, deleteBlobs, holdBlobs, sweepOrphanBlobs } from '@/lib/blobs';
+import { onOtherWindows } from '@/lib/other-windows';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
@@ -53,8 +54,10 @@ import {
   unhandledOutcome,
   unhandledWhy,
   type McpCallReceipt,
+  type McpServerConfig,
   type ToolDestination,
 } from '@/domain/mcp';
+import type { ProviderConnection } from '@/ai/providers';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -63,8 +66,12 @@ import {
   type FitResult,
 } from '@/ai/context';
 import {
+  installConnectionSwitchedOn,
+  installConnectionSwitchingOn,
   installEgressRevoker,
   installMcpGrantRevoker,
+  installMcpServerSwitchedOn,
+  installMcpServerSwitchingOn,
   installMcpToolPruner,
   useApp,
 } from '@/state/app';
@@ -179,6 +186,167 @@ const mcpWithdrawals = withdrawals();
 const providerWithdrawals = withdrawals();
 
 /**
+ * The withdrawals `load` has under way, of grants on disk that name a connection
+ * or MCP server that was missing or off, by id: each ends once the writes that
+ * drop those grants have settled, or once that connection or server is switched
+ * on again, whichever is first.
+ *
+ * Under way, a yes given to that id goes with the grants on disk, as one given
+ * while a switch-off is still being written does (`withdrawals`). But a person
+ * can switch the connection or server back on before those writes land, and be
+ * asked: that yes was given to something that is there, and was withdrawn all
+ * the same, and asked for again at the next request. Ending the withdrawal at
+ * the switch is safe because the store never holds the grants read from disk
+ * (see `load`): what it holds for that id after the switch was given after it.
+ */
+const launchWithdrawals = {
+  connections: new Map<string, (() => void)[]>(),
+  servers: new Map<string, (() => void)[]>(),
+};
+
+/** Begin a launch withdrawal of `id`. What it returns ends it; calling that again does nothing. */
+function beginAtLaunch(
+  under: Map<string, (() => void)[]>,
+  kind: ReturnType<typeof withdrawals>,
+  id: string,
+): () => void {
+  const finish = kind.begin(id);
+  let finished = false;
+  const end = (): void => {
+    if (finished) return;
+    finished = true;
+    finish();
+    const rest = (under.get(id) ?? []).filter((entry) => entry !== end);
+    if (rest.length > 0) under.set(id, rest);
+    else under.delete(id);
+  };
+  under.set(id, [...(under.get(id) ?? []), end]);
+  return end;
+}
+
+/** End every launch withdrawal of `id`: it has been switched on. */
+function switchedOn(under: Map<string, (() => void)[]>, id: string): void {
+  for (const end of [...(under.get(id) ?? [])]) end();
+}
+
+/**
+ * The grants `load` read from disk and left out of the store, by chat, from the
+ * moment the write that drops them is queued until it has landed: those naming a
+ * connection or server that was not there as granted, and those withdrawn before
+ * the list had loaded (`beforeTheList`). A write that failed leaves its entry,
+ * marked.
+ *
+ * The store never holds them, so nothing in this session honours them. The table
+ * does until that write lands, and a write can fail — a full disk. A connection
+ * switched on with one still there was on at the next launch, which honoured
+ * the grant, unasked. So switching a connection or server on waits for these,
+ * and makes a failed one again first (`afterStaleGrantsGo`).
+ */
+interface StaleOnDisk {
+  readonly grants: ReadonlySet<EgressGrant>;
+  /** Settles once the write has, however it did. */
+  settled: Promise<void>;
+  failed: boolean;
+  error: unknown;
+}
+
+const staleOnDisk = new Map<string, StaleOnDisk>();
+
+/**
+ * The chat list reads not yet judged: from before `load` makes its reads until it
+ * has queued the writes that drop what it found. A connection read off beside
+ * the list may have grants on disk that nothing has noted yet, so a switch-on
+ * waits for these first (`afterStaleGrantsGo`).
+ */
+const launchReads = new Set<Promise<void>>();
+
+/**
+ * Queue the write that drops `grants`, read from disk by `load`, from one chat:
+ * in the chat's turn, as a function of the chat as it stands when written. It
+ * drops those grant objects and nothing else, so a grant given since is never
+ * touched. The store already holds the chat without them, so it is written even
+ * when there is nothing left to drop. Not activity in the conversation.
+ */
+function writeStaleAway(get: () => ChatState, chatId: string, grants: ReadonlySet<EgressGrant>): Promise<void> {
+  const entry: StaleOnDisk = { grants, settled: Promise.resolve(), failed: false, error: undefined };
+  staleOnDisk.set(chatId, entry);
+  const writing = get().updateChat(chatId, (current) => ({
+    egressGrants: (current.egressGrants ?? []).filter((grant) => !grants.has(grant)),
+    updatedAt: current.updatedAt,
+  }));
+  entry.settled = writing.then(
+    // Written — or nothing to write, which is only once the chat's delete has
+    // landed and taken the row with it.
+    () => {
+      if (staleOnDisk.get(chatId) === entry) staleOnDisk.delete(chatId);
+    },
+    (error: unknown) => {
+      entry.failed = true;
+      entry.error = error;
+    },
+  );
+  return writing;
+}
+
+/**
+ * Make `write` — the write that switches a connection or MCP server on, on disk
+ * — once no grant `load` read from disk that `names` matches is left there, in
+ * the step it finds none. See `connectionSwitchingOn` in state/app.ts.
+ *
+ * Waits for a chat list still being judged, then for each write dropping such a
+ * grant. One that failed is made again, once; when that fails too this rejects
+ * with its error and `write` is not made, so the connection or server stays off
+ * and the next launch withdraws the grant again. FAILS CLOSED: a switch-on
+ * waits as long as those writes do.
+ *
+ * And, while it is off (`isOn`), until no chat in the store holds a grant `names`
+ * matches: `withdraw` is made once first, and when it rejects so does this,
+ * without making `write`. A switch-off drops every such grant, and sets the
+ * store only once its put has landed, so one still held is one whose put failed
+ * — or has not landed yet, which `withdraw` waits for in the chat's turn.
+ * Switched on with it there, it was honoured at once, and on disk at the next
+ * launch.
+ */
+async function afterStaleGrantsGo(
+  names: (grant: EgressGrant) => boolean,
+  isOn: () => boolean,
+  withdraw: () => Promise<void>,
+  write: () => Promise<void>,
+): Promise<void> {
+  let madeAgain = false;
+  let withdrawnAgain = false;
+  for (;;) {
+    if (launchReads.size > 0) {
+      await Promise.all(launchReads);
+      continue;
+    }
+    const left = [...staleOnDisk].filter(([, entry]) => [...entry.grants].some(names));
+    if (left.length === 0) {
+      if (
+        !withdrawnAgain &&
+        !isOn() &&
+        useChats.getState().chats.some((chat) => (chat.egressGrants ?? []).some(names))
+      ) {
+        withdrawnAgain = true;
+        await withdraw();
+        continue;
+      }
+      return write();
+    }
+    const underWay = left.filter(([, entry]) => !entry.failed);
+    if (underWay.length > 0) {
+      await Promise.all(underWay.map(([, entry]) => entry.settled));
+      continue;
+    }
+    if (madeAgain) throw left[0]![1].error;
+    madeAgain = true;
+    for (const [chatId, entry] of left) {
+      void writeStaleAway(() => useChats.getState(), chatId, entry.grants).catch(() => {});
+    }
+  }
+}
+
+/**
  * A change to one chat: the fields to set, or a function of the chat AS IT
  * STANDS WHEN THE CHANGE IS WRITTEN that returns them — or `null`, for none.
  *
@@ -259,6 +427,20 @@ const removedChats = new Set<string>();
  */
 const refusedRows = new Map<string, Map<string, Message>>();
 
+/**
+ * The holds on the attachment payloads of the rows in `refusedRows`, by chat,
+ * present exactly as long as that chat's entry there. A refused row is in no
+ * table the launch sweep reads, and is written after all if the delete fails,
+ * so what it names is kept until the delete has settled. See `holdBlobs`.
+ */
+const refusedHolds = new Map<string, (() => void)[]>();
+
+/** Let go of what `refusedHolds` holds for a chat whose delete has settled. */
+function releaseRefused(chatId: string): void {
+  for (const release of refusedHolds.get(chatId) ?? []) release();
+  refusedHolds.delete(chatId);
+}
+
 /** A turn that has been claimed, with the chat it runs in and what stops it. */
 interface LiveTurn {
   readonly chatId: string;
@@ -330,24 +512,35 @@ function releaseTurn(set: (partial: Partial<ChatState>) => void, turn: LiveTurn)
  * composer writes an image's payload when it is attached, and the delete takes
  * only the payloads the rows it found name. So those go too — once the delete
  * has landed, and only if it did: a chat whose delete failed may still show
- * them.
+ * them. Until the delete has settled they are held (`refusedHolds`).
+ *
+ * A row being written holds the payloads it names until it is written, because
+ * until then nothing on disk names them and the launch sweep would take them
+ * (`sweepOrphanBlobs`). The hold is taken in the step `send` is called in, which
+ * is the step the composer lets go of them in.
  */
 async function putMessage(message: Message): Promise<void> {
+  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
   // Asked in the same step the put is made. A delete asked for after this makes
   // its own write after the put, and the table applies them in that order, so
   // it takes the row with it; one asked for before is seen here.
   if (!removedChats.has(message.chatId)) {
-    await db.messages.put(message);
+    const release = holdBlobs(payloads);
+    try {
+      await db.messages.put(message);
+    } finally {
+      release();
+    }
     return;
   }
   const refused = refusedRows.get(message.chatId);
   if (refused) {
     refused.set(message.id, message);
+    refusedHolds.get(message.chatId)?.push(holdBlobs(payloads));
     return;
   }
   // The delete has landed: nothing will write this row, and nothing else names
   // its payloads.
-  const payloads = (message.attachments ?? []).map((attachment) => attachment.id);
   if (payloads.length === 0) return;
   await writeInTurn(message.chatId, async () => {
     if (removedChats.has(message.chatId)) await deleteBlobs(payloads);
@@ -397,6 +590,41 @@ function withdrawnBeforeTheList(chat: Chat): Chat | null {
   return { ...chat, egressGrants, tools };
 }
 
+/**
+ * Which grants read from disk still name somewhere to send to, and the ids of
+ * the connections and servers whose grants are withdrawn outright.
+ *
+ * A withdrawal — removing a connection or an MCP server, or switching one off —
+ * writes each chat that holds a grant for it, one after another. An app killed
+ * part-way left the rest on disk, and loaded back they came on again with the
+ * connection or server, unasked. So a grant stands only while what it names is
+ * there as it was granted: a connection that exists and is on, or an MCP server
+ * that exists, is on, and is at the address the grant names. Judged through
+ * `holdsGrant`, so each kind answers for its own key only, against the
+ * connections and servers read from disk beside the chat list.
+ *
+ * A server at a new address is not withdrawn outright: a grant for where it is
+ * now stands, and one given while the old address's goes is kept.
+ */
+function grantsThatStand(
+  connections: readonly ProviderConnection[],
+  servers: readonly McpServerConfig[],
+  chats: readonly Chat[],
+): { stands: (grant: EgressGrant) => boolean; connections: Set<string>; servers: Set<string> } {
+  const on = connections.filter((connection) => connection.enabled);
+  const up = servers.filter((server) => server.enabled);
+  const stands = (grant: EgressGrant): boolean =>
+    on.some((connection) => holdsGrant([grant], { kind: 'provider', connectionId: connection.id })) ||
+    up.some((server) => holdsGrant([grant], { kind: 'mcp', serverId: server.id, url: server.url }));
+  const gone = { connections: new Set<string>(), servers: new Set<string>() };
+  for (const grant of chats.flatMap((chat) => chat.egressGrants ?? [])) {
+    if (stands(grant)) continue;
+    if (grant.kind !== 'mcp') gone.connections.add(grant.connectionId);
+    else if (!up.some((server) => server.id === grant.serverId)) gone.servers.add(grant.serverId);
+  }
+  return { stands, ...gone };
+}
+
 /** The error an interrupted turn is recovered with. */
 const INTERRUPTED = 'This reply was interrupted before it finished.';
 
@@ -427,11 +655,30 @@ interface ChatState {
    * aborts every claimed turn, and a chat's delete every one in that chat.
    */
   controller: AbortController | null;
+  /**
+   * How many times the store has thrown away the draft in the composer. The
+   * composer discards its text and images in the step this changes. See
+   * `discardDraft`.
+   */
+  draftDiscards: number;
+  /**
+   * Chats whose delete has been asked for and has not settled, by id. The chat
+   * screen takes no draft in the open chat while it is one of these. See
+   * `removeChat`.
+   */
+  deleting: string[];
 
   load: () => Promise<void>;
   openChat: (chatId: string) => Promise<void>;
   newChat: (options?: { mode?: ChatMode; personaId?: string | null }) => Promise<string>;
   removeChat: (chatId: string) => Promise<void>;
+  /**
+   * Throw away the draft in the composer: its text, and every image attached to
+   * it, whose payloads the composer deletes in the same step. Owner rulings of
+   * 2026-09-14: deleting the chat a draft is being written in throws it away
+   * (`removeChat`), and so does Settings' delete of every conversation.
+   */
+  discardDraft: () => void;
   renameChat: (chatId: string, title: string) => Promise<void>;
   togglePin: (chatId: string) => Promise<void>;
   /**
@@ -476,38 +723,103 @@ export const useChats = create<ChatState>((set, get) => ({
   generating: false,
   context: null,
   controller: null,
+  draftDiscards: 0,
+  deleting: [],
 
   async load() {
-    const stored = await db.chats.orderBy('updatedAt').reverse().toArray();
-    // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
-    // the engine is, before this read lands, and ⌘N there starts a chat. A read
-    // taken before that chat was written replaced the store without it, and the
-    // screen was left on a thread nothing could be sent to. What the store holds
-    // was written to the table before it was set, so it is never older than the
-    // read; a chat being deleted is left out, or the read would bring it back.
-    const held = get().chats;
-    const known = new Set(held.map((chat) => chat.id));
-    const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
-    // Without what was withdrawn before this could see it, in the store from
-    // the first moment it holds these chats. See `beforeTheList`.
-    const stripped = unseen.map(withdrawnBeforeTheList);
-    beforeTheList.connections.clear();
-    beforeTheList.servers.clear();
-    beforeTheList.toolPrefixes.clear();
-    set({ loaded: true, chats: sortChats([...held, ...unseen.map((chat, at) => stripped[at] ?? chat)]) });
-    // And on disk, in each chat's turn.
-    await Promise.all(
-      stripped.flatMap((chat) =>
-        chat
-          ? [
-              writeInTurn(chat.id, async () => {
-                const current = get().chats.find((entry) => entry.id === chat.id);
-                if (current) await db.chats.put(current);
-              }),
-            ]
-          : [],
-      ),
-    );
+    // Noted BEFORE the reads are made, and until what they found has been
+    // queued to be written: a connection switched on meanwhile waits, since it
+    // may have been read off beside the list. See `launchReads`.
+    let judged = (): void => {};
+    const judging = new Promise<void>((resolve) => (judged = resolve));
+    launchReads.add(judging);
+    let rewritten: Promise<void>[] = [];
+    let withdrawn: Promise<void> = Promise.resolve();
+    try {
+      const [stored, connections, servers] = await Promise.all([
+        db.chats.orderBy('updatedAt').reverse().toArray(),
+        // Read beside the list, so its grants are judged against what was on disk
+        // with them. See `grantsThatStand`.
+        db.connections.toArray(),
+        db.mcpServers.toArray(),
+      ]);
+      // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
+      // the engine is, before this read lands, and ⌘N there starts a chat. A read
+      // taken before that chat was written replaced the store without it, and the
+      // screen was left on a thread nothing could be sent to. What the store holds
+      // was written to the table before it was set, so it is never older than the
+      // read; a chat being deleted is left out, or the read would bring it back.
+      const held = get().chats;
+      const known = new Set(held.map((chat) => chat.id));
+      const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
+      // Without what was withdrawn before this could see it, in the store from
+      // the first moment it holds these chats. See `beforeTheList`.
+      const stripped = unseen.map(withdrawnBeforeTheList);
+      beforeTheList.connections.clear();
+      beforeTheList.servers.clear();
+      beforeTheList.toolPrefixes.clear();
+      // Grants on disk naming a connection or server that is not there as it was
+      // granted, as read. Counted as being withdrawn before the store holds the
+      // chats, as a revocation counts before it reads, so a yes given to one of
+      // those destinations while they go goes with them — until it is switched on
+      // again. See `grantsThatStand` and `launchWithdrawals`.
+      const standing = grantsThatStand(connections, servers, unseen);
+      const stale = new Set(
+        unseen.flatMap((chat) => (chat.egressGrants ?? []).filter((grant) => !standing.stands(grant))),
+      );
+      const finishes = [
+        ...[...standing.connections].map((id) => beginAtLaunch(launchWithdrawals.connections, providerWithdrawals, id)),
+        ...[...standing.servers].map((id) => beginAtLaunch(launchWithdrawals.servers, mcpWithdrawals, id)),
+      ];
+      // NOR DOES THE STORE EVER HOLD THEM. Held until their write landed, a grant
+      // whose connection was switched back on meanwhile was honoured once the
+      // switch had ended the withdrawal. Only the grants read are left out: a
+      // grant given since is another object.
+      const withoutStale = (chat: Chat): Chat => {
+        const grants = chat.egressGrants ?? [];
+        const egressGrants = grants.filter((grant) => !stale.has(grant));
+        return egressGrants.length === grants.length ? chat : { ...chat, egressGrants };
+      };
+      const inStore = unseen.map((chat, at) => withoutStale(stripped[at] ?? chat));
+      set({ loaded: true, chats: sortChats([...held, ...inStore]) });
+      // And on disk, queued in the step the store took the chats, and noted until
+      // each has landed: a connection or server is not switched on while one
+      // naming it is still to land, and one that failed is made again first. See
+      // `writeStaleAway` and `afterStaleGrantsGo`.
+      //
+      // EVERY GRANT THE STORE LEFT OUT, those withdrawn before the list included.
+      // Those name somewhere that was there as read, so they are not stale, and
+      // were once written by a put nothing noted. A switch-on did not wait for it,
+      // and when it failed — a full disk — or was still under way, the connection
+      // was on on disk beside the grant, and the next launch honoured it.
+      const writes = unseen.flatMap((chat, at) => {
+        const kept = inStore[at];
+        if (kept === undefined || kept === chat) return [];
+        const holds = new Set(kept.egressGrants ?? []);
+        const dropped = new Set((chat.egressGrants ?? []).filter((grant) => !holds.has(grant)));
+        return [
+          {
+            stale: (chat.egressGrants ?? []).some((grant) => stale.has(grant)),
+            writing: writeStaleAway(get, chat.id, dropped),
+          },
+        ];
+      });
+      rewritten = writes.flatMap(({ stale: withdrawing, writing }) => (withdrawing ? [] : [writing]));
+      // The withdrawals end once EVERY write of a stale grant has settled. Ended
+      // at the first that failed, a yes given to a connection still off, in a
+      // chat whose write was still queued, was kept.
+      withdrawn = Promise.allSettled(
+        writes.flatMap(({ stale: withdrawing, writing }) => (withdrawing ? [writing] : [])),
+      ).then((settled) => {
+        for (const finish of finishes) finish();
+        for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
+      });
+    } finally {
+      launchReads.delete(judging);
+      judged();
+    }
+    // And the attachment payloads no message names. See `sweepOrphanBlobs`.
+    await Promise.all([...rewritten, withdrawn, sweepOrphanBlobs()]);
   },
 
   async openChat(chatId) {
@@ -613,6 +925,10 @@ export const useChats = create<ChatState>((set, get) => ({
     return chat.id;
   },
 
+  discardDraft() {
+    set({ draftDiscards: get().draftDiscards + 1 });
+  },
+
   removeChat(chatId) {
     // IN THE CHAT'S TURN, like every other write to it. Run straight away, the
     // delete was under way while a write queued behind another one ran, found
@@ -626,33 +942,76 @@ export const useChats = create<ChatState>((set, get) => ({
     // has just deleted.
     removedChats.add(chatId);
     if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
+    if (!refusedHolds.has(chatId)) refusedHolds.set(chatId, []);
     for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
+    if (!get().deleting.includes(chatId)) set({ deleting: [...get().deleting, chatId] });
+    // AND THE DRAFT BEING WRITTEN IN IT, NOW, when it is the chat open: its text,
+    // its images, and their payloads (owner ruling, 2026-09-14). Left in the
+    // composer, it carried over into whichever chat opened next, and its images
+    // stayed on the device until they were sent, removed, or swept at the next
+    // launch. Deleting another chat leaves the draft alone.
+    //
+    // NOT BROUGHT BACK IF THE DELETE FAILS, unlike the rows refused while it ran,
+    // which are written back below. Those are the conversation, which is still
+    // there, and some record what nothing can record again. The draft is what
+    // the person was about to send in a conversation they asked to delete, and
+    // its payloads went at once; bringing them back would mean keeping them until
+    // the delete had settled. So it fails closed.
+    //
+    // A SEND ALREADY MADE IS NOT THE DRAFT. Sending hands the draft's images to
+    // the message and the composer lets go of them: they are refused with its row
+    // while this runs, then taken or written back with it (`putMessage`), never
+    // left named by a row after being deleted.
+    //
+    // ANOTHER WINDOW'S DRAFT IS ITS OWN. Each tab the server profile serves has a
+    // store and a composer of its own, and nothing tells one what another has
+    // deleted. A draft there keeps its text and images: no row names them, so
+    // this delete does not take them, and that window's lock keeps them from any
+    // sweep (lib/blobs.ts).
+    if (get().activeChatId === chatId) get().discardDraft();
+    //
+    // AND NOTHING REACHES THE DRAFT UNTIL THE DELETE HAS SETTLED. The chat stays
+    // open until then, which can wait behind an earlier write to it, and text,
+    // an image or dictation added meanwhile carried over into the chat opened
+    // next. The chat screen takes no draft while the open chat is in `deleting`,
+    // and what reached the draft anyway is discarded again as the delete lands.
     return writeInTurn(chatId, async () => {
       try {
-        await deleteChat(chatId);
-      } catch (error) {
-        // The chat is still there, and so is what the thread on screen shows:
-        // the rows refused while this ran are written. Each put is MADE before
-        // the mark comes off, so a write to the chat made after that is applied
-        // after it, and wins.
-        const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+        try {
+          await deleteChat(chatId);
+        } catch (error) {
+          // The chat is still there, and so is what the thread on screen shows:
+          // the rows refused while this ran are written. Each put is MADE before
+          // the mark comes off, so a write to the chat made after that is applied
+          // after it, and wins.
+          const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+          refusedRows.delete(chatId);
+          const writing = refused.map((message) => db.messages.put(message));
+          removedChats.delete(chatId);
+          await Promise.allSettled(writing);
+          releaseRefused(chatId);
+          throw error;
+        }
+        // Landed. The rows refused meanwhile are never written, and their payloads
+        // are named by nothing else.
+        const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
+          (message.attachments ?? []).map((attachment) => attachment.id),
+        );
         refusedRows.delete(chatId);
-        const writing = refused.map((message) => db.messages.put(message));
-        removedChats.delete(chatId);
-        await Promise.allSettled(writing);
-        throw error;
+        try {
+          if (payloads.length > 0) await deleteBlobs(payloads);
+        } finally {
+          releaseRefused(chatId);
+        }
+        // In the step before the next chat is opened.
+        if (get().activeChatId === chatId) get().discardDraft();
+        set({
+          chats: get().chats.filter((chat) => chat.id !== chatId),
+          ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+        });
+      } finally {
+        set({ deleting: get().deleting.filter((id) => id !== chatId) });
       }
-      // Landed. The rows refused meanwhile are never written, and their payloads
-      // are named by nothing else.
-      const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
-        (message.attachments ?? []).map((attachment) => attachment.id),
-      );
-      refusedRows.delete(chatId);
-      if (payloads.length > 0) await deleteBlobs(payloads);
-      set({
-        chats: get().chats.filter((chat) => chat.id !== chatId),
-        ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
-      });
     });
   },
 
@@ -672,7 +1031,10 @@ export const useChats = create<ChatState>((set, get) => ({
       if (!chat) return;
       const changes = typeof patch === 'function' ? patch(chat) : patch;
       if (!changes) return;
-      const updated = { ...chat, ...changes, updatedAt: Date.now() };
+      // A change is activity in the conversation unless it carries `updatedAt`
+      // itself, as the launch's withdrawal of grants that name nowhere does:
+      // that is not something the person did in it, and must not reorder the list.
+      const updated = { ...chat, updatedAt: Date.now(), ...changes };
       await db.chats.put(updated);
       set({
         chats: sortChats(get().chats.map((entry) => (entry.id === chatId ? updated : entry))),
@@ -2024,6 +2386,32 @@ installEgressRevoker(async (connectionId) => {
 installMcpGrantRevoker(async (serverId) => {
   await useChats.getState().revokeMcpEgress(serverId);
 });
+
+// A connection or MCP server switched on again ends the launch's withdrawal of
+// the grants on disk that named it. See `launchWithdrawals`.
+installConnectionSwitchedOn((connectionId) => switchedOn(launchWithdrawals.connections, connectionId));
+installMcpServerSwitchedOn((serverId) => switchedOn(launchWithdrawals.servers, serverId));
+installConnectionSwitchingOn((connectionId, write, isOn) =>
+  afterStaleGrantsGo(
+    (grant) => grant.kind !== 'mcp' && grant.connectionId === connectionId,
+    isOn,
+    () => useChats.getState().revokeEgress(connectionId),
+    write,
+  ),
+);
+installMcpServerSwitchingOn((serverId, write, isOn) =>
+  afterStaleGrantsGo(
+    (grant) => grant.kind === 'mcp' && grant.serverId === serverId,
+    isOn,
+    () => useChats.getState().revokeMcpEgress(serverId),
+    write,
+  ),
+);
+
+// Another tab of the server profile deleted every conversation, and with them the
+// payloads of the images this draft shows (owner ruling, 2026-09-14). See
+// lib/other-windows.ts.
+onOtherWindows('conversations-cleared', () => useChats.getState().discardDraft());
 
 // Registered at module load for the same reason. An MCP tool id is
 // `mcp:<server name>.<tool>` (src/ai/mcp/tools.ts), so a server's tools are
