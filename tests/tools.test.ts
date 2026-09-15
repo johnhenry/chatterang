@@ -216,6 +216,13 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax('Ok <tool_call></tool_call> [TOOL_CALLS] now() end')).toBe('Ok   end');
   });
 
+  it('strips a call written with a closing bracket too many, in each tag form', () => {
+    expect(stripToolSyntax('Look.\n<tool_call>{"name": "calculate", "arguments": {"expression": "1"}}}</tool_call>')).toBe('Look.');
+    expect(stripToolSyntax('Look. [TOOL_CALLS] calculate({"expression": "1"}}) Done.')).toBe('Look.  Done.');
+    const prose = 'Close it with `}` and then `</tool_call>`: <tool_call>{"a": 1} is how it opens.';
+    expect(stripToolSyntax(prose)).toBe(prose);
+  });
+
   it('leaves an unfinished call alone, for the caller to cut', () => {
     const text = 'Reading.\n<tool_call>{"name":"leaky","arguments":{"path":"x';
     expect(stripToolSyntax(text)).toBe(text);

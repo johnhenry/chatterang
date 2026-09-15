@@ -1494,7 +1494,9 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
     const open = match.index + match[0].length;
     const close = endOfObject(text, open);
     if (close === -1) return match.index;
-    const rest = text.slice(close).trimStart().toLowerCase();
+    // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
+    // a call with a brace too many, stopped before its closing tag.
+    const rest = text.slice(close).replace(/^[\s}\]]*/, '').toLowerCase();
     const end = match[0].startsWith('<') ? '</tool_call>' : ')';
     if (end.startsWith(rest)) return match.index;
     from = close;

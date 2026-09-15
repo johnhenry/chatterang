@@ -2067,3 +2067,70 @@ describe('a tool round whose reasoning was left open', () => {
     expect(stopped.thinking, 'the reasoning').toContain('I should read the notes first.');
   });
 });
+
+/* ── Round 2: a call with one closing bracket too many ──────────────── */
+
+describe('a call written with one closing brace too many', () => {
+  const CASES = [
+    ['a <tool_call>', 'Let me look.\n<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}}}</tool_call>'],
+    ['a [TOOL_CALLS] call', 'Let me look. [TOOL_CALLS] leaky({"path": "canary-7f3a"}})'],
+  ] as const;
+
+  for (const [form, text] of CASES) {
+    it(`in ${form} after words: a finished reply stores and sends back none of it`, async () => {
+      const id = `r2_extra_brace_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
+      expect(stored.content, 'the stored reply').toBe('Let me look.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('that was all a finished reply wrote: stores and sends back none of it', async () => {
+    const id = 'r2_extra_brace_only';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}}}</tool_call>', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped before its closing tag: keeps only the words before it', async () => {
+    const id = 'r2_extra_brace_stopped';
+    const partial = 'Let me look.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}}</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me look.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});

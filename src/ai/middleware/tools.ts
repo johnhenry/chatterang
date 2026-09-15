@@ -292,14 +292,19 @@ export function endOfJson(text: string, start: number): number {
  * a body that does not parse is a malformed call, which runs nothing and is
  * still the model's plumbing. A fenced block is markup only when it reads as a
  * call, because any other is a code example.
+ *
+ * A tag or paren's close may come after stray closing brackets: a small model's
+ * commonest malformed call has one brace too many, `{"name": …, "arguments":
+ * {…}}}`, and its JSON closed a brace early and was not followed by the tag, so
+ * the call and its arguments were kept as the reply's words and sent back.
  */
 const CALL_SHAPES: readonly {
   readonly open: RegExp;
   readonly close: RegExp;
   readonly fenced: boolean;
 }[] = [
-  { open: /<tool_call>\s*(?=[{[])/gi, close: /^\s*<\/tool_call>/i, fenced: false },
-  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^\s*\)/, fenced: false },
+  { open: /<tool_call>\s*(?=[{[])/gi, close: /^[\s}\]]*<\/tool_call>/i, fenced: false },
+  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, fenced: false },
   { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
 ];
 
