@@ -1423,7 +1423,8 @@ function carriesReceipt(variant: MessageVariant): boolean {
  * there may be a call begun; that it may also be a marker named in prose is
  * the accepted limit.
  */
-const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$/i;
+const CALL_MARKER_AT_END =
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
@@ -1433,17 +1434,21 @@ const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\
  * the stopped pattern above cut "Mistral models put every call after the
  * special token [TOOL_CALLS]" to "... the special token".
  */
-const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/i;
+const CALL_OPENED_AT_END = /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
  * a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and a
  * `{`. The match ends where the arguments' `{` starts.
  *
- * The quote is spelled `\x22`: the source scans in tests/support/source-scan.ts
- * read a bare one in a regex literal as the start of a string.
+ * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the same
+ * `{"`. Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`.
+ *
+ * The quote is spelled `\x22`, and a fence's backtick `\x60`: the source scans
+ * in tests/support/source-scan.ts read a bare one in a regex literal as the
+ * start of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -1503,8 +1508,10 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
     if (close === -1) return match.index;
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
     // a call with a brace too many, stopped before its closing tag.
-    const rest = text.slice(close).replace(/^[\s}\]]*/, '').toLowerCase();
-    const end = match[0].startsWith('<') ? '</tool_call>' : ')';
+    // Compared with no whitespace: a fenced call's end is a fence, a line break
+    // and `</tool_call>`, and none of a call's closing tokens holds a space.
+    const rest = text.slice(close).replace(/^[\s}\]]*/, '').replace(/\s+/g, '').toLowerCase();
+    const end = !match[0].startsWith('<') ? ')' : match[0].includes('\x60') ? '\x60\x60\x60</tool_call>' : '</tool_call>';
     if (end.startsWith(rest)) return match.index;
     from = close;
   }

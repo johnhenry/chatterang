@@ -236,6 +236,13 @@ describe('stripToolSyntax', () => {
     );
   });
 
+  it('strips a fenced call wrapped in <tool_call> tags whole, in one pass', () => {
+    const wrapped = 'Checking.\n<tool_call>\n```json\n{"name":"calculate","arguments":{"expression":"2+2"}}\n```\n</tool_call>\nDone.';
+    expect(stripToolSyntax(wrapped)).toBe('Checking.\n\nDone.');
+    const malformed = 'Checking.\n<tool_call>\n```json\n{"name":"calculate","arguments":{"expression":"2+2",}}\n```\n</tool_call>';
+    expect(stripToolSyntax(malformed), 'markup whatever its JSON holds').toBe('Checking.');
+  });
+
   it('leaves an unfinished call alone, for the caller to cut', () => {
     const text = 'Reading.\n<tool_call>{"name":"leaky","arguments":{"path":"x';
     expect(stripToolSyntax(text)).toBe(text);

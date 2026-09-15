@@ -304,6 +304,9 @@ const CALL_SHAPES: readonly {
   readonly fenced: boolean;
 }[] = [
   { open: /<tool_call>\s*(?=[{[])/gi, close: /^[\s}\]]*<\/tool_call>/i, fenced: false },
+  // The tag around a fenced block: markup whatever the JSON holds, as the tag
+  // form is. Stripping only the fenced call inside left `<tool_call>\n\n</tool_call>`.
+  { open: /<tool_call>\s*```(?:json|tool)?\s*(?=[{[])/gi, close: /^[\s}\]]*```\s*<\/tool_call>/i, fenced: false },
   { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, fenced: false },
   { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
 ];

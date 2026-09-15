@@ -2191,3 +2191,146 @@ describe('a Qwen3-Coder <tool_call> with an XML body', () => {
     expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
   });
 });
+
+/* ── Round 2: a fenced call wrapped in <tool_call> tags ─────────────── */
+
+describe('a tool call written as a fenced block inside <tool_call> tags', () => {
+  const WRAPPED =
+    'Checking.\n<tool_call>\n```json\n{"name":"leaky","arguments":{"path":"canary-7f3a"}}\n```\n</tool_call>';
+
+  it('leaves none of its tags in a failed follow-up’s words, tried again and flipped back to', async () => {
+    const id = 'r2_wrapped_failed';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: WRAPPED },
+      { fail: 'the model crashed' },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      const failed = assistantRows(id).at(-1)!;
+      expect(failed.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(failed.error, 'the turn failed').toBe('the model crashed');
+      expect(failed.content, 'the failed row’s words').toBe('Checking.');
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Checking.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain('canary-7f3a');
+  });
+
+  it('leaves none of its tags in a stopped follow-up’s words, nor in the next request', async () => {
+    const id = 'r2_wrapped_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ reply: WRAPPED }, { partial: 'Found your', stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'Found your', gate.release);
+      const stopped = assistantRows(id).at(-1)!;
+      expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(stopped.content, 'the stored reply').toBe('Checking.\nFound your');
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('is cut from a finished reply cut off as its JSON opened', async () => {
+    const id = 'r2_wrapped_finished_opened';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['Checking.\n<tool_call>\n```json\n{']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+  });
+
+  it('is cut from a turn stopped as its fence opened', async () => {
+    const id = 'r2_wrapped_fence_opened';
+    const partial = 'Checking.\n<tool_call>\n```json\n';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '```json', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+  });
+
+  it('is cut from a turn stopped inside it', async () => {
+    const id = 'r2_wrapped_unfinished';
+    const partial = 'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a fenced call wrapped in <tool_call> tags, stopped before its closing tag', () => {
+  it('keeps only the words before it, and sends none of it back', async () => {
+    const id = 'r2_wrapped_closing_tag';
+    const partial =
+      'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n```\n</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a fenced call wrapped in <tool_call> tags, stopped on its closing fence', () => {
+  it('keeps only the words before it, and sends none of it back', async () => {
+    const id = 'r2_wrapped_closing_fence';
+    const partial = 'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n``';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '}}\n``', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
