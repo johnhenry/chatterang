@@ -185,28 +185,8 @@ export function extractTextualToolCalls(text: string): ToolUseContent[] {
   for (const match of text.matchAll(/```(?:json|tool)?\s*(\{[\s\S]*?\})\s*```/gi)) {
     const body = match[1];
     if (!body) continue;
-    try {
-      const parsed = JSON.parse(body) as {
-        tool?: string;
-        name?: string;
-        function?: string;
-        arguments?: unknown;
-        parameters?: unknown;
-        input?: unknown;
-      };
-      const name = parsed.tool ?? parsed.name ?? parsed.function;
-      if (typeof name === 'string') {
-        const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
-        calls.push({
-          type: 'tool_use',
-          id: `text_call_${index++}`,
-          name,
-          input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown>,
-        });
-      }
-    } catch {
-      // ignore
-    }
+    const call = fencedCall(body);
+    if (call) calls.push({ type: 'tool_use', id: `text_call_${index++}`, ...call });
   }
 
   // [TOOL_CALL] name({...})                              (Mistral-style)
@@ -219,13 +199,124 @@ export function extractTextualToolCalls(text: string): ToolUseContent[] {
   return calls;
 }
 
-/** Strip recognised tool-call syntax so the user never sees the plumbing. */
-export function stripToolSyntax(text: string): string {
-  return text
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-    .replace(/\[TOOL_CALLS?\]\s*\w+\s*\([\s\S]*?\)/gi, '')
-    .replace(/```(?:json|tool)?\s*\{[\s\S]*?"(?:tool|function)"[\s\S]*?\}\s*```/gi, '')
-    .trim();
+/**
+ * The call a fenced JSON block's body names, as `extractTextualToolCalls` reads
+ * one: a `tool`, `name` or `function` that is a string. Undefined for any other
+ * body — a tool DEFINITION, whose `function` is an object, or a config file.
+ */
+function fencedCall(body: string): { name: string; input: Record<string, unknown> } | undefined {
+  try {
+    const parsed = JSON.parse(body) as {
+      tool?: unknown;
+      name?: unknown;
+      function?: unknown;
+      arguments?: unknown;
+      parameters?: unknown;
+      input?: unknown;
+    };
+    const name = parsed.tool ?? parsed.name ?? parsed.function;
+    if (typeof name !== 'string') return undefined;
+    const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
+    return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Where the JSON object or array opening at `start` ends, just past its closing
+ * bracket; -1 if the text ends first. A bracket inside a string is not counted.
+ */
+export function endOfJson(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let at = start; at < text.length; at += 1) {
+    const char = text[at];
+    if (inString) {
+      if (char === '\\') at += 1;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === '{' || char === '[') {
+      depth += 1;
+    } else if (char === '}' || char === ']') {
+      depth -= 1;
+      if (depth === 0) return at + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Each textual call's shape: where its JSON may open, what must follow the JSON
+ * once it closes, and whether a body in that shape is a call.
+ *
+ * `<tool_call>` and `[TOOL_CALLS] name(` are markup whatever their JSON holds:
+ * a body that does not parse is a malformed call, which runs nothing and is
+ * still the model's plumbing. A fenced block is markup only when it reads as a
+ * call, because any other is a code example.
+ */
+const CALL_SHAPES: readonly {
+  readonly open: RegExp;
+  readonly close: RegExp;
+  readonly fenced: boolean;
+}[] = [
+  { open: /<tool_call>\s*(?=[{[])/gi, close: /^\s*<\/tool_call>/i, fenced: false },
+  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^\s*\)/, fenced: false },
+  { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
+];
+
+/** A call with nothing inside it at all: `<tool_call></tool_call>`, or `[TOOL_CALLS] name()`. */
+const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/gi;
+
+/**
+ * Strip recognised tool-call syntax so the user never sees the plumbing.
+ *
+ * WHAT IS STRIPPED IS A CALL, found by its JSON, not by a lazy match between
+ * two markers. The patterns this replaced were `<tool_call>[\s\S]*?</tool_call>`,
+ * `[TOOL_CALLS] name(` up to the first `)`, and any fenced JSON block holding a
+ * quoted "tool" or "function" up to the next closing fence. So prose that named
+ * `<tool_call>` and then `</tool_call>` lost every word between them — reasoning
+ * that named the one and an answer that named the other lost the whole answer;
+ * "[TOOL_CALLS] before (not after)" lost its aside; a JSON tool DEFINITION, and
+ * two code blocks with a quoted "tool" between them, were cut; and a call whose
+ * string argument held a ")" left the rest of its arguments behind.
+ *
+ * Now a `<tool_call>` or `[TOOL_CALLS] name(` is stripped only when JSON opens
+ * right after it, and only through that JSON's closing bracket — read past any
+ * bracket inside a string — and the tag or paren that closes the call. An
+ * unfinished call has no end, and is left for the caller: see
+ * `wordsWithoutCalls` in `state/chat.ts`.
+ *
+ * `readForCalls` says whether the text was read for calls. A fenced block is a
+ * call only in a turn that was — the engine runs `findToolCalls` only for a
+ * request that enabled a tool — and in one that was not, it is an example.
+ * The tag forms are stripped either way, as they always were.
+ */
+export function stripToolSyntax(text: string, options: { readForCalls?: boolean } = {}): string {
+  const readForCalls = options.readForCalls ?? true;
+  const spans: [number, number][] = [];
+  for (const { open, close, fenced } of CALL_SHAPES) {
+    if (fenced && !readForCalls) continue;
+    for (const match of text.matchAll(open)) {
+      const from = match.index + match[0].length;
+      const end = endOfJson(text, from);
+      if (end === -1) continue;
+      const closing = close.exec(text.slice(end));
+      if (!closing || (fenced && fencedCall(text.slice(from, end)) === undefined)) continue;
+      spans.push([match.index, end + closing[0].length]);
+    }
+  }
+  for (const match of text.matchAll(EMPTY_CALL)) spans.push([match.index, match.index + match[0].length]);
+
+  spans.sort((a, b) => a[0] - b[0]);
+  let out = '';
+  let at = 0;
+  for (const [start, end] of spans) {
+    if (start > at) out += text.slice(at, start);
+    at = Math.max(at, end);
+  }
+  return (out + text.slice(at)).trim();
 }
 
 /**

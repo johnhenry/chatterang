@@ -1208,7 +1208,8 @@ export class ChatterangEngine {
     const totalMs = Math.round(performance.now() - started);
     yield {
       type: 'done',
-      text: stripToolSyntax(text),
+      // A fenced JSON block is a call only in a turn read for calls; see `stripToolSyntax`.
+      text: stripToolSyntax(text, { readForCalls: Boolean(request.toolIds?.length) }),
       stats: {
         ...stats,
         totalMs,

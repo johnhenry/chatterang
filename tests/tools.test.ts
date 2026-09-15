@@ -179,4 +179,65 @@ describe('stripToolSyntax', () => {
     const text = 'Here:\n```js\nconst a = 1;\n```';
     expect(stripToolSyntax(text)).toContain('const a = 1;');
   });
+
+  it('keeps prose naming both tags, and an answer naming the tag its reasoning named the other of', () => {
+    const prose = 'Qwen wraps each call in a `<tool_call>` tag and ends it with `</tool_call>`, and the app reads JSON.';
+    expect(stripToolSyntax(prose)).toBe(prose);
+    const split = '<think>About the <tool_call> tag.</think>Every call ends with </tool_call>, and the app reads it.';
+    expect(stripToolSyntax(split)).toBe(split);
+  });
+
+  it('keeps a parenthetical aside after [TOOL_CALLS] named in prose', () => {
+    const prose = 'Mistral emits [TOOL_CALLS] before (not after) the function name.';
+    expect(stripToolSyntax(prose)).toBe(prose);
+  });
+
+  it('strips the whole of a call whose string argument holds a ")" or a closing tag', () => {
+    expect(stripToolSyntax('Ok [TOOL_CALLS] calculate({"expression": "(1920 * 1080) / 1e6"}) end')).toBe('Ok  end');
+    expect(
+      stripToolSyntax('A<tool_call>{"name":"note","arguments":{"text":"a </tool_call> b"}}</tool_call>B'),
+    ).toBe('AB');
+  });
+
+  it('strips a malformed call, which runs nothing and is still plumbing', () => {
+    expect(stripToolSyntax('<tool_call>{"name": "leaky", "arguments": {"path": "x",}}</tool_call>')).toBe('');
+    expect(stripToolSyntax('Ok [TOOL_CALLS] calculate({expression: 2}) end')).toBe('Ok  end');
+    expect(stripToolSyntax('Ok <tool_call></tool_call> [TOOL_CALLS] now() end')).toBe('Ok   end');
+  });
+
+  it('leaves an unfinished call alone, for the caller to cut', () => {
+    const text = 'Reading.\n<tool_call>{"name":"leaky","arguments":{"path":"x';
+    expect(stripToolSyntax(text)).toBe(text);
+  });
+
+  it('keeps a fenced tool definition, and strips a fenced block that reads as a call', () => {
+    const definition = '```json\n{"type": "function", "function": {"name": "get_weather"}}\n```';
+    expect(extractTextualToolCalls(definition)).toEqual([]);
+    expect(stripToolSyntax(definition)).toBe(definition);
+    const call = 'Here.\n```json\n{"tool": "calculate", "arguments": {"expression": "2+2"}}\n```';
+    expect(stripToolSyntax(call)).toBe('Here.');
+  });
+
+  it('keeps two JSON blocks and the prose between them when a quoted "tool" sits there', () => {
+    const text = '```json\n{"model": "qwen3"}\n```\n\nSet the "tool" key:\n\n```json\n{"enabled": true}\n```';
+    expect(stripToolSyntax(text)).toBe(text);
+  });
+
+  it('keeps a fenced block that reads as a call in text that was not read for calls, and still strips a tagged one', () => {
+    const fenced = '```json\n{"tool": "calculate", "arguments": {}}\n```';
+    expect(stripToolSyntax(fenced, { readForCalls: false })).toBe(fenced);
+    expect(stripToolSyntax('<tool_call>{"name":"a","arguments":{}}</tool_call>', { readForCalls: false })).toBe('');
+  });
+
+  it('strips every call extractTextualToolCalls reads, in each form', () => {
+    for (const text of [
+      '<tool_call>{"name":"calculate","arguments":{"expression":"(1+2)"}}</tool_call>',
+      '```json\n{"name": "calculate", "arguments": {"expression": "(1+2)"}}\n```',
+      '[TOOL_CALLS] calculate({"expression": "(1+2)"})',
+      '[TOOL_CALLS]\ncalculate({"expression": "9*9"})',
+    ]) {
+      expect(extractTextualToolCalls(text), text).toHaveLength(1);
+      expect(stripToolSyntax(text), text).toBe('');
+    }
+  });
 });

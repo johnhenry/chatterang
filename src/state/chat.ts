@@ -1506,16 +1506,19 @@ function unfinishedCallAt(text: string): number {
  * back.
  *
  * NOT IN A TURN THAT OFFERED NO TOOL, and no tool ran. There is no call to
- * strip, and the patterns are not tool-aware: one removes any fenced JSON block
- * naming a "function", so a JSON example the person watched arrive was cut from
- * the reply. A chat can name tools and offer none: an MCP tool's id stays on it
- * after its server is removed or disconnected.
+ * strip, and a call's opening shape at the end of the text is as likely a
+ * marker named in prose. A chat can name tools and offer none: an MCP tool's id
+ * stays on it after its server is removed or disconnected.
+ *
+ * `readForCalls` is whether the engine read the turn for calls, which decides
+ * whether a fenced JSON block naming a tool is one. Only a block the engine
+ * would have run is stripped: a tool DEFINITION, or a config file, is words.
  *
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.
  */
-function wordsWithoutCalls(content: string): string {
-  const finished = stripToolSyntax(content);
+function wordsWithoutCalls(content: string, readForCalls: boolean): string {
+  const finished = stripToolSyntax(content, { readForCalls });
   const unfinished = unfinishedCallAt(finished);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
 }
@@ -1887,7 +1890,9 @@ async function runGeneration(
           const split = splitThinking(event.text || raw);
           const readsCalls =
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
-          const content = (readsCalls ? wordsWithoutCalls(split.content) : split.content).trim();
+          const content = (
+            readsCalls ? wordsWithoutCalls(split.content, chat.tools.length > 0) : split.content
+          ).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown
           //           as stopped, and left out of every later request.
