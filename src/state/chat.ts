@@ -1505,9 +1505,11 @@ function unfinishedCallAt(text: string): number {
  * ran and was never shown on a send sheet, and its arguments were still sent
  * back.
  *
- * NOT IN A CHAT WITH NO TOOLS. There is no call to strip, and the patterns are
- * not tool-aware: one removes any fenced JSON block naming a "function", so a
- * JSON example the person watched arrive was cut from the reply.
+ * NOT IN A TURN THAT OFFERED NO TOOL, and no tool ran. There is no call to
+ * strip, and the patterns are not tool-aware: one removes any fenced JSON block
+ * naming a "function", so a JSON example the person watched arrive was cut from
+ * the reply. A chat can name tools and offer none: an MCP tool's id stays on it
+ * after its server is removed or disconnected.
  *
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.
@@ -1749,6 +1751,11 @@ async function runGeneration(
     const turnToolPolicy = narrowToolPolicy(turnPersona?.tools, turnPersona?.agentConfig, turnAllowedMcpServerIds);
     const alwaysAsk = turnToolPolicy.confirmPolicy === 'always-ask';
 
+    // Whether this request offers the model a tool: the registry lookup the
+    // engine makes to declare them, as the request is built. A chat's tool ids
+    // are not that — an MCP tool's stays on the chat after its server is
+    // removed or disconnected, and the request then offers none.
+    const offersTools = toolRegistry.toIRTools(chat.tools).length > 0;
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -1855,24 +1862,31 @@ async function runGeneration(
           // When it is empty the streamed deltas stand in for it, as they
           // always have — a turn cut short hands back no text of its own.
           //
-          // IN A CHAT WITH TOOLS the reply's words are read by
-          // `wordsWithoutCalls`, once its reasoning is split off, so a call named
-          // in the reasoning takes none of the answer with it. Read when:
-          //   - the engine handed back text: its patterns need a closing tag, so
-          //     a call cut off mid-arguments was still in it;
-          //   - the turn was stopped: a call it was writing or waiting to send;
+          // The reply's words are read by `wordsWithoutCalls`, once its
+          // reasoning is split off, so a call named in the reasoning takes none
+          // of the answer with it. Read when:
           //   - a tool ran in it: the engine resets its text after a tool round,
           //     so a follow-up that wrote nothing left every round's deltas,
-          //     the call that ran included, as the words of the reply.
+          //     the call that ran included, as the words of the reply;
+          //   - the request offered a tool, and
+          //       - the engine handed back text: its patterns need a closing
+          //         tag, so a call cut off mid-arguments was still in it; or
+          //       - the turn was stopped: a call it was writing or waiting to
+          //         send.
           // Otherwise a call was stored as the reply's words and sent back to
           // the model as history. A turn nobody stopped, in which no tool ran
           // and the engine handed back no text, keeps its deltas as before: a
           // reply that was only a fenced JSON example naming a "function",
           // which the engine strips.
+          //
+          // OFFERED, NOT NAMED ON THE CHAT. A chat keeps an MCP tool's id after
+          // its server is gone, and its requests offer no tool: nothing such a
+          // turn writes is a call, and reading it for one cut a JSON example,
+          // or a call marker named in prose, the person had watched arrive.
           const aborted = controller.signal.aborted;
           const split = splitThinking(event.text || raw);
           const readsCalls =
-            chat.tools.length > 0 && (event.text !== '' || aborted || toolCalls.length > 0);
+            toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
           const content = (readsCalls ? wordsWithoutCalls(split.content) : split.content).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown

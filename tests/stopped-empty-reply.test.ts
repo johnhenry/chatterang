@@ -1299,3 +1299,38 @@ describe('a reply that writes a call’s opening shape and goes on past it, in a
     expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
   });
 });
+
+/* ── A chat whose tools were not offered ────────────────────────────── */
+
+describe('a reply in a chat whose tool ids name nothing connected', () => {
+  // An MCP tool id kept after its server was removed: the request offers no tools.
+  const GONE = 'mcp:gone-server:note';
+  const EXAMPLE = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+
+  it('keeps a JSON example it was writing when it was stopped', async () => {
+    const id = 'gone_stopped_json';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is the shape:\n\n${EXAMPLE}\n\nEach entry`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'Each entry', gate.release);
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps a finished reply’s last word when it names a call marker', async () => {
+    const id = 'gone_finished_marker';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = 'Mistral models put every call after the special token [TOOL_CALLS]';
+    const local = recordingBackend([text]);
+    engineWith(local);
+
+    await useChats.getState().send('how does mistral mark a call?');
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+  });
+});
