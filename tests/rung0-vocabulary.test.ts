@@ -60,7 +60,7 @@ afterEach(async () => {
 const credentialOf = new Map<number, string>();
 
 const V = TUNNEL_WIRE_VERSION;
-const turnFrame = (turn: string): TunnelFrame => ({ v: V, kind: 'turn', turn, body: { messages: [] } });
+const turnFrame = (turn: string): TunnelFrame => ({ v: V, kind: 'turn', turn, toolLoop: 'host', body: { messages: [] } });
 const content = (turn: string, sequence: number, delta: string): TunnelFrame => ({
   v: V,
   kind: 'chunk',

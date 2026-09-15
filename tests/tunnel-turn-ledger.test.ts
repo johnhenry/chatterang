@@ -29,7 +29,7 @@ import {
  */
 
 const V = TUNNEL_WIRE_VERSION;
-const turn = (id = 't1'): TunnelFrame => ({ v: V, kind: 'turn', turn: id, body: { messages: [] } });
+const turn = (id = 't1'): TunnelFrame => ({ v: V, kind: 'turn', turn: id, toolLoop: 'host', body: { messages: [] } });
 const content = (sequence: number, id = 't1'): TunnelFrame => ({
   v: V,
   kind: 'chunk',

@@ -91,7 +91,7 @@ const chunk = (sequence: number, delta: string): TunnelFrame => ({
 
 /** One of each kind a pairing tunnel may NOT carry. */
 const OUTSIDE_THE_EXCHANGE: readonly TunnelFrame[] = [
-  { v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: 't1', body: { messages: [] } },
+  { v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: 't1', toolLoop: 'host', body: { messages: [] } },
   chunk(0, 'x'),
   { v: TUNNEL_WIRE_VERSION, kind: 'cancel', turn: 't1' },
   { v: TUNNEL_WIRE_VERSION, kind: 'ping' },
@@ -831,7 +831,13 @@ describe('revocation (#135)', () => {
      * after `revoke()` resolved. The listener's socket's `bytesRead` says when
      * the frames have been read off the wire, without reading them.
      */
-    const turn = (id: string): TunnelFrame => ({ v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: id, body: { messages: [] } });
+    const turn = (id: string): TunnelFrame => ({
+      v: TUNNEL_WIRE_VERSION,
+      kind: 'turn',
+      turn: id,
+      toolLoop: 'host',
+      body: { messages: [] },
+    });
     const frames = ['t1', 't2', 't3'].map((id) => encodeFrame(turn(id)));
     const gate = testGate();
     const revokedDevice = await gate.mintDevice();
