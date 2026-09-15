@@ -733,6 +733,38 @@ describe('main.ts wiring', () => {
     expect(source).not.toMatch(/createTunnel(?:Host|Listener)\s*\(|@chatterang\/tunnel\/host/);
   });
 
+  it('#7 ruling 7: the machine’s sleep and wake reach the one work broker', () => {
+    // `wirePowerEvents` is driven in tests/desktop-power-events.test.ts against a
+    // real broker. This pins that the file which RUNS hands it Electron's real
+    // `powerMonitor` and the one broker, inside `start()` (which runs only after
+    // `app.whenReady()`), right where that broker is built.
+    //
+    // FAULT INJECTED against main.ts, one at a time, each failing this test:
+    // deleting the `wirePowerEvents(powerMonitor, broker)` call (1), passing it
+    // a different emitter (1), moving the call out of `start()` (2), dropping
+    // `powerMonitor` from the electron import (3), and `will-quit` no longer
+    // removing the listeners (4).
+    const start = source.slice(source.indexOf('function start('), source.indexOf('function createWindow('));
+    expect(start.length).toBeGreaterThan(1000);
+    // 1 and 2. Called once, in start(), immediately after the broker is built.
+    expect([...source.matchAll(/wirePowerEvents\(/g)]).toHaveLength(1);
+    expect(start).toMatch(
+      /const broker = new WorkBroker\(\{[\s\S]*?\}\);\s*(?:\/\/[^\n]*\n\s*)*const stopPowerEvents = wirePowerEvents\(powerMonitor, broker\);/,
+    );
+    // 3. The real module, from Electron, and the join from the bridge file.
+    expect(source).toMatch(/import \{[^}]*\bpowerMonitor\b[^}]*\} from 'electron';/);
+    expect(source).toMatch(/import \{ wirePowerEvents \} from '\.\/bridge\/power-events\.js';/);
+    // 4. On quit the listeners go first, and the broker still ends every
+    //    generation before the fleet stops.
+    expect(source).toMatch(/app\.once\('will-quit', \(\) => \{\s*stopPowerEvents\(\);\s*broker\.quit\(\);\s*fleet\.dispose\(\);/);
+  });
+
+  it('#7 ruling 7: nothing keeps the computer awake', () => {
+    // A CONTROL: this passed before power events were wired, and must keep
+    // passing. The owner ruled no keep-awake; a sleep settles work instead.
+    expect(source).not.toMatch(/powerSaveBlocker/);
+  });
+
   it('[13] does not re-swallow a throwing notify', () => {
     // The reordered settle only helps while main.ts lets the throw reach the
     // Supervisor. Wrapping the notify in a bare try/catch restores the silent
