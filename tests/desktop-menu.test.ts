@@ -178,7 +178,13 @@ describe('the main process actually installs it, down the bridge', () => {
     const call = main.search(/^\s*installMenu\(\);$/m);
     expect(call, 'main.ts defines installMenu but never calls it').toBeGreaterThan(-1);
     expect(main).toContain('Menu.setApplicationMenu');
-    expect(call).toBeLessThan(main.indexOf('createWindow(pluginHost, fleet, senders)'));
+    // The first window is created by this call. #7 S6 renamed its middle
+    // argument (the teardown now reaches the work broker as well as the fleet),
+    // and the old literal's -1 turned this into "expected N to be less than -1";
+    // so the call is now asserted to exist before it is compared against.
+    const firstWindow = main.indexOf('createWindow(pluginHost, localTurns, senders)');
+    expect(firstWindow, 'main.ts no longer creates its first window with this call').toBeGreaterThan(-1);
+    expect(call).toBeLessThan(firstWindow);
   });
 
   it('sends the command down the preload bridge, not into the main world', () => {

@@ -104,6 +104,10 @@ export const useBench = create<BenchState>((set, get) => ({
     set({ running: { modelId, phase: 'loading', repetition: 0, repetitions } });
     app.setActivity('loading');
 
+    // Unloaded however the run ends. On the desktop a benchmark takes the one
+    // generation slot and does not wait for it (#7), so it is refused while a
+    // turn is using the model; the handle loaded for it used to stay loaded.
+    let handle: string | null = null;
     try {
       const load = await LlamaCpp.load({
         modelPath,
@@ -112,6 +116,7 @@ export const useBench = create<BenchState>((set, get) => ({
         gpuLayers: -1,
         useMmap: true,
       });
+      handle = load.handle;
 
       set({ running: { modelId, phase: 'prefill', repetition: 1, repetitions } });
       app.setActivity('running');
@@ -125,6 +130,7 @@ export const useBench = create<BenchState>((set, get) => ({
 
       set({ running: { modelId, phase: 'cooling', repetition: repetitions, repetitions } });
       await LlamaCpp.unload({ handle: load.handle }).catch(() => undefined);
+      handle = null;
 
       const device = app.device;
       const run: BenchmarkRun = {
@@ -155,6 +161,7 @@ export const useBench = create<BenchState>((set, get) => ({
     } catch (error) {
       app.toast(error instanceof Error ? error.message : 'The benchmark failed.', 'crit');
     } finally {
+      if (handle !== null) await LlamaCpp.unload({ handle }).catch(() => undefined);
       set({ running: null });
       app.setActivity('idle');
     }

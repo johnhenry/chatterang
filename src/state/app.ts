@@ -117,12 +117,18 @@ interface AppState {
   activity: EngineActivity;
   /** Live tokens-per-second while generating, for the rail readout. */
   liveRate: number | null;
+  /**
+   * Where this window's generation stands in the desktop's shared wait list
+   * (#7): 1 is next, null when it is not waiting. Only the desktop reports it.
+   */
+  turnWaiting: number | null;
   engine: ChatterangEngine | null;
 
   initialize: () => Promise<void>;
   updateSettings: (patch: Partial<Settings>) => Promise<void>;
   setActivity: (activity: EngineActivity) => void;
   setLiveRate: (rate: number | null) => void;
+  setTurnWaiting: (position: number | null) => void;
   refreshThermal: () => Promise<void>;
 
   addConnection: (connection: ProviderConnection) => Promise<void>;
@@ -274,6 +280,7 @@ export const useApp = create<AppState>((set, get) => ({
   toasts: [],
   approvals: [],
   activity: 'idle',
+  turnWaiting: null,
   liveRate: null,
   engine: null,
 
@@ -296,6 +303,7 @@ export const useApp = create<AppState>((set, get) => ({
       },
       fallbackBackendId: merged.fallbackBackendId,
       onWarning: (message) => get().toast(message, 'warn'),
+      onWaiting: (event) => get().setTurnWaiting(event.position > 0 ? event.position : null),
       onFallback: (event: FallbackEvent) => {
         set({ activity: 'remote' });
         get().toast(
@@ -337,6 +345,10 @@ export const useApp = create<AppState>((set, get) => ({
 
   setLiveRate(liveRate) {
     set({ liveRate });
+  },
+
+  setTurnWaiting(turnWaiting) {
+    set({ turnWaiting });
   },
 
   async refreshThermal() {

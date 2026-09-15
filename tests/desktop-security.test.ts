@@ -685,12 +685,52 @@ describe('main.ts wiring', () => {
     //
     // FAULT INJECTED: `releaseRenderer: (id, reason) => llamaSupervisor
     // .releaseRenderer(id, reason)` fails the first assertion.
-    expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*fleet\.releaseRenderer\(/);
+    //
+    // #7 S6 moved the call site one step out: the teardown reaches
+    // `localTurns`, which releases the window from the work broker and then
+    // calls `fleet.releaseRenderer` (`tests/desktop-local-turns.test.ts` drives
+    // that fan-out). So this pins both halves: the teardown names `localTurns`,
+    // and `localTurns` is built over the fleet. FAULT INJECTED: pointing the
+    // teardown back at `fleet.releaseRenderer` fails the first assertion, and
+    // building `admitLocalTurns` without `fleet` fails the second.
+    expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*localTurns\.releaseRenderer\(/);
+    expect(source).toMatch(/admitLocalTurns\(\{[^}]*\bfleet,/);
+    // And over the notifier the broker was built with, so a departed window is
+    // forgotten there too.
+    expect(source).toMatch(/admitLocalTurns\(\{[^}]*\bnotices,/);
     // And the quit path, which has the same shape and the same silence.
     expect(source).toContain('fleet.dispose()');
     // No supervisor is constructed here at all any more. One built beside the
     // fleet would be a second, unsupervised host serving the same plugins.
     expect(source).not.toMatch(/new Supervisor\(/);
+  });
+
+  it('#7 S6: a desktop generation takes the work broker’s one slot, and nothing here starts a listener', () => {
+    // `admitLocalTurns` is driven end to end in tests/desktop-local-turns.test.ts.
+    // This pins that the file which RUNS uses it, the only way that can be
+    // pinned. FAULT INJECTED against main.ts, one at a time, each failing this
+    // test: registering `LLAMA_PLUGIN` with the bare facade (1), a second
+    // `new WorkBroker(` (2), the fleet's notify without `withTurnProgress` (3),
+    // `will-quit` without `broker.quit()` (4), and a `createTunnelListener(`
+    // call (5).
+    //
+    // 1. llama.cpp is registered through the slot, never as the bare facade.
+    //    Registering `fleet.plugin(LLAMA_PLUGIN.name)` directly is a desktop
+    //    turn bypassing the slot.
+    expect(source).toMatch(/pluginHost\.register\(LOCAL_TURNS_PLUGIN,\s*localTurns\.plugin\)/);
+    expect(source).not.toMatch(/pluginHost\.register\(LLAMA_PLUGIN\b/);
+    expect(source).toMatch(/facade:\s*fleet\.plugin\(LLAMA_PLUGIN\.name\)/);
+    // 2. One broker: two would be two slots.
+    expect([...source.matchAll(/new WorkBroker\(/g)]).toHaveLength(1);
+    // 3. Tokens reach the broker as progress, and waiting positions reach the
+    //    window that owns the turn.
+    expect(source).toMatch(/notify:\s*withTurnProgress\(broker,/);
+    expect(source).toMatch(/const notices = localTurnNotices\(/);
+    expect(source).toMatch(/notifyWindow:\s*notices,/);
+    // 4. On quit the broker ends every generation before the fleet stops.
+    expect(source).toMatch(/broker\.quit\(\);\s*fleet\.dispose\(\);/);
+    // 5. No listener: #169 ruled a turn-carrying listener waits for #7.
+    expect(source).not.toMatch(/createTunnel(?:Host|Listener)\s*\(|@chatterang\/tunnel\/host/);
   });
 
   it('[13] does not re-swallow a throwing notify', () => {

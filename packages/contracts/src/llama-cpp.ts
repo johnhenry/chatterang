@@ -163,6 +163,24 @@ export interface TokenEvent {
   index: number;
 }
 
+/**
+ * A generation that is WAITING for the one slot it runs in (#7).
+ *
+ * Emitted as `llamaWaiting` by the desktop's main process, and by nothing
+ * else: the desktop's own turns and a paired phone's share one slot, and
+ * whoever waits is told. `position` 1 is next; 0 means the wait is over and
+ * the turn has started.
+ *
+ * Deliberately NOT one of `LlamaCppPlugin.addListener`'s overloads. No
+ * inference host emits it, so declaring it on the contract every host
+ * implements would be a promise three of them do not keep. A platform with no
+ * shared slot refuses the subscription or never fires it.
+ */
+export interface TurnWaitingEvent {
+  requestId: string;
+  position: number;
+}
+
 export interface GenerationEndEvent extends GenerateResult {
   error?: string;
 }

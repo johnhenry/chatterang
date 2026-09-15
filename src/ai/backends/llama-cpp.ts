@@ -23,8 +23,10 @@ import { LlamaCpp } from '@/plugins/llama-cpp';
 import type {
   ComputeBackendId,
   GenerateImage,
+  GenerateOptions,
   GenerateResult,
   TokenEvent,
+  TurnWaitingEvent,
 } from '@/plugins/llama-cpp';
 import type { ModelManifest, SamplerSettings } from '@/domain/manifest';
 import { inferTemplate, renderPrompt, templateStopSequences } from '@/ai/prompt';
@@ -47,6 +49,40 @@ export interface LlamaCppBackendConfig {
   onWarning?: (message: string) => void;
   /** Called with per-token throughput so the UI can show a live readout. */
   onProgress?: (progress: { requestId: string; tokens: number; elapsedMs: number }) => void;
+  /**
+   * Called when a streamed generation is waiting for the model, and with
+   * `position: 0` when it starts (#7). Only the desktop reports this.
+   */
+  onWaiting?: (event: TurnWaitingEvent) => void;
+}
+
+/**
+ * The one subscription the contract does not declare.
+ *
+ * `llamaWaiting` is emitted by the desktop's main process alone (see
+ * `TurnWaitingEvent`), so it is typed here, at the one call site, rather than
+ * added to an interface every inference host implements.
+ */
+interface WaitingEvents {
+  addListener(
+    eventName: 'llamaWaiting',
+    listener: (event: TurnWaitingEvent) => void,
+  ): Promise<{ remove(): Promise<void> }>;
+}
+
+/**
+ * The one method the contract does not declare, for the same reason.
+ *
+ * On the desktop a streamed turn holds the slot it shares with a paired
+ * phone's turns from its first decode until the turn is over, its tool calls
+ * included (#7, owner ruling). Every decode of the turn says so with
+ * `wholeTurn: true`, and `endTurn` says the turn is over. Only the desktop's
+ * main process has either (`LOCAL_TURNS_PLUGIN`): the headless server refuses
+ * the method, a native plugin has no such method, and every platform ignores
+ * the option.
+ */
+interface WholeTurns {
+  endTurn(options: { requestId: string }): Promise<void>;
 }
 
 interface LoadedHandle {
@@ -86,6 +122,8 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
   #config: LlamaCppBackendConfig;
   #loaded: LoadedHandle | null = null;
   #loading: Promise<LoadedHandle> | null = null;
+  /** Turns a streamed decode was sent for with `wholeTurn`, and not yet ended. See `endTurn`. */
+  #wholeTurns = new Set<string>();
 
   constructor(config: LlamaCppBackendConfig) {
     this.#config = config;
@@ -244,6 +282,21 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     this.#loaded = null;
   }
 
+  /**
+   * The turn `requestId` names is over, however it ended (#7). Called by the
+   * engine once per turn; sends something only for a turn this adapter
+   * streamed a decode for, and only once.
+   *
+   * A platform that refuses it, or has no such method, holds no slot, so that
+   * is not a failure. Never throws.
+   */
+  async endTurn(requestId: string): Promise<void> {
+    if (!this.#wholeTurns.delete(requestId)) return;
+    await Promise.resolve()
+      .then(() => (LlamaCpp as unknown as WholeTurns).endTurn({ requestId }))
+      .catch(() => undefined);
+  }
+
   /** Currently resident model id, for the instrument rail. */
   get residentModelId(): string | null {
     return this.#loaded?.modelId ?? null;
@@ -327,16 +380,55 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
       wake();
     });
 
+    // #7: on the desktop, this turn can wait for the one slot it shares with a
+    // paired phone's turns, and this window is told where it stands. A
+    // platform that does not know the event may refuse the subscription; that
+    // means "never waits here", not a failed turn.
+    const waiting = await Promise.resolve()
+      .then(() =>
+        (LlamaCpp as unknown as WaitingEvents).addListener('llamaWaiting', (event) => {
+          if (event.requestId !== requestId) return;
+          // No place in line after Stop (#305): it would put "Waiting" on the
+          // rail for a turn the person has ended. Its start (position 0) is
+          // still reported, because the start is what takes "Waiting" off the
+          // rail. A stopped turn can start in main before its cancel gets
+          // there, and it then decodes until the host honours the cancel.
+          if (signal?.aborted === true && event.position > 0) return;
+          this.#config.onWaiting?.(event);
+        }),
+      )
+      .catch(() => null);
+
     const abort = (): void => void LlamaCpp.cancel({ requestId }).catch(() => undefined);
     signal?.addEventListener('abort', abort, { once: true });
 
-    const generation = LlamaCpp.generate({
+    // STOPPED WHILE SUBSCRIBING (#305, #7). Both subscriptions above are
+    // awaited, and an abort that happened during them fires no event, so the
+    // listener just added would never cancel what follows. On the desktop that
+    // generation waits for the slot it shares with a paired phone and starts on
+    // the host once the slot frees, long after Stop. Nothing is asked for; the
+    // engine reads the aborted signal and ends the turn as stopped.
+    if (signal?.aborted === true) {
+      signal.removeEventListener('abort', abort);
+      await listener.remove().catch(() => undefined);
+      await waiting?.remove().catch(() => undefined);
+      return;
+    }
+
+    // #7: one decode of a turn that, on the desktop, keeps the slot until the
+    // engine ends the turn (`endTurn`), so a paired phone's turn cannot run
+    // between this decode and the next one after a tool call. Noted before the
+    // call, so a turn ended while this decode is still being asked for is ended.
+    const options: GenerateOptions & { wholeTurn: true } = {
       handle: loaded.handle,
       prompt,
       images,
       sampler: this.#sampler(request, loaded.modelId),
       requestId,
-    })
+      wholeTurn: true,
+    };
+    this.#wholeTurns.add(requestId);
+    const generation = LlamaCpp.generate(options)
       .then((result) => {
         finished = result;
       })
@@ -420,6 +512,7 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     } finally {
       signal?.removeEventListener('abort', abort);
       await listener.remove().catch(() => undefined);
+      await waiting?.remove().catch(() => undefined);
       await generation.catch(() => undefined);
     }
   }

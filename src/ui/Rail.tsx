@@ -43,6 +43,7 @@ export interface RailProps {
 export function Rail({ title, actions }: RailProps): ReactNode {
   const activity = useApp((state) => state.activity);
   const liveRate = useApp((state) => state.liveRate);
+  const turnWaiting = useApp((state) => state.turnWaiting);
   const device = useApp((state) => state.device);
   const activeChatId = useChats((state) => state.activeChatId);
   const chats = useChats((state) => state.chats);
@@ -179,6 +180,19 @@ export function Rail({ title, actions }: RailProps): ReactNode {
             <span className="chip chip--warn" title="Older messages were dropped to fit the context window.">
               <Icon name="alert" size={11} />
               −{context.dropped}
+            </span>
+          ) : null}
+
+          {/* #7: the desktop's own turns and a paired phone's share one slot,
+              and whoever waits is told, including the person here. A silent
+              wait reads as a hung app. */}
+          {turnWaiting !== null ? (
+            <span
+              className="chip chip--warn"
+              title="Another turn is using the model on this computer. This one starts when its turn comes."
+            >
+              <Icon name="gauge" size={11} />
+              Waiting · {turnWaiting === 1 ? 'next in line' : `#${String(turnWaiting)} in line`}
             </span>
           ) : null}
 
