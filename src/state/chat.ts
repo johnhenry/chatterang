@@ -1422,7 +1422,7 @@ function carriesReceipt(variant: MessageVariant): boolean {
  * there may be a call begun; that it may also be a marker named in prose is
  * the accepted limit.
  */
-const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\][ \t]*(?:\w+[ \t]*\(\s*|\w*\s*)$/i;
+const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
@@ -1432,7 +1432,7 @@ const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\][ \t]*(?:\w+[ \
  * the stopped pattern above cut "Mistral models put every call after the
  * special token [TOOL_CALLS]" to "... the special token".
  */
-const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\][ \t]*\w+[ \t]*\(\s*$/i;
+const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
@@ -1442,7 +1442,7 @@ const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\][ \t]*\w+[ \t]*\
  * The quote is spelled `\x22`: the source scans in tests/support/source-scan.ts
  * read a bare one in a regex literal as the start of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\][ \t]*\w+[ \t]*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;

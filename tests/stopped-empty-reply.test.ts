@@ -1592,3 +1592,53 @@ describe('a finished reply in a chat offering tools, ending on a call marker', (
   }
 });
 
+describe('a turn stopped mid-arguments of a [TOOL_CALLS] call whose name is on the next line', () => {
+  it('keeps the words before it and sends none of it back', async () => {
+    const id = 'r1_mistral_newline';
+    const partial = 'Reading it.\n[TOOL_CALLS]\nleaky({"path": "canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Reading it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words before it when Stop landed on the name and its paren', async () => {
+    const id = 'r1_mistral_newline_paren';
+    const partial = 'Reading it.\n[TOOL_CALLS]\nleaky(';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'leaky(', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Reading it.');
+  });
+});
+
+describe('a finished reply cut off as a [TOOL_CALLS] call opened with its name on the next line', () => {
+  it('stores none of the call', async () => {
+    const id = 'r1_mistral_newline_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['Checking.\n[TOOL_CALLS]\nleaky(']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Checking.');
+  });
+});
+
