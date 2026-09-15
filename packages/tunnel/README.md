@@ -166,9 +166,22 @@ What a pairing tunnel can hold is bounded, one named constant per limit
 
 Rung 0's test credential is minted exactly that way.
 `createTunnelClient({ url, credential })` sends it in the header, and only over
-`wss:` or `ws://127.0.0.1`. Node's WebSocket can send a header; a webview's
-cannot, and throws rather than connecting without it. The phone's transport is
-#181's plugin.
+`wss:` or `ws://127.0.0.1`. That check runs before any transport is made, so it
+covers every transport, and it covers `credentialRef` (a name the transport's
+own store keeps the secret under) as well. Node's WebSocket can send a header; a
+webview's cannot, and throws rather than connecting without it.
+
+The phone's transport is #181's plugin, and the client takes it as an option:
+`createTunnelClient({ url, credential, transport })`. A `TunnelTransport` is
+bytes in, bytes out, and exactly one close, with the upgrade's HTTP status when
+the host answered one. The gate, the sequence checks, `bye` and the close-code
+faults run over it unchanged. The plugin's contract is
+`@chatterang/contracts/tunnel-socket`; the adapter from it is passed in, never
+imported by `client/`. A connection that closes before it opens rejects with a
+`TunnelConnectError`: `CREDENTIAL_REFUSED` (401 with a credential),
+`PAIRING_NOT_OPEN` (401 without one), `HOST_COULD_NOT_CHECK` (503),
+`UPGRADE_REFUSED` (any other status) or `UNREACHABLE`. The `WebSocket` default
+can only say `UNREACHABLE`, because a WHATWG socket hides the status.
 
 ## The TLS identity (#179, #180)
 
@@ -316,7 +329,9 @@ without bound.
 ## What is deliberately not here
 
 - **A production transport.** #181 chose a native socket plugin on both
-  platforms, and that plugin is not built. What exists is rung 0 (#156):
+  platforms, and that plugin is not built. Its contract is declared
+  (`packages/contracts/src/tunnel-socket.ts`) and the client accepts a transport,
+  but no plugin, web shim or adapter exists yet (#295). What exists is rung 0 (#156):
   `createTunnelClient`, `createTunnelHost` and `createTunnelListener` speak the
   real wire format over loopback `ws://`, through the credential gate. **No app
   starts a listener** (#158). A listener that carries turns waits on #7, per
