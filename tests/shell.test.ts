@@ -115,6 +115,45 @@ function shell(actor: 'user' | 'model', confirm = vi.fn(async () => true)): Chat
 
 /* ── Security: what the shell must not be able to do ─────────────────── */
 
+/**
+ * A tunnel device credential's shape: `<deviceId>.<secret>`, 22 and 43
+ * base64url characters (packages/tunnel/src/host/credential.ts).
+ *
+ * UNANCHORED, bounded by characters base64url does not use. The greps below
+ * read a whole VFS dump, where a credential would sit inside a JSON string;
+ * `^…$` could only match a dump that was nothing but a credential.
+ */
+const DEVICE_CREDENTIAL = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/;
+const CANARY_CREDENTIAL = 'CANARYdeviceIdCANARY00.CANARYsecretCANARYsecretCANARYsecretCANARY1';
+
+/** A phone's paired-device row (`PairedDeviceRecord`, #133), plus whatever a regression spreads into it. */
+function pairedRow(extra: Record<string, unknown> = {}) {
+  return {
+    id: 'CANARYdeviceIdCANARY00',
+    spkiPin: 'CANARYpinCANARYpinCANARYpinCANARYpinCANARY0=',
+    hostKind: 'desktop',
+    name: 'CANARY Studio',
+    addresses: ['192.168.1.4'],
+    port: 8973,
+    pairedAt: 0,
+    capabilities: ['inference'],
+    ...extra,
+  };
+}
+
+/**
+ * Stores that offer the projection a `pairedDevices` hook. `ShellStores` has
+ * none, and that is the point: this is the shape a projection of the table
+ * would have to be handed, so a projection that took it would show up below.
+ */
+function pairedDevicesHook(rows: readonly unknown[]): Partial<ShellStores> {
+  return { pairedDevices: () => rows } as unknown as Partial<ShellStores>;
+}
+
+function pairedDevicesOf(seeded: ShellStores): readonly unknown[] {
+  return (seeded as unknown as { pairedDevices: () => readonly unknown[] }).pairedDevices();
+}
+
 describe('sandbox boundaries', () => {
   it('does not provide curl — network access is not registered', async () => {
     const names = await bundledCommandNames();
@@ -148,6 +187,9 @@ describe('sandbox boundaries', () => {
     const CANARY_DEVICE_KEY = 'canary-device-private-scalar-9f8e7d6c5b4a3928';
 
     const seeded = stores({
+      // A paired-device row (#133) carrying a tunnel credential it must never
+      // hold, handed to the projection the way a spread `...row` would hand it.
+      ...pairedDevicesHook([pairedRow({ credential: CANARY_CREDENTIAL })]),
       providers: () => ({
         toggle: vi.fn(async () => undefined),
         list: [
@@ -186,6 +228,83 @@ describe('sandbox boundaries', () => {
     expect(dump).not.toMatch(
       /apiKey|api_key|privateKey|private_key|secretKey|secret_key|pairingToken|passkey|sk-|Bearer/i,
     );
+    // And the tunnel credential's own shape, `<deviceId>.<secret>`, which
+    // contains none of the words above.
+    expect(JSON.stringify(pairedDevicesOf(seeded))).toMatch(DEVICE_CREDENTIAL);
+    expect(dump).not.toMatch(DEVICE_CREDENTIAL);
+  });
+
+  it('greps for the device credential’s shape inside a dump, not only as a whole string', async () => {
+    // The shape is `<deviceId>.<secret>`: 16 and 32 bytes, base64url, 22 and
+    // 43 characters (packages/tunnel/src/host/credential.ts). Anchored, it can
+    // match only a string that IS a credential, and every grep in this file
+    // reads a whole VFS dump, where one would sit inside a JSON string.
+    const poisoned = stores({
+      device: () => ({
+        chipset: CANARY_CREDENTIAL,
+        totalMemory: 1,
+        cpuCores: 1,
+        backends: [],
+        simulated: false,
+        engineVersion: 'x',
+      }),
+    });
+    const dump = JSON.stringify(await buildVfs(poisoned));
+    expect(dump).toMatch(DEVICE_CREDENTIAL);
+    expect(dump).not.toMatch(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
+
+    // Bounded, so a longer base64url run is not read as one.
+    expect(`x${CANARY_CREDENTIAL}`).not.toMatch(DEVICE_CREDENTIAL);
+    expect(`${CANARY_CREDENTIAL}x`).not.toMatch(DEVICE_CREDENTIAL);
+    // And the default projection carries nothing of that shape by accident.
+    expect(JSON.stringify(await buildVfs(stores()))).not.toMatch(DEVICE_CREDENTIAL);
+  });
+
+  it('does not project the paired-device table, its rows or a credential in one (#133, #124)', async () => {
+    /*
+     * #132's projection decision was never recorded (#124 notes it), and the
+     * table now exists. So the answer is pinned here, fail-closed: NOT
+     * projected. A paired desktop's pin, addresses and name are the phone's
+     * map of where the user's own machine is, and nothing a model needs to
+     * read to answer a question. Projecting any of it is a decision to make on
+     * purpose, with this test edited in the same change.
+     */
+    expect(PROJECTED_PATHS.filter((path) => /pair/i.test(path))).toEqual([]);
+
+    const row = pairedRow({ credential: CANARY_CREDENTIAL });
+    const seeded = stores(pairedDevicesHook([row]));
+    const files = await buildVfs(seeded);
+    const dump = JSON.stringify(files);
+
+    // Positive control: the projection ran over the same stores.
+    expect(Object.keys(files).some((path) => path.startsWith('/chats/'))).toBe(true);
+
+    expect(Object.keys(files).filter((path) => /pair/i.test(path))).toEqual([]);
+    for (const canary of [row.id, row.spkiPin, row.name, CANARY_CREDENTIAL]) {
+      expect(dump, `the VFS carries ${canary} from a paired-device row`).not.toContain(canary);
+    }
+    expect(dump).not.toMatch(DEVICE_CREDENTIAL);
+
+    // The same sweep a model can run, through the shell itself.
+    const sh = new ChatterangShell({ stores: seeded, actor: 'model', confirm: vi.fn(async () => true) });
+    const SHAPE = "'(^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{22}[.][A-Za-z0-9_-]{43}([^A-Za-z0-9_-]|$)'";
+    const swept = await sh.exec(`grep -rlE ${SHAPE} /`);
+    expect(swept.stdout).toBe('');
+    // Positive control: the sweep finds that shape where the shell can see it.
+    await sh.exec(`echo "token=${CANARY_CREDENTIAL};" > /workspace/control.txt`);
+    const control = await sh.exec(`grep -rlE ${SHAPE} /`);
+    expect(control.stdout).toContain('/workspace/control.txt');
+
+    // And the adapter that builds the real stores never reads the table,
+    // which is where a projection would have to be wired first.
+    const shellDir = join(process.cwd(), 'src/shell');
+    const shellSources = readdirSync(shellDir).filter((file) => /\.(ts|tsx)$/.test(file));
+    expect(shellSources).toEqual(expect.arrayContaining(['stores.ts', 'vfs.ts']));
+    for (const file of shellSources) {
+      expect(readFileSync(join(shellDir, file), 'utf8'), `src/shell/${file} names pairedDevices`).not.toContain(
+        'pairedDevices',
+      );
+    }
   });
 
   it('mounts only app data, nothing resembling a device path', async () => {
