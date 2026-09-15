@@ -633,6 +633,12 @@ interface ChatState {
    * `discardDraft`.
    */
   draftDiscards: number;
+  /**
+   * Chats whose delete has been asked for and has not settled, by id. The chat
+   * screen takes no draft in the open chat while it is one of these. See
+   * `removeChat`.
+   */
+  deleting: string[];
 
   load: () => Promise<void>;
   openChat: (chatId: string) => Promise<void>;
@@ -690,6 +696,7 @@ export const useChats = create<ChatState>((set, get) => ({
   context: null,
   controller: null,
   draftDiscards: 0,
+  deleting: [],
 
   async load() {
     // Noted BEFORE the reads are made, and until what they found has been
@@ -907,6 +914,7 @@ export const useChats = create<ChatState>((set, get) => ({
     if (!refusedRows.has(chatId)) refusedRows.set(chatId, new Map());
     if (!refusedHolds.has(chatId)) refusedHolds.set(chatId, []);
     for (const turn of liveTurns) if (turn.chatId === chatId) turn.controller.abort();
+    if (!get().deleting.includes(chatId)) set({ deleting: [...get().deleting, chatId] });
     // AND THE DRAFT BEING WRITTEN IN IT, NOW, when it is the chat open: its text,
     // its images, and their payloads (owner ruling, 2026-09-14). Left in the
     // composer, it carried over into whichever chat opened next, and its images
@@ -931,37 +939,49 @@ export const useChats = create<ChatState>((set, get) => ({
     // this delete does not take them, and that window's lock keeps them from any
     // sweep (lib/blobs.ts).
     if (get().activeChatId === chatId) get().discardDraft();
+    //
+    // AND NOTHING REACHES THE DRAFT UNTIL THE DELETE HAS SETTLED. The chat stays
+    // open until then, which can wait behind an earlier write to it, and text,
+    // an image or dictation added meanwhile carried over into the chat opened
+    // next. The chat screen takes no draft while the open chat is in `deleting`,
+    // and what reached the draft anyway is discarded again as the delete lands.
     return writeInTurn(chatId, async () => {
       try {
-        await deleteChat(chatId);
-      } catch (error) {
-        // The chat is still there, and so is what the thread on screen shows:
-        // the rows refused while this ran are written. Each put is MADE before
-        // the mark comes off, so a write to the chat made after that is applied
-        // after it, and wins.
-        const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+        try {
+          await deleteChat(chatId);
+        } catch (error) {
+          // The chat is still there, and so is what the thread on screen shows:
+          // the rows refused while this ran are written. Each put is MADE before
+          // the mark comes off, so a write to the chat made after that is applied
+          // after it, and wins.
+          const refused = [...(refusedRows.get(chatId)?.values() ?? [])];
+          refusedRows.delete(chatId);
+          const writing = refused.map((message) => db.messages.put(message));
+          removedChats.delete(chatId);
+          await Promise.allSettled(writing);
+          releaseRefused(chatId);
+          throw error;
+        }
+        // Landed. The rows refused meanwhile are never written, and their payloads
+        // are named by nothing else.
+        const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
+          (message.attachments ?? []).map((attachment) => attachment.id),
+        );
         refusedRows.delete(chatId);
-        const writing = refused.map((message) => db.messages.put(message));
-        removedChats.delete(chatId);
-        await Promise.allSettled(writing);
-        releaseRefused(chatId);
-        throw error;
-      }
-      // Landed. The rows refused meanwhile are never written, and their payloads
-      // are named by nothing else.
-      const payloads = [...(refusedRows.get(chatId)?.values() ?? [])].flatMap((message) =>
-        (message.attachments ?? []).map((attachment) => attachment.id),
-      );
-      refusedRows.delete(chatId);
-      try {
-        if (payloads.length > 0) await deleteBlobs(payloads);
+        try {
+          if (payloads.length > 0) await deleteBlobs(payloads);
+        } finally {
+          releaseRefused(chatId);
+        }
+        // In the step before the next chat is opened.
+        if (get().activeChatId === chatId) get().discardDraft();
+        set({
+          chats: get().chats.filter((chat) => chat.id !== chatId),
+          ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
+        });
       } finally {
-        releaseRefused(chatId);
+        set({ deleting: get().deleting.filter((id) => id !== chatId) });
       }
-      set({
-        chats: get().chats.filter((chat) => chat.id !== chatId),
-        ...(get().activeChatId === chatId ? { activeChatId: null, messages: [] } : {}),
-      });
     });
   },
 

@@ -608,6 +608,114 @@ describe('deleting the chat the draft is being written in', () => {
 
     expect(chips(), 'no chip for it in the chat that stayed').toHaveLength(0);
   });
+
+  /*
+   * BETWEEN CONFIRMING AND THE DELETE LANDING.
+   *
+   * The draft is discarded as the delete is asked for, but the chat stays open
+   * until its delete has had its turn and landed, and that can wait behind an
+   * earlier write to the chat. The composer is not keyed by chat: what reached
+   * the draft meanwhile — text, an image, dictation — was there in whichever
+   * chat opened next, and the image's payload stayed on the device.
+   *
+   * So the composer takes nothing into the draft of a chat whose delete is being
+   * carried out, and whatever reached it anyway is discarded again as the delete
+   * lands. The second is measured by driving the field and the file input with
+   * events, which a disabled control does not stop.
+   */
+  it('takes nothing into the draft while the chat’s delete is being carried out', async () => {
+    const { next } = given('closed_meanwhile');
+    await render(createElement(ChatScreen));
+    fake.hold('deleteChat');
+
+    await deleteFromList('closed_meanwhile');
+
+    expect(inStore('closed_meanwhile'), 'the control: the delete has not landed').toBe(true);
+    expect(useChats.getState().activeChatId, 'the control: it is still the chat open').toBe('closed_meanwhile');
+    expect.soft(field().disabled, 'the field').toBe(true);
+    expect
+      .soft(document.querySelector<HTMLButtonElement>('button[aria-label="Attach an image"]')?.disabled, 'attaching')
+      .toBe(true);
+    expect
+      .soft(document.querySelector<HTMLButtonElement>('button[aria-label="Dictate"]')?.disabled, 'dictation')
+      .toBe(true);
+
+    fake.release('deleteChat');
+    await until('the next chat to open', () => useChats.getState().activeChatId === next);
+    expect(field().disabled, 'in the chat opened next').toBe(false);
+    expect(field().value).toBe('');
+  });
+
+  it('discards what reached the draft meanwhile once the delete lands, text, image and payload', async () => {
+    const { next } = given('reached_meanwhile');
+    await render(createElement(ChatScreen));
+    fake.hold('deleteChat');
+    await deleteFromList('reached_meanwhile');
+
+    await type('typed after confirming the delete');
+    const late = await attach();
+    expect(fake.blobs.has(late), 'the control: its payload was written').toBe(true);
+
+    fake.release('deleteChat');
+    await until('the next chat to open', () => useChats.getState().activeChatId === next);
+    await act(async () => {
+      await macrotask();
+    });
+
+    expect.soft(field().value, 'text in the chat opened next').toBe('');
+    expect.soft(chips(), 'chips in the chat opened next').toHaveLength(0);
+    expect.soft(fake.blobs.has(late), 'the late image’s payload').toBe(false);
+  });
+
+  it('discards it too when the delete waits its turn behind an earlier write to the chat', async () => {
+    const { next } = given('queued_meanwhile');
+    await render(createElement(ChatScreen));
+    let landRename = (): void => {};
+    fake.db.chats.put.mockImplementationOnce(async (row: Row) => {
+      await new Promise<void>((resolve) => (landRename = resolve));
+      fake.chats.set(row.id, structuredClone(row));
+    });
+    let renaming: Promise<void> = Promise.resolve();
+    await act(async () => {
+      renaming = useChats.getState().renameChat('queued_meanwhile', 'renamed');
+      await macrotask();
+    });
+
+    await deleteFromList('queued_meanwhile');
+    expect.soft(field().disabled, 'taking nothing while it waits').toBe(true);
+    await type('typed while the delete waits');
+    const late = await attach();
+
+    await act(async () => {
+      landRename();
+      await renaming;
+    });
+    await until('the next chat to open', () => useChats.getState().activeChatId === next);
+    await act(async () => {
+      await macrotask();
+    });
+
+    expect.soft(fake.chats.has('queued_meanwhile'), 'the control: the delete landed').toBe(false);
+    expect.soft(field().value, 'text in the chat opened next').toBe('');
+    expect.soft(chips(), 'chips in the chat opened next').toHaveLength(0);
+    expect.soft(fake.blobs.has(late), 'the late image’s payload').toBe(false);
+  });
+
+  it('takes a draft again when the delete fails and the chat stays', async () => {
+    given('failed_meanwhile');
+    await render(createElement(ChatScreen));
+    fake.deleteChat.mockImplementationOnce(async () => {
+      throw new Error('The disk is full.');
+    });
+
+    await act(async () => {
+      await expect(useChats.getState().removeChat('failed_meanwhile')).rejects.toThrow('The disk is full.');
+    });
+
+    expect(inStore('failed_meanwhile'), 'the control: the chat stays').toBe(true);
+    expect(field().disabled, 'the field').toBe(false);
+    await type('still here');
+  });
 });
 
 /*

@@ -25,6 +25,11 @@ export function ChatScreen(): ReactNode {
   const activeChatId = useChats((state) => state.activeChatId);
   const messages = useChats((state) => state.messages);
   const generating = useChats((state) => state.generating);
+  // Nothing is taken into the draft of a chat whose delete is being carried out:
+  // it would carry over into the chat opened next. See `removeChat`.
+  const deletingOpenChat = useChats(
+    (state) => state.activeChatId !== null && state.deleting.includes(state.activeChatId),
+  );
 
   const [drawer, setDrawer] = useState<'none' | 'chats' | 'settings' | 'model'>('none');
   const [editing, setEditing] = useState<Message | null>(null);
@@ -226,7 +231,7 @@ export function ChatScreen(): ReactNode {
           )}
 
           <Composer
-            disabled={!hasTarget}
+            disabled={!hasTarget || deletingOpenChat}
             generating={generating}
             acceptsImages={acceptsImages}
             /*
