@@ -33,6 +33,7 @@ import {
   type LlamaModelResolver,
 } from '@/ai/backends/llama-cpp';
 import {
+  callNames,
   createToolMiddleware,
   findToolCalls,
   runToolCalls,
@@ -940,6 +941,8 @@ export class ChatterangEngine {
      * the stored reply was the second sentence alone.
      */
     const said: string[] = [];
+    /** The tools the latest request declared, as the registry held them when it was built. */
+    let offered: ChatterangTool[] = [];
     let stats: GenerationStatsSnapshot = {};
     const tools: ExecutedTool[] = [];
 
@@ -1062,7 +1065,7 @@ export class ChatterangEngine {
       }
 
       // Taken as the request is built, beside the tool list `#toIR` declares.
-      const offered = declaredTools(request.toolIds);
+      offered = declaredTools(request.toolIds);
       const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
 
       // STOPPED: no request goes to a backend, whether the turn was stopped
@@ -1169,7 +1172,7 @@ export class ChatterangEngine {
       const roundLimitReached = iteration >= effectiveMaxRounds;
       // Tool calls only become readable once the turn has finished.
       const calls = request.toolIds?.length
-        ? findToolCalls({ role: 'assistant', content: turn.text })
+        ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered))
         : [];
 
       if (calls.length === 0) break;
@@ -1211,8 +1214,9 @@ export class ChatterangEngine {
       ];
 
       // The round's words stay in the answer, and the next round's follow them.
-      // This round was read for calls, so a fenced call is stripped as one.
-      const words = stripToolSyntax(text);
+      // A fenced call is stripped as one only when it names an offered tool, as
+      // `findToolCalls` read it just above.
+      const words = stripToolSyntax(text, { offered: callNames(offered) });
       if (words) said.push(words);
       text = '';
     }
@@ -1221,8 +1225,8 @@ export class ChatterangEngine {
     yield {
       type: 'done',
       // Every tool round's words, then the last round's. A fenced JSON block is
-      // a call only in a turn read for calls; see `stripToolSyntax`.
-      text: [...said, stripToolSyntax(text, { readForCalls: Boolean(request.toolIds?.length) })]
+      // a call only when it names a tool the request offered; see `fencedCall`.
+      text: [...said, stripToolSyntax(text, { offered: callNames(offered) })]
         .filter((part) => part !== '')
         .join('\n\n'),
       stats: {

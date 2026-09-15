@@ -1881,3 +1881,73 @@ describe('a JSON record with a "name" key, in a chat with a tool on', () => {
     expect(last.content, 'the words the person watched arrive').toBe(text);
   });
 });
+
+/* ── Round 2: a fenced block names a tool the turn offered, or is words ─ */
+
+describe('a fenced call example in a chat whose tool ids name nothing connected', () => {
+  const GONE = 'mcp:gone-server:note';
+  const EXAMPLE_CALL = '```json\n{"tool": "search", "arguments": {"query": "weather"}}\n```';
+
+  it('stays in a reply stopped after it', async () => {
+    const id = 'r2_gone_fenced_stopped';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('what goes in the config?', 'Then restart', gate.release);
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('stays in a reply whose stream failed after it', async () => {
+    const id = 'r2_gone_fenced_failed';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what goes in the config?');
+    await until(() => useChats.getState().messages.some((message) => message.content.includes('Then restart')));
+    // Released with nobody pressing Stop: the stream fails.
+    gate.release();
+    await sending;
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect(failed.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('is not run, and stays in a finished reply', async () => {
+    const id = 'r2_gone_fenced_finished';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart it.`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('what goes in the config?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+});
+
+describe('a fenced block naming a tool the chat does not offer, in a chat with a tool on', () => {
+  it('is not run, and stays in a finished reply', async () => {
+    const id = 'r2_unoffered_fenced';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = 'Here is a person:\n\n```json\n{"name": "Alice Chen"}\n```\n\nAdd more fields as you need them.';
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('a minimal person record, please');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+});

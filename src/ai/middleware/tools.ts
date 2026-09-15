@@ -138,10 +138,22 @@ export function unlessStopped<T>(waiting: Promise<T>, signal: AbortSignal | unde
 }
 
 /**
+ * The names a textual call can give and be run by: each tool a request offered,
+ * by its name and by its id, as `enabledTool` resolves a call's name.
+ */
+export function callNames(tools: readonly Pick<ChatterangTool, 'id' | 'name'>[]): string[] {
+  return tools.flatMap((tool) => [tool.id, tool.name]);
+}
+
+/**
  * Recognise a textual tool call. Local models produce these in a handful of
  * shapes; all of them reduce to a name plus a JSON argument object.
+ *
+ * `offered` is what the request offered, as {@link callNames} gives it. A
+ * fenced JSON block is a call only when it names one of those: see
+ * `fencedCall`.
  */
-export function extractTextualToolCalls(text: string): ToolUseContent[] {
+export function extractTextualToolCalls(text: string, offered: readonly string[]): ToolUseContent[] {
   const calls: ToolUseContent[] = [];
   let index = 0;
 
@@ -185,7 +197,7 @@ export function extractTextualToolCalls(text: string): ToolUseContent[] {
   for (const match of text.matchAll(/```(?:json|tool)?\s*(\{[\s\S]*?\})\s*```/gi)) {
     const body = match[1];
     if (!body) continue;
-    const call = fencedCall(body);
+    const call = fencedCall(body, offered);
     if (call) calls.push({ type: 'tool_use', id: `text_call_${index++}`, ...call });
   }
 
@@ -215,8 +227,19 @@ const FENCED_CALL_KEYS: ReadonlySet<string> = new Set(['tool', 'name', 'function
  * "Alice Chen", and the record the person asked for was stripped from the reply
  * — from a stopped one too, which was stored with no words and shown as
  * "Stopped before its first word" when the record was all it wrote.
+ *
+ * AND ONLY A NAME THE TURN OFFERED, by id or by name (`offered`, as
+ * {@link callNames} gives it). A tag or `[TOOL_CALLS]` is a model's call markup
+ * whatever it names, and is run and refused as a name nothing stands behind; a
+ * fenced block is the shape of any JSON example. In a chat whose only tool id
+ * named a disconnected server, whose requests offer nothing, a generic example
+ * `{"tool": "search", "arguments": …}` was run as a call, and stripped from the
+ * reply — finished, stopped or failed.
  */
-function fencedCall(body: string): { name: string; input: Record<string, unknown> } | undefined {
+function fencedCall(
+  body: string,
+  offered: readonly string[],
+): { name: string; input: Record<string, unknown> } | undefined {
   try {
     const parsed = JSON.parse(body) as {
       tool?: unknown;
@@ -229,7 +252,7 @@ function fencedCall(body: string): { name: string; input: Record<string, unknown
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
     if (Object.keys(parsed).some((key) => !FENCED_CALL_KEYS.has(key))) return undefined;
     const name = parsed.tool ?? parsed.name ?? parsed.function;
-    if (typeof name !== 'string') return undefined;
+    if (typeof name !== 'string' || !offered.includes(name)) return undefined;
     const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
     return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
   } catch {
@@ -302,22 +325,21 @@ const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/
  * unfinished call has no end, and is left for the caller: see
  * `wordsWithoutCalls` in `state/chat.ts`.
  *
- * `readForCalls` says whether the text was read for calls. A fenced block is a
- * call only in a turn that was — the engine runs `findToolCalls` only for a
- * request that enabled a tool — and in one that was not, it is an example.
- * The tag forms are stripped either way, as they always were.
+ * `offered` is what the turn's request offered, as {@link callNames} gives it.
+ * A fenced block is stripped only when it names one of those — the call
+ * `extractTextualToolCalls` would have read and run — and is an example
+ * otherwise. The tag forms are stripped whatever they name, as they always were.
  */
-export function stripToolSyntax(text: string, options: { readForCalls?: boolean } = {}): string {
-  const readForCalls = options.readForCalls ?? true;
+export function stripToolSyntax(text: string, { offered }: { readonly offered: readonly string[] }): string {
   const spans: [number, number][] = [];
   for (const { open, close, fenced } of CALL_SHAPES) {
-    if (fenced && !readForCalls) continue;
+    if (fenced && offered.length === 0) continue;
     for (const match of text.matchAll(open)) {
       const from = match.index + match[0].length;
       const end = endOfJson(text, from);
       if (end === -1) continue;
       const closing = close.exec(text.slice(end));
-      if (!closing || (fenced && fencedCall(text.slice(from, end)) === undefined)) continue;
+      if (!closing || (fenced && fencedCall(text.slice(from, end), offered) === undefined)) continue;
       spans.push([match.index, end + closing[0].length]);
     }
   }
@@ -342,8 +364,8 @@ export function stripToolSyntax(text: string, options: { readForCalls?: boolean 
  * (johnhenry/ai.matey#46), and a tool call cannot be executed mid-stream in
  * any case — the arguments are not complete until the turn ends.
  */
-export function findToolCalls(message: IRMessage): ToolUseContent[] {
-  return [...structuredToolCalls(message), ...extractTextualToolCalls(messageToText(message))];
+export function findToolCalls(message: IRMessage, offered: readonly string[]): ToolUseContent[] {
+  return [...structuredToolCalls(message), ...extractTextualToolCalls(messageToText(message), offered)];
 }
 
 /** Run a batch of tool calls, returning both IR results and UI records. */
@@ -804,7 +826,7 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
     let messages: IRMessage[] = [...context.request.messages];
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      const calls = findToolCalls(response.message);
+      const calls = findToolCalls(response.message, callNames(declared));
       if (calls.length === 0) break;
 
       const batch = await runToolCalls(options.registry, calls, {
@@ -863,7 +885,7 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
 
     // Hand the executed tools to the UI via response metadata, and clean the
     // model's tool syntax out of the visible answer.
-    const stripped = stripToolSyntax(messageToText(response.message));
+    const stripped = stripToolSyntax(messageToText(response.message), { offered: callNames(declared) });
     // If stripping leaves nothing, the model's whole reply was a tool call and
     // the follow-up turn did not happen. An empty message is never the right
     // thing to show, so keep the raw text and let the caller decide.

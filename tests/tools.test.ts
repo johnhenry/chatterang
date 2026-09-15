@@ -6,7 +6,15 @@ import {
   evaluateExpression,
   toolRegistry,
 } from '@/ai/tools/registry';
-import { extractTextualToolCalls, stripToolSyntax } from '@/ai/middleware/tools';
+import { extractTextualToolCalls as extractFrom, stripToolSyntax as stripFrom } from '@/ai/middleware/tools';
+
+/** What a chat with the calculator on offers, as `callNames` gives it. */
+const OFFERED = ['calculator', 'calculate'];
+
+/** Read as a turn offering the calculator reads it, unless `offered` says otherwise. */
+const extractTextualToolCalls = (text: string, offered: readonly string[] = OFFERED) => extractFrom(text, offered);
+const stripToolSyntax = (text: string, reading: { offered: readonly string[] } = { offered: OFFERED }) =>
+  stripFrom(text, reading);
 
 describe('evaluateExpression', () => {
   it('evaluates arithmetic with correct precedence', () => {
@@ -138,6 +146,7 @@ describe('extractTextualToolCalls', () => {
   it('reads a fenced JSON block', () => {
     const calls = extractTextualToolCalls(
       '```json\n{"tool": "get_datetime", "arguments": {"timezone": "UTC"}}\n```',
+      ['datetime', 'get_datetime'],
     );
     expect(calls[0]?.name).toBe('get_datetime');
     expect(calls[0]?.input).toEqual({ timezone: 'UTC' });
@@ -236,10 +245,20 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(text)).toBe(text);
   });
 
-  it('keeps a fenced block that reads as a call in text that was not read for calls, and still strips a tagged one', () => {
+  it('keeps a fenced block that reads as a call in text from a turn that offered no tool, and still strips a tagged one', () => {
     const fenced = '```json\n{"tool": "calculate", "arguments": {}}\n```';
-    expect(stripToolSyntax(fenced, { readForCalls: false })).toBe(fenced);
-    expect(stripToolSyntax('<tool_call>{"name":"a","arguments":{}}</tool_call>', { readForCalls: false })).toBe('');
+    expect(stripToolSyntax(fenced, { offered: [] })).toBe(fenced);
+    expect(stripToolSyntax('<tool_call>{"name":"a","arguments":{}}</tool_call>', { offered: [] })).toBe('');
+  });
+
+  it('reads a fenced block as a call only when it names a tool the turn offered, by name or by id', () => {
+    const example = '```json\n{"tool": "search", "arguments": {"query": "weather"}}\n```';
+    expect(extractTextualToolCalls(example)).toEqual([]);
+    expect(stripToolSyntax(example)).toBe(example);
+    expect(extractTextualToolCalls(example, ['web', 'search']).map((call) => call.name)).toEqual(['search']);
+    expect(stripToolSyntax(example, { offered: ['web', 'search'] })).toBe('');
+    const byId = '```json\n{"tool": "calculator", "arguments": {"expression": "2+2"}}\n```';
+    expect(extractTextualToolCalls(byId).map((call) => call.name)).toEqual(['calculator']);
   });
 
   it('strips every call extractTextualToolCalls reads, in each form', () => {

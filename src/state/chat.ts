@@ -60,7 +60,7 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import { stripToolSyntax } from '@/ai/middleware/tools';
+import { callNames, stripToolSyntax } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1528,9 +1528,10 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
  * prose. A chat can name tools and offer none: an MCP tool's id
  * stays on it after its server is removed or disconnected.
  *
- * `readForCalls` is whether the engine read the turn for calls, which decides
- * whether a fenced JSON block naming a tool is one. Only a block the engine
- * would have run is stripped: a tool DEFINITION, or a config file, is words.
+ * `offered` is the names a call could give in the request, as `callNames` gives
+ * them, which decides whether a fenced JSON block naming a tool is one. Only a
+ * block the engine would have run is stripped: a tool DEFINITION, a config
+ * file, or an example naming a tool the turn did not offer, is words.
  *
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.
@@ -1538,12 +1539,12 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
 function wordsWithoutCalls(
   content: string,
   {
-    readForCalls,
+    offered,
     stopped,
     cutsUnfinished,
-  }: { readonly readForCalls: boolean; readonly stopped: boolean; readonly cutsUnfinished: boolean },
+  }: { readonly offered: readonly string[]; readonly stopped: boolean; readonly cutsUnfinished: boolean },
 ): string {
-  const finished = stripToolSyntax(content, { readForCalls });
+  const finished = stripToolSyntax(content, { offered });
   if (!cutsUnfinished) return finished;
   const unfinished = unfinishedCallAt(finished, stopped);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
@@ -1784,7 +1785,16 @@ async function runGeneration(
     // engine makes to declare them, as the request is built. A chat's tool ids
     // are not that — an MCP tool's stays on the chat after its server is
     // removed or disconnected, and the request then offers none.
-    const offersTools = toolRegistry.toIRTools(chat.tools).length > 0;
+    //
+    // `offered` is the names a call can give among them, which decides whether
+    // a fenced JSON block naming a tool is one, as the engine's extractor does.
+    const offered = callNames(
+      chat.tools.flatMap((toolId) => {
+        const tool = toolRegistry.get(toolId);
+        return tool ? [tool] : [];
+      }),
+    );
+    const offersTools = offered.length > 0;
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -1860,7 +1870,7 @@ async function runGeneration(
               // as a version, and flipping back to it sent the call, and the
               // arguments that went to the server, to the model.
               content: wordsWithoutCalls(split.content, {
-                readForCalls: chat.tools.length > 0,
+                offered,
                 stopped: false,
                 cutsUnfinished: true,
               }),
@@ -1932,7 +1942,7 @@ async function runGeneration(
           const readsCalls =
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
           const content = wordsWithoutCalls(split.content, {
-            readForCalls: chat.tools.length > 0,
+            offered,
             stopped: aborted,
             cutsUnfinished: readsCalls,
           }).trim();
@@ -2034,7 +2044,7 @@ async function runGeneration(
             // version carries no error, and flipping back to it sent a call
             // that ran, arguments and all, to the model.
             content: wordsWithoutCalls(partial.content, {
-              readForCalls: chat.tools.length > 0,
+              offered,
               stopped: false,
               cutsUnfinished: offersTools || toolCalls.length > 0,
             }).trim(),
