@@ -1415,11 +1415,24 @@ function carriesReceipt(variant: MessageVariant): boolean {
 }
 
 /**
- * A tool call's opening marker with nothing after it: `<tool_call>` followed
- * by the end of the text or a lone `{`; `[TOOL_CALL]` or `[TOOL_CALLS]`
- * followed by the end, by a tool name the text ends in, or by `name(`.
+ * A tool call's opening marker with nothing after it, in a STOPPED turn:
+ * `<tool_call>` followed by the end of the text or a lone `{`; `[TOOL_CALL]`
+ * or `[TOOL_CALLS]` followed by the end, by a tool name the text ends in, or
+ * by `name(`. A stopped turn's text ends wherever Stop landed, so a bare marker
+ * there may be a call begun; that it may also be a marker named in prose is
+ * the accepted limit.
  */
 const CALL_MARKER_AT_END = /<tool_call>\s*\{?\s*$|\[TOOL_CALLS?\][ \t]*(?:\w+[ \t]*\(\s*|\w*\s*)$/i;
+
+/**
+ * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
+ * `<tool_call>{` or `[TOOL_CALLS] name(` at the end. A finished reply ended
+ * where the model ended it, and one ending on a bare `[TOOL_CALLS]` or
+ * `<tool_call>`, or on "[TOOL_CALLS] token", is a sentence naming the marker:
+ * the stopped pattern above cut "Mistral models put every call after the
+ * special token [TOOL_CALLS]" to "... the special token".
+ */
+const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\][ \t]*\w+[ \t]*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
@@ -1473,7 +1486,7 @@ function endOfObject(text: string, start: number): number {
  * "Stopped before its first word". Everything after it, which the person had
  * watched arrive, was gone.
  */
-function unfinishedCallAt(text: string): number {
+function unfinishedCallAt(text: string, stopped: boolean): number {
   let from = 0;
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
@@ -1485,7 +1498,7 @@ function unfinishedCallAt(text: string): number {
     if (end.startsWith(rest)) return match.index;
     from = close;
   }
-  return text.search(CALL_MARKER_AT_END);
+  return text.search(stopped ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
 }
 
 /**
@@ -1517,9 +1530,12 @@ function unfinishedCallAt(text: string): number {
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.
  */
-function wordsWithoutCalls(content: string, readForCalls: boolean): string {
+function wordsWithoutCalls(
+  content: string,
+  { readForCalls, stopped }: { readonly readForCalls: boolean; readonly stopped: boolean },
+): string {
   const finished = stripToolSyntax(content, { readForCalls });
-  const unfinished = unfinishedCallAt(finished);
+  const unfinished = unfinishedCallAt(finished, stopped);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
 }
 
@@ -1891,7 +1907,9 @@ async function runGeneration(
           const readsCalls =
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
           const content = (
-            readsCalls ? wordsWithoutCalls(split.content, chat.tools.length > 0) : split.content
+            readsCalls
+              ? wordsWithoutCalls(split.content, { readForCalls: chat.tools.length > 0, stopped: aborted })
+              : split.content
           ).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown

@@ -1549,3 +1549,46 @@ describe('a call whose string arguments hold a ")"', () => {
   });
 });
 
+describe('a finished reply in a chat offering tools, ending on a call marker', () => {
+  for (const text of [
+    'Mistral models put every call after the special token [TOOL_CALLS]',
+    'Qwen and Hermes open every call with <tool_call>',
+    'Before the name, Mistral writes its special [TOOL_CALLS] token',
+  ]) {
+    it(`keeps its last word: ${JSON.stringify(text.slice(-24))}`, async () => {
+      const id = `r1_marker_${text.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('how is a call marked?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(local.seen[0]?.tools?.map((tool) => tool.name), 'the tools the request offered').toEqual(['leaky']);
+      expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+    });
+  }
+
+  for (const text of ['Checking.\n<tool_call>{', 'Checking.\n[TOOL_CALLS] leaky(']) {
+    it(`still stores none of a call cut off as it opened: ${JSON.stringify(text.slice(10))}`, async () => {
+      const id = `r1_opened_${text.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id).at(-1)?.content).toBe('Checking.');
+    });
+  }
+});
+
