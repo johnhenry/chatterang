@@ -1809,3 +1809,75 @@ describe('a turn killed after an MCP call left', () => {
     expect(last, 'the request after flipping back').not.toContain(SECRET);
   });
 });
+
+/* ── Round 2: a JSON record is not a call ───────────────────────────── */
+
+/** A data record whose most common key happens to be one a fenced call names its tool with. */
+const RECORD = '```json\n{"name": "Alice Chen", "email": "alice@example.com", "age": 34}\n```';
+
+describe('a JSON record with a "name" key, in a chat with a tool on', () => {
+  it('stays whole in a reply stopped after it, with the prose around it, and is sent back', async () => {
+    const id = 'r2_record_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is a sample user record:\n\n${RECORD}\n\nYou can add more fields such as`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('a sample user record as JSON, please', 'more fields such as', gate.release);
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(partial);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', partial]);
+  });
+
+  it('is kept, and the reply not called stopped, when the record was all a stopped reply wrote', async () => {
+    const id = 'r2_record_only_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: RECORD, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('a sample user record as JSON, please', '"age": 34', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: RECORD,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+  });
+
+  it('is not run as a call to a tool named after its value, and stays in a finished reply', async () => {
+    const id = 'r2_record_finished';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Here is a sample user record:\n\n${RECORD}\n\nYou can add more fields.`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('a sample user record as JSON, please');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(local.seen, 'no follow-up request').toHaveLength(1);
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+
+  it('a tool definition naming an offered tool is not run, and stays in a finished reply', async () => {
+    const id = 'r2_offered_definition';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'My calculator is declared like this:\n\n```json\n{"name": "calculate", "description": "Evaluate arithmetic", ' +
+      '"parameters": {"type": "object", "properties": {"expression": {"type": "string"}}}}\n```';
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('what tools do you have?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+});

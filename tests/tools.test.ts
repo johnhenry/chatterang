@@ -218,6 +218,19 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(call)).toBe('Here.');
   });
 
+  it('reads a fenced block as a call only when it holds a name and its arguments, and nothing else', () => {
+    const record = '```json\n{"name": "Alice Chen", "email": "alice@example.com", "age": 34}\n```';
+    expect(extractTextualToolCalls(record)).toEqual([]);
+    expect(stripToolSyntax(record)).toBe(record);
+    const definition =
+      '```json\n{"name": "calculate", "description": "Evaluate arithmetic", "parameters": {"type": "object"}}\n```';
+    expect(extractTextualToolCalls(definition)).toEqual([]);
+    expect(stripToolSyntax(definition)).toBe(definition);
+    const call = '```json\n{"name": "calculate", "parameters": {"expression": "2+2"}}\n```';
+    expect(extractTextualToolCalls(call).map((found) => found.name)).toEqual(['calculate']);
+    expect(stripToolSyntax(call)).toBe('');
+  });
+
   it('keeps two JSON blocks and the prose between them when a quoted "tool" sits there', () => {
     const text = '```json\n{"model": "qwen3"}\n```\n\nSet the "tool" key:\n\n```json\n{"enabled": true}\n```';
     expect(stripToolSyntax(text)).toBe(text);

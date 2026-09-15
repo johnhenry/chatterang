@@ -199,10 +199,22 @@ export function extractTextualToolCalls(text: string): ToolUseContent[] {
   return calls;
 }
 
+/** Every key a fenced call is written with: the tool it names, and its arguments. */
+const FENCED_CALL_KEYS: ReadonlySet<string> = new Set(['tool', 'name', 'function', 'arguments', 'parameters', 'input']);
+
 /**
  * The call a fenced JSON block's body names, as `extractTextualToolCalls` reads
- * one: a `tool`, `name` or `function` that is a string. Undefined for any other
- * body — a tool DEFINITION, whose `function` is an object, or a config file.
+ * one: an object holding a `tool`, `name` or `function` that is a string, and
+ * nothing but that and its arguments. Undefined for any other body — a tool
+ * DEFINITION, whose `function` is an object or which has a `description`, a
+ * config file, or a data record.
+ *
+ * NOTHING BUT A NAME AND ITS ARGUMENTS. `name` is the commonest key a JSON record
+ * has, and any object with a string `name` was a call: a sample user record,
+ * `{"name": "Alice Chen", "email": …}`, was run as a call to a tool named
+ * "Alice Chen", and the record the person asked for was stripped from the reply
+ * — from a stopped one too, which was stored with no words and shown as
+ * "Stopped before its first word" when the record was all it wrote.
  */
 function fencedCall(body: string): { name: string; input: Record<string, unknown> } | undefined {
   try {
@@ -213,7 +225,9 @@ function fencedCall(body: string): { name: string; input: Record<string, unknown
       arguments?: unknown;
       parameters?: unknown;
       input?: unknown;
-    };
+    } | null;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    if (Object.keys(parsed).some((key) => !FENCED_CALL_KEYS.has(key))) return undefined;
     const name = parsed.tool ?? parsed.name ?? parsed.function;
     if (typeof name !== 'string') return undefined;
     const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
