@@ -740,6 +740,38 @@ export function deriveTitle(text: string): string {
   return cleaned.length > 42 ? `${cleaned.slice(0, 41).trimEnd()}…` : cleaned;
 }
 
+/** Where a reasoning block opens and where it closes, as {@link splitThinking} and {@link maskReasoning} both read them. */
+const REASONING_OPEN = /<(think|thinking|reasoning)>/i;
+const REASONING_CLOSE = /<\/(think|thinking|reasoning)>/i;
+
+/**
+ * A generation's text with each reasoning block, its tags included, blanked to
+ * spaces, read as {@link splitThinking} reads them: a block still open runs to
+ * the end. Every other character stays where it was.
+ *
+ * FOR FINDING WHERE SOMETHING STANDS IN A GENERATION'S WORDS. A tool round is
+ * cut where a call it ended inside starts (`cutUnfinishedCall` in
+ * ai/middleware/tools.ts), and a round is read with its reasoning still in it.
+ * Reasoning that names a call it never finishes — `<think>A call opens
+ * [TOOL_CALLS] leaky({"path": "</think>` — was taken for that call, and the cut
+ * took the round's answer with it.
+ */
+export function maskReasoning(raw: string): string {
+  let masked = '';
+  let rest = raw;
+  for (;;) {
+    const open = REASONING_OPEN.exec(rest);
+    if (!open) return masked + rest;
+    masked += rest.slice(0, open.index);
+    const inside = open.index + open[0].length;
+    const close = REASONING_CLOSE.exec(rest.slice(inside));
+    if (!close) return masked + ' '.repeat(rest.length - open.index);
+    const end = inside + close.index + close[0].length;
+    masked += ' '.repeat(end - open.index);
+    rest = rest.slice(end);
+  }
+}
+
 /**
  * Split a raw model response into visible answer and reasoning trace.
  * Handles the `<think>` convention used by reasoning-tuned open models, and
@@ -747,16 +779,13 @@ export function deriveTitle(text: string): string {
  * the trace live (PRD §3.4 — Thinking Mode).
  */
 export function splitThinking(raw: string): { content: string; thinking: string; open: boolean } {
-  const OPEN = /<(think|thinking|reasoning)>/i;
-  const CLOSE = /<\/(think|thinking|reasoning)>/i;
-
-  const openMatch = OPEN.exec(raw);
+  const openMatch = REASONING_OPEN.exec(raw);
   if (!openMatch) return { content: raw, thinking: '', open: false };
 
   const before = raw.slice(0, openMatch.index);
   const rest = raw.slice(openMatch.index + openMatch[0].length);
 
-  const closeMatch = CLOSE.exec(rest);
+  const closeMatch = REASONING_CLOSE.exec(rest);
   if (!closeMatch) {
     // Block still open — everything after the tag is reasoning so far.
     return { content: before, thinking: rest, open: true };

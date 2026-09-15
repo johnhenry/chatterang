@@ -2428,3 +2428,91 @@ describe('a call written with a closing brace too few', () => {
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
+
+/* ── Round 3: a tool round that ends inside a call ──────────────────── */
+
+/** A second call cut off in its arguments, as a round that hit its token limit leaves one. */
+const HALF_CALL = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a';
+
+/** A second call whose JSON closed with no closing tag after it. */
+const UNTAGGED_CALL = '<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}';
+
+/** A tool turn's calling round: words, a call that runs, then `tail`, where the round ends. */
+const roundEndingIn = (tail: string): string => `Reading both.\n${CALL}\n${tail}`;
+
+describe('a finished tool turn whose calling round ended inside a second call', () => {
+  for (const [form, tail] of [
+    ['half-written', HALF_CALL],
+    ['with no closing tag', UNTAGGED_CALL],
+  ] as const) {
+    it(`${form}: keeps the follow-up’s answer, and stores and sends none of the call`, async () => {
+      const id = `r3_round_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([roundEndingIn(tail), 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const ran = assistantRows(id)[1]!;
+      expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(ran.content, 'the stored reply').toBe('Reading both.\n\nThey mention a passphrase.');
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual([
+        'assistant',
+        'Reading both.\n\nThey mention a passphrase.',
+      ]);
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps the calling round’s words written after a call with a closing brace too few', async () => {
+    const id = 'r3_round_short_brace_words';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `Let me look.\n${SHORT_BRACE}\nI have asked for your notes.\n${CALL}`,
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.content, 'the stored reply').toBe(
+      'Let me look.\n\nI have asked for your notes.\n\nThey mention a passphrase.',
+    );
+  });
+
+  it('keeps the calling round’s words when its reasoning named a call it did not finish', async () => {
+    const id = 'r3_round_reasoning_names_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `<think>A call opens [TOOL_CALLS] leaky({"path": "</think>Let me look.\n${CALL}`,
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.content, 'the stored reply').toBe('Let me look.\n\nThey mention a passphrase.');
+    expect(ran.thinking, 'the reasoning').toContain('A call opens');
+  });
+});

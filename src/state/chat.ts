@@ -61,7 +61,7 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import { callNames, stripToolSyntax, xmlCallEnd } from '@/ai/middleware/tools';
+import { callNames, cutUnfinishedCall, stripToolSyntax } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1416,109 +1416,6 @@ function carriesReceipt(variant: MessageVariant): boolean {
 }
 
 /**
- * A tool call's opening marker with nothing after it, in a STOPPED turn:
- * `<tool_call>` followed by the end of the text or a lone `{`; `[TOOL_CALL]`
- * or `[TOOL_CALLS]` followed by the end, by a tool name the text ends in, or
- * by `name(`. A stopped turn's text ends wherever Stop landed, so a bare marker
- * there may be a call begun; that it may also be a marker named in prose is
- * the accepted limit.
- */
-const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$/i;
-
-/**
- * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
- * `<tool_call>{` or `[TOOL_CALLS] name(` at the end. A finished reply ended
- * where the model ended it, and one ending on a bare `[TOOL_CALLS]` or
- * `<tool_call>`, or on "[TOOL_CALLS] token", is a sentence naming the marker:
- * the stopped pattern above cut "Mistral models put every call after the
- * special token [TOOL_CALLS]" to "... the special token".
- */
-const CALL_OPENED_AT_END = /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/i;
-
-/**
- * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
- * a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and a
- * `{`. The match ends where the arguments' `{` starts.
- *
- * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the same
- * `{"`. Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`.
- *
- * The quote is spelled `\x22`, and a fence's backtick `\x60`: the source scans
- * in tests/support/source-scan.ts read a bare one in a regex literal as the
- * start of a string.
- */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)/gi;
-
-/**
- * Where the JSON object opening at `start` ends, just past its closing brace;
- * -1 if the text ends first. A brace inside a string is not counted.
- */
-function endOfObject(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let at = start; at < text.length; at += 1) {
-    const char = text[at];
-    if (inString) {
-      if (char === '\\') at += 1;
-      else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
-    } else if (char === '{') {
-      depth += 1;
-    } else if (char === '}') {
-      depth -= 1;
-      if (depth === 0) return at + 1;
-    }
-  }
-  return -1;
-}
-
-/**
- * Where a tool call still being written starts, or -1: a call's opening shape
- * with the text ending inside it.
- *
- * Its arguments' JSON still open at the end of the text; or closed, with
- * nothing after them but what is left of the call's own end — some of
- * `</tool_call>`, or of the `)`. Or an opening marker the text ends on.
- *
- * ANCHORED TO THE END OF THE TEXT, NOT TO THE MARKER. Any `<tool_call>` or
- * `[tool_calls]` was cut to the end of the reply, and a reply can name one in
- * words: "Qwen wraps each call in a `<tool_call>` tag", or a TOML example with
- * a `[tool_calls]` table. Then any `<tool_call>{"` was, and a reply can show
- * one: an example of Qwen's format with no closing tag and the explanation
- * after it, cut from the example on — finished or stopped, and a reply whose
- * words began with such an example was stored with none and shown as
- * "Stopped before its first word". Everything after it, which the person had
- * watched arrive, was gone.
- */
-function unfinishedCallAt(text: string, stopped: boolean): number {
-  let from = 0;
-  for (const match of text.matchAll(CALL_OPENING)) {
-    if (match.index < from) continue;
-    const open = match.index + match[0].length;
-    if (text.startsWith('<', open)) {
-      // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
-      const end = xmlCallEnd(text, match.index);
-      if (end === 'open') return match.index;
-      if (end !== -1) from = end;
-      continue;
-    }
-    const close = endOfObject(text, open);
-    if (close === -1) return match.index;
-    // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
-    // a call with a brace too many, stopped before its closing tag.
-    // Compared with no whitespace: a fenced call's end is a fence, a line break
-    // and `</tool_call>`, and none of a call's closing tokens holds a space.
-    const rest = text.slice(close).replace(/^[\s}\]]*/, '').replace(/\s+/g, '').toLowerCase();
-    const end = !match[0].startsWith('<') ? ')' : match[0].includes('\x60') ? '\x60\x60\x60</tool_call>' : '</tool_call>';
-    if (end.startsWith(rest)) return match.index;
-    from = close;
-  }
-  return text.search(stopped ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
-}
-
-/**
  * A reply's words with its tool calls read out of them, in a chat with tools.
  *
  * Handed the reply's text AFTER its reasoning is split off. Read over the raw
@@ -1570,9 +1467,7 @@ function wordsWithoutCalls(
   },
 ): string {
   const finished = stripToolSyntax(content, { offered, ran });
-  if (!cutsUnfinished) return finished;
-  const unfinished = unfinishedCallAt(finished, stopped);
-  return unfinished === -1 ? finished : finished.slice(0, unfinished);
+  return cutsUnfinished ? cutUnfinishedCall(finished, { stopped }) : finished;
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */

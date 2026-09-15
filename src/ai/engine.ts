@@ -35,6 +35,7 @@ import {
 import {
   callNames,
   createToolMiddleware,
+  cutUnfinishedCall,
   findToolCalls,
   runToolCalls,
   stripToolSyntax,
@@ -1218,7 +1219,14 @@ export class ChatterangEngine {
       // `findToolCalls` read it just above.
       // Its reasoning ends with it: a tag it left open would take the next
       // round's words into reasoning once the rounds are joined.
-      const words = closeReasoning(stripToolSyntax(text, { offered: callNames(offered), ran: true }));
+      // So does a call it ended inside — a second call cut off in its arguments,
+      // or one with no closing tag — which has no end for `stripToolSyntax` to
+      // match. Cut here, where the round ends: joined to the next round's words,
+      // it was either cut with all of them or kept with its arguments. See
+      // `cutUnfinishedCall`.
+      const words = closeReasoning(
+        stripToolSyntax(cutUnfinishedCall(text, { stopped: false }), { offered: callNames(offered), ran: true }),
+      );
       if (words) said.push(words);
       text = '';
     }
