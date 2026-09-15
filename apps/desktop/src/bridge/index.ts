@@ -46,6 +46,34 @@ export type {
   SupervisorPolicy,
   SupervisorTimers,
 } from './supervisor.js';
+export {
+  BROKER_TICK_MS,
+  MAX_CONCURRENT_TURNS,
+  MAX_WAITING_PER_DEVICE,
+  MAX_WAITING_PER_WINDOW,
+  MAX_WAITING_TOTAL,
+  PROMPT_ANSWER_TIMEOUT_MS,
+  RETAIN_RESULT_COUNT,
+  RETAIN_RESULT_MS,
+  RETAIN_RESULT_PER_DEVICE,
+  UNIT_DRAIN_TIMEOUT_MS,
+  UNIT_IDLE_TIMEOUT_MS,
+  WorkBroker,
+} from './work-broker.js';
+export type {
+  AdmitRefusal,
+  AdmitResult,
+  BrokerNotice,
+  ChannelCloseReason,
+  Owner,
+  OwnerChannel,
+  PromptOutcome,
+  PromptRefusal,
+  UnitEnd,
+  UnitRequest,
+  UnitTerminal,
+  WorkBrokerOptions,
+} from './work-broker.js';
 export { HostRuntime, createHostRuntime } from './host-runtime.js';
 export type {
   CallGuard,
