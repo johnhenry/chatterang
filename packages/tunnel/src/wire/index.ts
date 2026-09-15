@@ -85,6 +85,24 @@
  * None of them carries an IR escape hatch, so `FIELD_POLICY` gains no row:
  * every field below is a string, a boolean or a safe integer, checked on the
  * way out as well as on the way in.
+ *
+ * ── #152: WHO RUNS THE TOOL LOOP ──────────────────────────────────────
+ *
+ * The owner's ruling on #152: the request says who owns the tool loop, both
+ * sides implement both paths, the device that asks can require that the loop
+ * stays with it, the far side refuses with a defined frame, and the flag is
+ * part of the wire contract. So `turn` carries `toolLoop` — a named field on
+ * the frame, never `metadata.custom` (#141) — and `TOOL_LOOP_UNSUPPORTED` is the
+ * refusal. See {@link ToolLoop} for the two values.
+ *
+ * A WRITER MUST SAY ONE OF THE TWO, AND A READER GETS WHAT ARRIVED. The one
+ * deliberate break from "checked both ways": `encodeFrame` refuses a `turn`
+ * that does not say `requester` or `host`, but `decodeFrame` does NOT refuse a
+ * missing or unknown value. A decode error closes the tunnel, and a host could
+ * then never send the refusal the ruling asks for. So the value is carried as
+ * it came, {@link toolLoopOf} is the one reader, and it answers `null` for
+ * anything but the two values — which a host refuses, failing closed. Which
+ * loops a host runs is the host's to say, not this file's.
  */
 
 /**
@@ -99,6 +117,10 @@
  * and no build has carried a tunnel to anyone, so there is no deployed version
  * 1 for a new kind to be incompatible with. The first build that ships a
  * tunnel is the one whose frames are version 1.
+ *
+ * STILL 1 AFTER `turn` GAINED A REQUIRED `toolLoop` (#152), for the same reason:
+ * no phone ships the tunnel, so no deployed writer sends a `turn` without one.
+ * Once a build has shipped, a field a peer must send is a version bump.
  */
 export const TUNNEL_WIRE_VERSION = 1;
 
@@ -222,10 +244,39 @@ export interface RelayedPrompt {
   readonly cancelLabel?: string;
 }
 
+/**
+ * Who runs the tools the model calls in a turn (#152).
+ *
+ * - `'requester'`: the device that asked for the turn runs them. The host
+ *   serves inference only, and its reply ends at the model's tool calls.
+ * - `'host'`: the host runs the tools its policy allows (#170).
+ */
+export type ToolLoop = 'requester' | 'host';
+
+/** Every {@link ToolLoop} this build knows. */
+export const TOOL_LOOPS: readonly ToolLoop[] = Object.freeze(['requester', 'host'] as const);
+
+function isToolLoop(value: unknown): value is ToolLoop {
+  return value === 'requester' || value === 'host';
+}
+
 /** Frames that belong to one turn, and carry its id. */
 export type TurnFrame =
-  /** A turn going up. `body` is the request; the codec decides what may cross. */
-  | { readonly v: number; readonly kind: 'turn'; readonly turn: TurnId; readonly body: unknown }
+  /**
+   * A turn going up. `body` is the request; the codec decides what may cross.
+   *
+   * `toolLoop` says who runs the turn's tools. It is `unknown` because a
+   * decoded frame carries it as it arrived (see the #152 note at the top of
+   * this file): a writer must set a {@link ToolLoop}, and `encodeFrame` refuses
+   * anything else; a reader reads it only through {@link toolLoopOf}.
+   */
+  | {
+      readonly v: number;
+      readonly kind: 'turn';
+      readonly turn: TurnId;
+      readonly toolLoop: unknown;
+      readonly body: unknown;
+    }
   /** One `IRStreamChunk` coming down, as a payload rather than as the frame. */
   | { readonly v: number; readonly kind: 'chunk'; readonly turn: TurnId; readonly body: unknown }
   /** Stop this turn. Mid-stream, which is why it needs the id. */
@@ -360,6 +411,20 @@ export function isTurnScoped(kind: FrameKind): kind is TurnScopedKind {
 }
 
 /**
+ * Who a turn asked to run its tool loop, or `null` (#152).
+ *
+ * THE ONE READER OF `toolLoop`, AND IT FAILS CLOSED. A missing field, a value
+ * this build does not know, a different spelling and a non-string are all
+ * `null`, never a default: a host that guessed `host` would run tools on a
+ * device that asked to keep them. A host refuses `null` with
+ * `TOOL_LOOP_UNSUPPORTED`, as it refuses a loop it does not run.
+ */
+export function toolLoopOf(frame: Extract<TunnelFrame, { readonly kind: 'turn' }>): ToolLoop | null {
+  if (frame.kind !== 'turn') return null;
+  return isToolLoop(frame.toolLoop) ? frame.toolLoop : null;
+}
+
+/**
  * What a refusal means to the end that receives it, as one table (#7).
  *
  * - `kind` is what an app renders: busy, quitting, suspended and refused are
@@ -374,10 +439,11 @@ export function isTurnScoped(kind: FrameKind): kind is TurnScopedKind {
  *   turn and ends turns ends every turn its sender was running on the tunnel,
  *   and is final for that tunnel (see `createTurnLedger`).
  * - `beforeStart` is whether the code may only be sent before the turn it names
- *   has started: before any prompt or chunk for it. `WAIT_LIST_FULL` and
- *   `HOST_DOES_NOT_RUN_TURNS` say nothing in the turn ran, which is what makes
- *   asking again safe, so the ledger refuses either once something could have;
- *   `RESULT_UNKNOWN` says nothing of that turn is here to send.
+ *   has started: before any prompt or chunk for it. `WAIT_LIST_FULL`,
+ *   `HOST_DOES_NOT_RUN_TURNS` and `TOOL_LOOP_UNSUPPORTED` say nothing in the
+ *   turn ran, which is what makes asking again safe, so the ledger refuses each
+ *   once something could have; `RESULT_UNKNOWN` says nothing of that turn is
+ *   here to send.
  */
 export type RefusalKind =
   /** `WAIT_LIST_FULL`: nothing ran, and the host may take it later. */
@@ -386,7 +452,11 @@ export type RefusalKind =
   | 'quitting'
   /** `HOST_SUSPENDED`: the host is going to sleep and does not keep itself awake (#7 ruling 7). */
   | 'suspended'
-  /** `HOST_DOES_NOT_RUN_TURNS`: this host does not run a paired device's turns. */
+  /**
+   * `HOST_DOES_NOT_RUN_TURNS`: this host does not run a paired device's turns.
+   * `TOOL_LOOP_UNSUPPORTED`: this host does not run this turn's tool loop where
+   * the turn asked for it, or could not read where that was (#152).
+   */
   | 'refused'
   /** `PROMPT_EXPIRED`: that call was refused and recorded as not sent; the turn goes on (#170). */
   | 'prompt-expired'
@@ -443,6 +513,17 @@ export const REFUSALS = Object.freeze({
   HOST_DOES_NOT_RUN_TURNS: Object.freeze({
     kind: 'refused',
     scope: 'turn-or-connection',
+    endsTurn: true,
+    beforeStart: true,
+  }),
+  /*
+   * #152: the turn's `toolLoop` names a loop this host does not run, or
+   * `toolLoopOf` read it as `null`. One turn, before it starts: nothing ran, so
+   * the device may ask again with the other loop.
+   */
+  TOOL_LOOP_UNSUPPORTED: Object.freeze({
+    kind: 'refused',
+    scope: 'turn',
     endsTurn: true,
     beforeStart: true,
   }),
@@ -667,7 +748,17 @@ function readFrame(frame: Record<string, unknown>, reading: Reading): TunnelFram
     switch (k) {
       case 'cancel':
         return { v, kind: k, turn };
-      case 'turn':
+      case 'turn': {
+        // Carried as it came on the way in, refused unless it is one of the
+        // two on the way out: see the #152 note at the top of this file.
+        const toolLoop = frame.toolLoop;
+        if (reading === 'encode' && !isToolLoop(toolLoop)) {
+          throw new TunnelWireError(
+            `turn frame's toolLoop ${JSON.stringify(toolLoop) ?? String(toolLoop)} is not ${TOOL_LOOPS.map((loop) => `'${loop}'`).join(' or ')}`,
+          );
+        }
+        return { v, kind: k, turn, toolLoop, body: frame.body };
+      }
       case 'chunk':
         return { v, kind: k, turn, body: frame.body };
       case 'attach':

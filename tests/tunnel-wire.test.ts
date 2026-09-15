@@ -27,7 +27,7 @@ import {
 
 /** One of every kind, so the exhaustiveness check below has something to find. */
 const SAMPLES: Record<string, TunnelFrame> = {
-  turn: { v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: 't1', body: { messages: [] } },
+  turn: { v: TUNNEL_WIRE_VERSION, kind: 'turn', turn: 't1', toolLoop: 'host', body: { messages: [] } },
   chunk: {
     v: TUNNEL_WIRE_VERSION,
     kind: 'chunk',
@@ -354,6 +354,7 @@ describe('the error frame’s refusal vocabulary', () => {
       DESKTOP_QUITTING: { kind: 'quitting', scope: 'turn-or-connection', endsTurn: true, beforeStart: false },
       HOST_SUSPENDED: { kind: 'suspended', scope: 'turn-or-connection', endsTurn: true, beforeStart: false },
       HOST_DOES_NOT_RUN_TURNS: { kind: 'refused', scope: 'turn-or-connection', endsTurn: true, beforeStart: true },
+      TOOL_LOOP_UNSUPPORTED: { kind: 'refused', scope: 'turn', endsTurn: true, beforeStart: true },
       PROMPT_EXPIRED: { kind: 'prompt-expired', scope: 'prompt', endsTurn: false, beforeStart: false },
       RESULT_UNKNOWN: { kind: 'result-unknown', scope: 'attach', endsTurn: true, beforeStart: true },
       FRAME_UNEXPECTED: { kind: 'unexpected', scope: 'any', endsTurn: false, beforeStart: false },

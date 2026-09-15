@@ -225,12 +225,29 @@ They are on the wire now, in `wire/`:
 | `answer` (turn, prompt id, yes/no) | asker → runner | The answer to that one prompt. |
 | `attach` (turn) | asker → runner | Collect a result held while this device's socket was gone (ruling 4). |
 | `ack` (turn) | asker → runner | That turn's terminal arrived whole; whatever holds it may let it go. |
-| `error` codes in `REFUSALS` | runner → asker | `WAIT_LIST_FULL`, `DESKTOP_QUITTING`, `HOST_SUSPENDED`, `HOST_DOES_NOT_RUN_TURNS`, `PROMPT_EXPIRED`, `RESULT_UNKNOWN`. |
+| `error` codes in `REFUSALS` | runner → asker | `WAIT_LIST_FULL`, `DESKTOP_QUITTING`, `HOST_SUSPENDED`, `HOST_DOES_NOT_RUN_TURNS`, `TOOL_LOOP_UNSUPPORTED` (#152, below), `PROMPT_EXPIRED`, `RESULT_UNKNOWN`. |
 | `error` `FRAME_UNEXPECTED` | either | One of your frames was dropped unread. Changes no turn and no prompt. |
 
 Roles are per turn. The end that sends a turn's `turn`, or its `attach`, asks
 for it; the other end runs it. Under #7 the phone asks and the desktop runs, but
 the wire does not say which device is which.
+
+### #152: who runs the tool loop
+
+Every `turn` frame says who runs the tools the model calls, in a named
+`toolLoop` field on the frame (never `metadata.custom`, #141):
+
+- `requester`: the device that asked runs them. The host serves inference only,
+  and its reply ends at the model's tool calls.
+- `host`: the host runs the tools its policy allows (#170).
+
+A writer must say one of the two, and `encodeFrame` refuses a `turn` that does
+not. `decodeFrame` does not refuse a missing or unknown value: a decode error
+closes the tunnel, and the host could then never send its refusal. So the value
+arrives as it was sent. `toolLoopOf` is the one reader, and it answers `null` for
+anything but the two values. A host refuses a loop it does not run, and `null`,
+with `TOOL_LOOP_UNSUPPORTED`. That refusal names one turn and is sent before the
+turn starts, so the device may ask again with the other loop.
 
 - **Every field is checked both ways.** `encodeFrame` runs the decoder's own
   per-arm rules on the frame it writes. A position JSON would turn into `null`,
@@ -252,8 +269,9 @@ the wire does not say which device is which.
   - A turn that arrived by `attach` may be sent only its terminal chunk.
   - It refuses a refusal of a turn that is already over, so an app is handed
     one terminal per turn.
-  - It refuses `WAIT_LIST_FULL` and `HOST_DOES_NOT_RUN_TURNS` once a turn has
-    started, because both say nothing ran. It refuses `RESULT_UNKNOWN` for a
+  - It refuses `WAIT_LIST_FULL`, `HOST_DOES_NOT_RUN_TURNS` and
+    `TOOL_LOOP_UNSUPPORTED` once a turn has started, because each says nothing
+    ran. It refuses `RESULT_UNKNOWN` for a
     turn that did not come by `attach`, and any code in `REFUSALS` other than
     `FRAME_UNEXPECTED` from the end that asked for the turn.
 

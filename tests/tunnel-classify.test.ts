@@ -27,7 +27,7 @@ const refusalFrame = (code: string, where: { turn?: string; prompt?: string } = 
 });
 
 const SAMPLES: Record<FrameKind, TunnelFrame> = {
-  turn: { v: V, kind: 'turn', turn: 't1', body: {} },
+  turn: { v: V, kind: 'turn', turn: 't1', toolLoop: 'host', body: {} },
   chunk: { v: V, kind: 'chunk', turn: 't1', body: { type: 'content', sequence: 0, delta: 'x' } },
   cancel: { v: V, kind: 'cancel', turn: 't1' },
   waiting: { v: V, kind: 'waiting', turn: 't1', body: { position: 3 } },
