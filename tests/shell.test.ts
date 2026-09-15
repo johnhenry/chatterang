@@ -16,7 +16,7 @@ import { chatterangCommands, renderTranscript, table } from '@/shell/commands';
 import { nonChatRole } from '@/domain/manifest';
 import { REACH_DEVICE, REACH_REMOTE } from '@/domain/chat';
 import { normalizePath } from '@/shell/fs';
-import { PROJECTED_PATHS, buildVfs, isProjectedPath, slug } from '@/shell/vfs';
+import { PROJECTED_PATHS, buildVfs, isProjectedPath, slug, type VfsSnapshot } from '@/shell/vfs';
 
 /**
  * The shell is a sandbox with a model on the other end of it, so the tests
@@ -119,12 +119,28 @@ function shell(actor: 'user' | 'model', confirm = vi.fn(async () => true)): Chat
  * A tunnel device credential's shape: `<deviceId>.<secret>`, 22 and 43
  * base64url characters (packages/tunnel/src/host/credential.ts).
  *
- * UNANCHORED, bounded by characters base64url does not use. The greps below
- * read a whole VFS dump, where a credential would sit inside a JSON string;
- * `^…$` could only match a dump that was nothing but a credential.
+ * UNANCHORED, bounded by characters base64url does not use. A projected file
+ * holds a credential inside other text, and `^…$` could only match a file that
+ * was nothing but one. Match it through {@link credentialShapedIn}, not against
+ * `JSON.stringify` of the snapshot.
  */
 const DEVICE_CREDENTIAL = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/;
 const CANARY_CREDENTIAL = 'CANARYdeviceIdCANARY00.CANARYsecretCANARYsecretCANARYsecretCANARY1';
+
+/**
+ * The paths of the projected files whose path or text holds a credential's shape.
+ *
+ * PER FILE, never over `JSON.stringify(files)`. In that JSON every line break,
+ * tab or carriage return inside a file is a backslash and a LETTER (`\n`, `\t`,
+ * `\r`). A credential at the start of a line then has a base64url character in
+ * front of it, the lookbehind refuses every start, and the grep reads clean on
+ * the likeliest leak there is: a credential on its own line in a transcript.
+ */
+function credentialShapedIn(files: VfsSnapshot): string[] {
+  return Object.entries(files)
+    .filter(([path, text]) => DEVICE_CREDENTIAL.test(`${path}\n${text}`))
+    .map(([path]) => path);
+}
 
 /** A phone's paired-device row (`PairedDeviceRecord`, #133), plus whatever a regression spreads into it. */
 function pairedRow(extra: Record<string, unknown> = {}) {
@@ -231,14 +247,14 @@ describe('sandbox boundaries', () => {
     // And the tunnel credential's own shape, `<deviceId>.<secret>`, which
     // contains none of the words above.
     expect(JSON.stringify(pairedDevicesOf(seeded))).toMatch(DEVICE_CREDENTIAL);
-    expect(dump).not.toMatch(DEVICE_CREDENTIAL);
+    expect(credentialShapedIn(files)).toEqual([]);
   });
 
-  it('greps for the device credential’s shape inside a dump, not only as a whole string', async () => {
+  it('greps each projected file for the device credential’s shape, not only a whole string', async () => {
     // The shape is `<deviceId>.<secret>`: 16 and 32 bytes, base64url, 22 and
     // 43 characters (packages/tunnel/src/host/credential.ts). Anchored, it can
-    // match only a string that IS a credential, and every grep in this file
-    // reads a whole VFS dump, where one would sit inside a JSON string.
+    // match only a string that IS a credential, and a projected file holds one
+    // inside other text.
     const poisoned = stores({
       device: () => ({
         chipset: CANARY_CREDENTIAL,
@@ -249,15 +265,46 @@ describe('sandbox boundaries', () => {
         engineVersion: 'x',
       }),
     });
-    const dump = JSON.stringify(await buildVfs(poisoned));
-    expect(dump).toMatch(DEVICE_CREDENTIAL);
-    expect(dump).not.toMatch(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
+    const files = await buildVfs(poisoned);
+    expect(credentialShapedIn(files)).toEqual(['/device.json']);
+    expect(files['/device.json']).not.toMatch(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
 
     // Bounded, so a longer base64url run is not read as one.
     expect(`x${CANARY_CREDENTIAL}`).not.toMatch(DEVICE_CREDENTIAL);
     expect(`${CANARY_CREDENTIAL}x`).not.toMatch(DEVICE_CREDENTIAL);
     // And the default projection carries nothing of that shape by accident.
-    expect(JSON.stringify(await buildVfs(stores()))).not.toMatch(DEVICE_CREDENTIAL);
+    expect(credentialShapedIn(await buildVfs(stores()))).toEqual([]);
+  });
+
+  it('finds a credential at the start of a line, which the JSON of the whole snapshot hides', async () => {
+    /*
+     * The likeliest leak: a credential pasted into a chat on its own line, then
+     * projected to /chats/*.md. `JSON.stringify` writes the break before it as
+     * a backslash and a letter, so a grep over the JSON sees `n`, `t` or `r`
+     * in front of the credential and reads clean. Each file's own text has the
+     * break itself, which base64url does not use.
+     */
+    for (const before of ['\n', '\t', '\r\n']) {
+      const label = JSON.stringify(before);
+      const poisoned = stores({
+        chats: () => ({
+          activeChatId: 'chat_1',
+          list: [{ id: 'chat_1', title: 'Notes', messageCount: 1, updatedAt: 0, mode: 'chat' }],
+          messagesFor: async () => [
+            { role: 'user', content: `the pairing credential:${before}${CANARY_CREDENTIAL}`, createdAt: 0 },
+          ],
+          open: async () => undefined,
+          create: async () => 'chat_new',
+        }),
+      });
+      const files = await buildVfs(poisoned);
+
+      // Positive control: the transcript really carries it, after that break.
+      expect(files['/chats/notes.md'], label).toContain(`${before}${CANARY_CREDENTIAL}`);
+      expect(credentialShapedIn(files), label).toEqual(['/chats/notes.md']);
+      // Why per file: the same pattern over the JSON of the snapshot misses it.
+      expect(JSON.stringify(files), label).not.toMatch(DEVICE_CREDENTIAL);
+    }
   });
 
   it('does not project the paired-device table, its rows or a credential in one (#133, #124)', async () => {
@@ -283,7 +330,7 @@ describe('sandbox boundaries', () => {
     for (const canary of [row.id, row.spkiPin, row.name, CANARY_CREDENTIAL]) {
       expect(dump, `the VFS carries ${canary} from a paired-device row`).not.toContain(canary);
     }
-    expect(dump).not.toMatch(DEVICE_CREDENTIAL);
+    expect(credentialShapedIn(files)).toEqual([]);
 
     // The same sweep a model can run, through the shell itself.
     const sh = new ChatterangShell({ stores: seeded, actor: 'model', confirm: vi.fn(async () => true) });
