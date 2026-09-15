@@ -298,16 +298,41 @@ function writeStaleAway(get: () => ChatState, chatId: string, grants: ReadonlySe
  * with its error and `write` is not made, so the connection or server stays off
  * and the next launch withdraws the grant again. FAILS CLOSED: a switch-on
  * waits as long as those writes do.
+ *
+ * And, while it is off (`isOn`), until no chat in the store holds a grant `names`
+ * matches: `withdraw` is made once first, and when it rejects so does this,
+ * without making `write`. A switch-off drops every such grant, and sets the
+ * store only once its put has landed, so one still held is one whose put failed
+ * — or has not landed yet, which `withdraw` waits for in the chat's turn.
+ * Switched on with it there, it was honoured at once, and on disk at the next
+ * launch.
  */
-async function afterStaleGrantsGo(names: (grant: EgressGrant) => boolean, write: () => Promise<void>): Promise<void> {
+async function afterStaleGrantsGo(
+  names: (grant: EgressGrant) => boolean,
+  isOn: () => boolean,
+  withdraw: () => Promise<void>,
+  write: () => Promise<void>,
+): Promise<void> {
   let madeAgain = false;
+  let withdrawnAgain = false;
   for (;;) {
     if (launchReads.size > 0) {
       await Promise.all(launchReads);
       continue;
     }
     const left = [...staleOnDisk].filter(([, entry]) => [...entry.grants].some(names));
-    if (left.length === 0) return write();
+    if (left.length === 0) {
+      if (
+        !withdrawnAgain &&
+        !isOn() &&
+        useChats.getState().chats.some((chat) => (chat.egressGrants ?? []).some(names))
+      ) {
+        withdrawnAgain = true;
+        await withdraw();
+        continue;
+      }
+      return write();
+    }
     const underWay = left.filter(([, entry]) => !entry.failed);
     if (underWay.length > 0) {
       await Promise.all(underWay.map(([, entry]) => entry.settled));
@@ -2366,11 +2391,21 @@ installMcpGrantRevoker(async (serverId) => {
 // the grants on disk that named it. See `launchWithdrawals`.
 installConnectionSwitchedOn((connectionId) => switchedOn(launchWithdrawals.connections, connectionId));
 installMcpServerSwitchedOn((serverId) => switchedOn(launchWithdrawals.servers, serverId));
-installConnectionSwitchingOn((connectionId, write) =>
-  afterStaleGrantsGo((grant) => grant.kind !== 'mcp' && grant.connectionId === connectionId, write),
+installConnectionSwitchingOn((connectionId, write, isOn) =>
+  afterStaleGrantsGo(
+    (grant) => grant.kind !== 'mcp' && grant.connectionId === connectionId,
+    isOn,
+    () => useChats.getState().revokeEgress(connectionId),
+    write,
+  ),
 );
-installMcpServerSwitchingOn((serverId, write) =>
-  afterStaleGrantsGo((grant) => grant.kind === 'mcp' && grant.serverId === serverId, write),
+installMcpServerSwitchingOn((serverId, write, isOn) =>
+  afterStaleGrantsGo(
+    (grant) => grant.kind === 'mcp' && grant.serverId === serverId,
+    isOn,
+    () => useChats.getState().revokeMcpEgress(serverId),
+    write,
+  ),
 );
 
 // Another tab of the server profile deleted every conversation, and with them the

@@ -2019,4 +2019,128 @@ describe('a connection or server switched back on while the launch withdraws the
     });
   });
 
+  describe('after its switch-off could not write its grants away', () => {
+    /*
+     * A switch-off withdraws each chat's grants through `updateChat`, which sets
+     * the store only once the put has landed. A put that failed — a full disk —
+     * left the grant in the store and on disk, and the switch-off rejected with
+     * the switch showing off. Switched back on, the grant was honoured at once:
+     * the next turn sent tool output to the connection without asking.
+     */
+    const SERVER_ON = { id: 'mcp_off', name: 'off', url: OFF_URL, enabled: true, createdAt: 1 };
+    const CONNECTION_ON = { ...OPENAI, id: 'conn_off', label: 'Off', enabled: true };
+
+    beforeEach(() => {
+      useApp.setState({ connections: [CONNECTION_ON] });
+      useMcp.setState({ servers: [SERVER_ON], states: {} });
+      useChats.setState({ loaded: true, chats: [chatOnDisk('swept', [])], activeChatId: null, messages: [] });
+    });
+
+    /** Chat puts fail while `full.value`; every put to the chats, connections and servers tables is recorded. */
+    function recordingWrites() {
+      const order: string[] = [];
+      const full = { value: false };
+      chatsTable.put.mockImplementation((async (chat: Chat) => {
+        if (full.value) throw new Error('The disk is full.');
+        order.push(`chat ${chat.id}`);
+      }) as never);
+      vi.mocked(tables.connections.put).mockImplementation((async (connection: { id: string; enabled: boolean }) => {
+        order.push(`connection ${connection.id} ${connection.enabled ? 'on' : 'off'}`);
+      }) as never);
+      vi.mocked(tables.mcpServers.update).mockImplementation((async (id: string, changes: { enabled: boolean }) => {
+        order.push(`server ${id} ${changes.enabled ? 'on' : 'off'}`);
+        return 1;
+      }) as never);
+      return {
+        order,
+        full,
+        restore: () => {
+          chatsTable.put.mockImplementation(async () => {});
+          vi.mocked(tables.connections.put).mockImplementation((async () => {}) as never);
+          vi.mocked(tables.mcpServers.update).mockImplementation((async () => 1) as never);
+        },
+      };
+    }
+
+    it('withdraws that grant again before the connection is switched on, so the next turn asks', async () => {
+      const writes = recordingWrites();
+      try {
+        await useChats.getState().grantEgress('swept', 'conn_off');
+        writes.full.value = true;
+        await expect(useApp.getState().toggleConnection('conn_off', false)).rejects.toThrow('The disk is full.');
+        expect(connectionsOf('swept'), 'the control: the store still holds it').toEqual(['conn_off']);
+        expect(useApp.getState().connections[0]?.enabled, 'the control: switched off').toBe(false);
+
+        writes.full.value = false;
+        writes.order.length = 0;
+        await useApp.getState().toggleConnection('conn_off', true);
+        expect(writes.order, 'the grant written away, then the connection switched on').toEqual([
+          'chat swept',
+          'connection conn_off on',
+        ]);
+        expect(connectionsOf('swept'), 'the store').toEqual([]);
+
+        const { secretSent, asked } = await aTurn();
+        expect(asked, 'asked once switched back on').toHaveLength(1);
+        expect(secretSent, 'tool output sent unasked').toBe(false);
+      } finally {
+        writes.restore();
+      }
+    });
+
+    it('is not switched on while that grant still cannot be written away', async () => {
+      const writes = recordingWrites();
+      try {
+        await useChats.getState().grantEgress('swept', 'conn_off');
+        writes.full.value = true;
+        await expect(useApp.getState().toggleConnection('conn_off', false)).rejects.toThrow('The disk is full.');
+        writes.order.length = 0;
+
+        await expect(useApp.getState().toggleConnection('conn_off', true)).rejects.toThrow('The disk is full.');
+        expect(writes.order, 'nothing switched on on disk').toEqual([]);
+        expect(useApp.getState().connections[0]?.enabled, 'nor in the store').toBe(false);
+      } finally {
+        writes.restore();
+      }
+    });
+
+    it('withdraws an MCP grant again before the server is switched on', async () => {
+      const writes = recordingWrites();
+      try {
+        await useChats.getState().grantMcpEgress('swept', { serverId: 'mcp_off', url: OFF_URL });
+        writes.full.value = true;
+        await expect(useMcp.getState().toggle('mcp_off', false)).rejects.toThrow('The disk is full.');
+        expect(grantsOf('swept'), 'the control: the store still holds it').toHaveLength(1);
+
+        writes.full.value = false;
+        writes.order.length = 0;
+        await useMcp.getState().toggle('mcp_off', true);
+        expect(writes.order, 'the grant written away, then the server switched on').toEqual([
+          'chat swept',
+          'server mcp_off on',
+        ]);
+        expect(grantsOf('swept'), 'the store').toEqual([]);
+      } finally {
+        writes.restore();
+      }
+    });
+
+    it('leaves the grants of a connection or server that is already on alone when it is switched on again', async () => {
+      // The control: `provider enable` switches on a connection that may be on.
+      const writes = recordingWrites();
+      try {
+        await useChats.getState().grantEgress('swept', 'conn_off');
+        await useChats.getState().grantMcpEgress('swept', { serverId: 'mcp_off', url: OFF_URL });
+        writes.order.length = 0;
+
+        await useApp.getState().toggleConnection('conn_off', true);
+        await useMcp.getState().toggle('mcp_off', true);
+
+        expect(writes.order).toEqual(['connection conn_off on', 'server mcp_off on']);
+        expect(grantsOf('swept'), 'the store').toHaveLength(2);
+      } finally {
+        writes.restore();
+      }
+    });
+  });
 });

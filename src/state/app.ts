@@ -289,10 +289,16 @@ export function noticeMcpServerSwitchedOn(serverId: string): void {
  * without making `write`, so nothing is switched on (`afterStaleGrantsGo` in
  * state/chat.ts).
  *
+ * NOR WHILE THE STORE STILL HOLDS A GRANT NAMING IT, when it is off. A switch-off
+ * whose withdrawal write failed left the grant in the store and on disk, and
+ * switching back on honoured it at once. `isOn` says whether it is on as the
+ * store has it now: a connection already on, switched on again, keeps its
+ * grants.
+ *
  * The uninstalled defaults make the write: without the chat store there is no
  * launch, and no grant it read.
  */
-type SwitchingOn = (id: string, write: () => Promise<void>) => Promise<void>;
+type SwitchingOn = (id: string, write: () => Promise<void>, isOn: () => boolean) => Promise<void>;
 
 let connectionSwitchingOn: SwitchingOn = (_id, write) => write();
 
@@ -306,8 +312,12 @@ export function installMcpServerSwitchingOn(hook: SwitchingOn): void {
   mcpServerSwitchingOn = hook;
 }
 
-export function switchMcpServerOn(serverId: string, write: () => Promise<void>): Promise<void> {
-  return mcpServerSwitchingOn(serverId, write);
+export function switchMcpServerOn(
+  serverId: string,
+  write: () => Promise<void>,
+  isOn: () => boolean,
+): Promise<void> {
+  return mcpServerSwitchingOn(serverId, write, isOn);
 }
 
 /**
@@ -461,11 +471,16 @@ export const useApp = create<AppState>((set, get) => ({
 
     if (enabled) {
       // Switched on only once no grant a launch read from disk naming it off is
-      // left there, from the list as it stands then. See `connectionSwitchingOn`.
-      await connectionSwitchingOn(id, async () => {
-        ({ all: connections, changed } = listed());
-        if (changed) await db.connections.put(changed);
-      });
+      // left there, nor one a switch-off could not write away, from the list as
+      // it stands then. See `connectionSwitchingOn`.
+      await connectionSwitchingOn(
+        id,
+        async () => {
+          ({ all: connections, changed } = listed());
+          if (changed) await db.connections.put(changed);
+        },
+        () => get().connections.find((connection) => connection.id === id)?.enabled === true,
+      );
       if (!changed) return;
     } else {
       // A switch-off is written as it always was: its withdrawal waits on none

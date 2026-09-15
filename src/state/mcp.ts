@@ -46,8 +46,12 @@ async function noticeMcpServerSwitchedOn(serverId: string): Promise<void> {
   (await import('@/state/app')).noticeMcpServerSwitchedOn(serverId);
 }
 
-async function switchMcpServerOn(serverId: string, write: () => Promise<void>): Promise<void> {
-  await (await import('@/state/app')).switchMcpServerOn(serverId, write);
+async function switchMcpServerOn(
+  serverId: string,
+  write: () => Promise<void>,
+  isOn: () => boolean,
+): Promise<void> {
+  await (await import('@/state/app')).switchMcpServerOn(serverId, write, isOn);
 }
 
 interface McpState {
@@ -144,8 +148,10 @@ export const useMcp = create<McpState>((set, get) => ({
       await db.mcpServers.update(id, { enabled });
     };
     // Switched on only once no grant a launch read from disk naming it off is
-    // left there, as a connection is (`toggleConnection`).
-    await (enabled ? switchMcpServerOn(id, write) : write());
+    // left there, nor one a switch-off could not write away, as a connection is
+    // (`toggleConnection`).
+    const isOn = (): boolean => get().servers.find((server) => server.id === id)?.enabled === true;
+    await (enabled ? switchMcpServerOn(id, write, isOn) : write());
     set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
     try {
       // Switched on: a launch still withdrawing the grants on disk that named it
