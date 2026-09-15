@@ -438,6 +438,22 @@ export interface MessageVariant {
    * that direction while it fails silent in the other.
    */
   readonly unrecorded?: true;
+  /**
+   * Set on a generation stopped before its first word: Stop landed while it had
+   * no text — waiting for the model, waiting at a send sheet, or waiting for the
+   * shared model slot (#7).
+   *
+   * Owner ruling: such a reply is KEPT, shown as stopped, and left out of what
+   * is sent to the model. Kept, because a stopped turn can carry MCP receipts,
+   * and a reply dropped would take the record of what did or did not leave with
+   * it. Left out, because an assistant message with no text is refused by the
+   * bridge before any backend — and with it every later request in the chat.
+   *
+   * Absent on a reply stopped after some text, which keeps its text and its
+   * display as it always did. Rows written before this existed have no marker;
+   * see {@link showsStopped} for how they read.
+   */
+  readonly stopped?: true;
 }
 
 export interface Message {
@@ -456,6 +472,8 @@ export interface Message {
   streaming?: boolean;
   /** Set when generation failed; content holds the user-facing explanation. */
   error?: string;
+  /** A reply stopped before its first word. See {@link MessageVariant.stopped}. */
+  stopped?: true;
   /**
    * Every generation of this turn, oldest last-but-one, newest last —
    * INCLUDING the one currently projected onto the fields above.
@@ -599,6 +617,7 @@ export function currentVariant(message: Message): MessageVariant {
     toolCalls: message.toolCalls,
     provenance: message.provenance,
     stats: message.stats,
+    stopped: message.stopped,
   };
 }
 
@@ -621,6 +640,7 @@ export function applyVariant(message: Message, index: number): Message {
     toolCalls: variant.toolCalls,
     provenance: variant.provenance,
     stats: variant.stats,
+    stopped: variant.stopped,
     variantIndex: index,
   };
 }
@@ -635,6 +655,61 @@ export function displaysUnrecorded(message: Message): boolean {
   const index = message.variantIndex;
   if (index === undefined) return false;
   return message.variants?.[index]?.unrecorded === true;
+}
+
+/* ── A reply stopped before its first word ──────────────────────────── */
+
+/**
+ * Does the thread, and the export, show this generation as a reply stopped
+ * before its first word?
+ *
+ * A marked one does. So does an empty reply with no receipt and no marker, by
+ * owner ruling: that is what a turn stopped before its first token left on disk
+ * before the marker existed. An unmarked empty reply WITH a receipt is not
+ * called stopped — nothing recorded that it was, and a turn whose tool rounds
+ * ran out before it wrote anything leaves the same shape — and keeps the
+ * display it had.
+ *
+ * A reply with text is never shown as stopped, marker or not.
+ *
+ * Structural rather than `MessageVariant`, so the transcript's narrower row
+ * type can ask it too.
+ */
+export function showsStopped(generation: {
+  readonly content: string;
+  readonly stopped?: true;
+  readonly toolCalls?: readonly { readonly receipt?: unknown }[];
+}): boolean {
+  if (generation.content.trim().length > 0) return false;
+  if (generation.stopped === true) return true;
+  return !(generation.toolCalls?.some((call) => call.receipt !== undefined) ?? false);
+}
+
+/**
+ * Is this row left out of what is sent to the model?
+ *
+ * An assistant reply with no text, whatever made it so: stopped before its
+ * first word (marked, or written before the marker existed), a generation with
+ * no text flipped back to, a turn whose tool rounds ran out before it wrote a
+ * word. The bridge refuses an assistant message whose content is empty before
+ * any backend sees it, so there is nothing such a row adds to a request except
+ * that refusal — for this request and every later one in the chat.
+ *
+ * NOTHING ELSE OF IT WAS EVER SENT. History carries a row's `content`; its tool
+ * calls and their receipts are never sent as history, only the taint mark they
+ * imply, and a row with no text has nothing to mark. Leaving it out sends no
+ * less of them than before.
+ */
+export function leftOutOfContext(message: {
+  readonly role: MessageRole;
+  readonly content: string;
+  readonly attachments?: readonly unknown[];
+}): boolean {
+  return (
+    message.role === 'assistant' &&
+    message.content.trim().length === 0 &&
+    (message.attachments?.length ?? 0) === 0
+  );
 }
 
 export function newId(prefix: string): string {

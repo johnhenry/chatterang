@@ -5,7 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
-import { currentVariant, ranOnDevice, ranThroughLocalCli } from '@/domain/chat';
+import { currentVariant, ranOnDevice, ranThroughLocalCli, showsStopped } from '@/domain/chat';
 import { mayHaveLeft, unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
@@ -147,6 +147,12 @@ export function MessageView({
   // is precisely the confident falsehood the record exists to prevent.
   const provenance = shown.provenance;
   const toolCalls = shown.toolCalls;
+
+  // A reply stopped before its first word (owner ruling): kept in the thread,
+  // with any receipts it carries above, and said to be stopped rather than left
+  // as an empty body. Read off `shown`, so flipping to such a generation says so
+  // and flipping away does not. There is nothing in it to copy or read aloud.
+  const stoppedEarly = !message.streaming && !message.error && showsStopped(shown);
 
   const toggleSpeech = (): void => {
     if (speaking) {
@@ -294,6 +300,15 @@ export function MessageView({
             Try again
           </button>
         </div>
+      ) : stoppedEarly ? (
+        <div className="msg__body">
+          {/* The label is the word a person sees; the rest is for a screen
+              reader, which would otherwise hear "Stopped" attached to nothing. */}
+          <p className="msg__stopped" style={{ margin: 0 }}>
+            <span className="label">Stopped</span>
+            <span className="sr-only"> before its first word</span>
+          </p>
+        </div>
       ) : (
         <div className="msg__body">
           {settings.renderMarkdown ? (
@@ -309,16 +324,20 @@ export function MessageView({
 
       {!message.streaming && !message.error ? (
         <div className="msg__foot">
-          <CopyButton text={shown.content} />
-          <button
-            type="button"
-            className="icon-btn"
-            data-active={speaking ? 'true' : undefined}
-            onClick={toggleSpeech}
-            aria-label={speaking ? 'Stop reading aloud' : 'Read aloud'}
-          >
-            <Icon name="speaker" size={15} />
-          </button>
+          {stoppedEarly ? null : (
+            <>
+              <CopyButton text={shown.content} />
+              <button
+                type="button"
+                className="icon-btn"
+                data-active={speaking ? 'true' : undefined}
+                onClick={toggleSpeech}
+                aria-label={speaking ? 'Stop reading aloud' : 'Read aloud'}
+              >
+                <Icon name="speaker" size={15} />
+              </button>
+            </>
+          )}
           <button
             type="button"
             className="icon-btn"

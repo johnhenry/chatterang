@@ -17,6 +17,7 @@ import {
   deriveTitle,
   displaysUnrecorded,
   holdsGrant,
+  leftOutOfContext,
   newId,
   splitThinking,
   REACH_LOCAL_VIA_THIRD_PARTY,
@@ -59,6 +60,7 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
+import { stripToolSyntax } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1745,11 +1747,22 @@ async function runGeneration(
             });
           }
 
-          const split = splitThinking(event.text || raw);
+          // `event.text` has had its tool-call syntax stripped by the engine.
+          // When it is empty the streamed deltas stand in for it — a turn cut
+          // short hands back no text of its own — and those were never
+          // stripped: a turn stopped at an MCP send sheet stored the model's
+          // raw call, arguments and all, as the words of its reply, and sent
+          // them back to the model as history. Stripped the same way here.
+          const split = splitThinking(event.text || stripToolSyntax(raw));
+          const content = split.content.trim();
+          // STOPPED BEFORE ITS FIRST WORD (owner ruling): kept, marked, shown as
+          // stopped, and left out of every later request. Only the empty case —
+          // a reply stopped after some text keeps its text and its display.
+          const stopped = controller.signal.aborted && content.length === 0;
           // The generation is assembled as ONE value and then projected onto
           // the row, so the row cannot end up holding half of it.
           const own: MessageVariant = {
-            content: split.content.trim(),
+            content,
             thinking: split.thinking || undefined,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             provenance: {
@@ -1791,6 +1804,7 @@ async function runGeneration(
                 : undefined,
             },
             stats: event.stats,
+            stopped: stopped ? true : undefined,
           };
           // A first generation needs no list; a regenerated one appends itself
           // to the generations it was asked to replace.
@@ -1804,6 +1818,7 @@ async function runGeneration(
             toolCalls: own.toolCalls,
             provenance: own.provenance,
             stats: own.stats,
+            stopped: own.stopped,
             streaming: false,
             variants,
             variantIndex: variants ? variants.length - 1 : undefined,
@@ -2585,8 +2600,10 @@ export async function buildMessages(
   const models = useModels.getState();
   const persona = chat.personaId ? personas.byId[chat.personaId] : undefined;
 
+  // A reply with no text is left out, stopped or not: the bridge refuses the
+  // whole request over it, before any backend. See `leftOutOfContext`.
   const history = messages
-    .filter((message) => !message.streaming && !message.error)
+    .filter((message) => !message.streaming && !message.error && !leftOutOfContext(message))
     .slice(0, messages.length - dropTail)
     .slice(-HISTORY_TURNS);
 
