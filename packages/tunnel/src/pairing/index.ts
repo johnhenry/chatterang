@@ -585,7 +585,7 @@ export class PairingFitError extends Error {
  *   2. `unique-local-ipv6` — fc00::/7. The same network by IPv6, and stable,
  *      unlike the temporary globals a laptop cycles through.
  *   3. `public-ipv4` — every other unicast IPv4, INCLUDING CGNAT's 100.64/10.
- *      Checked rather than assumed: `apps/server/src/addresses.ts` ranks only
+ *      Checked rather than assumed: `host/addresses.ts` ranks only
  *      RFC 1918 as private and puts 100.64/10 with the globally routable
  *      addresses, and nothing else in the codebase ranks reachability. A
  *      tailnet address is 100.64/10, and whether it deserves to rank higher is
@@ -600,20 +600,21 @@ export class PairingFitError extends Error {
  *      summary put it, and the codec is why: an address holds sixteen bytes
  *      and no zone index, so a link-local address arrives with its interface
  *      left to chance — the reason `typed.ts` refuses a zone
- *      (`zone-index-unsupported`) and `apps/server/src/addresses.ts` never
+ *      (`zone-index-unsupported`) and `host/addresses.ts` never
  *      advertises fe80::/10 at all. With it: IPv4 link-local 169.254/16 (DHCP
  *      failed, per the same file), and a `.local` name, whose multicast DNS is
  *      link-scoped and which v1 does not resolve ({@link isMulticastDnsName}).
  *
- * Classes 1–4 are the ranks `apps/server/src/addresses.ts` already gives the
- * addresses a headless server advertises, restated because this half imports
- * nothing; `tests/tunnel-pairing-fit.test.ts` holds the two to the same order.
+ * Classes 1–4 are the ranks `host/addresses.ts` already gives the addresses a
+ * host advertises (the headless server, and the desktop once it pairs),
+ * restated because this half imports nothing; `tests/tunnel-pairing-fit.test.ts`
+ * holds the two to the same order.
  *
  * NEVER AN ADDRESS NO PHONE CAN DIAL, whether or not there is room. Class
  * `unroutable` is dropped before ranking: loopback 127/8 and ::1 (on the phone
  * they name the phone), the unspecified 0/8 and :: (bind addresses, not
  * places to dial), and multicast and reserved IPv4 224/3 and IPv6 ff00::/8. It
- * is what `apps/server/src/addresses.ts` leaves out as `internal`, extended to
+ * is what `host/addresses.ts` leaves out as `internal`, extended to
  * the ranges a host enumerating its own interfaces would not see there. A
  * link-local address stays, because on one network it can work.
  *
@@ -621,7 +622,7 @@ export class PairingFitError extends Error {
  * compared without ASCII case) reaches nothing the first did not, so only the
  * first is kept. Otherwise a host that listed one ULA four times would push a
  * genuinely different route out of a code under pressure.
- * `apps/server/src/addresses.ts` removes duplicates for the same reason.
+ * `host/addresses.ts` removes duplicates for the same reason.
  *
  * STRICTLY FROM THE END. A shorter address later in the order is never carried
  * in place of a longer one earlier that does not fit; that would put a less

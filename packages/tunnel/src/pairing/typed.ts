@@ -212,8 +212,8 @@ export function parseTypedEndpoint(text: string): TypedEndpoint {
 
   /*
    * A ZONE INDEX (`fe80::1%en0`) CANNOT BE CARRIED, and that is the reason it
-   * is refused — not the one `apps/server/src/addresses.ts` gives. There, a
-   * zone came from the SERVER and names an interface on a different machine.
+   * is refused — not the one `host/addresses.ts` gives. There, a zone came from
+   * the HOST and names an interface on a different machine.
    * Here the person typed it on the phone, so it would name the phone's own
    * interface and could be meaningful. But `PairingAddress` is shared with the
    * QR payload and holds sixteen bytes and no interface, so a zone has nowhere

@@ -289,15 +289,22 @@ async function main(): Promise<void> {
   }
 
   /*
-   * WHAT PAIRING WILL ADVERTISE (#252), printed at boot.
+   * WHAT PAIRING WILL ADVERTISE ONCE IT IS ON (#252), printed at boot.
+   *
+   * Pairing is not on: this server starts no tunnel listener and mints no
+   * pairing code, and the line says so rather than "pairing advertises".
    *
    * `describe` above deliberately refuses to turn a wildcard bind into a
    * browsable URL — only the operator knows which of this machine's names they
    * reach it by. Pairing cannot make that refusal: the phone needs somewhere
-   * to dial and there is no operator in the loop at that moment. So this
-   * guesses, offers SEVERAL, and prints them — which is the half that keeps a
-   * guess honest, because an operator who never sees the list cannot know it
-   * is wrong.
+   * to dial and there is no operator in the loop at that moment. So the tunnel
+   * host guesses (`advertisedAddresses` in `@chatterang/tunnel/host`, the one
+   * enumeration the desktop's codes will carry too), offers SEVERAL, and this
+   * prints them — which is the half that keeps a guess honest, because an
+   * operator who never sees the list cannot know it is wrong.
+   *
+   * The list is for the pairing payload only. No certificate carries it: a
+   * client checks the key pin it learned at pairing, not a name (#295).
    */
   for (const line of describeAdvertised(
     advertisedAddressesForThisMachine(options.advertise),

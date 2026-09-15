@@ -2453,6 +2453,13 @@ describe('a listening socket forces the privacy copy to change', () => {
     MAX_PAIRING_FRAME_BYTES: 'binds nothing',
     MAX_PAIRING_BACKLOG: 'binds nothing',
     PAIRING_HANDOVER_MS: 'binds nothing',
+    // What a host advertises in a pairing code (#252, #134): `node:os`'s
+    // `networkInterfaces()`, which reads the interface table, a ranking, and
+    // text turned into codec bytes. It lists addresses; it opens nothing.
+    MAX_ADVERTISED: 'binds nothing',
+    advertisedAddresses: 'binds nothing',
+    advertisedAddressesForThisMachine: 'binds nothing',
+    pairingAddressesOf: 'binds nothing',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [
