@@ -2744,3 +2744,73 @@ describe('a finished reply in a chat offering a tool, naming a call’s opening 
     });
   }
 });
+
+describe('a local turn whose stream died mid-reasoning, diverted to the cloud fallback', () => {
+  const REASONING = 'The user wants a summary of';
+  const CLOUD_WORDS = 'Your notes mention a passphrase and';
+
+  /**
+   * Send; once the local model's reasoning is on screen, let its stream die; wait
+   * for the cloud's words, as answer or as reasoning. The send is handed back in
+   * an object, so it is not awaited here.
+   */
+  async function divertedUntilCloudWrites(dies: () => void): Promise<{ sending: Promise<void> }> {
+    const sending = useChats.getState().send('summarise my notes');
+    await until(() => useChats.getState().messages.some((message) => (message.thinking ?? '').includes(REASONING)));
+    dies();
+    await until(() =>
+      useChats
+        .getState()
+        .messages.some((message) => `${message.content}${message.thinking ?? ''}`.includes(CLOUD_WORDS)),
+    );
+    return { sending };
+  }
+
+  it('stopped while the cloud wrote: shows and keeps the cloud’s words as the answer, and is not called stopped', async () => {
+    const id = 'r4_fallback_reasoning_stopped';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>${REASONING}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: CLOUD_WORDS, stall: gate.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    const { sending } = await divertedUntilCloudWrites(dies.release);
+    const onScreen = useChats.getState().messages.at(-1)?.content;
+    useChats.getState().stop();
+    gate.release();
+    await sending;
+
+    expect(onScreen, 'the answer on screen while the cloud wrote').toBe(CLOUD_WORDS);
+    const stopped = assistantRows(id).at(-1)!;
+    expect(
+      { content: stopped.content, thinking: stopped.thinking, stopped: stopped.stopped },
+      'the stored reply',
+    ).toEqual({ content: CLOUD_WORDS, thinking: REASONING, stopped: undefined });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      expect(bodyText(), 'the body').toContain(CLOUD_WORDS);
+    });
+  });
+
+  it('failed in the cloud too: the failed row keeps the cloud’s words as its answer', async () => {
+    const id = 'r4_fallback_reasoning_failed';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const cloudDies = held();
+    const local = scriptedBackend([{ partial: `<think>${REASONING}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: CLOUD_WORDS, stall: cloudDies.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    const { sending } = await divertedUntilCloudWrites(dies.release);
+    cloudDies.release();
+    await sending;
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect({ content: failed.content, thinking: failed.thinking }, 'the failed row').toEqual({
+      content: CLOUD_WORDS,
+      thinking: REASONING,
+    });
+  });
+});

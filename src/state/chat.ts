@@ -1847,6 +1847,15 @@ async function runGeneration(
         case 'fallback':
           // A local round whose stream died has ended where it died, and the
           // fallback's words follow it: see `endRound`.
+          //
+          // And so has any reasoning it left open, as a round that called a
+          // tool: a local model that died mid-`<think>` left the tag open, and
+          // everything the cloud wrote after it was read as reasoning — shown
+          // as reasoning while it arrived, stored with no words and shown as
+          // "Stopped before its first word" when stopped, and kept as no words
+          // in a failed row. See `closeReasoning`.
+          raw = closeReasoning(raw);
+          shown = closeReasoning(shown);
           endRound();
           app.setActivity('remote');
           break;
