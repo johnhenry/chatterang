@@ -36,7 +36,8 @@ import type {
  *   - Stop pressed while the page is still subscribing to hear it wait sends
  *     no generate at all;
  *   - a second turn the store refuses neither takes the slot nor queues for it;
- *   - and the rail hears nothing about a stopped turn's place in line.
+ *   - and the rail hears nothing about a stopped turn's place in line, but
+ *     still hears its start, which is what takes "Waiting" off the rail.
  *
  * Every layer between them is production code: the real chat store and
  * `ChatterangEngine` with its `LlamaCppBackendAdapter`, over a `LlamaCpp` that
@@ -186,11 +187,17 @@ function desktop() {
 
   /** The page's listeners, by the subscription id it chose. */
   const pageListeners = new Map<number, (event: unknown) => void>();
+  /** While `held`, `llamaWaiting` events main sent are still on their way to the page. */
+  const waitingInFlight = { held: false, pending: [] as (() => void)[] };
   const pluginHost = new PluginHost((senderId, payload) => {
     const listener = senderId === WINDOW ? pageListeners.get(payload.subscriptionId) : undefined;
     if (listener === undefined) return false;
     // An IPC message: cloned, and delivered after the send returns.
     const data = structuredClone(payload.data);
+    if (waitingInFlight.held && payload.eventName === 'llamaWaiting') {
+      waitingInFlight.pending.push(() => listener(data));
+      return true;
+    }
     queueMicrotask(() => listener(data));
     return true;
   });
@@ -253,6 +260,8 @@ function desktop() {
     ended: [] as string[],
     /** Set once the window is gone: nothing the page calls reaches main. */
     gone: false,
+    /** Set `held` to keep `llamaWaiting` events on their way to the page; deliver `pending` to let them arrive. */
+    waitingInFlight,
     /** Set to hold the page's `llamaWaiting` subscription open. */
     holdWaiting: null as Promise<void> | null,
     subscribingToWaiting: false,
@@ -552,6 +561,48 @@ describe('Stop and the shared slot (#7, #305)', () => {
       expect(useChats.getState().generating).toBe(false);
     } finally {
       subscription.release();
+      await drainAll([phone], [sending]);
+    }
+  });
+
+  it('a turn stopped after main started it, but before the page heard it start, takes "Waiting" off the rail when that start arrives', async () => {
+    // A stopped turn can start in main before its cancel reaches main. Main
+    // sends the page its start (position 0) and the host its generate; the
+    // cancel then goes to the host, which decodes until it honours it.
+    // FAULT INJECTED: dropping every `llamaWaiting` event after Stop, the start
+    // included, left the rail saying "Waiting" until the stopped turn settled
+    // ("the rail while the host stops the stopped turn: expected 1 to be null").
+    given('stop_starting');
+    const phone = main.phoneTurn('phone-4');
+    const sending = useChats.getState().send('a question');
+    try {
+      await until(() => useApp.getState().turnWaiting === 1);
+      const turn = main.asked[0]!;
+
+      // The phone's turn ends and main starts this one. Its start is still on
+      // its way to the page when Stop is pressed.
+      main.waitingInFlight.held = true;
+      phone.resolve();
+      await until(() => main.generated().length === 1);
+      stop();
+      await until(() => main.cancelledOnHost().includes(turn));
+      for (const deliver of main.waitingInFlight.pending.splice(0)) deliver();
+      await settle();
+
+      expect(useChats.getState().generating, 'the stopped turn is still settling').toBe(true);
+      expect(useApp.getState().turnWaiting, 'the rail while the host stops the stopped turn').toBeNull();
+      expect(
+        heard.filter((entry) => entry.requestId === turn && entry.afterStop),
+        'what the page heard about the stopped turn after Stop',
+      ).toEqual([{ requestId: turn, position: 0, afterStop: true }]);
+
+      main.finish(turn, undefined, 'cancelled');
+      await sending;
+      expect(useChats.getState().generating).toBe(false);
+      expect(useApp.getState().turnWaiting).toBeNull();
+    } finally {
+      main.waitingInFlight.held = false;
+      for (const deliver of main.waitingInFlight.pending.splice(0)) deliver();
       await drainAll([phone], [sending]);
     }
   });

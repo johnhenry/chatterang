@@ -387,9 +387,13 @@ export class LlamaCppBackendAdapter implements BackendAdapter {
     const waiting = await Promise.resolve()
       .then(() =>
         (LlamaCpp as unknown as WaitingEvents).addListener('llamaWaiting', (event) => {
-          // Not after Stop (#305): a place in line for a stopped turn would
-          // put "Waiting" on the rail for a turn the person has ended.
-          if (event.requestId !== requestId || signal?.aborted === true) return;
+          if (event.requestId !== requestId) return;
+          // No place in line after Stop (#305): it would put "Waiting" on the
+          // rail for a turn the person has ended. Its start (position 0) is
+          // still reported, because the start is what takes "Waiting" off the
+          // rail. A stopped turn can start in main before its cancel gets
+          // there, and it then decodes until the host honours the cancel.
+          if (signal?.aborted === true && event.position > 0) return;
           this.#config.onWaiting?.(event);
         }),
       )

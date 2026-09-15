@@ -245,10 +245,13 @@ describe('a streamed desktop generation hears that it is waiting (#7)', () => {
     }
   });
 
-  it('a place in line that arrives after Stop is not reported', async () => {
+  it('a place in line that arrives after Stop is not reported, and the start that arrives after it still is', async () => {
     // The rail would say "Waiting" about a turn the person has already stopped.
+    // The start (position 0) is what takes "Waiting" off the rail, so it still
+    // gets through.
     // FAULT INJECTED: removing the aborted check from the `llamaWaiting`
-    // listener reported the second position.
+    // listener reported the second position. Dropping every event after Stop,
+    // the start included, reported nothing after Stop.
     const fake = fakeLlama();
     vi.doMock('@/plugins/llama-cpp', () => ({ LlamaCpp: fake.plugin }));
     const { LlamaCppBackendAdapter } = await import('@/ai/backends/llama-cpp');
@@ -265,7 +268,10 @@ describe('a streamed desktop generation hears that it is waiting (#7)', () => {
     fake.finish();
     await done;
 
-    expect(seen).toEqual([{ requestId: 'turn-1', position: 2 }]);
+    expect(seen).toEqual([
+      { requestId: 'turn-1', position: 2 },
+      { requestId: 'turn-1', position: 0 },
+    ]);
   });
 
   it('a streamed decode asks to keep the slot for its whole turn, and ending that turn tells the platform once', async () => {
