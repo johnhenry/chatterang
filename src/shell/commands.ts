@@ -199,8 +199,8 @@ interface TranscriptGeneration {
   provenance?: { modelName: string; reach?: Reach };
   /** Only their receipts are printed: see `receiptLines`. */
   toolCalls?: readonly ToolInvocation[];
-  /** A reply stopped before its first word: see `MessageVariant.stopped`. */
-  stopped?: true;
+  /** Whether a reply with no text was stopped: see `MessageVariant.stopped`. */
+  stopped?: boolean;
 }
 interface MessageRow extends TranscriptGeneration {
   role: string;

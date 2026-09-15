@@ -769,3 +769,213 @@ describe('the transcript', () => {
     expect(markdown.slice(markdown.indexOf('Half an answer'))).not.toContain(STOPPED_NOTE);
   });
 });
+
+/* ── The words a stopped turn streamed ──────────────────────────────── */
+
+const { CALL, leakyTool } = await import('./support/egress-probe');
+
+/** Send, let the backend stream some text, press Stop once `marker` is on screen, then let the stream go. */
+async function stopAfterSome(text: string, marker: string, release: () => void): Promise<void> {
+  const sending = useChats.getState().send(text);
+  await until(() => useChats.getState().messages.some((message) => message.content.includes(marker)));
+  useChats.getState().stop();
+  release();
+  await sending;
+}
+
+describe('a reply stopped after some text, in a chat with no tools', () => {
+  // Names a "function" inside a fenced JSON block: the shape the engine's
+  // tool-syntax stripping removes, and not a tool call in a chat with no tools.
+  const EXAMPLE = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+
+  it('keeps a JSON example it was writing, word for word', async () => {
+    const id = 'partial_json';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is the shape:\n\n${EXAMPLE}\n\nEach entry`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'Each entry', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.content, 'the words the person watched arrive').toBe(partial);
+    expect(stopped.stopped, 'a reply with text carries no marker').toBeUndefined();
+  });
+
+  it('is not called stopped, nor left out, when such an example was all it wrote', async () => {
+    const id = 'partial_json_only';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: EXAMPLE, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'get_weather', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: EXAMPLE,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      expect(control('Read aloud')).not.toBeNull();
+    });
+
+    await useChats.getState().send('third');
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', EXAMPLE],
+      ['user', 'third'],
+    ]);
+  });
+});
+
+describe('a turn stopped while the model was still writing its tool call', () => {
+  it('keeps the words before the call, and sends none of the call back to the model', async () => {
+    const id = 'partial_call';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = 'Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(stopped.content, 'the stopped reply, on disk').toBe('Filing it now.');
+    expect(stopped.stopped).toBeUndefined();
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', 'Filing it now.'],
+      ['user', 'third'],
+    ]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('is a reply stopped before its first word when the unfinished call was all it wrote', async () => {
+    const id = 'partial_call_only';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+
+      const stopped = assistantRows(id).at(-1)!;
+      expect(stopped, 'the stopped reply, on disk').toMatchObject({ content: '', stopped: true });
+      await mounted(stopped, () => {
+        expect(stoppedNote()).toBe(STOPPED_NOTE);
+      });
+
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[1])).toEqual([]);
+    expect(spoken(local.seen[1]).map(([role]) => role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── A reply nobody stopped ─────────────────────────────────────────── */
+
+describe('an empty reply nobody stopped', () => {
+  it('that spent itself reasoning is recorded as not stopped, and neither shown nor exported as stopped', async () => {
+    const id = 'thinking_only';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<think>Let me weigh the options carefully</think>', 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('which one?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.error, 'not a failure').toBeUndefined();
+    expect(last.thinking).toContain('weigh the options');
+    expect(last, 'finished with no words, and recorded as not stopped').toMatchObject({
+      content: '',
+      stopped: false,
+    });
+    await mounted(last, () => {
+      expect(stoppedNote(), 'the thread').toBeNull();
+    });
+    expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').not.toContain(STOPPED_NOTE);
+
+    await useChats.getState().send('and?');
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[1]), 'still left out of the next request').toEqual([]);
+  });
+
+  it('whose tool ran and whose follow-up wrote nothing keeps today’s row, display and regeneration', async () => {
+    const id = 'local_tool_empty';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([CALL, '', 'Again.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+
+      const last = assistantRows(id).at(-1)!;
+      expect(last.error, 'not a failure').toBeUndefined();
+      expect(last.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(last.stopped, 'nothing stopped it').not.toBe(true);
+      expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').not.toContain(
+        STOPPED_NOTE,
+      );
+      await mounted(last, () => {
+        expect(stoppedNote(), 'the thread').toBeNull();
+      });
+
+      await useChats.getState().regenerate(last.id);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const regenerated = assistantRows(id).at(-1)!;
+    expect(regenerated.content).toBe('Again.');
+    expect(
+      regenerated.variants?.map((variant) => variant.toolCalls?.map((call) => call.name)),
+      'the generation that ran the tool is kept, with its record',
+    ).toEqual([['leaky'], undefined]);
+  });
+});
+
+/* ── The chat list ──────────────────────────────────────────────────── */
+
+describe('the chat list, after a reply stopped before its first word', () => {
+  it('keeps the preview it had rather than blanking it', async () => {
+    const id = 'preview';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }]);
+    engineWith(local);
+
+    await stopBeforeTheFirstToken('second', () => local.seen.length, gate.release);
+
+    expect(assistantRows(id).at(-1)).toMatchObject({ content: '', stopped: true });
+    expect(useChats.getState().chats.find((entry) => entry.id === id)?.preview, 'the sidebar').toBe('second');
+    expect((fake.chats.get(id) as Chat | undefined)?.preview, 'on disk').toBe('second');
+  });
+});

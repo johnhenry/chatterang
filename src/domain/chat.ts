@@ -439,9 +439,11 @@ export interface MessageVariant {
    */
   readonly unrecorded?: true;
   /**
-   * Set on a generation stopped before its first word: Stop landed while it had
-   * no text — waiting for the model, waiting at a send sheet, or waiting for the
-   * shared model slot (#7).
+   * Whether a generation that finished with NO TEXT was stopped.
+   *
+   * `true` on a generation stopped before its first word: Stop landed while it
+   * had no text — waiting for the model, waiting at a send sheet, or waiting
+   * for the shared model slot (#7).
    *
    * Owner ruling: such a reply is KEPT, shown as stopped, and left out of what
    * is sent to the model. Kept, because a stopped turn can carry MCP receipts,
@@ -449,11 +451,19 @@ export interface MessageVariant {
    * it. Left out, because an assistant message with no text is refused by the
    * bridge before any backend — and with it every later request in the chat.
    *
-   * Absent on a reply stopped after some text, which keeps its text and its
-   * display as it always did. Rows written before this existed have no marker;
-   * see {@link showsStopped} for how they read.
+   * `false` on a generation that finished with no text and was NOT stopped: a
+   * model that spent its whole reply reasoning, or wrote nothing after its
+   * tools ran. It is still left out of what is sent — the bridge refuses it
+   * just the same — but it is not called stopped. {@link showsStopped} reads an
+   * empty reply with no marker as stopped, for rows written before the marker
+   * existed, and without `false` every such reply this build finishes would be
+   * caught by that reading too.
+   *
+   * Absent on a reply with text, stopped after some text or not, which keeps
+   * its text and its display as it always did; and on rows written before this
+   * existed.
    */
-  readonly stopped?: true;
+  readonly stopped?: boolean;
 }
 
 export interface Message {
@@ -472,8 +482,8 @@ export interface Message {
   streaming?: boolean;
   /** Set when generation failed; content holds the user-facing explanation. */
   error?: string;
-  /** A reply stopped before its first word. See {@link MessageVariant.stopped}. */
-  stopped?: true;
+  /** Whether a reply with no text was stopped. See {@link MessageVariant.stopped}. */
+  stopped?: boolean;
   /**
    * Every generation of this turn, oldest last-but-one, newest last —
    * INCLUDING the one currently projected onto the fields above.
@@ -663,12 +673,15 @@ export function displaysUnrecorded(message: Message): boolean {
  * Does the thread, and the export, show this generation as a reply stopped
  * before its first word?
  *
- * A marked one does. So does an empty reply with no receipt and no marker, by
- * owner ruling: that is what a turn stopped before its first token left on disk
- * before the marker existed. An unmarked empty reply WITH a receipt is not
- * called stopped — nothing recorded that it was, and a turn whose tool rounds
- * ran out before it wrote anything leaves the same shape — and keeps the
- * display it had.
+ * An empty reply with a marker says which it is: `true` was stopped, `false`
+ * finished with no words and nobody stopped it. Every empty reply this build
+ * finishes carries one.
+ *
+ * An empty reply with NO marker was written before the marker existed. With no
+ * receipt it is shown as stopped, by owner ruling: that is what a turn stopped
+ * before its first token left on disk. WITH a receipt it is not called stopped
+ * — nothing recorded that it was, and a turn whose tool rounds ran out before
+ * it wrote anything leaves the same shape — and keeps the display it had.
  *
  * A reply with text is never shown as stopped, marker or not.
  *
@@ -677,11 +690,11 @@ export function displaysUnrecorded(message: Message): boolean {
  */
 export function showsStopped(generation: {
   readonly content: string;
-  readonly stopped?: true;
+  readonly stopped?: boolean;
   readonly toolCalls?: readonly { readonly receipt?: unknown }[];
 }): boolean {
   if (generation.content.trim().length > 0) return false;
-  if (generation.stopped === true) return true;
+  if (generation.stopped !== undefined) return generation.stopped;
   return !(generation.toolCalls?.some((call) => call.receipt !== undefined) ?? false);
 }
 

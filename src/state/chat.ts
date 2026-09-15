@@ -1414,6 +1414,36 @@ function carriesReceipt(variant: MessageVariant): boolean {
   return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
 }
 
+/**
+ * The words of a turn Stop cut short, read from what it streamed.
+ *
+ * Such a turn hands back no text of its own, so its streamed deltas stand in
+ * for it, and those are whatever the model wrote — plumbing included.
+ *
+ * IN A CHAT WITH TOOLS, a tool call is plumbing. A finished one is stripped as
+ * the engine strips a finished reply's: a turn stopped at an MCP send sheet
+ * stored the model's call, arguments and all, as the words of its reply, and
+ * sent it back to the model as history. So is one still being written when
+ * Stop landed, which the engine's patterns cannot see because it has no end to
+ * match: everything from its opening tag on goes. That call never ran and was
+ * never shown on a send sheet, and its arguments were still sent back.
+ *
+ * IN A CHAT WITH NO TOOLS nothing is stripped, as before. There is no call to
+ * strip, and the patterns are not tool-aware: one removes any fenced JSON
+ * block naming a "function", so a JSON example the person watched arrive was
+ * cut from the reply — and one that was all the reply held made it an empty
+ * "Stopped" reply, left out of every later request.
+ *
+ * An unfinished call in a fenced block is not cut: nothing tells it from the
+ * start of a JSON example.
+ */
+function wordsOfAStoppedTurn(raw: string, toolsEnabled: boolean): string {
+  if (!toolsEnabled) return raw;
+  const finished = stripToolSyntax(raw);
+  const unfinished = finished.search(/<tool_call>|\[TOOL_CALLS?\]/i);
+  return unfinished === -1 ? finished : finished.slice(0, unfinished);
+}
+
 /* ── Generation ─────────────────────────────────────────────────────── */
 
 interface RunOptions {
@@ -1748,17 +1778,25 @@ async function runGeneration(
           }
 
           // `event.text` has had its tool-call syntax stripped by the engine.
-          // When it is empty the streamed deltas stand in for it — a turn cut
-          // short hands back no text of its own — and those were never
-          // stripped: a turn stopped at an MCP send sheet stored the model's
-          // raw call, arguments and all, as the words of its reply, and sent
-          // them back to the model as history. Stripped the same way here.
-          const split = splitThinking(event.text || stripToolSyntax(raw));
+          // When it is empty the streamed deltas stand in for it, as they
+          // always have — a turn cut short hands back no text of its own. A
+          // STOPPED turn's deltas are read by `wordsOfAStoppedTurn`, so a call
+          // it was writing or waiting to send is not stored as its words and
+          // sent back to the model. Any other turn keeps what it kept before.
+          const aborted = controller.signal.aborted;
+          const split = splitThinking(
+            event.text || (aborted ? wordsOfAStoppedTurn(raw, chat.tools.length > 0) : raw),
+          );
           const content = split.content.trim();
-          // STOPPED BEFORE ITS FIRST WORD (owner ruling): kept, marked, shown as
-          // stopped, and left out of every later request. Only the empty case —
-          // a reply stopped after some text keeps its text and its display.
-          const stopped = controller.signal.aborted && content.length === 0;
+          // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
+          //   true  — stopped before its first word (owner ruling): kept, shown
+          //           as stopped, and left out of every later request.
+          //   false — finished with no words, nobody stopped it: a reply spent
+          //           reasoning, say. Written so the display's reading of old
+          //           unmarked rows (`showsStopped`) never calls it stopped.
+          // A reply with words carries neither, stopped after some text or
+          // not, and keeps its text and its display.
+          const stopped = content.length > 0 ? undefined : aborted;
           // The generation is assembled as ONE value and then projected onto
           // the row, so the row cannot end up holding half of it.
           const own: MessageVariant = {
@@ -1804,7 +1842,7 @@ async function runGeneration(
                 : undefined,
             },
             stats: event.stats,
-            stopped: stopped ? true : undefined,
+            stopped,
           };
           // A first generation needs no list; a regenerated one appends itself
           // to the generations it was asked to replace.
@@ -1891,7 +1929,10 @@ async function runGeneration(
       const last = get().messages.at(-1);
       await useChats.getState().updateChat(chat.id, (chatNow) => ({
         messageCount: chatNow.messageCount + 1,
-        preview: last?.content.slice(0, 120) ?? chatNow.preview,
+        // A reply with no words leaves the preview it had — the text just
+        // sent — rather than blanking the chat in the list and in the list's
+        // search. `??` took an empty reply for something to show.
+        preview: last?.content ? last.content.slice(0, 120) : chatNow.preview,
       }));
     }
   }
