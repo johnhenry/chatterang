@@ -216,6 +216,11 @@ async function main(): Promise<void> {
     },
   });
 
+  // Read before anything listens: an `--advertise` a pairing code cannot carry
+  // refuses to start the server (`addresses.ts`), and the refusal belongs with
+  // the other flag refusals above, not after a socket is already bound.
+  const advertised = advertisedAddressesForThisMachine(options.advertise);
+
   const log = (line: string): void => console.log(`[chatterang-server] ${line}`);
 
   const pluginHost = new PluginHost(
@@ -289,18 +294,29 @@ async function main(): Promise<void> {
   }
 
   /*
-   * WHAT PAIRING WILL ADVERTISE (#252), printed at boot.
+   * WHAT PAIRING WILL ADVERTISE ONCE IT IS ON (#252), printed at boot.
+   *
+   * Pairing is not on: this server starts no tunnel listener and mints no
+   * pairing code, and the line says so rather than "pairing advertises".
    *
    * `describe` above deliberately refuses to turn a wildcard bind into a
    * browsable URL — only the operator knows which of this machine's names they
    * reach it by. Pairing cannot make that refusal: the phone needs somewhere
-   * to dial and there is no operator in the loop at that moment. So this
-   * guesses, offers SEVERAL, and prints them — which is the half that keeps a
-   * guess honest, because an operator who never sees the list cannot know it
-   * is wrong.
+   * to dial and there is no operator in the loop at that moment. So the tunnel
+   * host guesses (`advertisedAddresses` in `@chatterang/tunnel/host`, the one
+   * enumeration the desktop's codes will carry too), offers SEVERAL, and this
+   * prints them — which is the half that keeps a guess honest, because an
+   * operator who never sees the list cannot know it is wrong.
+   *
+   * The list is for the pairing payload only. No certificate carries it: a
+   * client checks the key pin it learned at pairing, not a name (#295).
+   *
+   * `advertised` was read before the server listened, and an `--advertise` in
+   * it has already been through the step every pairing code takes, so this
+   * line never shows a value a code would refuse.
    */
   for (const line of describeAdvertised(
-    advertisedAddressesForThisMachine(options.advertise),
+    advertised,
     options.advertise !== undefined && options.advertise.trim() !== '',
   )) {
     log(line);

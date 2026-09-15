@@ -1,10 +1,16 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 
-import { advertisedAddresses, type InterfaceMap } from '../apps/server/src/addresses.js';
+import {
+  advertisedAddresses,
+  pairingAddressesOf,
+  type AdvertisedAddress,
+  type InterfaceMap,
+} from '@chatterang/tunnel/host';
 import {
   ADDRESS_DNS,
   ADDRESS_IPV4,
+  ADDRESS_IPV6,
   HOST_DESKTOP,
   HOST_SERVER,
   MAX_ADDRESSES,
@@ -19,6 +25,7 @@ import {
   fitPairingPayload,
   pairingAddressReach,
   parseTypedEndpoint,
+  TypedEntryError,
   type PairingAddress,
   type PairingPayload,
   type PairingReach,
@@ -213,7 +220,7 @@ describe('the order is reachability from a phone', () => {
     ['192.167.255.255', 'public-ipv4'],
     ['192.168.0.1', 'private-ipv4'],
     ['192.169.0.1', 'public-ipv4'],
-    // CGNAT: ranked with the public addresses, as apps/server/src/addresses.ts ranks it.
+    // CGNAT: ranked with the public addresses, as packages/tunnel/src/host/addresses.ts ranks it.
     ['100.64.0.1', 'public-ipv4'],
     ['100.127.255.255', 'public-ipv4'],
     ['8.8.8.8', 'public-ipv4'],
@@ -315,12 +322,13 @@ describe('the order is reachability from a phone', () => {
     expect(name(pressed.addresses)).toEqual(['PRIVATE', 'ULA_A', '?', 'PUBLIC6']);
   });
 
-  it('agrees with the order a headless server advertises in', () => {
+  it('agrees with the order a host advertises in', () => {
     /*
-     * ONE RANKING, TWO COPIES. `apps/server/src/addresses.ts` ranks what a
-     * server advertises; this half imports nothing, so it restates the ranks,
-     * and this holds the two together — CGNAT included, which is where they
-     * would most plausibly part.
+     * ONE RANKING, TWO COPIES. `packages/tunnel/src/host/addresses.ts` ranks
+     * what a host (the headless server, and the desktop once it pairs)
+     * advertises; `pairing/` imports nothing, so it restates the ranks, and
+     * this holds the two together — CGNAT included, which is where they would
+     * most plausibly part.
      */
     const map: InterfaceMap = {
       en0: [
@@ -340,6 +348,108 @@ describe('the order is reachability from a phone', () => {
       const fitted = fitPairingPayload(payload(addresses));
       expect(fitted.addresses.map((address) => texts.get(address))).toEqual(advertised);
     }
+  });
+});
+
+describe('a host’s enumerated list, drawn into a code', () => {
+  /*
+   * THE LIST A HOST PRINTS IS THE LIST ITS CODE CARRIES. The enumeration makes
+   * text, because an operator reads it; the codec carries bytes. The desktop
+   * and the server both need that step, so it lives beside the enumeration in
+   * the host (`pairingAddressesOf`), not once in each app.
+   */
+  const v4 = (address: string) => ({ address, family: 'IPv4', internal: false });
+  const v6 = (address: string) => ({ address, family: 'IPv6', internal: false });
+
+  it('turns each advertised address into the bytes the codec carries, in the same order', () => {
+    const advertised: AdvertisedAddress[] = [
+      { kind: 'ipv4', value: '192.168.1.10' },
+      { kind: 'ipv6', value: 'fd00::5' },
+      { kind: 'dns', value: 'Desk.Example.com.' },
+      { kind: 'dns', value: 'desk.local' },
+    ];
+    const converted = pairingAddressesOf(advertised);
+    expect(converted).toEqual([at('192.168.1.10'), at('fd00::5'), at('desk.example.com'), dns('desk.local')]);
+    expect(converted.map((address) => address.kind)).toEqual([ADDRESS_IPV4, ADDRESS_IPV6, ADDRESS_DNS, ADDRESS_DNS]);
+    // A `.local` name is carried the way a QR payload admits one (see
+    // `local-name-unreachable` in typed.ts), and the fit ranks it link-local.
+    expect(pairingAddressReach(converted[3]!)).toBe('link-local');
+    expect(decodePairingUri(encodePairingUri(payload(converted))).addresses).toEqual(converted);
+  });
+
+  it('fits the 296-character cap and drops addresses from the least-reachable end', () => {
+    const map: InterfaceMap = {
+      en0: [v4('192.168.1.10'), v6('fd00:1::5'), v6('2001:db8:1:2::1')],
+      en1: [v4('10.0.0.5'), v6('fd00:2::5'), v6('2001:db8:3:4::1')],
+      wan: [v4('203.0.113.9'), v4('100.64.0.7')],
+    };
+    const advertised = advertisedAddresses(map);
+    const texts = advertised.map((address) => address.value);
+    expect(texts).toEqual([
+      '10.0.0.5', '192.168.1.10', 'fd00:1::5', 'fd00:2::5', '100.64.0.7', '203.0.113.9', '2001:db8:1:2::1', '2001:db8:3:4::1',
+    ]);
+    const converted = pairingAddressesOf(advertised);
+    expect(MAX_PAIRING_URI_LENGTH).toBe(296);
+
+    // Beside a short name all eight fit, and none is dropped.
+    expect(fitPairingPayload(payload(converted, 'Desk', HOST_SERVER)).addresses).toEqual(converted);
+
+    // Beside the whole 64-byte name they do not, so some give way…
+    const tight = payload(converted, 'x'.repeat(MAX_NAME_BYTES), HOST_SERVER);
+    expect(reasonOf(() => encodePairingUri(tight))).toBe('too-long');
+    const fitted = fitPairingPayload(tight);
+    expect(encodePairingUri(fitted).length).toBeLessThanOrEqual(MAX_PAIRING_URI_LENGTH);
+    const kept = fitted.addresses.length;
+    expect(kept).toBeGreaterThan(0);
+    expect(kept).toBeLessThan(converted.length);
+    // …from the END: what stays is the first `kept`, the same objects in order,
+    fitted.addresses.forEach((address, i) => expect(address, texts[i]).toBe(converted[i]));
+    // one more would not have fit,
+    expect(reasonOf(() => encodePairingUri({ ...tight, addresses: converted.slice(0, kept + 1) }))).toBe('too-long');
+    // and what went is the least reachable: the global IPv6 addresses.
+    expect(texts.slice(kept)).toEqual(['2001:db8:1:2::1', '2001:db8:3:4::1']);
+  });
+
+  it('refuses text a code could not carry as written, rather than dropping or reinterpreting it', () => {
+    const reason = (address: AdvertisedAddress): unknown => {
+      try {
+        pairingAddressesOf([address]);
+        return null;
+      } catch (error) {
+        if (error instanceof TypedEntryError) return error.reason;
+        throw error;
+      }
+    };
+    // A port has nowhere to go: a code carries one port for all its addresses.
+    expect(reason({ kind: 'ipv4', value: '192.168.1.10:8973' })).toBe('bad-ipv4');
+    expect(reason({ kind: 'dns', value: 'desk.lan:8973' })).toBe('bad-dns-name');
+    expect(reason({ kind: 'ipv6', value: '[fd00::5]:8973' })).toBe('bad-ipv6');
+    expect(reason({ kind: 'ipv6', value: '[fd00::5]' })).toBe('bad-ipv6');
+    // A zone index names an interface on the host, which the phone does not have.
+    expect(reason({ kind: 'ipv6', value: 'fe80::1%en0' })).toBe('zone-index-unsupported');
+    // The kind an address claims is the kind it has to be.
+    expect(reason({ kind: 'dns', value: '10.0.0.1' })).toBe('bad-dns-name');
+    expect(reason({ kind: 'ipv4', value: 'fd00::5' })).toBe('bad-ipv4');
+    expect(reason({ kind: 'ipv4', value: 'desk.lan' })).toBe('bad-ipv4');
+    expect(reason({ kind: 'ipv6', value: '10.0.0.1' })).toBe('bad-ipv6');
+    expect(reason({ kind: 'ipv6', value: 'a:b' })).toBe('bad-ipv6');
+    expect(reason({ kind: 'ipv4', value: '010.0.0.1' })).toBe('bad-ipv4');
+    // One bad entry refuses the list: a code without an address the operator
+    // named is a code nobody asked for.
+    expect(() =>
+      pairingAddressesOf([{ kind: 'ipv4', value: '192.168.1.10' }, { kind: 'ipv4', value: '300.0.0.1' }]),
+    ).toThrow(TypedEntryError);
+    // Control: each shape above, written correctly, converts.
+    for (const ok of [
+      { kind: 'ipv4', value: '192.168.1.10' },
+      { kind: 'dns', value: 'desk.lan' },
+      { kind: 'ipv6', value: 'fd00::5' },
+      { kind: 'ipv6', value: 'fe80::1' },
+      { kind: 'ipv6', value: '::ffff:192.168.1.4' },
+    ] as const) {
+      expect(reason(ok), ok.value).toBeNull();
+    }
+    expect(pairingAddressesOf([])).toEqual([]);
   });
 });
 

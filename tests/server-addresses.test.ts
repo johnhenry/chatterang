@@ -2,18 +2,31 @@ import { describe, expect, it } from 'vitest';
 
 import {
   advertisedAddresses,
-  describeAdvertised,
   MAX_ADVERTISED,
+  pairingAddressesOf,
   type InterfaceMap,
+} from '@chatterang/tunnel/host';
+import { MAX_ADDRESSES, TypedEntryError } from '@chatterang/tunnel/pairing';
+import {
+  advertisedAddresses as advertisedByServer,
+  advertisedAddressesForThisMachine as advertisedByServerForThisMachine,
+  describeAdvertised,
 } from '../apps/server/src/addresses.js';
 
 /**
- * #252: a headless server that can name its own address.
+ * #252: a host that can name its own address.
  *
  * Driven with INJECTED interface maps, because the interesting cases are the
  * ones this build machine does not have — a link-local-only host, a host with
  * nine addresses, a host with nothing but loopback. A test that read the real
  * `os.networkInterfaces()` would assert whatever the CI runner happens to be.
+ *
+ * THE ENUMERATION LIVES IN THE TUNNEL HOST (`packages/tunnel/src/host/
+ * addresses.ts`), because the desktop needs the same list for its pairing
+ * payload and cannot import `apps/server`, which depends on it (#158 asks for
+ * one implementation). The server keeps what only a server has: `--advertise`
+ * and the line it prints at boot. The enumeration cases below drive the host;
+ * the override and boot-line cases drive the server's wrapper.
  */
 
 const v4 = (address: string, internal = false) => ({ address, family: 'IPv4', internal });
@@ -87,11 +100,35 @@ describe('order is a claim about reachability, best first', () => {
     expect(advertisedAddresses(outside)[0]?.value).toBe('192.168.0.1');
   });
 
+  it('ranks CGNAT’s 100.64/10 with the public addresses, not with the private LAN', () => {
+    /*
+     * A tailnet address is 100.64/10, and whether it deserves to rank higher is
+     * an open question — but it is ONE question, answered in one place, and
+     * `pairingAddressReach` gives the same answer (`public-ipv4`). Ranking it
+     * as private here would put it ahead of the ULA and part the two orders.
+     */
+    const map: InterfaceMap = {
+      a: [v4('100.64.0.7')],
+      b: [v6('fd00::5')],
+      c: [v4('192.168.1.10')],
+      d: [v4('100.127.255.254')],
+    };
+    expect(advertisedAddresses(map).map((a) => a.value)).toEqual([
+      '192.168.1.10', 'fd00::5', '100.127.255.254', '100.64.0.7',
+    ]);
+  });
+
   it('caps the list at what #134’s payload can carry', () => {
+    /*
+     * Against the CODEC's cap, not only the constant here: comparing the
+     * length with `MAX_ADVERTISED` alone let `MAX_ADVERTISED = 12` pass, and a
+     * list of twelve is one `encodePairingUri` refuses as `too-many-addresses`.
+     */
     const map: InterfaceMap = {
       en0: Array.from({ length: 12 }, (_, i) => v4(`192.168.1.${i + 10}`)),
     };
-    expect(advertisedAddresses(map)).toHaveLength(MAX_ADVERTISED);
+    expect(MAX_ADVERTISED).toBe(MAX_ADDRESSES);
+    expect(advertisedAddresses(map)).toHaveLength(MAX_ADDRESSES);
   });
 
   it('offers one address per IPv6 /64, not every privacy-extension temporary', () => {
@@ -158,22 +195,131 @@ describe('the operator’s answer replaces ours', () => {
      * publish — and would do it invisibly, because the flag appeared honoured.
      */
     const map: InterfaceMap = { en0: [v4('192.168.1.10'), v4('203.0.113.9')] };
-    expect(advertisedAddresses(map, 'desk.example.com')).toEqual([
+    expect(advertisedByServer(map, 'desk.example.com')).toEqual([
       { kind: 'dns', value: 'desk.example.com' },
     ]);
   });
 
   it('classifies what the operator typed', () => {
     const none: InterfaceMap = {};
-    expect(advertisedAddresses(none, '10.0.0.4')[0]?.kind).toBe('ipv4');
-    expect(advertisedAddresses(none, 'fd00::9')[0]?.kind).toBe('ipv6');
-    expect(advertisedAddresses(none, 'desk.local')[0]?.kind).toBe('dns');
+    expect(advertisedByServer(none, '10.0.0.4')[0]?.kind).toBe('ipv4');
+    expect(advertisedByServer(none, 'fd00::9')[0]?.kind).toBe('ipv6');
+    expect(advertisedByServer(none, 'desk.local')[0]?.kind).toBe('dns');
+  });
+
+  it('at boot too: the operator’s answer replaces this machine’s list, whatever it has', () => {
+    // `main.ts` prints `advertisedAddressesForThisMachine(options.advertise)`,
+    // which reads the real interfaces. With an override it must not matter
+    // what they are, so this holds on any machine.
+    expect(advertisedByServerForThisMachine('desk.example.com')).toEqual([
+      { kind: 'dns', value: 'desk.example.com' },
+    ]);
+    expect(advertisedByServerForThisMachine('  10.0.0.4  ')).toEqual([{ kind: 'ipv4', value: '10.0.0.4' }]);
   });
 
   it('ignores an empty or blank override rather than advertising nothing', () => {
     const map: InterfaceMap = { en0: [v4('192.168.1.10')] };
-    expect(advertisedAddresses(map, '')).toHaveLength(1);
-    expect(advertisedAddresses(map, '   ')).toHaveLength(1);
+    expect(advertisedByServer(map, '')).toHaveLength(1);
+    expect(advertisedByServer(map, '   ')).toHaveLength(1);
+  });
+
+  it('without an override, prints exactly the host’s list: one enumeration, not a second copy', () => {
+    /*
+     * The move changed where the list is made and nothing about what the
+     * server prints. A server that kept its own copy would pass every case
+     * above and drift from the desktop's list the first time either changed.
+     */
+    const map: InterfaceMap = {
+      lo0: [v4('127.0.0.1', true), v6('::1', true)],
+      en0: [v4('192.168.1.10'), v6('fe80::1%en0'), v6('2001:db8:1:2::1'), v6('2001:db8:1:2::2')],
+      en1: [v4('100.64.0.7'), v6('fd00::5'), v4('169.254.3.4'), v4('10.0.0.5')],
+      bridge0: [v4('192.168.1.10')],
+    };
+    const host = advertisedAddresses(map);
+    expect(host.map((a) => a.value)).toEqual([
+      '10.0.0.5', '192.168.1.10', 'fd00::5', '100.64.0.7', '2001:db8:1:2::1',
+    ]);
+    expect(advertisedByServer(map)).toEqual(host);
+    expect(advertisedByServer(map, '  ')).toEqual(host);
+  });
+});
+
+describe('an --advertise the boot line shows is one a pairing code can carry', () => {
+  /*
+   * THE BOOT LINE USED TO PROMISE WHAT THE CODE WOULD REFUSE. `--advertise`
+   * was classified by shape — any colon made it IPv6 — and printed as "it will
+   * advertise (--advertise): 192.168.1.4:8973", while `pairingAddressesOf`, the
+   * step every code goes through, refuses that text. The refusal would have come
+   * at code-minting time, after the confirm half had told the operator the
+   * value was fine, and it would have named IPv6 for text written as IPv4 with a
+   * port. The operator's answer now goes through the same step at boot, and a
+   * value a code cannot carry stops the server before it listens.
+   */
+  const refusalOf = (text: string): Error | null => {
+    try {
+      advertisedByServer({}, text);
+      return null;
+    } catch (error) {
+      if (error instanceof Error) return error;
+      throw error;
+    }
+  };
+
+  it('refuses at boot every value the host would refuse when it draws a code', () => {
+    for (const text of [
+      '192.168.1.4:8973',
+      'desk.lan:8973',
+      'desk:8973',
+      'https://desk.lan',
+      '[fd00::5]:8973',
+      '[fd00::5]',
+      'fe80::1%en0',
+      'désk.lan',
+      '300.1.1.1',
+      '010.0.0.1',
+    ]) {
+      const refusal = refusalOf(text);
+      expect(refusal, text).not.toBeNull();
+      expect(refusal!.message, text).toContain(`--advertise ${text}`);
+      expect(refusal!.cause, text).toBeInstanceOf(TypedEntryError);
+      // The path `main.ts` takes, too, whatever this machine's interfaces are.
+      expect(() => advertisedByServerForThisMachine(text), text).toThrow(refusal!.message);
+    }
+  });
+
+  it('accepts only what the host accepts, of the kind it claims, and shows it as written', () => {
+    for (const text of [
+      '10.0.0.4',
+      '  10.0.0.4  ',
+      'fd00::9',
+      'fe80::1',
+      '::ffff:192.168.1.4',
+      'desk.lan',
+      'Desk.Example.com.',
+      // Carried the way a QR payload admits one; see `pairingAddressesOf`.
+      'desk.local',
+    ]) {
+      const list = advertisedByServer({}, text);
+      expect(list, text).toHaveLength(1);
+      // The helper checks the kind against the bytes, so a wrong kind throws here.
+      expect(() => pairingAddressesOf(list), text).not.toThrow();
+      expect(describeAdvertised(list, true).join(' '), text).toContain(`(--advertise): ${text.trim()}`);
+    }
+  });
+
+  it('names the kind the operator wrote, and says a port is what has nowhere to go', () => {
+    const reasonOf = (text: string): unknown => (refusalOf(text)?.cause as TypedEntryError | undefined)?.reason;
+    expect(reasonOf('192.168.1.4:8973')).toBe('bad-ipv4');
+    expect(reasonOf('desk.lan:8973')).toBe('bad-dns-name');
+    expect(reasonOf('[fd00::5]:8973')).toBe('bad-ipv6');
+    for (const text of ['192.168.1.4:8973', 'desk.lan:8973', '[fd00::5]:8973']) {
+      expect(refusalOf(text)!.message, text).toMatch(/\bport\b/);
+      expect(refusalOf(text)!.message, text).not.toMatch(/IPv6/);
+    }
+    expect(reasonOf('fe80::1%en0')).toBe('zone-index-unsupported');
+    expect(refusalOf('fe80::1%en0')!.message).toMatch(/zone index/);
+    // Control: a value with no port is not told it has one.
+    expect(refusalOf('désk.lan')!.message).not.toMatch(/\bport\b/);
   });
 });
 
@@ -199,5 +345,34 @@ describe('the confirm half, which is what keeps enumeration honest', () => {
     const lines = describeAdvertised([], false);
     expect(lines.join(' ')).toContain('will not work');
     expect(lines.join(' ')).toContain('--advertise');
+  });
+
+  it('claims only what is true at boot: pairing is not on, and no certificate carries these', () => {
+    /*
+     * THE LINE USED TO SAY TWO FALSE THINGS. "Pairing advertises" and "these
+     * addresses go into every pairing code and into the certificate".
+     *
+     *   - The server mints no pairing code: it starts no tunnel listener, and
+     *     `tunnel-identity.ts` says nothing calls its key loader yet. So the
+     *     line says what pairing WILL advertise once it is on.
+     *   - #295's ruling: a client checks only the key pin it learned at
+     *     pairing, never the certificate's hostname or SAN list, which keeps
+     *     the certificate free of an address list that goes stale. So no
+     *     certificate is a consumer of this list, and the line names none.
+     *
+     * When a change turns pairing on in the server, this line and this test
+     * move in that change — the listen inventory in privacy-copy.test.ts is
+     * what makes that change touch copy.
+     */
+    for (const lines of [
+      describeAdvertised([{ kind: 'ipv4', value: '192.168.1.10' }, { kind: 'ipv6', value: 'fd00::5' }], false),
+      describeAdvertised([{ kind: 'dns', value: 'desk.example.com' }], true),
+      describeAdvertised([], false),
+    ]) {
+      const text = lines.join(' ');
+      expect(text, text).not.toMatch(/certificate/i);
+      expect(text, text).not.toMatch(/\bpairing advertises\b/i);
+      expect(text, text).toContain('pairing is not on yet');
+    }
   });
 });

@@ -95,6 +95,19 @@ export { createDeviceCredentials, createMemoryCredentialStore } from './credenti
 export type { CredentialStore, DeviceCredentials, MintedCredential } from './credential.js';
 
 /*
+ * WHERE A PHONE COULD DIAL THIS HOST (#252, #134): the one enumeration both
+ * apps' pairing codes carry, and the step from its text to the codec's bytes.
+ * It reads the interface table and binds nothing — see `addresses.ts`.
+ */
+export {
+  MAX_ADVERTISED,
+  advertisedAddresses,
+  advertisedAddressesForThisMachine,
+  pairingAddressesOf,
+} from './addresses.js';
+export type { AdvertisedAddress, InterfaceAddress, InterfaceMap } from './addresses.js';
+
+/*
  * THE TUNNEL'S TLS IDENTITY (#179, #180): the key a paired client pins, the
  * certificates made from it, and the owner-only store both apps keep it in.
  * None of it binds anything — see `identity.ts` and `identity-store.ts` — and
