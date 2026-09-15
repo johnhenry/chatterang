@@ -223,6 +223,20 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(prose)).toBe(prose);
   });
 
+  it('strips a call written with a closing bracket too few through the tag or paren that ends it, in each tag form', () => {
+    expect(
+      stripToolSyntax('Look.\n<tool_call>{"name": "calculate", "arguments": {"expression": "1"}</tool_call>\nDone.'),
+    ).toBe('Look.\n\nDone.');
+    expect(stripToolSyntax('Look. [TOOL_CALLS] calculate({"expression": {"a": "1"}) Done.')).toBe('Look.  Done.');
+    expect(
+      stripToolSyntax('Look.\n<tool_call>\n```json\n{"name":"calculate","arguments":{"expression":"1"}\n```\n</tool_call>\nDone.'),
+    ).toBe('Look.\n\nDone.');
+    const prose = 'Write `<tool_call>{"name": "x"` and end it with `</tool_call>`, and the app reads it.';
+    expect(stripToolSyntax(prose), 'prose between the opening and the tag is not JSON').toBe(prose);
+    const unfinished = 'Look.\n<tool_call>{"name": "calculate", "arguments": {"expression": "1"}';
+    expect(stripToolSyntax(unfinished), 'with no tag after it, it is the caller’s to cut').toBe(unfinished);
+  });
+
   it('strips a Qwen3-Coder call whose body is XML, and keeps prose naming its tags', () => {
     const call = '<tool_call>\n<function=calculate>\n<parameter=expression>\n2+2\n</parameter>\n</function>\n</tool_call>';
     expect(stripToolSyntax(`Checking.\n${call}\nDone.`)).toBe('Checking.\n\nDone.');

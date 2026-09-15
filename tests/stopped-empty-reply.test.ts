@@ -2334,3 +2334,97 @@ describe('a fenced call wrapped in <tool_call> tags, stopped on its closing fenc
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
+
+/* ── Round 3: a call with a closing brace too few ───────────────────── */
+
+/**
+ * A call with one closing brace too few, ended by its closing tag. Its JSON does
+ * not parse, so it runs nothing; its JSON never closes, so it was read as a call
+ * still being written, and everything after it was cut.
+ */
+const SHORT_BRACE = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}</tool_call>';
+
+describe('a call written with a closing brace too few', () => {
+  it('between words: a finished reply keeps the words after it, and stores and sends none of the call', async () => {
+    const id = 'r3_short_brace_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me look.\n${SHORT_BRACE}\nI have asked for your notes; one moment.`, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls, 'no tool ran').toBeUndefined();
+    expect(stored.content, 'the stored reply').toBe('Let me look.\n\nI have asked for your notes; one moment.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  for (const [before, expected] of [
+    ['Let me look.\n', 'Let me look.\n\nThey mention a passphrase.'],
+    ['', 'They mention a passphrase.'],
+  ] as const) {
+    it(`beside a call that ran${before ? ', after words' : ''}: a finished turn keeps the follow-up’s answer, and sends it back`, async () => {
+      const id = `r3_short_brace_ran_${before.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`${before}${SHORT_BRACE}\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const ran = assistantRows(id)[1]!;
+      expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
+        content: expected,
+        stopped: undefined,
+      });
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', expected]);
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('beside a call that ran: a stopped follow-up keeps its words, is not called stopped, and sends none of the call', async () => {
+    const id = 'r3_short_brace_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `${SHORT_BRACE}\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(stopped?.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a pass',
+      stopped: undefined,
+    });
+    await mounted(stopped!, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});

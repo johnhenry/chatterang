@@ -297,19 +297,80 @@ export function endOfJson(text: string, start: number): number {
  * commonest malformed call has one brace too many, `{"name": …, "arguments":
  * {…}}}`, and its JSON closed a brace early and was not followed by the tag, so
  * the call and its arguments were kept as the reply's words and sent back.
+ *
+ * `short` is the token that ends a tag or paren form, for a call with a closing
+ * bracket too few: see {@link shortCallEnd}. A fenced block has none, because
+ * any other is a code example.
  */
 const CALL_SHAPES: readonly {
   readonly open: RegExp;
   readonly close: RegExp;
+  readonly short?: RegExp;
   readonly fenced: boolean;
 }[] = [
-  { open: /<tool_call>\s*(?=[{[])/gi, close: /^[\s}\]]*<\/tool_call>/i, fenced: false },
+  { open: /<tool_call>\s*(?=[{[])/gi, close: /^[\s}\]]*<\/tool_call>/i, short: /<\/tool_call>/iy, fenced: false },
   // The tag around a fenced block: markup whatever the JSON holds, as the tag
   // form is. Stripping only the fenced call inside left `<tool_call>\n\n</tool_call>`.
-  { open: /<tool_call>\s*```(?:json|tool)?\s*(?=[{[])/gi, close: /^[\s}\]]*```\s*<\/tool_call>/i, fenced: false },
-  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, fenced: false },
+  {
+    open: /<tool_call>\s*```(?:json|tool)?\s*(?=[{[])/gi,
+    close: /^[\s}\]]*```\s*<\/tool_call>/i,
+    short: /\x60{3}\s*<\/tool_call>/iy,
+    fenced: false,
+  },
+  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, short: /\)/y, fenced: false },
   { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
 ];
+
+/**
+ * Where a call whose JSON opens at `start` and has a closing bracket too few
+ * ends: just past `short`, the token that ends its form, when that token comes
+ * outside any string before the JSON's brackets close, and the JSON before it
+ * parses once the brackets still open are closed. -1 for anything else — a call
+ * whose JSON closes, one still being written, or prose.
+ *
+ * A small model's other commonest malformed call is a brace too few:
+ * `<tool_call>{"name": "leaky", "arguments": {"path": "notes.md"}</tool_call>`.
+ * Its JSON never closes, so it was not stripped, and the unfinished-call cut
+ * read it as a call still being written: everything after it went, the words
+ * the model wrote after its closing tag, and in a tool turn the follow-up's
+ * whole answer. The reply was stored with none of them, or with no words at all
+ * and shown as "Stopped before its first word".
+ *
+ * THE FIRST SUCH TOKEN, AND ONLY JSON BEFORE IT. The extractor reads a tag's
+ * body up to the first `</tool_call>` too. Prose between an opening shape and a
+ * closing tag it names — "write `<tool_call>{"name": "x"` and end it with
+ * `</tool_call>`" — does not parse, and keeps every word.
+ */
+export function shortCallEnd(text: string, start: number, short: RegExp): number {
+  const open: string[] = [];
+  let inString = false;
+  for (let at = start; at < text.length; at += 1) {
+    const char = text[at];
+    if (inString) {
+      if (char === '\\') at += 1;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === '{' || char === '[') {
+      open.push(char);
+    } else if (char === '}' || char === ']') {
+      open.pop();
+      if (open.length === 0) return -1;
+    } else if (open.length > 0) {
+      short.lastIndex = at;
+      const token = short.exec(text);
+      if (!token) continue;
+      const closers = open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('');
+      try {
+        const parsed: unknown = JSON.parse(text.slice(start, at) + closers);
+        return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? at + token[0].length : -1;
+      } catch {
+        return -1;
+      }
+    }
+  }
+  return -1;
+}
 
 /** A call with nothing inside it at all: `<tool_call></tool_call>`, or `[TOOL_CALLS] name()`. */
 const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/gi;
@@ -434,10 +495,17 @@ export function stripToolSyntax(
 ): string {
   if (offered.length === 0 && !ran) return text.trim();
   const spans: [number, number][] = [];
-  for (const { open, close, fenced } of CALL_SHAPES) {
+  for (const { open, close, short, fenced } of CALL_SHAPES) {
     if (fenced && offered.length === 0) continue;
     for (const match of text.matchAll(open)) {
       const from = match.index + match[0].length;
+      // A closing bracket too few, ended by its tag or paren: read before the
+      // JSON's end, which a later brace in the text can supply. See `shortCallEnd`.
+      const shortEnd = short ? shortCallEnd(text, from, short) : -1;
+      if (shortEnd !== -1) {
+        spans.push([match.index, shortEnd]);
+        continue;
+      }
       const end = endOfJson(text, from);
       if (end === -1) continue;
       const closing = close.exec(text.slice(end));
