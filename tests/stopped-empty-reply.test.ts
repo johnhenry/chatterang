@@ -1714,3 +1714,39 @@ describe('a finished reply that is only a malformed <tool_call>', () => {
   });
 });
 
+describe('a failed tool turn, tried again and flipped back to', () => {
+  it('stores none of the call as its words and sends none of it', async () => {
+    const id = 'r1_failed_tool_turn';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}</tool_call>' },
+      { fail: 'the model crashed' },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+
+      const failed = assistantRows(id).at(-1)!;
+      expect(failed.error, 'the turn failed').toBe('the model crashed');
+      expect(failed.content, 'the failed row’s words').toBe('Checking.');
+
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      expect(regenerated.variants?.map((variant) => variant.content)).toEqual(['Checking.', 'Again.']);
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Checking.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain('canary-7f3a');
+  });
+});
+

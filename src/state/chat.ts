@@ -2020,7 +2020,15 @@ async function runGeneration(
           const partial = splitThinking(raw);
           const failed: Message = {
             ...placeholder,
-            content: partial.content.trim(),
+            // With its calls read out as a finished reply's are. A failed row
+            // is left out of history, but Try again keeps it as a version, a
+            // version carries no error, and flipping back to it sent a call
+            // that ran, arguments and all, to the model.
+            content: wordsWithoutCalls(partial.content, {
+              readForCalls: chat.tools.length > 0,
+              stopped: false,
+              cutsUnfinished: offersTools || toolCalls.length > 0,
+            }).trim(),
             thinking: partial.thinking || undefined,
             // The calls happened, and a receipt among them says something left.
             // The placeholder has none, so without this line a failed turn
