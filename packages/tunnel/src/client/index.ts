@@ -14,11 +14,16 @@
  * needs a mobile framework installed is not shared code. All four are asserted
  * in `tests/layering.test.ts`, against these real files rather than a copy.
  *
- * NOT IMPLEMENTED HERE, AND NO LONGER FOR THE REASON THIS COMMENT USED TO
- * GIVE. It said the transport waits on #181 choosing between plaintext LAN
- * plus an application-layer handshake and a native socket plugin. #181 chose,
- * on 2026-09-11: **a native socket plugin, on both platforms. One transport,
- * not two.**
+ * THE TRANSPORT IS HANDED IN. #181 chose, on 2026-09-11: **a native socket
+ * plugin, on both platforms. One transport, not two.** That plugin cannot be
+ * imported here (it is `@capacitor/`), so this file does not open the phone's
+ * socket at all. `createTunnelClient` takes a {@link TunnelTransport} (bytes
+ * in, bytes out, one close) and runs everything that makes a tunnel a tunnel
+ * over it: the protocol gate, the sequence checks, `bye`, and the close codes
+ * and HTTP statuses read as faults. The plugin's contract is
+ * `packages/contracts/src/tunnel-socket.ts`; an app passes in the adapter from
+ * that plugin to this shape (#295). The `WebSocket` global stays the default,
+ * which is rung 0 (#156).
  *
  * Plaintext `ws://` lost on one measured fact, recorded here because a
  * rejected option that is not written down is one somebody re-proposes:
@@ -29,11 +34,6 @@
  * rescued it — an mDNS name resolving inside a WebView — has never been
  * measured. Two transports was rejected on its own warning: two threat
  * models, two negative tests, and two failure classifications for #186.
- *
- * So what is missing here is WORK, not a decision. The client is #156; the
- * listener is #157 and #158. What this package delivers today is still the
- * BOUNDARY: a shape the transport is poured into, with a guard that fails the
- * day someone pours it into the wrong half.
  */
 
 import { createProtocolGate, faultMessage } from '../stream/index.js';
@@ -57,10 +57,11 @@ import {
  * The client end of a tunnel.
  *
  * Deliberately expressed in {@link TunnelFrame}s and nothing else — no socket,
- * no URL scheme, no handshake. Those belong to the native socket plugin #181
- * chose and #156 builds; this is the part that was the same under either
- * option, which is why it could be written down before the ruling and why it
- * needs no revision after it.
+ * no URL scheme, no handshake. Those belong to the transport underneath, which
+ * is the native socket plugin #181 chose on a phone and the `WebSocket` global
+ * at rung 0; this is the part that is the same over either, which is why it
+ * could be written down before the ruling and why it needs no revision after
+ * it.
  */
 export interface TunnelClient {
   /** Hand one frame to the peer. */
@@ -203,28 +204,188 @@ export type TunnelClose =
   | { readonly kind: 'clean'; readonly reason?: string }
   | { readonly kind: 'abnormal'; readonly code: string; readonly message: string };
 
+/**
+ * Where a transport connects, and what it presents.
+ *
+ * Built by `createTunnelClient` AFTER it has checked that `url` may carry a
+ * credential, which is how that check covers every transport and not only the
+ * default. At most one of `credential` and `credentialRef`, and the credential
+ * is never inside `url` (#136): a transport presents it in
+ * `TUNNEL_CREDENTIAL_HEADER`.
+ */
+export interface TunnelTransportTarget {
+  readonly url: string;
+  /** The device credential itself. */
+  readonly credential?: string;
+  /** The name a transport's own store keeps the credential under. JavaScript never holds the secret. */
+  readonly credentialRef?: string;
+}
+
+/**
+ * THE BYTES UNDER A TUNNEL, AND NOTHING ELSE.
+ *
+ * No frames, no gate, no faults: those are the client's, and they run the same
+ * over every transport. What a transport owes the client:
+ *
+ * - `onOpen` fires at most once, when frames may be sent.
+ * - `onFrame` gets one message's exact bytes. A transport decodes nothing, so
+ *   `decodeFrame`'s fatal UTF-8 decoder is the one validator.
+ * - `onClose` fires EXACTLY ONCE, whether or not the connection opened: the
+ *   close code (1006 when there was no close frame), the reason, and
+ *   `httpStatus` only when the server answered the upgrade with a status other
+ *   than 101. That status is what tells a refused credential from a host that
+ *   is not there.
+ * - EVEN WHEN NO CONNECTION WAS EVER MADE. A transport that failed before any
+ *   host could answer (a pin that did not match, a stored credential that is
+ *   gone, a plugin that refused to start) says so with `failure`, still through
+ *   `onClose`, still once. A transport that says nothing leaves the client
+ *   waiting; one that says only 1006 tells a person to look for a network fault.
+ * - No event is delivered from inside the factory call. `createTunnelClient`
+ *   registers its listeners after the factory returns, in the same turn.
+ * - `send` after the connection has closed writes nothing. `close` is
+ *   idempotent.
+ *
+ * A transport that delivers anything after its close — a frame, a second
+ * close, an open — has broken this, and the client ignores and counts it (see
+ * {@link TunnelClientOptions.onIgnoredAfterClose}) rather than decoding it.
+ */
+export interface TunnelTransport {
+  send(bytes: Uint8Array): void;
+  onOpen(listener: () => void): void;
+  onFrame(listener: (bytes: Uint8Array) => void): void;
+  onClose(
+    listener: (code: number, reason: string, httpStatus?: number, failure?: TunnelTransportFailure) => void,
+  ): void;
+  close(code?: number, reason?: string): void;
+}
+
+/**
+ * Why a transport ended a connection before it opened, when no host answered
+ * and it was not for want of one. Only before open; after it, the close code
+ * decides.
+ *
+ * - `PEER_MISMATCH`: the handshake showed a key other than the paired one, and
+ *   the transport wrote nothing to it.
+ * - `CREDENTIAL_MISSING`: the store a `credentialRef` names holds nothing under
+ *   it, so there was nothing to present.
+ * - `TRANSPORT_FAILED`: the transport would not or could not start at all.
+ *
+ * The socket plugin's `TunnelCloseFailure` and its `connect` rejection codes
+ * map onto these by the same names, with `OPTIONS_REFUSED` as
+ * `TRANSPORT_FAILED`. This file imports nothing from the contract, so the
+ * names are repeated rather than shared.
+ */
+export type TunnelTransportFailure = 'PEER_MISMATCH' | 'CREDENTIAL_MISSING' | 'TRANSPORT_FAILED';
+
+/** Open a connection to `target`. Called once per client, after the credential check. */
+export type TunnelTransportFactory = (target: TunnelTransportTarget) => TunnelTransport;
+
+/** Something a transport delivered after its terminal close, which the client did not read. */
+export interface IgnoredAfterClose {
+  readonly delivered: 'open' | 'frame' | 'close';
+  /** How many deliveries this client has ignored so far, this one included. */
+  readonly count: number;
+}
+
 export interface TunnelClientOptions {
-  /** `ws://127.0.0.1:<port>` for rung 0. */
+  /** `ws://127.0.0.1:<port>` for rung 0; `wss:` through the socket plugin. */
   readonly url: string;
   /**
-   * The device credential the host minted, sent in `TUNNEL_CREDENTIAL_HEADER`
-   * and never in `url` (#136). Omitted, the connection presents nothing and a
-   * host admits it only while it is showing a pairing code, and only to pair.
+   * The device credential the host minted, presented in
+   * `TUNNEL_CREDENTIAL_HEADER` and never in `url` (#136). Omitted, with no
+   * `credentialRef` either, the connection presents nothing and a host admits
+   * it only while it is showing a pairing code, and only to pair.
    *
-   * WHERE THIS WORKS, said plainly: the standard `WebSocket` constructor has
-   * no way to set a request header. Node's (undici) takes a non-standard
-   * `{ headers }` init — measured: the header arrives — and that is what rung
-   * 0 runs on. A webview's `WebSocket` reads the same init as a subprotocol
-   * name and throws, so on a phone this fails loudly rather than connecting
-   * without the credential. The phone's real transport is #181's native socket
-   * plugin, which sets the header itself.
+   * WHERE THE DEFAULT CAN SEND IT, said plainly: the standard `WebSocket`
+   * constructor has no way to set a request header. Node's (undici) takes a
+   * non-standard `{ headers }` init — measured: the header arrives — and that
+   * is what rung 0 runs on. A webview's `WebSocket` reads the same init as a
+   * subprotocol name and throws, so on a phone the default fails loudly rather
+   * than connecting without the credential. The phone's transport is #181's
+   * socket plugin, passed in as {@link transport}, which sets the header itself.
    *
-   * REFUSED OVER PLAINTEXT OFF LOOPBACK: with a credential, `url` must be
-   * `wss:`, or `ws:` to exactly `127.0.0.1`. A bearer credential over plaintext
-   * on a LAN is a bearer credential on the wire, which is the argument
-   * `apps/server/src/binding.ts` makes for its own token.
+   * REFUSED OVER PLAINTEXT OFF LOOPBACK, BY EVERY TRANSPORT: with a credential
+   * or a `credentialRef`, `url` must be `wss:`, or `ws:` to exactly
+   * `127.0.0.1`. A bearer credential over plaintext on a LAN is a bearer
+   * credential on the wire, which is the argument `apps/server/src/binding.ts`
+   * makes for its own token. The check runs before the transport is made.
    */
   readonly credential?: string;
+  /**
+   * The name a transport's own store keeps the credential under, for a
+   * transport that reads the secret itself so that JavaScript never holds it
+   * (the socket plugin's `credentialRef`). Not with `credential`. The
+   * `WebSocket` default has no store and refuses it.
+   */
+  readonly credentialRef?: string;
+  /**
+   * The transport to run the tunnel over. Omitted, the `WebSocket` global
+   * ({@link webSocketTransport}), which is rung 0. The app passes the socket
+   * plugin's adapter here; this file never imports a plugin.
+   */
+  readonly transport?: TunnelTransportFactory;
+  /**
+   * Told about each thing the transport delivers after its terminal close.
+   * None of it is read, decoded or answered. A transport that does this has a
+   * bug worth seeing, and a count is how it is seen without trusting it.
+   */
+  readonly onIgnoredAfterClose?: (ignored: IgnoredAfterClose) => void;
+}
+
+/**
+ * Why a tunnel never opened.
+ *
+ * `UNREACHABLE` is the only one that means "not there". Each of the rest needs
+ * a different screen.
+ *
+ * A host that answered the upgrade with an HTTP status:
+ *
+ * - `CREDENTIAL_REFUSED` (401, a credential presented): revoked, or never
+ *   issued there. Pair again.
+ * - `PAIRING_NOT_OPEN` (401, nothing presented): the host is not showing a
+ *   pairing code. There was no credential to refuse, so "pair again" would be
+ *   the wrong thing to say.
+ * - `HOST_COULD_NOT_CHECK` (503): the host's gate could not read its store.
+ *   Nothing was revoked; try again. The host sends 503 rather than 401 for
+ *   exactly this reason (`packages/tunnel/src/host/index.ts`).
+ * - `UPGRADE_REFUSED`: any other status, carried in `httpStatus`.
+ *
+ * A transport that stopped before any host could answer
+ * ({@link TunnelTransportFailure}), with no status:
+ *
+ * - `PEER_MISMATCH`: the address answered with a key other than the paired
+ *   desktop's, and nothing was sent to it. A desktop whose identity was reset
+ *   needs pairing again.
+ * - `CREDENTIAL_MISSING`: this device no longer holds its credential. Pair
+ *   again.
+ * - `TRANSPORT_FAILED`: the transport would not start, or named a failure this
+ *   build does not know. Not "cannot reach": nothing says the host is missing.
+ *
+ * The `WebSocket` default can only ever say `UNREACHABLE`: a WHATWG socket
+ * reports a refused upgrade as `error` then `close` 1006, with no status
+ * (measured on Node 24). The status comes from a transport that can see it.
+ */
+export type TunnelConnectFault =
+  | 'UNREACHABLE'
+  | 'CREDENTIAL_REFUSED'
+  | 'PAIRING_NOT_OPEN'
+  | 'HOST_COULD_NOT_CHECK'
+  | 'UPGRADE_REFUSED'
+  | 'PEER_MISMATCH'
+  | 'CREDENTIAL_MISSING'
+  | 'TRANSPORT_FAILED';
+
+export class TunnelConnectError extends Error {
+  override readonly name = 'TunnelConnectError';
+  readonly code: TunnelConnectFault;
+  /** The upgrade's HTTP status, when the host answered with one. */
+  readonly httpStatus: number | undefined;
+
+  constructor(code: TunnelConnectFault, message: string, httpStatus: number | undefined) {
+    super(message);
+    this.code = code;
+    this.httpStatus = httpStatus;
+  }
 }
 
 /** Can this URL carry a credential? `wss:` anywhere, or plaintext loopback. */
@@ -238,50 +399,229 @@ function carriesCredentialSafely(url: string): boolean {
   return parsed.protocol === 'wss:' || (parsed.protocol === 'ws:' && parsed.hostname === '127.0.0.1');
 }
 
+const UNSAFE_CREDENTIAL =
+  'tunnel client: a device credential goes only over wss://, or ws:// to 127.0.0.1. ' +
+  'Over plaintext on a network it is readable by anyone on the path.';
+
+/** The target, or a refusal. Runs before any transport is made. */
+function targetOf(options: TunnelClientOptions): TunnelTransportTarget {
+  if (options.credential !== undefined && options.credentialRef !== undefined) {
+    throw new Error('tunnel client: give a credential or a credentialRef, not both');
+  }
+  const presented =
+    options.credential !== undefined
+      ? { credential: options.credential }
+      : options.credentialRef !== undefined
+        ? { credentialRef: options.credentialRef }
+        : null;
+  if (presented !== null && !carriesCredentialSafely(options.url)) throw new Error(UNSAFE_CREDENTIAL);
+  return { url: options.url, ...presented };
+}
+
+/**
+ * Why a connection closed before it opened, as a fault a screen can explain.
+ *
+ * A FAILURE IS READ BEFORE A STATUS. A transport that refused the peer wrote
+ * no request, so no status can be the host's answer to this device; and a
+ * failed pin reported as "credential refused" would send a person to re-pair
+ * with whatever answered. A failure this build has no name for is
+ * `TRANSPORT_FAILED`: read as `UNREACHABLE`, a newer transport's fault would be
+ * the misdirection these faults exist to end.
+ */
+function refusalBeforeOpen(
+  target: TunnelTransportTarget,
+  httpStatus: number | undefined,
+  failure: TunnelTransportFailure | undefined,
+): TunnelConnectError {
+  const { url } = target;
+  if (failure === 'PEER_MISMATCH') {
+    return new TunnelConnectError(
+      'PEER_MISMATCH',
+      `tunnel client: ${url} did not present the key of the desktop this device paired with, so nothing was sent to it. ` +
+        "If that desktop's identity was reset, pair again.",
+      undefined,
+    );
+  }
+  if (failure === 'CREDENTIAL_MISSING') {
+    return new TunnelConnectError(
+      'CREDENTIAL_MISSING',
+      `tunnel client: this device no longer holds the credential it paired with, so nothing was presented to ${url}. Pair again.`,
+      undefined,
+    );
+  }
+  if (failure !== undefined) {
+    return new TunnelConnectError(
+      'TRANSPORT_FAILED',
+      `tunnel client: the transport could not start a connection to ${url}`,
+      undefined,
+    );
+  }
+  if (httpStatus === undefined) {
+    return new TunnelConnectError('UNREACHABLE', `tunnel client: cannot reach ${url}`, undefined);
+  }
+  if (httpStatus === 401) {
+    return target.credential !== undefined || target.credentialRef !== undefined
+      ? new TunnelConnectError(
+          'CREDENTIAL_REFUSED',
+          `tunnel client: ${url} refused this device's credential. It was revoked or never issued there; pair again.`,
+          401,
+        )
+      : new TunnelConnectError(
+          'PAIRING_NOT_OPEN',
+          `tunnel client: ${url} is not showing a pairing code, and this connection presented no credential`,
+          401,
+        );
+  }
+  if (httpStatus === 503) {
+    return new TunnelConnectError(
+      'HOST_COULD_NOT_CHECK',
+      `tunnel client: ${url} could not check whether to let this connection in. Nothing was revoked; try again.`,
+      503,
+    );
+  }
+  return new TunnelConnectError(
+    'UPGRADE_REFUSED',
+    `tunnel client: ${url} answered the upgrade with HTTP ${String(httpStatus)}`,
+    httpStatus,
+  );
+}
+
+/** How an open tunnel ended, by the transport's close code, when no `bye` came first. */
+function closeOf(code: number): TunnelClose {
+  /*
+   * A REFUSAL IS NOT A CUT. A listener already holding as many tunnels as
+   * its app allows closes a new connection with `TUNNEL_CAP_CLOSE_CODE`
+   * before sending anything (#169). Read as PEER_GONE, a full desktop looks
+   * exactly like a cable pulled mid-stream, which is neither true nor
+   * something a screen can explain.
+   */
+  if (code === TUNNEL_CAP_CLOSE_CODE) {
+    return {
+      kind: 'abnormal',
+      code: 'TUNNEL_FULL',
+      message: 'the other device is already holding as many connections as it allows',
+    };
+  }
+  /*
+   * The same argument for the pairing refusal (#136): a connection that was
+   * let in only to pair, and tried something else or outlived the code on
+   * screen. Not a cut, and not something to retry without pairing.
+   */
+  if (code === TUNNEL_PAIRING_ONLY_CLOSE_CODE) {
+    return {
+      kind: 'abnormal',
+      code: 'PAIRING_ONLY',
+      message: 'the other device accepted this connection only to pair',
+    };
+  }
+  // And the window, which is a different fault: the code this connection was
+  // let in under is no longer shown. Pairing again needs a new code.
+  if (code === TUNNEL_PAIRING_CLOSED_CLOSE_CODE) {
+    return {
+      kind: 'abnormal',
+      code: 'PAIRING_WINDOW_CLOSED',
+      message: 'the pairing code this connection was let in under is no longer shown',
+    };
+  }
+  /*
+   * See the host's identical branch. `bye` is obliged on a deliberate close
+   * (#260), so a socket that goes away without one is reported as abnormal
+   * rather than as the end of a stream — which is the distinction #185 says
+   * does not currently exist and which #156's faults 3 and 4 assert.
+   */
+  return { kind: 'abnormal', code: 'PEER_GONE', message: 'the peer went away without a bye' };
+}
+
 /**
  * The socket, with the credential in a header when there is one.
  *
  * The cast is the non-standard init described on
  * {@link TunnelClientOptions.credential}, and it is confined to this function.
+ * The credential check is repeated here for a caller that uses
+ * {@link webSocketTransport} directly.
  */
-function openSocket(options: TunnelClientOptions): WebSocket {
-  if (options.credential === undefined) return new WebSocket(options.url);
-  if (!carriesCredentialSafely(options.url)) {
-    throw new Error(
-      'tunnel client: a device credential goes only over wss://, or ws:// to 127.0.0.1. ' +
-        'Over plaintext on a network it is readable by anyone on the path.',
-    );
-  }
+function openSocket(target: TunnelTransportTarget): WebSocket {
+  if (target.credential === undefined) return new WebSocket(target.url);
+  if (!carriesCredentialSafely(target.url)) throw new Error(UNSAFE_CREDENTIAL);
   const WithHeaders = WebSocket as unknown as new (
     url: string,
     init: { readonly headers: Readonly<Record<string, string>> },
   ) => WebSocket;
-  return new WithHeaders(options.url, { headers: { [TUNNEL_CREDENTIAL_HEADER]: options.credential } });
+  return new WithHeaders(target.url, { headers: { [TUNNEL_CREDENTIAL_HEADER]: target.credential } });
 }
 
 /**
- * Connect to a tunnel host.
+ * The default transport: the global `WebSocket`, which is rung 0.
  *
- * USES THE GLOBAL `WebSocket`, which is not laziness — it is the whole reason
- * this half can exist. Node 24 ships a WebSocket CLIENT (undici) and every
+ * USES THE GLOBAL, which is not laziness — it is the whole reason this half can
+ * exist without a plugin. Node 24 ships a WebSocket CLIENT (undici) and every
  * target this half runs in has one: the iOS and Android webviews, the desktop
  * renderer, and Node. #157's ruling is about the SERVER, which Node does not
  * ship and which lives in the other half behind a ban.
  *
- * So the asymmetry in this package — a dependency on one side and a global on
- * the other — is the asymmetry in the platform, not a preference.
+ * ONLY `close` IS A TERMINAL, never `error`. A WHATWG socket that fails fires
+ * `error` and then `close` — measured on Node 24 for a refused upgrade and for
+ * a port nobody listens on, both `close` 1006 — so reporting `error` as well
+ * would be the second terminal {@link TunnelTransport} forbids.
+ */
+export const webSocketTransport: TunnelTransportFactory = (target) => {
+  if (target.credentialRef !== undefined) {
+    throw new Error(
+      'tunnel client: the WebSocket transport has no credential store, so it cannot present a credentialRef',
+    );
+  }
+  const socket = openSocket(target);
+  socket.binaryType = 'arraybuffer';
+  return {
+    send: (bytes) => socket.send(bytes),
+    onOpen: (listener) => socket.addEventListener('open', () => listener(), { once: true }),
+    onFrame: (listener) =>
+      socket.addEventListener('message', (event: MessageEvent) => {
+        const data = event.data as ArrayBuffer | string;
+        listener(typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data));
+      }),
+    onClose: (listener) =>
+      socket.addEventListener('close', (event: CloseEvent) => listener(event.code, event.reason), { once: true }),
+    close: (code, reason) => (code === undefined ? socket.close() : socket.close(code, reason)),
+  };
+};
+
+/**
+ * Connect to a tunnel host, over the transport given or the `WebSocket` global.
+ *
+ * Rejects with a {@link TunnelConnectError} when the connection closes before
+ * it opens, and with a plain `Error` when the options are refused before any
+ * transport is made (a credential somewhere unsafe, or both credential forms).
+ *
+ * So the asymmetry in this package — a dependency on one side and a global
+ * (or an injected transport) on the other — is the asymmetry in the platform,
+ * not a preference.
  */
 export async function createTunnelClient(options: TunnelClientOptions): Promise<TunnelClient> {
-  const socket = openSocket(options);
-  socket.binaryType = 'arraybuffer';
+  const target = targetOf(options);
+  const transport = (options.transport ?? webSocketTransport)(target);
 
   const inbox: TunnelFrame[] = [];
   let wake: (() => void) | null = null;
   let ended: TunnelClose | null = null;
+  /**
+   * Where the transport is. `closing` is this end having asked it to close;
+   * `closed` is the transport's one `onClose` having arrived, after which
+   * nothing it delivers is read.
+   */
+  let state: 'connecting' | 'open' | 'closing' | 'closed' = 'connecting';
+  let opened = false;
+  let ignored = 0;
 
   let settle!: () => void;
   const closed = new Promise<void>((resolve) => {
     settle = resolve;
+  });
+  let admit!: () => void;
+  let refuse!: (error: TunnelConnectError) => void;
+  const opening = new Promise<void>((resolve, reject) => {
+    admit = resolve;
+    refuse = reject;
   });
   // This tunnel's turn state and sequence counts. See the host's.
   const gate = createProtocolGate();
@@ -293,20 +633,50 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
     settle();
   };
 
-  socket.addEventListener('message', (event: MessageEvent) => {
-    const data = event.data as ArrayBuffer | string;
+  /** This end closes the transport, once. */
+  const shut = (): void => {
+    if (state === 'closing' || state === 'closed') return;
+    state = 'closing';
+    transport.close();
+  };
+
+  const ignore = (delivered: IgnoredAfterClose['delivered']): void => {
+    ignored += 1;
+    options.onIgnoredAfterClose?.({ delivered, count: ignored });
+  };
+
+  transport.onOpen(() => {
+    if (state === 'closed') {
+      ignore('open');
+      return;
+    }
+    if (opened) return;
+    opened = true;
+    if (state === 'connecting') state = 'open';
+    admit();
+  });
+
+  transport.onFrame((bytes) => {
+    /*
+     * AFTER THE TERMINAL CLOSE, NOTHING IS READ. A transport that delivers a
+     * frame after saying the connection is over has broken its contract, and a
+     * frame decoded then could reach an app after `ended()` was settled, or
+     * move a turn the app has already been told is over. Counted, not decoded.
+     */
+    if (state === 'closed') {
+      ignore('frame');
+      return;
+    }
     let frame: TunnelFrame;
     try {
-      frame = decodeFrame(
-        typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data),
-      );
+      frame = decodeFrame(bytes);
     } catch (error) {
       finish({
         kind: 'abnormal',
         code: 'FRAME_INVALID',
         message: error instanceof Error ? error.message : 'frame refused',
       });
-      socket.close();
+      shut();
       return;
     }
     if (frame.kind === 'bye') {
@@ -320,7 +690,7 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
      */
     const verdict = gate.receive(frame);
     if (verdict.verdict === 'refuse') {
-      if (socket.readyState === WebSocket.OPEN) socket.send(gate.send(verdict.reply));
+      if (state === 'open') transport.send(gate.send(verdict.reply));
       return;
     }
     /*
@@ -340,74 +710,51 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
      */
     if (verdict.verdict === 'fault') {
       finish({ kind: 'abnormal', code: 'SEQUENCE_BROKEN', message: faultMessage(verdict.fault) });
-      socket.close();
+      shut();
       return;
     }
     inbox.push(frame);
     wake?.();
   });
 
-  socket.addEventListener('close', (event: CloseEvent) => {
-    /*
-     * A REFUSAL IS NOT A CUT. A listener already holding as many tunnels as
-     * its app allows closes a new connection with `TUNNEL_CAP_CLOSE_CODE`
-     * before sending anything (#169). Read as PEER_GONE, a full desktop looks
-     * exactly like a cable pulled mid-stream, which is neither true nor
-     * something a screen can explain.
-     */
-    if (event.code === TUNNEL_CAP_CLOSE_CODE) {
-      finish({
-        kind: 'abnormal',
-        code: 'TUNNEL_FULL',
-        message: 'the other device is already holding as many connections as it allows',
-      });
+  transport.onClose((code, _reason, httpStatus, failure) => {
+    // Exactly one terminal; a second is the transport's bug, not a new ending.
+    if (state === 'closed') {
+      ignore('close');
       return;
     }
+    state = 'closed';
     /*
-     * The same argument for the pairing refusal (#136): a connection that was
-     * let in only to pair, and tried something else or outlived the code on
-     * screen. Not a cut, and not something to retry without pairing.
+     * CLOSED BEFORE IT OPENED: the transport refused the peer or could not
+     * start, the host answered the upgrade with a status, or nothing answered
+     * at all. A 401 read as "cannot reach" sends a person looking for a network
+     * fault when their phone has been revoked, a 503 read as 401 tells a paired
+     * phone it was revoked when it was not, and a failed pin read as either
+     * hides that something other than the paired desktop answered.
      */
-    if (event.code === TUNNEL_PAIRING_ONLY_CLOSE_CODE) {
-      finish({
-        kind: 'abnormal',
-        code: 'PAIRING_ONLY',
-        message: 'the other device accepted this connection only to pair',
-      });
+    if (!opened) {
+      const refusal = refusalBeforeOpen(target, httpStatus, failure);
+      finish({ kind: 'abnormal', code: refusal.code, message: refusal.message });
+      refuse(refusal);
       return;
     }
-    // And the window, which is a different fault: the code this connection was
-    // let in under is no longer shown. Pairing again needs a new code.
-    if (event.code === TUNNEL_PAIRING_CLOSED_CLOSE_CODE) {
-      finish({
-        kind: 'abnormal',
-        code: 'PAIRING_WINDOW_CLOSED',
-        message: 'the pairing code this connection was let in under is no longer shown',
-      });
-      return;
-    }
-    /*
-     * See the host's identical branch. `bye` is obliged on a deliberate close
-     * (#260), so a socket that goes away without one is reported as abnormal
-     * rather than as the end of a stream — which is the distinction #185 says
-     * does not currently exist and which #156's faults 3 and 4 assert.
-     */
-    // Otherwise unconditional; the latch holds every other answer. See the host's.
-    finish({ kind: 'abnormal', code: 'PEER_GONE', message: 'the peer went away without a bye' });
+    // Open, a status or a failure means nothing: the upgrade already succeeded.
+    // The close code decides, and the latch holds any earlier answer (`bye`, a
+    // fault).
+    finish(closeOf(code));
   });
 
-  await new Promise<void>((resolve, reject) => {
-    socket.addEventListener('open', () => resolve(), { once: true });
-    socket.addEventListener('error', () => reject(new Error(`tunnel client: cannot reach ${options.url}`)), { once: true });
-  });
+  await opening;
 
   return {
     async send(frame) {
       // The obligations are symmetric: a client streams a reply back when the
       // desktop asks the phone for a turn, and a client that sends an answer
       // to a prompt nobody raised has a bug the gate throws on. See
-      // `createProtocolGate`.
-      socket.send(gate.send(frame));
+      // `createProtocolGate`. Once the transport is closing or closed the
+      // bytes are dropped, as a WHATWG socket drops them.
+      const bytes = gate.send(frame);
+      if (state === 'open') transport.send(bytes);
     },
     async *receive() {
       for (;;) {
@@ -424,14 +771,14 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
     ended: () => ended,
     closed,
     async close(reason?: string) {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(
+      if (state === 'open') {
+        transport.send(
           encodeFrame({ v: TUNNEL_WIRE_VERSION, kind: 'bye', ...(reason ? { body: { reason } } : {}) }),
         );
       }
-      // Before `socket.close()`, for the reason the host's does. See there.
+      // Before closing the transport, for the reason the host's does. See there.
       finish({ kind: 'clean', reason });
-      socket.close();
+      shut();
     },
   };
 }
