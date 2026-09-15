@@ -64,6 +64,18 @@
  * tears it down in `main.ts`). A generate without the flag is one decode, as
  * before: the non-streamed path sends none.
  *
+ * A TURN ITS WINDOW'S TEARDOWN ENDED STAYS ENDED. A reload's teardown runs on
+ * `did-start-navigation`, and the old document keeps running until the new one
+ * commits, so that document's next decode can still reach main after the
+ * teardown. Its turn was ended `OWNER_LOST`, and the page that would end it is
+ * about to be replaced. Admitted as a new turn, that decode would keep the slot
+ * between steps with no page left to end it, and every later turn would wait
+ * behind it until the window went away again. So the window keeps the
+ * requestIds its teardown ended, and a later decode of one of them is refused
+ * `OWNER_LOST` and never reaches the host. The page's `endTurn` for that turn
+ * removes the requestId. A page replaced before it could send one leaves its
+ * requestId behind: one string per turn, kept for as long as main runs.
+ *
  * A WORKER'S GENERATIONS RUN UNDER THE UNIT IT RUNS. Ruling 1 puts a phone's
  * turn in a hidden worker window (S5), whose engine calls `LlamaCpp.generate`
  * through this same plugin. That unit already holds the slot; admitting its
@@ -181,7 +193,8 @@ export interface LocalTurns {
   /**
    * A window went away. Its units leave the broker first, so a waiting turn
    * can never start for a page that is gone and a turn it held gives the slot
-   * back, and then the fleet releases what it was running.
+   * back, and then the fleet releases what it was running. A whole turn it
+   * held stays ended: a later decode of that turn is refused `OWNER_LOST`.
    */
   releaseRenderer(senderId: number, reason: string): void;
 }
@@ -379,6 +392,19 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
   const wholeTurns = new Map<string, WholeTurn>();
   const turnKey = (senderId: number, requestId: string): string => `${String(senderId)} ${requestId}`;
 
+  /**
+   * By window, the requestIds of the whole turns its teardown ended that its
+   * page has not ended since. A reload's old document can still ask to decode
+   * one of them, and none may start again.
+   */
+  const endedByTeardown = new Map<number, Set<string>>();
+  const forgetEndedByTeardown = (senderId: number, requestId: string): void => {
+    const ended = endedByTeardown.get(senderId);
+    if (ended === undefined) return;
+    ended.delete(requestId);
+    if (ended.size === 0) endedByTeardown.delete(senderId);
+  };
+
   /** One decode under a whole turn's unit. */
   const decodeUnder = async (turn: WholeTurn, request: unknown): Promise<unknown> => {
     const owner: Owner = { kind: 'window', id: turn.senderId };
@@ -413,6 +439,13 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     const owner: Owner = { kind: 'window', id: senderId };
     const key = turnKey(senderId, requestId);
     const held = wholeTurns.get(key);
+
+    if (endedByTeardown.get(senderId)?.has(requestId) === true) {
+      // Its window's teardown ended this turn: a reload whose old document is
+      // still running. Admitted again, it would hold the slot for a page that
+      // can no longer end it.
+      throw codedError(ENDED.OWNER_LOST, 'OWNER_LOST');
+    }
 
     if (held !== undefined) {
       // One decode at a time, and none while the first still waits.
@@ -552,7 +585,11 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     // its page's end finds nothing here: the phone's unit is its work's to end.
     const key = turnKey(senderId, requestId);
     const turn = wholeTurns.get(key);
-    if (turn === undefined) return undefined;
+    if (turn === undefined) {
+      // A turn its window's teardown ended: its page has ended it too.
+      forgetEndedByTeardown(senderId, requestId);
+      return undefined;
+    }
     wholeTurns.delete(key);
     if (!turn.started) {
       // Still waiting for the slot, or ended before it took it: it never starts.
@@ -604,7 +641,13 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
     plugin: implementation as unknown as PluginImplementation,
     releaseRenderer(senderId, reason) {
       broker.releaseWindow(senderId);
-      for (const [key, turn] of wholeTurns) if (turn.senderId === senderId) wholeTurns.delete(key);
+      for (const [key, turn] of wholeTurns) {
+        if (turn.senderId !== senderId) continue;
+        wholeTurns.delete(key);
+        const ended = endedByTeardown.get(senderId) ?? new Set<string>();
+        ended.add(turn.requestId);
+        endedByTeardown.set(senderId, ended);
+      }
       notices.release(senderId);
       fleet.releaseRenderer(senderId, reason);
     },

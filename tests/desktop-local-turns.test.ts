@@ -943,6 +943,81 @@ describe('a desktop turn holds the one slot from its first decode until the page
     expect(r.events(2, 'llamaEnd')).toEqual([]);
   });
 
+  it('a later decode its old page sends after its window’s teardown is refused OWNER_LOST and never reaches the host, and the window’s next turn starts at once', async () => {
+    // A reload tears the window down on `did-start-navigation`, and the old
+    // document keeps running until the new one commits, so its next decode can
+    // still reach main.
+    // FAULT INJECTED: with no record of the turns the teardown ended, that
+    // decode was admitted as a new turn and kept the slot between steps for a
+    // page that could no longer end it ("a decode of a turn its window’s
+    // teardown ended reached the host").
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'reloaded');
+    // Between two decodes, the page reloads.
+    r.localTurns.releaseRenderer(1, 'The page that started this generation navigated away.');
+    await settle();
+    expect(r.broker.slotCount, 'the teardown gave the slot back').toBe(0);
+
+    const stale = r.generate(1, 'reloaded', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'a decode of a turn its window’s teardown ended reached the host').toEqual(['reloaded']);
+    await expect(stale).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    expect(r.broker.isRunning(WINDOW_1, 'reloaded')).toBe(false);
+    expect(r.broker.slotCount).toBe(0);
+    expect(r.events(1, 'llamaEnd'), 'the refused decode never started, so it has no llamaEnd').toHaveLength(1);
+    // Asked again, it is refused again.
+    await expect(r.generate(1, 'reloaded', { wholeTurn: true })).rejects.toMatchObject({ code: 'OWNER_LOST' });
+
+    // The next page's first turn starts at once, and holds the slot for the whole turn.
+    const next = r.generate(1, 'next', { wholeTurn: true });
+    await settle();
+    expect(r.generated()).toEqual(['reloaded', 'next']);
+    expect(r.events(1, TURN_WAITING_EVENT)).toEqual([]);
+    r.finish('next');
+    await next;
+    const phone = r.phoneTurn('phone-1');
+    await settle();
+    expect(phone.starts).toBe(0);
+    await r.endTurn(1, 'next');
+    await settle();
+    expect(phone.starts).toBe(1);
+    phone.resolve('done');
+    await settle();
+
+    // Once its page has ended it, the requestId is the page's again, as it is
+    // for any turn it ended.
+    await r.endTurn(1, 'reloaded');
+    const reused = r.generate(1, 'reloaded', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'a requestId its page had ended stayed refused').toEqual(['reloaded', 'next', 'reloaded']);
+    r.finish('reloaded');
+    await reused;
+    await r.endTurn(1, 'reloaded');
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
+  });
+
+  it('a first decode still waiting when its window is torn down is refused OWNER_LOST if the old page asks for it again', async () => {
+    const r = rig();
+    r.subscribe(1);
+    const phone = r.phoneTurn('phone-1');
+    const waiting = r.generate(1, 'waited', { wholeTurn: true });
+    await settle();
+    expect(r.broker.positionOf(WINDOW_1, 'waited')).toBe(1);
+
+    r.localTurns.releaseRenderer(1, 'The page that started this generation navigated away.');
+    await expect(waiting).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    const again = r.generate(1, 'waited', { wholeTurn: true });
+    await settle();
+    expect(r.broker.waitingCount, 'a turn its window’s teardown ended waits for the slot again').toBe(0);
+    await expect(again).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    phone.resolve('done');
+    await settle();
+    expect(r.generated()).toEqual([]);
+    expect(r.broker.slotCount).toBe(0);
+  });
+
   it('cancelled while its first decode still waits: it never holds the slot, gets one cancelled llamaEnd, and its end afterwards is nothing', async () => {
     const r = rig();
     r.subscribe(1);

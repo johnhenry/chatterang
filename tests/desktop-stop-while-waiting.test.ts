@@ -260,6 +260,14 @@ function desktop() {
     ended: [] as string[],
     /** Set once the window is gone: nothing the page calls reaches main. */
     gone: false,
+    /**
+     * Set to have the page's document replaced as soon as its next generate
+     * has reached main: from then on nothing it calls reaches main.
+     */
+    replaceAfterGenerate: false,
+    /** A call from whatever document window 1 shows now, straight to main. */
+    invoke: (method: string, args: unknown[]): Promise<unknown> =>
+      pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, method, args),
     /** Set `held` to keep `llamaWaiting` events on their way to the page; deliver `pending` to let them arrive. */
     waitingInFlight,
     /** Set to hold the page's `llamaWaiting` subscription open. */
@@ -341,7 +349,9 @@ function desktop() {
       if (state.gone) return Promise.reject(new Error('The window is gone.'));
       state.asked.push(options.requestId);
       state.pageOptions.push(structuredClone(options));
-      return pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'generate', [options]);
+      const generating = pluginHost.invoke(WINDOW, LLAMA_PLUGIN.name, 'generate', [options]);
+      if (state.replaceAfterGenerate) state.gone = true;
+      return generating;
     },
     cancel: (options: { requestId: string }) =>
       state.gone
@@ -888,6 +898,70 @@ describe('a desktop turn holds the one slot for the whole turn, its tool calls i
       expect(main.broker.isRunning(PHONE, 'phone-q')).toBe(true);
       expect(main.broker.slotCount).toBe(1);
       expect(main.broker.waitingCount).toBe(0);
+    } finally {
+      await cleanUp();
+    }
+  });
+
+  it('a decode the old page sends after its reload’s teardown never reaches the host, and nothing holds the slot for a page that can no longer end its turn', async () => {
+    // Cmd+R tears the window down on `did-start-navigation`, but the old
+    // document keeps running until the new one commits, so what it asks for in
+    // that gap still reaches main.
+    // FAULT INJECTED: with no record of the turns the teardown ended, the old
+    // page's next decode opened a new whole turn that no page could end, and a
+    // phone turn waited behind it for ever ("a phone turn waits behind a unit no
+    // page can end": phoneStarts 0, staleUnitRunning true).
+    try {
+      const started = await inItsToolCall('reloaded', tool);
+      sending = started.sending;
+      const { turn } = started;
+
+      main.localTurns.releaseRenderer(WINDOW, 'The page that started this generation navigated away.');
+      await settle();
+      expect(main.broker.slotCount, 'the teardown gave the slot back').toBe(0);
+
+      // Its tool returns in that gap, and it asks for its turn's next decode.
+      // The new document commits straight after: the old page can no longer
+      // end its turn.
+      main.replaceAfterGenerate = true;
+      tool.release();
+      await until(() => main.asked.length === 2);
+      await settle();
+      expect(main.asked, 'the old page asked main for its next decode').toEqual([turn, turn]);
+      expect(main.generated(), 'decodes the host was asked for').toEqual([turn]);
+      await sending;
+      await settle();
+      expect(main.broker.isRunning(OWNER, turn), 'the old page’s turn holds the slot again').toBe(false);
+      expect(main.broker.slotCount).toBe(0);
+
+      // The reloaded page's first turn reaches the host at once, and a phone
+      // turn starts when that turn ends.
+      const fresh = main.invoke('generate', [
+        { handle: 'h1', prompt: 'hello', requestId: 'req_newpage0001', wholeTurn: true },
+      ]);
+      void fresh.catch(() => undefined);
+      await settle();
+      expect(
+        {
+          reachedHost: main.generated().includes('req_newpage0001'),
+          position: main.broker.positionOf(OWNER, 'req_newpage0001'),
+        },
+        'the reloaded page’s first turn',
+      ).toEqual({ reachedHost: true, position: 0 });
+      const phone = main.phoneTurn('phone-after-reload');
+      phones.push(phone);
+      main.finish('req_newpage0001', 'fresh');
+      await fresh;
+      await main.invoke('endTurn', [{ requestId: 'req_newpage0001' }]);
+      await settle();
+      expect(
+        {
+          phoneStarts: phone.starts,
+          slotCount: main.broker.slotCount,
+          staleUnitRunning: main.broker.isRunning(OWNER, turn),
+        },
+        'a phone turn waits behind a unit no page can end',
+      ).toEqual({ phoneStarts: 1, slotCount: 1, staleUnitRunning: false });
     } finally {
       await cleanUp();
     }
