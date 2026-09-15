@@ -216,6 +216,11 @@ async function main(): Promise<void> {
     },
   });
 
+  // Read before anything listens: an `--advertise` a pairing code cannot carry
+  // refuses to start the server (`addresses.ts`), and the refusal belongs with
+  // the other flag refusals above, not after a socket is already bound.
+  const advertised = advertisedAddressesForThisMachine(options.advertise);
+
   const log = (line: string): void => console.log(`[chatterang-server] ${line}`);
 
   const pluginHost = new PluginHost(
@@ -305,9 +310,13 @@ async function main(): Promise<void> {
    *
    * The list is for the pairing payload only. No certificate carries it: a
    * client checks the key pin it learned at pairing, not a name (#295).
+   *
+   * `advertised` was read before the server listened, and an `--advertise` in
+   * it has already been through the step every pairing code takes, so this
+   * line never shows a value a code would refuse.
    */
   for (const line of describeAdvertised(
-    advertisedAddressesForThisMachine(options.advertise),
+    advertised,
     options.advertise !== undefined && options.advertise.trim() !== '',
   )) {
     log(line);

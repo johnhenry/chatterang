@@ -3,9 +3,10 @@ import { describe, expect, it } from 'vitest';
 import {
   advertisedAddresses,
   MAX_ADVERTISED,
+  pairingAddressesOf,
   type InterfaceMap,
 } from '@chatterang/tunnel/host';
-import { MAX_ADDRESSES } from '@chatterang/tunnel/pairing';
+import { MAX_ADDRESSES, TypedEntryError } from '@chatterang/tunnel/pairing';
 import {
   advertisedAddresses as advertisedByServer,
   advertisedAddressesForThisMachine as advertisedByServerForThisMachine,
@@ -240,6 +241,85 @@ describe('the operator’s answer replaces ours', () => {
     ]);
     expect(advertisedByServer(map)).toEqual(host);
     expect(advertisedByServer(map, '  ')).toEqual(host);
+  });
+});
+
+describe('an --advertise the boot line shows is one a pairing code can carry', () => {
+  /*
+   * THE BOOT LINE USED TO PROMISE WHAT THE CODE WOULD REFUSE. `--advertise`
+   * was classified by shape — any colon made it IPv6 — and printed as "it will
+   * advertise (--advertise): 192.168.1.4:8973", while `pairingAddressesOf`, the
+   * step every code goes through, refuses that text. The refusal would have come
+   * at code-minting time, after the confirm half had told the operator the
+   * value was fine, and it would have named IPv6 for text written as IPv4 with a
+   * port. The operator's answer now goes through the same step at boot, and a
+   * value a code cannot carry stops the server before it listens.
+   */
+  const refusalOf = (text: string): Error | null => {
+    try {
+      advertisedByServer({}, text);
+      return null;
+    } catch (error) {
+      if (error instanceof Error) return error;
+      throw error;
+    }
+  };
+
+  it('refuses at boot every value the host would refuse when it draws a code', () => {
+    for (const text of [
+      '192.168.1.4:8973',
+      'desk.lan:8973',
+      'desk:8973',
+      'https://desk.lan',
+      '[fd00::5]:8973',
+      '[fd00::5]',
+      'fe80::1%en0',
+      'désk.lan',
+      '300.1.1.1',
+      '010.0.0.1',
+    ]) {
+      const refusal = refusalOf(text);
+      expect(refusal, text).not.toBeNull();
+      expect(refusal!.message, text).toContain(`--advertise ${text}`);
+      expect(refusal!.cause, text).toBeInstanceOf(TypedEntryError);
+      // The path `main.ts` takes, too, whatever this machine's interfaces are.
+      expect(() => advertisedByServerForThisMachine(text), text).toThrow(refusal!.message);
+    }
+  });
+
+  it('accepts only what the host accepts, of the kind it claims, and shows it as written', () => {
+    for (const text of [
+      '10.0.0.4',
+      '  10.0.0.4  ',
+      'fd00::9',
+      'fe80::1',
+      '::ffff:192.168.1.4',
+      'desk.lan',
+      'Desk.Example.com.',
+      // Carried the way a QR payload admits one; see `pairingAddressesOf`.
+      'desk.local',
+    ]) {
+      const list = advertisedByServer({}, text);
+      expect(list, text).toHaveLength(1);
+      // The helper checks the kind against the bytes, so a wrong kind throws here.
+      expect(() => pairingAddressesOf(list), text).not.toThrow();
+      expect(describeAdvertised(list, true).join(' '), text).toContain(`(--advertise): ${text.trim()}`);
+    }
+  });
+
+  it('names the kind the operator wrote, and says a port is what has nowhere to go', () => {
+    const reasonOf = (text: string): unknown => (refusalOf(text)?.cause as TypedEntryError | undefined)?.reason;
+    expect(reasonOf('192.168.1.4:8973')).toBe('bad-ipv4');
+    expect(reasonOf('desk.lan:8973')).toBe('bad-dns-name');
+    expect(reasonOf('[fd00::5]:8973')).toBe('bad-ipv6');
+    for (const text of ['192.168.1.4:8973', 'desk.lan:8973', '[fd00::5]:8973']) {
+      expect(refusalOf(text)!.message, text).toMatch(/\bport\b/);
+      expect(refusalOf(text)!.message, text).not.toMatch(/IPv6/);
+    }
+    expect(reasonOf('fe80::1%en0')).toBe('zone-index-unsupported');
+    expect(refusalOf('fe80::1%en0')!.message).toMatch(/zone index/);
+    // Control: a value with no port is not told it has one.
+    expect(refusalOf('désk.lan')!.message).not.toMatch(/\bport\b/);
   });
 });
 
