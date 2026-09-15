@@ -2814,3 +2814,79 @@ describe('a local turn whose stream died mid-reasoning, diverted to the cloud fa
     });
   });
 });
+
+describe('a <tool_call> whose body is calls, but not one JSON object', () => {
+  for (const [form, call] of [
+    [
+      'two call objects',
+      '<tool_call>\n{"name":"leaky","arguments":{"path":"a.md"}}\n{"name":"leaky","arguments":{"path":"canary-7f3a"}}\n</tool_call>',
+    ],
+    ['a name and its arguments in parens', '<tool_call>leaky({"path":"canary-7f3a"})</tool_call>'],
+    ['a name on its own line and its JSON', '<tool_call>\nleaky\n{"path": "canary-7f3a"}\n</tool_call>'],
+  ] as const) {
+    it(`${form}: a finished reply stores and sends back none of it`, async () => {
+      const id = `r4_tag_body_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Reading it.\n${call}`, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
+      expect(stored.content, 'the stored reply').toBe('Reading it.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  for (const [form, partial] of [
+    [
+      'inside its second call object',
+      'Reading both.\n<tool_call>\n{"name":"leaky","arguments":{"path":"a.md"}}\n{"name":"leaky","arguments":{"path":"canary-7f3a',
+    ],
+    ['inside a name’s parens', 'Reading both.\n<tool_call>leaky({"path":"canary-7f3a'],
+  ] as const) {
+    it(`stopped ${form}: keeps only the words before it, and sends none of it back`, async () => {
+      const id = `r4_tag_body_stopped_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', 'canary-7f3a', gate.release);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Reading both.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps prose that names both tags with words between them, finished', async () => {
+    const id = 'r4_tag_body_prose';
+    const words = 'Qwen puts <tool_call> first, then a name such as leaky, then {"path": "notes.md"}, and </tool_call> last.';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([words]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does qwen format a call?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(words);
+  });
+});

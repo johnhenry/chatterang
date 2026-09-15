@@ -325,12 +325,14 @@ const CALL_OPENED_AT_END = /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[
  *
  * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the same
  * `{"`. Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`.
+ * One whose body is a name and its JSON opens `<tool_call>`, the name, and a
+ * `(` or `{`: see `taggedCallsEnd`.
  *
  * The quote is spelled `\x22`, and a fence's backtick `\x60`: the source scans
  * in tests/support/source-scan.ts read a bare one in a regex literal as the
  * start of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)|<tool_call>\s*(?=[\w.:-]+\s*[({])/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -386,23 +388,31 @@ const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'tool', 'function']);
  * follows" — has a brace that never closes, or a quote that never does, and was
  * cut from the call's opening on: the sentences after it, which the person had
  * watched arrive, were gone from the stored reply and every later request.
+ *
+ * `until`, when given, is where JSON that closed ends, just past its closing
+ * bracket: then the question is whether what lies between is JSON's tokens
+ * alone, as `taggedCallsEnd` asks of each call in a tag.
  */
 function writesJson(
   text: string,
   start: number,
-  { tagged, offered }: { readonly tagged: boolean; readonly offered: readonly string[] },
+  {
+    tagged,
+    offered,
+    until = text.length,
+  }: { readonly tagged: boolean; readonly offered: readonly string[]; readonly until?: number },
 ): boolean {
   /** Each bracket still open: an object reading a key, or reading the value of `naming` one; or an array. */
   const containers: { readonly object: boolean; key: boolean; naming: boolean }[] = [];
   let at = start;
-  while (at < text.length) {
+  while (at < until) {
     const char = text.charAt(at);
     const top = containers.at(-1);
     if (/\s/.test(char)) {
       at += 1;
     } else if (char === '"') {
       let end = at + 1;
-      while (end < text.length && text.charAt(end) !== '"') end += text.charAt(end) === '\\' ? 2 : 1;
+      while (end < until && text.charAt(end) !== '"') end += text.charAt(end) === '\\' ? 2 : 1;
       const body = text.slice(at + 1, end);
       const ownWord = tagged && containers.length === 1 && top !== undefined && (top.key || top.naming);
       if (ownWord && /\s/.test(body) && !offered.some((name) => name.startsWith(body))) return false;
@@ -413,8 +423,8 @@ function writesJson(
       at += 1;
     } else if (char === '}' || char === ']') {
       containers.pop();
-      // Closed before the end: not JSON still being written.
-      if (containers.length === 0) return false;
+      // Closed before the end: not JSON still being written, nor JSON that ends there.
+      if (containers.length === 0) return at + 1 === until;
       at += 1;
     } else if (char === ':') {
       if (top?.object) top.key = false;
@@ -431,7 +441,7 @@ function writesJson(
       if (word === undefined) return false;
       at += word.length;
       AFTER_KEY.lastIndex = at;
-      if (!JSON_WORD.test(word) && at < text.length && !AFTER_KEY.test(text)) return false;
+      if (!JSON_WORD.test(word) && at < until && !AFTER_KEY.test(text)) return false;
     }
   }
   return true;
@@ -485,6 +495,13 @@ export function unfinishedCallAt(
       continue;
     }
     const form = CALL_END[!match[0].startsWith('<') ? 'paren' : match[0].includes('\x60') ? 'fencedTag' : 'tag'];
+    if (form === CALL_END.tag && text.charAt(open) !== '{') {
+      // A name and its JSON inside the tag, read by its structure: see `taggedCallsEnd`.
+      const end = taggedCallsEnd(text, match.index, offered);
+      if (end === 'open') return match.index;
+      if (end !== -1) from = end;
+      continue;
+    }
     const short = shortCallEnd(text, open, form.token);
     if (short !== -1) {
       from = short;
@@ -501,6 +518,15 @@ export function unfinishedCallAt(
     // and `</tool_call>`, and none of a call's closing tokens holds a space.
     const rest = text.slice(close).replace(/^[\s}\]]*/, '').replace(/\s+/g, '').toLowerCase();
     if (form.text.startsWith(rest)) return match.index;
+    // More calls after it inside the same tag: see `taggedCallsEnd`.
+    if (form === CALL_END.tag) {
+      const end = taggedCallsEnd(text, match.index, offered);
+      if (end === 'open') return match.index;
+      if (end !== -1) {
+        from = end;
+        continue;
+      }
+    }
     from = close;
   }
   return text.search(stopped ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
@@ -695,6 +721,98 @@ export function xmlCallEnd(text: string, at: number): number | 'open' {
   }
 }
 
+/** Where a call {@link taggedCallsEnd} reads may start: any `<tool_call>`. */
+const TAG_OPENING = /<tool_call>/gi;
+/** A tool's name as a call inside a tag writes it before its JSON: by name or by id. */
+const CALL_NAME = /[\w.:-]+/y;
+/** The tag that ends every `<tool_call>`. */
+const TAG_END = '</tool_call>';
+
+/**
+ * Where a `<tool_call>` starting at `at` whose body is calls ends, just past its
+ * `</tool_call>`; `'open'` when the text ends inside one; -1 when what is there
+ * is not one.
+ *
+ *     <tool_call>
+ *     {"name": "a", "arguments": {…}}
+ *     {"name": "b", "arguments": {…}}
+ *     </tool_call>
+ *
+ *     <tool_call>a({…})</tool_call>
+ *
+ *     <tool_call>
+ *     a
+ *     {…}
+ *     </tool_call>
+ *
+ * One or more calls, each a JSON object or array, or a name and its JSON object
+ * in parens or not, with whitespace between them and nothing else. Nothing runs
+ * from these: `extractTextualToolCalls` reads a tag's body as one JSON object.
+ * They are still the model's calls, and a turn that offered a tool strips a tag
+ * form whatever its body. The single-object form `stripToolSyntax` already
+ * strips took out neither, so both calls, arguments included, were stored as
+ * the reply's words and sent back to the model; the lazy
+ * `<tool_call>[\s\S]*?</tool_call>` it replaced had removed them.
+ *
+ * READ BY ITS STRUCTURE, as `xmlCallEnd` reads Qwen3-Coder's: prose naming both
+ * tags has words between them that are neither a name followed by JSON nor
+ * JSON, and keeps every one. A call's JSON is read as its tokens alone (see
+ * {@link writesJson}), and one with a closing bracket too few ends at its tag or
+ * paren (see {@link shortCallEnd}), so a later brace in the text cannot carry a
+ * call across the words after it.
+ */
+export function taggedCallsEnd(text: string, at: number, offered: readonly string[]): number | 'open' {
+  let pos = at + '<tool_call>'.length;
+  let calls = 0;
+  const skipSpace = (): void => {
+    while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
+  };
+  for (;;) {
+    skipSpace();
+    if (pos === text.length) return calls > 0 ? 'open' : -1;
+    const rest = text.slice(pos, pos + TAG_END.length).toLowerCase();
+    if (rest === TAG_END) return calls > 0 ? pos + TAG_END.length : -1;
+    if (pos + rest.length === text.length && TAG_END.startsWith(rest)) return calls > 0 ? 'open' : -1;
+
+    CALL_NAME.lastIndex = pos;
+    const name = CALL_NAME.exec(text)?.[0];
+    let paren = false;
+    if (name !== undefined) {
+      pos += name.length;
+      skipSpace();
+      paren = text.charAt(pos) === '(';
+      if (paren) {
+        pos += 1;
+        skipSpace();
+      }
+      // A name the text ends on is as likely a word; with its paren, a call begun.
+      if (pos === text.length) return paren ? 'open' : -1;
+    }
+    const opener = text.charAt(pos);
+    if (opener !== '{' && !(name === undefined && opener === '[')) return -1;
+
+    const shortEnd = shortCallEnd(text, pos, paren ? CALL_END.paren.token : CALL_END.tag.token);
+    if (shortEnd !== -1) {
+      if (!paren) return shortEnd;
+      pos = shortEnd;
+      calls += 1;
+      continue;
+    }
+    const end = endOfJson(text, pos);
+    if (end === -1) return writesJson(text, pos, { tagged: name === undefined, offered }) ? 'open' : -1;
+    if (!writesJson(text, pos, { tagged: false, offered, until: end })) return -1;
+    pos = end;
+    // Stray closing brackets are the call's, as the single-object form reads them.
+    while (pos < text.length && /[\s}\]]/.test(text.charAt(pos))) pos += 1;
+    if (paren) {
+      if (pos === text.length) return 'open';
+      if (text.charAt(pos) !== ')') return -1;
+      pos += 1;
+    }
+    calls += 1;
+  }
+}
+
 /**
  * Strip recognised tool-call syntax so the user never sees the plumbing.
  *
@@ -755,6 +873,10 @@ export function stripToolSyntax(
   for (const match of text.matchAll(EMPTY_CALL)) spans.push([match.index, match.index + match[0].length]);
   for (const match of text.matchAll(XML_CALL_OPENING)) {
     const end = xmlCallEnd(text, match.index);
+    if (end !== 'open' && end !== -1) spans.push([match.index, end]);
+  }
+  for (const match of text.matchAll(TAG_OPENING)) {
+    const end = taggedCallsEnd(text, match.index, offered);
     if (end !== 'open' && end !== -1) spans.push([match.index, end]);
   }
 

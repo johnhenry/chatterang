@@ -351,3 +351,49 @@ describe('cutUnfinishedCall', () => {
     expect(cutUnfinishedCall('Ok.\n<tool_call>{"name": "My No', { stopped: true, offered })).toBe('Ok.\n');
   });
 });
+
+describe('a <tool_call> whose body is calls, but not one JSON object', () => {
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+
+  it('is stripped whole: two call objects, a name and its arguments in parens, a name and its JSON', () => {
+    for (const call of [
+      '<tool_call>\n{"name":"calculate","arguments":{"expression":"1"}}\n{"name":"calculate","arguments":{"expression":"2"}}\n</tool_call>',
+      '<tool_call>calculate({"expression": "(1+2)"})</tool_call>',
+      '<tool_call>\ncalculate\n{"expression": "1"}\n</tool_call>',
+      '<tool_call> calculate {"expression": "1"} calculate({"expression": "2"}) </tool_call>',
+    ]) {
+      expect(stripToolSyntax(`Ok.\n${call}\nDone.`), call).toBe('Ok.\n\nDone.');
+    }
+  });
+
+  it('is stripped through its closing tag when a later call in it has a closing brace too few', () => {
+    const call = '<tool_call>\n{"name":"calculate","arguments":{}}\n{"name":"calculate","arguments":{"expression":"1"}\n</tool_call>';
+    expect(stripToolSyntax(`Ok.\n${call}\nDone.`)).toBe('Ok.\n\nDone.');
+  });
+
+  it('keeps prose between the tags', () => {
+    for (const prose of [
+      'Qwen puts <tool_call> first, then a name, then {"a": 1}, and </tool_call> last.',
+      'It opens <tool_call>{"a": 1} and it ends </tool_call>.',
+      'Qwen writes <tool_call>get_weather(city) </tool_call> for it.',
+      'It opens <tool_call>{"a": 1} {"b": then its words, {"c": 2}} </tool_call> and ends.',
+    ]) {
+      expect(stripToolSyntax(prose), prose).toBe(prose);
+      expect(cut(prose), prose).toBe(prose);
+    }
+  });
+
+  it('is cut where it starts when the text ends inside a later call in it, or inside a name’s parens', () => {
+    expect(
+      cut('Ok.\n<tool_call>\n{"name":"calculate","arguments":{}}\n{"name":"calculate","arguments":{"expression":"1'),
+    ).toBe('Ok.\n');
+    expect(cut('Ok.\n<tool_call>calculate({"expression": "1')).toBe('Ok.\n');
+    expect(cut('Ok.\n<tool_call>calculate(', true)).toBe('Ok.\n');
+    expect(cut('Ok.\n<tool_call>{"name":"calculate","arguments":{}}\ncalculate({"expression": "1"})\n</tool_')).toBe('Ok.\n');
+  });
+
+  it('is not cut at a word after a closed object that the text ends on', () => {
+    const text = 'It opens <tool_call>{"a": 1} and';
+    expect(cut(text, true)).toBe(text);
+  });
+});
