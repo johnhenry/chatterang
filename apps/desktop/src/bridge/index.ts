@@ -85,6 +85,14 @@ export {
   withTurnProgress,
 } from './local-turns.js';
 export type { HostedUnit, HostedUnitOf, LocalTurnNotices, LocalTurns, LocalTurnsOptions } from './local-turns.js';
+export {
+  PEER_TURN_ENGINE,
+  PEER_TURN_IDLE_TIMEOUT_MS,
+  WORKER_EXECUTOR,
+  WORKER_IDLE_MS,
+  createWorkerHost,
+} from './worker-host.js';
+export type { WorkerFailure, WorkerHost, WorkerHostOptions, WorkerSpawn, WorkerTurnEnd } from './worker-host.js';
 export { HostRuntime, createHostRuntime } from './host-runtime.js';
 export type {
   CallGuard,
@@ -120,6 +128,10 @@ export {
   ONNX_EVENTS,
   ONNX_METHODS,
   ONNX_PLUGIN,
+  PEER_TURN_EVENTS,
+  PEER_TURN_METHODS,
+  PEER_TURN_PLUGIN,
+  PEER_TURN_STREAM,
   SENDER_SCOPED,
   fromWireError,
   toWireError,
@@ -140,6 +152,10 @@ export type {
   LlamaEventName,
   MessageLink,
   OnnxEventMap,
+  PeerTurnCancel,
+  PeerTurnEndEvent,
+  PeerTurnFrameEvent,
+  PeerTurnStart,
   PluginDefinition,
   WireError,
 } from './protocol.js';

@@ -318,6 +318,85 @@ export const DSH_PLUGIN: PluginDefinition = Object.freeze({
   events: Object.freeze([] as string[]),
 });
 
+/**
+ * The two invocable methods of a paired device's turn, run in the hidden
+ * worker (#7 ruling 1).
+ *
+ * A HOST-LINK PROTOCOL, NOT A RENDERER PLUGIN. Main speaks it to the worker
+ * over the worker's message port, through a `Supervisor` that
+ * `bridge/worker-host.ts` builds per worker life; no `PluginHost` registers
+ * it, so no window's page can call `peerTurnStart` or subscribe to a phone's
+ * frames. `tests/desktop-worker-host.test.ts` pins that `main.ts` does not.
+ *
+ * `addListener` and `removeAllListeners` are absent for the reason recorded
+ * above `LLAMA_METHODS`: the boundary serves them.
+ */
+export const PEER_TURN_METHODS = Object.freeze(['peerTurnStart', 'peerTurnCancel'] as const);
+
+/**
+ * The two events the worker emits for a turn: a frame on its way to the
+ * device (progress), and the turn's one end (terminal).
+ */
+export const PEER_TURN_EVENTS = Object.freeze(['peerTurnFrame', 'peerTurnEnd'] as const);
+
+export const PEER_TURN_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'PeerTurn',
+  methods: PEER_TURN_METHODS,
+  events: PEER_TURN_EVENTS,
+});
+
+/**
+ * The stream names of `PEER_TURN_PLUGIN`, as data.
+ *
+ * `bridge/worker-host.ts` builds the `EngineSpec` from these, adding the
+ * deadline and the synthesised end, which are behaviour and so do not belong
+ * in this file. The `Supervisor` refuses at construction a stream that names
+ * anything its definition does not declare (`supervisor.ts`), so a typo here
+ * is a boot failure rather than a turn that hangs.
+ */
+export const PEER_TURN_STREAM = Object.freeze({
+  start: 'peerTurnStart',
+  cancel: 'peerTurnCancel',
+  terminal: 'peerTurnEnd',
+  progress: Object.freeze(['peerTurnFrame'] as const),
+} as const);
+
+/**
+ * `peerTurnStart`'s one argument.
+ *
+ * `frame` is an ENCODED TUNNEL FRAME, opaque here: the bytes `encodeFrame`
+ * (`@chatterang/tunnel/wire`) produced for the device's turn. This file does
+ * not decode it and names no tunnel type, so the worker's turn runner (S4) can
+ * change what it reads without changing this protocol. `requestId` is minted
+ * by main per run; it is not the device's turn id.
+ */
+export interface PeerTurnStart {
+  readonly requestId: string;
+  readonly frame: Uint8Array;
+}
+
+/** `peerTurnCancel`'s one argument. */
+export interface PeerTurnCancel {
+  readonly requestId: string;
+}
+
+/** `peerTurnFrame`: one encoded tunnel frame on its way to the device. Opaque here. */
+export interface PeerTurnFrameEvent {
+  readonly requestId: string;
+  readonly frame: Uint8Array;
+}
+
+/**
+ * `peerTurnEnd`: the turn's one end. From the worker, `frame` is its encoded
+ * end frame. One the `Supervisor` synthesised for a worker that could not
+ * speak carries `error` and no `frame`.
+ */
+export interface PeerTurnEndEvent {
+  readonly requestId: string;
+  readonly frame?: Uint8Array;
+  readonly error?: string;
+}
+
 /** What `DshHost.getStatus()` answers. */
 export interface DshStatus {
   /** True only when `assertBoot` returned without throwing. */
