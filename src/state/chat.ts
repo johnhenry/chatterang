@@ -1877,9 +1877,12 @@ async function runGeneration(
             });
           }
 
-          // `event.text` has had its finished tool calls stripped by the engine.
-          // When it is empty the streamed deltas stand in for it, as they
-          // always have — a turn cut short hands back no text of its own.
+          // `event.text` has had its finished tool calls stripped by the engine,
+          // and holds every round's words. When it is empty the streamed deltas
+          // stand in for it, as they always have. A STOPPED turn is read from
+          // the deltas whatever it holds: the engine never finished reading the
+          // round Stop cut, so its text has the earlier rounds' words and none
+          // of that one's.
           //
           // The reply's words are read by `wordsWithoutCalls`, once its
           // reasoning is split off, so a call named in the reasoning takes none
@@ -1903,7 +1906,7 @@ async function runGeneration(
           // turn writes is a call, and reading it for one cut a JSON example,
           // or a call marker named in prose, the person had watched arrive.
           const aborted = controller.signal.aborted;
-          const split = splitThinking(event.text || raw);
+          const split = splitThinking(aborted ? raw : event.text || raw);
           const readsCalls =
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
           const content = (

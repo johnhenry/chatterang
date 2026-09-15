@@ -931,6 +931,15 @@ export class ChatterangEngine {
     // ── Generate, then run any tools, then generate again ───────────────
     let messages: IRMessage[] = [...request.messages];
     let text = '';
+    /**
+     * The words of each round that called a tool, its calls taken out.
+     *
+     * `text` is reset after a tool round, so the finished reply used to be only
+     * what the model wrote after its last tool ran: "Let me check your notes
+     * first." streamed, a tool ran, "They mention a passphrase." followed, and
+     * the stored reply was the second sentence alone.
+     */
+    const said: string[] = [];
     let stats: GenerationStatsSnapshot = {};
     const tools: ExecutedTool[] = [];
 
@@ -1201,15 +1210,21 @@ export class ChatterangEngine {
         markTainted({ role: 'tool', content: batch.results }),
       ];
 
-      // The visible answer is whatever the model says after the tools ran.
+      // The round's words stay in the answer, and the next round's follow them.
+      // This round was read for calls, so a fenced call is stripped as one.
+      const words = stripToolSyntax(text);
+      if (words) said.push(words);
       text = '';
     }
 
     const totalMs = Math.round(performance.now() - started);
     yield {
       type: 'done',
-      // A fenced JSON block is a call only in a turn read for calls; see `stripToolSyntax`.
-      text: stripToolSyntax(text, { readForCalls: Boolean(request.toolIds?.length) }),
+      // Every tool round's words, then the last round's. A fenced JSON block is
+      // a call only in a turn read for calls; see `stripToolSyntax`.
+      text: [...said, stripToolSyntax(text, { readForCalls: Boolean(request.toolIds?.length) })]
+        .filter((part) => part !== '')
+        .join('\n\n'),
       stats: {
         ...stats,
         totalMs,

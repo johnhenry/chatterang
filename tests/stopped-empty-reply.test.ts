@@ -1642,3 +1642,50 @@ describe('a finished reply cut off as a [TOOL_CALLS] call opened with its name o
   });
 });
 
+describe('words a model writes before a tool call that runs', () => {
+  it('stay in the stored reply once the follow-up answers', async () => {
+    const id = 'r1_words_before_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me check your notes first.\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.content).toBe('Let me check your notes first.\n\nThey mention a passphrase.');
+  });
+});
+
+describe('words a model writes before a tool call that runs, when the follow-up is stopped', () => {
+  it('stay in the stored reply beside the follow-up’s words', async () => {
+    const id = 'r1_words_before_call_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me check your notes first.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'Let me check your notes first.\nThey mention a pass',
+      stopped: undefined,
+    });
+  });
+});
+
