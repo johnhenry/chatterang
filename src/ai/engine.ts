@@ -1225,7 +1225,10 @@ export class ChatterangEngine {
       // it was either cut with all of them or kept with its arguments. See
       // `cutUnfinishedCall`.
       const words = closeReasoning(
-        stripToolSyntax(cutUnfinishedCall(text, { stopped: false }), { offered: callNames(offered), ran: true }),
+        stripToolSyntax(cutUnfinishedCall(text, { stopped: false, offered: callNames(offered) }), {
+          offered: callNames(offered),
+          ran: true,
+        }),
       );
       if (words) said.push(words);
       text = '';

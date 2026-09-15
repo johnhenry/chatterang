@@ -6,7 +6,11 @@ import {
   evaluateExpression,
   toolRegistry,
 } from '@/ai/tools/registry';
-import { extractTextualToolCalls as extractFrom, stripToolSyntax as stripFrom } from '@/ai/middleware/tools';
+import {
+  cutUnfinishedCall,
+  extractTextualToolCalls as extractFrom,
+  stripToolSyntax as stripFrom,
+} from '@/ai/middleware/tools';
 
 /** What a chat with the calculator on offers, as `callNames` gives it. */
 const OFFERED = ['calculator', 'calculate'];
@@ -317,5 +321,33 @@ describe('stripToolSyntax', () => {
       expect(extractTextualToolCalls(text), text).toHaveLength(1);
       expect(stripToolSyntax(text), text).toBe('');
     }
+  });
+});
+
+describe('cutUnfinishedCall', () => {
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+
+  it('keeps words that name a call’s opening and go on past it in prose', () => {
+    for (const text of [
+      'Look for `[TOOL_CALLS] calculate({` in the output, then read the JSON.',
+      'Qwen starts each call with `<tool_call>{"name": "` and the tool name follows.',
+      'A call opens <tool_call>{" and then its name.',
+    ]) {
+      expect(cut(text), text).toBe(text);
+      expect(cut(text, true), `${text} (stopped)`).toBe(text);
+    }
+  });
+
+  it('cuts a call the text ends inside, whatever its arguments’ strings hold', () => {
+    expect(cut('Ok.\n<tool_call>{"name": "calculate", "arguments": {"expression": "one plus one')).toBe('Ok.\n');
+    expect(cut('Ok.\n[TOOL_CALLS] calculate({"expression": "one plus one')).toBe('Ok.\n');
+    expect(cut('Ok.\n[TOOL_CALLS] calculate({expression: 2')).toBe('Ok.\n');
+    expect(cut('Ok.\n<tool_call>{"name": "calc')).toBe('Ok.\n');
+    expect(cut('Ok.\n<tool_call>{"name": "calculate", "arguments": {"expression": 1.5e')).toBe('Ok.\n');
+  });
+
+  it('cuts a call cut off in a name with a space in it that a tool offered has', () => {
+    const offered = ['mcp:My Notes.note', 'My Notes.note'];
+    expect(cutUnfinishedCall('Ok.\n<tool_call>{"name": "My No', { stopped: true, offered })).toBe('Ok.\n');
   });
 });

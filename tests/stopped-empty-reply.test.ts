@@ -2673,3 +2673,74 @@ describe('a local turn whose stream died inside a call, diverted to the cloud fa
     expect(failed.content, 'the failed row’s words').toBe('Checking.\nFrom the cloud: your notes mention');
   });
 });
+
+/* ── Round 4: a call's opening named in words that go on past it ───── */
+
+describe('a finished reply in a chat offering a tool, naming a call’s opening it does not finish', () => {
+  for (const [form, words] of [
+    [
+      'the Mistral opening',
+      'To parse it, look for the prefix `[TOOL_CALLS] get_weather({` in the output and read the JSON until its brackets balance. Everything after that is the arguments object.',
+    ],
+    [
+      'the Qwen opening',
+      'Qwen starts each call with `<tool_call>{"name": "` and the tool name follows, then the arguments object and the closing tag.',
+    ],
+  ] as const) {
+    it(`${form}: keeps every word, and sends them back`, async () => {
+      const id = `r4_named_opening_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([words, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('how do I parse a tool call?');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
+      expect(stored.content, 'the stored reply').toBe(words);
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+    });
+  }
+
+  it('stopped after the words that follow it: keeps every word', async () => {
+    const id = 'r4_named_opening_stopped';
+    const partial = 'Look for the prefix `[TOOL_CALLS] get_weather({` in the output, then read the JSON until';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('how do I parse a tool call?', 'read the JSON until', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(partial);
+  });
+
+  for (const [form, tail] of [
+    ['a tag call', '<tool_call>{"name": "leaky", "arguments": {"path": "my notes canary-7f3a'],
+    ['a Mistral call', '[TOOL_CALLS] leaky({"path": "my notes canary-7f3a'],
+    ['a tag call cut off in its name', '<tool_call>{"name": "lea'],
+  ] as const) {
+    it(`still stores none of ${form} it ended inside`, async () => {
+      const id = `r4_ended_inside_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Checking.\n${tail}`]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+    });
+  }
+});

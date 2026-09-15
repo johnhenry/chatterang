@@ -356,6 +356,87 @@ function endOfObject(text: string, start: number): number {
   return -1;
 }
 
+/** A word JSON writes bare: a number, `true`, `false` or `null`. */
+const JSON_WORD = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/;
+/** Any bare word, read where {@link writesJson} finds one. */
+const BARE_WORD = /[\w.+-]+/y;
+/** A colon after a bare word, which makes it a key a small model left unquoted. */
+const AFTER_KEY = /\s*:/y;
+/** The keys a tag form's JSON names its tool by, as `extractTextualToolCalls` and `fencedCall` read them. */
+const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'tool', 'function']);
+
+/**
+ * Could the text from `start`, where a call's JSON opens, to the end of the text
+ * be that JSON still being written?
+ *
+ * Only JSON's own tokens stand outside its strings — brackets, colons, commas,
+ * strings, numbers, `true`, `false`, `null`, and a key left unquoted — and a
+ * word the text ends in, which may be one of those half written. Nothing is
+ * asked of their order: a small model's call can be malformed and is still its
+ * call.
+ *
+ * `tagged` is a tag form's JSON, whose top-level keys are the call's own and
+ * whose `name` names a tool. Neither holds a space, unless the name is the start
+ * of an offered tool's that does (an MCP server's name can).
+ *
+ * THE BRACES AND QUOTES ALONE CANNOT TELL A CALL FROM PROSE. A finished reply
+ * explaining how to parse a call — "look for the prefix `[TOOL_CALLS]
+ * get_weather({` in the output and read the JSON until its brackets balance",
+ * or "Qwen starts each call with `<tool_call>{"name": "` and the tool name
+ * follows" — has a brace that never closes, or a quote that never does, and was
+ * cut from the call's opening on: the sentences after it, which the person had
+ * watched arrive, were gone from the stored reply and every later request.
+ */
+function writesJson(
+  text: string,
+  start: number,
+  { tagged, offered }: { readonly tagged: boolean; readonly offered: readonly string[] },
+): boolean {
+  /** Each bracket still open: an object reading a key, or reading the value of `naming` one; or an array. */
+  const containers: { readonly object: boolean; key: boolean; naming: boolean }[] = [];
+  let at = start;
+  while (at < text.length) {
+    const char = text.charAt(at);
+    const top = containers.at(-1);
+    if (/\s/.test(char)) {
+      at += 1;
+    } else if (char === '"') {
+      let end = at + 1;
+      while (end < text.length && text.charAt(end) !== '"') end += text.charAt(end) === '\\' ? 2 : 1;
+      const body = text.slice(at + 1, end);
+      const ownWord = tagged && containers.length === 1 && top !== undefined && (top.key || top.naming);
+      if (ownWord && /\s/.test(body) && !offered.some((name) => name.startsWith(body))) return false;
+      if (top?.object && top.key) top.naming = NAMING_KEYS.has(body);
+      at = end + 1;
+    } else if (char === '{' || char === '[') {
+      containers.push({ object: char === '{', key: char === '{', naming: false });
+      at += 1;
+    } else if (char === '}' || char === ']') {
+      containers.pop();
+      // Closed before the end: not JSON still being written.
+      if (containers.length === 0) return false;
+      at += 1;
+    } else if (char === ':') {
+      if (top?.object) top.key = false;
+      at += 1;
+    } else if (char === ',') {
+      if (top?.object) {
+        top.key = true;
+        top.naming = false;
+      }
+      at += 1;
+    } else {
+      BARE_WORD.lastIndex = at;
+      const word = BARE_WORD.exec(text)?.[0];
+      if (word === undefined) return false;
+      at += word.length;
+      AFTER_KEY.lastIndex = at;
+      if (!JSON_WORD.test(word) && at < text.length && !AFTER_KEY.test(text)) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Where a tool call still being written starts, or -1: a call's opening shape
  * with the text ending inside it.
@@ -382,8 +463,16 @@ function endOfObject(text: string, start: number): number {
  * into them — or, closed with no tag, followed by those words and kept, its
  * arguments stored and sent back. Each round is cut where it ends, by
  * {@link cutUnfinishedCall}, before the next is joined to it.
+ *
+ * ENDING INSIDE ITS ARGUMENTS MEANS WRITING JSON TO THE END, as
+ * {@link writesJson} reads it. A brace that never closes, or a quote that
+ * never does, is as often a sentence naming a call's opening and going on.
+ * `offered` is the names a call can give, as {@link callNames} gives them.
  */
-export function unfinishedCallAt(text: string, stopped: boolean): number {
+export function unfinishedCallAt(
+  text: string,
+  { stopped, offered }: { readonly stopped: boolean; readonly offered: readonly string[] },
+): number {
   let from = 0;
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
@@ -402,7 +491,10 @@ export function unfinishedCallAt(text: string, stopped: boolean): number {
       continue;
     }
     const close = endOfObject(text, open);
-    if (close === -1) return match.index;
+    if (close === -1) {
+      if (writesJson(text, open, { tagged: form !== CALL_END.paren, offered })) return match.index;
+      continue;
+    }
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
     // a call with a brace too many, stopped before its closing tag.
     // Compared with no whitespace: a fenced call's end is a fence, a line break
@@ -417,13 +509,17 @@ export function unfinishedCallAt(text: string, stopped: boolean): number {
 /**
  * `text` up to where a tool call it ended inside starts — see
  * {@link unfinishedCallAt} — or all of it. `stopped` is whether Stop ended it
- * rather than the model or a failed stream.
+ * rather than the model or a failed stream; `offered` is the names a call can
+ * give, as {@link callNames} gives them.
  *
  * Found in its WORDS: a round's text still holds its reasoning, and a call its
  * reasoning names is not one the round was writing. See `maskReasoning`.
  */
-export function cutUnfinishedCall(text: string, { stopped }: { readonly stopped: boolean }): string {
-  const at = unfinishedCallAt(maskReasoning(text), stopped);
+export function cutUnfinishedCall(
+  text: string,
+  reading: { readonly stopped: boolean; readonly offered: readonly string[] },
+): string {
+  const at = unfinishedCallAt(maskReasoning(text), reading);
   return at === -1 ? text : text.slice(0, at);
 }
 

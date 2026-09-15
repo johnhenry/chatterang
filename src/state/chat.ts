@@ -1467,7 +1467,7 @@ function wordsWithoutCalls(
   },
 ): string {
   const finished = stripToolSyntax(content, { offered, ran });
-  return cutsUnfinished ? cutUnfinishedCall(finished, { stopped }) : finished;
+  return cutsUnfinished ? cutUnfinishedCall(finished, { stopped, offered }) : finished;
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */
@@ -1750,7 +1750,7 @@ async function runGeneration(
       // is told for a failed turn: a round that ran no tool and was offered
       // none ends on an example, not a call.
       if (offersTools || toolCalls.length > 0) {
-        raw = raw.slice(0, roundStart) + cutUnfinishedCall(raw.slice(roundStart), { stopped: false });
+        raw = raw.slice(0, roundStart) + cutUnfinishedCall(raw.slice(roundStart), { stopped: false, offered });
       }
       roundStart = raw.length;
     };
