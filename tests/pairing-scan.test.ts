@@ -808,7 +808,14 @@ describe('a scan persists nothing', () => {
   const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     'src/lib/qr-scan.ts': ['@chatterang/tunnel/pairing', '@/lib/oat-fountain', '@/lib/qr-decode'],
     'src/lib/qr-decode.ts': ['@/lib/oat-fountain', 'jsqr'],
-    'src/lib/pairing.ts': ['@chatterang/tunnel/pairing'],
+    // #256: the seam binds a pairing connection to the certificate it
+    // negotiated. The binding half by dynamic import, the socket contract's
+    // types, and still nothing that could store, send or log a frame.
+    'src/lib/pairing.ts': [
+      '@chatterang/contracts/tunnel-socket',
+      '@chatterang/tunnel/binding',
+      '@chatterang/tunnel/pairing',
+    ],
     'src/features/pairing/ScanPane.tsx': [
       'react',
       '@chatterang/tunnel/pairing',
