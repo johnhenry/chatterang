@@ -286,7 +286,7 @@ const v6 = versions.find((version) => version._cfg?.version === 6)?._cfg?.conten
 const v7 = versions.find((version) => version._cfg?.version === 7)?._cfg?.contentUpgrade;
 
 describe('the versions these migrations claim', () => {
-  it('are 6, 7, 8 and 9, each declared once, in order, with 9 the highest', () => {
+  it('are 6, 7, 8, 9 and 10, each declared once, in order, with 10 the highest', () => {
     /*
      * Two `.version(n)` calls sharing an n is worse than the bug being fixed:
      * Dexie keeps the last and the other migration silently never runs.
@@ -300,6 +300,11 @@ describe('the versions these migrations claim', () => {
      * suite failed rather than the number being collided into. Updating the
      * bound is the intended cost of adding a version — a guard that had to be
      * edited is a guard that was read.
+     *
+     * #133's paired-device table is v10 (`tests/db-paired-devices.test.ts`).
+     * #195 takes 11. Uniqueness alone does not catch a reused number: Dexie
+     * hands a second `.version(n)` the same Version object and merges into it,
+     * so `_versions` stays unique. The highest bound is what catches that.
      */
     const declared = versions.map((version) => Number(version._cfg?.version));
 
@@ -307,8 +312,9 @@ describe('the versions these migrations claim', () => {
     expect(declared).toContain(7);
     expect(declared).toContain(8);
     expect(declared).toContain(9);
+    expect(declared).toContain(10);
     expect(new Set(declared).size).toBe(declared.length);
-    expect(Math.max(...declared)).toBe(9);
+    expect(Math.max(...declared)).toBe(10);
     expect([...declared]).toEqual([...declared].sort((a, b) => a - b));
   });
 

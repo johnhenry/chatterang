@@ -115,6 +115,80 @@ export interface AppSetting {
   value: unknown;
 }
 
+/** What a paired host lets this phone use it for. `inference` is the only grant v1 writes (#133). */
+export type PairedDeviceCapability = 'inference';
+
+/**
+ * A desktop or headless server this phone has paired with (#133).
+ *
+ * LANDED BEFORE ANYTHING CAN WRITE IT. The owner's #133 ruling lets this table
+ * arrive tested but unreachable, ahead of the pairing controller, the
+ * paired-devices panel (#137) and the privacy copy, which land together.
+ * Nothing in `src/` reads or writes it until then, and
+ * `tests/db-paired-devices.test.ts` fails the day something does.
+ *
+ * WHAT IS NOT HERE, ON PURPOSE:
+ *
+ *   - The CREDENTIAL. The desktop mints `<deviceId>.<secret>` and the phone
+ *     presents it on every connection, but where the phone keeps that secret
+ *     is not ruled (#135: an OS keychain through the socket plugin, or a row
+ *     like an API key). A column would decide it by default, in the same
+ *     database the model-driven tools run beside. So there is no column.
+ *   - The desktop's DIGEST of that credential. That is the desktop's record,
+ *     kept in its main process (#133 ruling, #179), not the phone's.
+ *   - Any TRANSCRIPT, and any MODEL LIST or capability cache. Those are
+ *     derived and go stale, and a stale model list is how a phone offers a
+ *     model the desktop no longer has. Ask the host.
+ *
+ * ERASING HERE DOES NOT REACH THE DESKTOP. `eraseEverything()` deletes this
+ * table with the rest of the database, and the desktop still holds its record
+ * of this phone, and will accept the credential if it is presented again. That
+ * asymmetry is revocation's to close (#131 item 6), not this table's.
+ *
+ * The shell does not project this table (`tests/shell.test.ts`).
+ */
+export interface PairedDeviceRecord {
+  /**
+   * The `deviceId` the host minted: the part of the credential before the dot
+   * (packages/tunnel/src/host/credential.ts), 16 bytes of base64url.
+   *
+   * The same id the desktop's registry keys on and a turn's
+   * `{ kind: 'paired', device }` reach carries (`PairedDevice` in
+   * `src/domain/chat.ts`), so a transcript, this row and the host's record
+   * agree about which device is which (#125). Not reused after unpairing.
+   */
+  readonly id: string;
+  /**
+   * The host certificate's SPKI fingerprint, base64: the 32 trust bytes the
+   * pairing code carried (#181). Indexed, so a reconnect can find the row for
+   * the certificate it was actually shown.
+   */
+  readonly spkiPin: string;
+  /**
+   * The pairing code's host-kind byte, as words: 1 is `desktop`, 2 is `server`
+   * (`HOST_DESKTOP`/`HOST_SERVER` in packages/tunnel/src/pairing). Words and
+   * not the byte, because `src/db` may not import the pairing half
+   * (`tests/layering.test.ts`).
+   */
+  readonly hostKind: 'desktop' | 'server';
+  /** The host's name as it was at pairing, shown to a person. */
+  readonly name: string;
+  /**
+   * A CACHE of where the host said it might be reached, most-preferred first,
+   * as text. May go stale; the pin, not the address, says who answered.
+   */
+  readonly addresses: readonly string[];
+  /** A cache, as `addresses` is. */
+  readonly port: number;
+  readonly pairedAt: number;
+  /**
+   * Grants, not an identity: a later capability is a new grant on an existing
+   * pairing rather than a second pairing system, and revoking drops grants
+   * (#133, #131).
+   */
+  readonly capabilities: readonly PairedDeviceCapability[];
+}
+
 class ChatterangDatabase extends Dexie {
   chats!: EntityTable<Chat, 'id'>;
   messages!: EntityTable<Message, 'id'>;
@@ -127,6 +201,7 @@ class ChatterangDatabase extends Dexie {
   settings!: EntityTable<AppSetting, 'key'>;
   mcpServers!: EntityTable<McpServerConfig, 'id'>;
   blobs!: EntityTable<StoredBlob, 'id'>;
+  pairedDevices!: EntityTable<PairedDeviceRecord, 'id'>;
 
   constructor() {
     super('chatterang');
@@ -332,6 +407,21 @@ class ChatterangDatabase extends Dexie {
      * v10.
      */
     this.version(9).stores({ messages: 'id, chatId, createdAt, [chatId+createdAt]' });
+
+    /**
+     * v10 — the phone's paired-device table (#133), which the owner's ruling
+     * placed at the next version after v9.
+     *
+     * ADDITIVE, NO UPGRADE FUNCTION, as `mcpServers` at v2: a new table
+     * restates nothing an install holds and rewrites no row, so a v9 install
+     * opens here with its chats and messages as they were. See
+     * {@link PairedDeviceRecord} for what the row holds and, more to the
+     * point, what it does not.
+     *
+     * ON THE VERSION NUMBER, per v7's note: #133 is v10 because it landed.
+     * #195 (a durable queue) takes v11.
+     */
+    this.version(10).stores({ pairedDevices: 'id, spkiPin' });
   }
 }
 
