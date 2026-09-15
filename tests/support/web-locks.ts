@@ -40,6 +40,12 @@ export interface Locks {
   releaseQueries(): void;
   /** How many queries are waiting on `holdQueries`. */
   pendingQueries(): number;
+  /**
+   * Grant no request until `releaseGrants`: each waits in the queue and is
+   * listed as pending, as one does in a browser that has not answered it yet.
+   */
+  holdGrants(): void;
+  releaseGrants(): void;
 }
 
 export function webLocks(): Locks {
@@ -48,10 +54,12 @@ export function webLocks(): Locks {
   const clients = new WeakMap<LockManager, string>();
   const closed = new Set<string>();
   let holdingQueries = false;
+  let holdingGrants = false;
   const answers: (() => void)[] = [];
   let windows = 0;
 
   const grantable = (request: Entry, ahead: readonly Entry[]): boolean => {
+    if (holdingGrants) return false;
     const on = held.filter((entry) => entry.name === request.name);
     const before = ahead.filter((entry) => entry.name === request.name);
     return request.mode === 'exclusive'
@@ -156,6 +164,13 @@ export function webLocks(): Locks {
       for (const answer of answers.splice(0)) answer();
     },
     pendingQueries: () => answers.length,
+    holdGrants() {
+      holdingGrants = true;
+    },
+    releaseGrants() {
+      holdingGrants = false;
+      pump();
+    },
   };
 }
 

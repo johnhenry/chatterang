@@ -41,18 +41,30 @@ export type { StoredBlob } from '@/db';
  *
  * So a sweep runs only in a window that is the only one open. Each window holds
  * a Web Lock of its own name, under `WINDOW`, for as long as it is open; the
- * browser lets go of it when the window goes. A sweep holds `SWEEP`
- * exclusively, asks which locks are held, and deletes nothing if another
- * window's is among them. A window takes its own lock while it holds `SWEEP`
- * shared, so no window joins between a sweep's question and its deletes; and a
- * window writes no payload until it has joined (`putBlob`).
+ * browser lets go of it when the window goes. A window writes no payload until
+ * it holds that lock (`putBlob`). A sweep reads which payloads are on disk
+ * FIRST, then asks which locks are held or asked for, and deletes nothing if
+ * another window's is among them.
+ *
+ * THE ORDER IS WHAT MAKES THAT ENOUGH. Every payload the sweep read was written
+ * before it read, by a window that held its lock before it wrote. So that
+ * window is seen when the sweep asks, unless it has closed, and a window that
+ * has closed writes no row after that: the rows the sweep reads next name
+ * everything it sent. A window that joins after the question writes only
+ * payloads the sweep never read, and it deletes nothing else.
+ *
+ * NOTHING WAITS ON ANOTHER WINDOW. A window's own lock has a name no other
+ * window asks for, so it is granted at once. Joining once waited for a lock
+ * every sweep held exclusively, so no window could join between a sweep's
+ * question and its deletes; a sweep whose database work stalled then left
+ * every other window unable to attach an image, with nothing on screen to say
+ * so, for as long as it stalled.
  *
  * Where there are no Web Locks — an origin that is not a secure context — no
  * other window can be seen, so no sweep runs. A draft let go still deletes its
  * own payloads (`Composer`).
  */
 const locks: LockManager | undefined = globalThis.navigator?.locks;
-const SWEEP = 'chatterang:attachment-sweep';
 const WINDOW = 'chatterang:attachment-window:';
 const ownWindow = `${WINDOW}${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}`;
 
@@ -67,21 +79,12 @@ function join(manager: LockManager): Promise<void> {
   return new Promise<void>((settle) => {
     try {
       manager
-        .request(SWEEP, { mode: 'shared' }, () =>
-          new Promise<void>((entered) => {
-            manager
-              .request(ownWindow, () => {
-                entered();
-                // Held until this window goes.
-                return new Promise<never>(() => {});
-              })
-              .catch(() => entered());
-          }),
-        )
-        .then(
-          () => settle(),
-          () => settle(),
-        );
+        .request(ownWindow, () => {
+          settle();
+          // Held until this window goes.
+          return new Promise<never>(() => {});
+        })
+        .catch(() => settle());
     } catch {
       settle();
     }
@@ -202,6 +205,11 @@ export function holdBlobs(ids: readonly string[]): () => void {
  * sweeping, nor where there are no Web Locks; the next launch of a window that
  * is alone sweeps. See "Other windows" at the top of this file.
  *
+ * IN THIS ORDER, and each step only once the one before has answered: the
+ * payloads on disk, then the other windows, then the rows. Payloads read after
+ * the question could be a window's that joined after it; rows read before it
+ * could miss a message a window sent and then closed.
+ *
  * Every payload in the table is an attachment's (see the top of this file). A
  * read that fails deletes nothing.
  */
@@ -211,22 +219,17 @@ export async function sweepOrphanBlobs(): Promise<void> {
   const kept = new Set(holds.keys());
   sweeps.add(kept);
   try {
-    await manager.request(SWEEP, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
-      if (!lock) return;
-      const { held = [], pending = [] } = await manager.query();
-      const others = [...held, ...pending].some(
-        ({ name }) => name !== undefined && name.startsWith(WINDOW) && name !== ownWindow,
-      );
-      if (others) return;
-      const named = new Set<string>();
-      const [stored] = await Promise.all([
-        db.blobs.toCollection().primaryKeys(),
-        db.messages.each((row) => {
-          for (const attachment of row.attachments ?? []) named.add(attachment.id);
-        }),
-      ]);
-      await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
+    const stored = await db.blobs.toCollection().primaryKeys();
+    const { held = [], pending = [] } = await manager.query();
+    const others = [...held, ...pending].some(
+      ({ name }) => name !== undefined && name.startsWith(WINDOW) && name !== ownWindow,
+    );
+    if (others) return;
+    const named = new Set<string>();
+    await db.messages.each((row) => {
+      for (const attachment of row.attachments ?? []) named.add(attachment.id);
     });
+    await deleteBlobs(stored.filter((id) => !named.has(id) && !kept.has(id)));
   } finally {
     sweeps.delete(kept);
   }

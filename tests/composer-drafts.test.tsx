@@ -24,7 +24,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { stage } from './support/stage';
-import { anotherWindow } from './support/web-locks';
+import { anotherWindow, installedLocks } from './support/web-locks';
 
 const fake = vi.hoisted(() => {
   const blobs = new Map<string, { id: string }>();
@@ -292,4 +292,97 @@ describe('an image being composed, while another window of the app launches', ()
     expect(fake.blobs.has(id), 'still on screen as a chip here').toBe(true);
     expect(chip()).not.toBeNull();
   });
+});
+
+describe('an image attached in a window that opens while another window’s launch sweep has not finished', () => {
+  /*
+   * A window writes no payload until it holds its own Web Lock (`putBlob`).
+   * Joining once waited for a lock every sweep held exclusively, from before it
+   * asked which windows were open until after its deletes. So a sweep whose
+   * work stalled — a database request that never completed, a tab frozen part
+   * way — kept every window that opened after it from writing an image: no
+   * chip, no toast, no error, for as long as that sweep ran.
+   *
+   * The other window's sweep is stalled here at its question, which is held
+   * unanswered. The window attaching is one of its own, opened after the sweep
+   * began, so it has yet to join.
+   */
+  it('is written and shown, and the sweep deletes neither it nor anything else while the window is open', async () => {
+    const locks = installedLocks();
+    fake.blobs.set('att_orphan', { id: 'att_orphan' });
+    const sweeper = await anotherWindow(() => import('@/lib/blobs'));
+    locks.holdQueries();
+    const sweeping = sweeper.loaded.sweepOrphanBlobs();
+    let opened: Awaited<ReturnType<typeof openComposerWindow>> | null = null;
+    try {
+      for (let turn = 0; turn < 50 && locks.pendingQueries() === 0; turn += 1) await macrotask();
+      expect(locks.pendingQueries(), 'the control: the other window’s sweep is waiting on its question').toBe(1);
+
+      opened = await openComposerWindow();
+      const input = opened.container.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const file = new File([new Uint8Array([137, 80, 78, 71])], 'cat.png', { type: 'image/png' });
+      Object.defineProperty(input, 'files', { configurable: true, value: { 0: file, length: 1 } });
+      await opened.act(async () => {
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await stage('the image’s write to land', fake.when(() => fake.landed.size === 1));
+      await opened.act(async () => {
+        await macrotask();
+      });
+
+      expect(
+        opened.container.querySelector('button[aria-label="Remove attachment"]'),
+        'a chip for the image',
+      ).not.toBeNull();
+      expect(locks.pendingQueries(), 'the control: the sweep has still not been answered').toBe(1);
+
+      locks.releaseQueries();
+      await sweeping;
+      // Before the window closes: closing it lets its draft go, which deletes the image.
+      const [written] = [...fake.landed];
+      expect(fake.blobs.has(written!), 'the image, once the sweep has finished').toBe(true);
+      expect(fake.blobs.has('att_orphan'), 'the control: other windows were open, so the sweep deleted nothing').toBe(
+        true,
+      );
+    } finally {
+      locks.releaseQueries();
+      await sweeping;
+      await opened?.close();
+      sweeper.close();
+    }
+  });
+
+  /** A window that loads the composer as the app does, with a root of its own. */
+  async function openComposerWindow() {
+    const window = await anotherWindow(async () => ({
+      Composer: (await import('@/features/chat/Composer')).Composer,
+      react: await import('react'),
+      client: await import('react-dom/client'),
+    }));
+    const { Composer: ItsComposer, react, client } = window.loaded;
+    const itsContainer = document.createElement('div');
+    document.body.append(itsContainer);
+    const itsRoot = client.createRoot(itsContainer);
+    await react.act(async () => {
+      itsRoot.render(
+        react.createElement(ItsComposer, {
+          disabled: false,
+          generating: false,
+          acceptsImages: true,
+          placeholder: 'Message',
+          onSend: () => undefined,
+          onStop: () => undefined,
+        }),
+      );
+    });
+    return {
+      container: itsContainer,
+      act: react.act,
+      close: async (): Promise<void> => {
+        await react.act(async () => itsRoot.unmount());
+        itsContainer.remove();
+        window.close();
+      },
+    };
+  }
 });

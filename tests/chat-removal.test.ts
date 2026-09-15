@@ -1395,9 +1395,10 @@ describe('an attachment payload, while another window of the app is open', () =>
   });
 
   it('keeps the payload of a window that opens while a sweep is between asking which windows are open and deleting', async () => {
-    // The sweep asks which windows hold a lock, then reads and deletes. A window
-    // opened in between was not in the answer. It must not write a payload the
-    // sweep's read can see before that sweep has finished.
+    // The sweep reads which payloads are on disk, asks which windows hold a lock,
+    // then reads the rows and deletes. A window opened after the question was
+    // not in the answer, and the payload it writes must not be among those the
+    // sweep deletes.
     fake.blobs.set('att_before', { id: 'att_before' });
     const locks = installedLocks();
     locks.holdQueries();
@@ -1421,6 +1422,31 @@ describe('an attachment payload, while another window of the app is open', () =>
 
     expect(fake.blobs.has('att_before'), 'the control: the sweep ran, and took what nothing named').toBe(false);
     expect(fake.blobs.has('att_opened'), 'the payload the window that opened wrote').toBe(true);
+  });
+
+  it('deletes nothing while another window has asked for its lock and not yet been granted it', async () => {
+    // A window that has just opened is listed as waiting for its lock before it
+    // holds it. It writes no payload until then, but it is open.
+    fake.blobs.set('att_waiting', { id: 'att_waiting' });
+    const locks = installedLocks();
+    const observer = locks.window();
+    locks.holdGrants();
+    let other: Awaited<ReturnType<typeof anotherWindow<typeof import('@/lib/blobs')>>> | null = null;
+    try {
+      other = await anotherWindow(blobsModule);
+      expect(
+        (await observer.query()).pending!.some((lock) => lock.name?.startsWith('chatterang:attachment-window:')),
+        'the control: the other window is waiting for its lock',
+      ).toBe(true);
+
+      await sweepOrphanBlobs();
+
+      expect(fake.blobs.has('att_waiting')).toBe(true);
+    } finally {
+      locks.releaseGrants();
+      other?.close();
+      locks.close(observer);
+    }
   });
 
   it('deletes nothing on an origin with no Web Locks, where no other window can be seen', async () => {

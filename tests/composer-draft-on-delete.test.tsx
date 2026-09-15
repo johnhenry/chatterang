@@ -757,22 +757,19 @@ describe('Settings › delete all conversations', () => {
 describe('an image whose write is still waiting for this window to join the other windows', () => {
   /*
    * `putBlob` writes nothing until this window holds its Web Lock (see "Other
-   * windows" in lib/blobs.ts), and that waits while another window sweeps. A
-   * draft discarded meanwhile writes nothing at all: its bytes never reach the
-   * table, rather than being written and deleted again.
+   * windows" in lib/blobs.ts), and the browser grants that lock when it gets to
+   * it: an image picked as the page opens waits. A draft discarded meanwhile
+   * writes nothing at all: its bytes never reach the table, rather than being
+   * written and deleted again.
    *
-   * A window of its own, so that its lock is still to be taken: its module
-   * graph, React included, is loaded while another window holds the sweep lock.
+   * A window of its own, so that its lock is still to be granted: its module
+   * graph, React included, is loaded while the locks grant nothing.
    */
   it('is never written when its chat is deleted meanwhile', async () => {
-    const SWEEP = 'chatterang:attachment-sweep';
     const locks = installedLocks();
-    const sweeper = locks.window();
-    let letGo = (): void => {};
-    const sweeping = sweeper.request(SWEEP, () => new Promise<void>((resolve) => (letGo = resolve)));
-    await until('another window to hold the sweep lock', async () =>
-      (await sweeper.query()).held!.some((lock) => lock.name === SWEEP),
-    );
+    const observer = locks.window();
+    locks.holdGrants();
+    const letGo = (): void => locks.releaseGrants();
 
     const win = await anotherWindow(async () => ({
       Composer: (await import('@/features/chat/Composer')).Composer,
@@ -785,7 +782,7 @@ describe('an image whose write is still waiting for this window to join the othe
     const windowRoot = win.loaded.client.createRoot(container);
     try {
       expect(
-        (await sweeper.query()).pending!.some((lock) => lock.name === SWEEP && lock.mode === 'shared'),
+        (await observer.query()).pending!.some((lock) => lock.name?.startsWith('chatterang:attachment-window:')),
         'the control: the window is waiting to join',
       ).toBe(true);
       win.loaded.useChats.setState({ loaded: true, chats: [chat('locked', 1)], activeChatId: 'locked', messages: [] });
@@ -814,10 +811,9 @@ describe('an image whose write is still waiting for this window to join the othe
         await win.loaded.useChats.getState().removeChat('locked');
       });
       letGo();
-      await sweeping;
       // This file's own window and the one opened here.
       await until('the window to join', async () =>
-        (await sweeper.query()).held!.filter((lock) => lock.name?.startsWith('chatterang:attachment-window:')).length === 2,
+        (await observer.query()).held!.filter((lock) => lock.name?.startsWith('chatterang:attachment-window:')).length === 2,
       );
       await win.loaded.react.act(async () => {
         for (let turn = 0; turn < 5; turn += 1) await macrotask();
@@ -831,7 +827,7 @@ describe('an image whose write is still waiting for this window to join the othe
       await win.loaded.react.act(async () => windowRoot.unmount());
       container.remove();
       win.close();
-      locks.close(sweeper);
+      locks.close(observer);
     }
   });
 });
