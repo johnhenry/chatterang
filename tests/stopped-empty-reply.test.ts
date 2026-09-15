@@ -979,3 +979,120 @@ describe('the chat list, after a reply stopped before its first word', () => {
     expect((fake.chats.get(id) as Chat | undefined)?.preview, 'on disk').toBe('second');
   });
 });
+
+/* ── Tool-call syntax in a chat with tools ──────────────────────────── */
+
+/** Run `body` with the MCP probe registered, in a chat that enables it. */
+async function inToolsChat(id: string, body: () => Promise<void>): Promise<ReturnType<typeof mcpProbe>> {
+  const probe = mcpProbe();
+  given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+  try {
+    toolRegistry.register(probe.tool);
+    await body();
+  } finally {
+    toolRegistry.unregister(probe.tool.id);
+  }
+  return probe;
+}
+
+describe('a reply stopped after some text, in a chat with tools', () => {
+  it('keeps its answer when its reasoning mentioned <tool_call>, and is not called stopped', async () => {
+    const id = 'think_mentions_call';
+    // Named twice in the reasoning: as a word, and in the shape a call opens with.
+    const reasoning = 'A plain fact. No need to emit a <tool_call> for this, nor <tool_call>{"name": "notes.note"} at all.';
+    const partial = `<think>${reasoning}</think>The capital of Australia is Canberra, which`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'Canberra, which', gate.release);
+      const stopped = assistantRows(id).at(-1)!;
+      expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+        content: 'The capital of Australia is Canberra, which',
+        stopped: undefined,
+      });
+      expect(stopped.thinking, 'its reasoning, as the model wrote it').toBe(reasoning);
+      await mounted(stopped, () => {
+        expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      });
+      await useChats.getState().send('third');
+    });
+
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', 'The capital of Australia is Canberra, which'],
+      ['user', 'third'],
+    ]);
+  });
+
+  it('still cuts an unfinished call written after its reasoning', async () => {
+    const id = 'think_then_call';
+    const partial =
+      '<think>File it.</think>Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    const probe = await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    const stopped = assistantRows(id)[1]!;
+    expect({ content: stopped.content, thinking: stopped.thinking }).toEqual({
+      content: 'Filing it now.',
+      thinking: 'File it.',
+    });
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words after a literal `<tool_call>` in prose', async () => {
+    const id = 'prose_call_tag';
+    const partial = 'Qwen wraps each call in a `<tool_call>` tag. Inside it is JSON naming the tool, and the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps a TOML example with a [tool_calls] table', async () => {
+    const id = 'toml_tool_calls';
+    const partial =
+      'Add this to your config:\n\n```toml\n[tool_calls]\nenabled = true\nmax_rounds = 4\n```\n\nThen restart the';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'restart the', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('cuts an unfinished [TOOL_CALLS] call and sends none of it back', async () => {
+    const id = 'mistral_call';
+    const partial = 'Reading it.\n[TOOL_CALLS] leaky({"path": "canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Reading it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});

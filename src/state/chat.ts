@@ -1415,32 +1415,51 @@ function carriesReceipt(variant: MessageVariant): boolean {
 }
 
 /**
- * The words of a turn Stop cut short, read from what it streamed.
+ * A tool call still being written: its opening marker, in the shape of a call,
+ * with the text ending inside it.
  *
- * Such a turn hands back no text of its own, so its streamed deltas stand in
- * for it, and those are whatever the model wrote — plumbing included.
+ * `<tool_call>` followed by the end of the text, or by the `{"` a call's JSON
+ * opens with. `[TOOL_CALL]` or `[TOOL_CALLS]` followed by the end of the text,
+ * by a tool name the text ends in, or by `name(` and the end or a `{`.
  *
- * IN A CHAT WITH TOOLS, a tool call is plumbing. A finished one is stripped as
- * the engine strips a finished reply's: a turn stopped at an MCP send sheet
- * stored the model's call, arguments and all, as the words of its reply, and
- * sent it back to the model as history. So is one still being written when
- * Stop landed, which the engine's patterns cannot see because it has no end to
- * match: everything from its opening tag on goes. That call never ran and was
- * never shown on a send sheet, and its arguments were still sent back.
+ * ANCHORED TO THAT SHAPE, NOT TO THE MARKER. Any `<tool_call>` or
+ * `[tool_calls]` was cut to the end of the reply, and a reply can name one in
+ * words: "Qwen wraps each call in a `<tool_call>` tag", or a TOML example with
+ * a `[tool_calls]` table. Everything after it, which the person had watched
+ * arrive, was gone.
  *
- * IN A CHAT WITH NO TOOLS nothing is stripped, as before. There is no call to
- * strip, and the patterns are not tool-aware: one removes any fenced JSON
- * block naming a "function", so a JSON example the person watched arrive was
- * cut from the reply — and one that was all the reply held made it an empty
- * "Stopped" reply, left out of every later request.
+ * The quote is spelled `\x22`: the source scans in tests/support/source-scan.ts
+ * read a bare one in a regex literal as the start of a string.
+ */
+const UNFINISHED_CALL = /<tool_call>\s*(?:\{\s*\x22|\{?\s*$)|\[TOOL_CALLS?\][ \t]*(?:\w+[ \t]*\(\s*(?:\{|$)|\w*\s*$)/i;
+
+/**
+ * A reply's words with its tool calls read out of them, in a chat with tools.
+ *
+ * Handed the reply's text AFTER its reasoning is split off. Read over the raw
+ * deltas, a `<tool_call>` the model only mentioned while reasoning was taken
+ * for an unfinished call: the cut took the closing think tag and the whole
+ * answer with it, and the reply was stored as "Stopped before its first word"
+ * and left out of every later request.
+ *
+ * A finished call is stripped as the engine strips a finished reply's: a turn
+ * stopped at an MCP send sheet stored the model's call, arguments and all, as
+ * the words of its reply, and sent it back to the model as history. So is one
+ * still being written, which the engine's patterns cannot see because it has
+ * no end to match: everything from its opening marker on goes. That call never
+ * ran and was never shown on a send sheet, and its arguments were still sent
+ * back.
+ *
+ * NOT IN A CHAT WITH NO TOOLS. There is no call to strip, and the patterns are
+ * not tool-aware: one removes any fenced JSON block naming a "function", so a
+ * JSON example the person watched arrive was cut from the reply.
  *
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.
  */
-function wordsOfAStoppedTurn(raw: string, toolsEnabled: boolean): string {
-  if (!toolsEnabled) return raw;
-  const finished = stripToolSyntax(raw);
-  const unfinished = finished.search(/<tool_call>|\[TOOL_CALLS?\]/i);
+function wordsWithoutCalls(content: string): string {
+  const finished = stripToolSyntax(content);
+  const unfinished = finished.search(UNFINISHED_CALL);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
 }
 
@@ -1779,15 +1798,16 @@ async function runGeneration(
 
           // `event.text` has had its tool-call syntax stripped by the engine.
           // When it is empty the streamed deltas stand in for it, as they
-          // always have — a turn cut short hands back no text of its own. A
-          // STOPPED turn's deltas are read by `wordsOfAStoppedTurn`, so a call
-          // it was writing or waiting to send is not stored as its words and
-          // sent back to the model. Any other turn keeps what it kept before.
+          // always have — a turn cut short hands back no text of its own. In a
+          // chat with tools, a STOPPED turn's words are read by
+          // `wordsWithoutCalls`, so a call it was writing or waiting to send is
+          // not stored as its words and sent back to the model. Read once its
+          // reasoning is split off, so a call named in the reasoning takes none
+          // of the answer with it. Any other turn keeps what it kept before.
           const aborted = controller.signal.aborted;
-          const split = splitThinking(
-            event.text || (aborted ? wordsOfAStoppedTurn(raw, chat.tools.length > 0) : raw),
-          );
-          const content = split.content.trim();
+          const split = splitThinking(event.text || raw);
+          const readsCalls = !event.text && aborted && chat.tools.length > 0;
+          const content = (readsCalls ? wordsWithoutCalls(split.content) : split.content).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown
           //           as stopped, and left out of every later request.
