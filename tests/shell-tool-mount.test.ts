@@ -171,6 +171,6 @@ describe('the bash tool a model drives', () => {
     const tool = createBashTool({ confirm });
     const result = await run(tool, 'mount add --write');
     expect(result.isError).toBe(true);
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('folder chooser'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('folder chooser'), undefined);
   });
 });
