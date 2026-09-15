@@ -17,7 +17,10 @@
 //   turns down today) the OLD document's calls keep arriving, whether any
 //   arrives after the new document commits ('did-frame-navigate' /
 //   'did-navigate'), and whether main could tell the two documents apart
-//   without an id the page supplies.
+//   without an id the page supplies;
+// - for every invoke, whether `event.senderFrame` was `event.sender.mainFrame`
+//   when it arrived: what a handler refusing calls from a frame that is not the
+//   current main frame would have refused.
 //
 // The window is hidden with backgroundThrottling:false, so its 1 ms interval
 // is not throttled to once a second. It opens no socket; it checks with lsof
@@ -80,6 +83,12 @@ function frameIdentity(frame) {
   } catch (error) {
     return { threw: error.name };
   }
+}
+
+/** Same frame host: the same `frameToken` in the same renderer process. */
+function sameFrame(a, b) {
+  if (a === null || b === null || a.token === undefined || b.token === undefined) return false;
+  return a.token === b.token && a.processId === b.processId;
 }
 
 function record(wc) {
@@ -194,6 +203,22 @@ async function oneNavigation(wc, fire, delay) {
       distinguishable: oldIds.every((id) => !newIds.includes(id)),
       mainFrameAtDidStartNavigation: start?.mainFrameAtEvent ?? null,
       mainFrameAtDidFrameNavigate: frameNav?.mainFrameAtEvent ?? null,
+      // Whether the old document's frame was still webContents.mainFrame at
+      // each event: a turn tagged with its frame at admission can be found
+      // stale only once this is false.
+      oldFrameIsMainFrameAtDidStartNavigation: lastOld ? sameFrame(lastOld.senderFrame, start?.mainFrameAtEvent ?? null) : null,
+      oldFrameIsMainFrameAtDidFrameNavigate: lastOld ? sameFrame(lastOld.senderFrame, frameNav?.mainFrameAtEvent ?? null) : null,
+    },
+    // A check made when each call arrives, refusing a call whose senderFrame is
+    // not the current webContents.mainFrame: what it would have refused.
+    arrivalMainFrameCheck: {
+      oldCallsAfterDidStartNavigation: oldAfterStart.length,
+      oldCallsAfterDidStartNavigationFromMainFrame: oldAfterStart.filter((i) => i.fromMainFrameAtArrival).length,
+      oldCallsAfterCommit: oldAfterCommit.length,
+      oldCallsAfterCommitFromMainFrame: oldAfterCommit.filter((i) => i.fromMainFrameAtArrival).length,
+      newCalls: news.length,
+      newCallsFromMainFrame: news.filter((i) => i.fromMainFrameAtArrival).length,
+      wouldRefuse: [...olds, ...news].filter((i) => !i.fromMainFrameAtArrival).length,
     },
   };
 }
@@ -225,12 +250,17 @@ app.whenReady().then(async () => {
   let error;
   try {
     ipcMain.handle('probe-decode', (event, payload) => {
+      const senderFrame = frameIdentity(event.senderFrame);
+      const mainFrame = frameIdentity(event.sender.mainFrame);
       invokes.push({
         at: now(),
         docId: payload.docId,
         seq: payload.seq,
         kind: payload.kind,
-        senderFrame: frameIdentity(event.senderFrame),
+        senderFrame,
+        // The check #313's direction 2 would make as the call arrives: is the
+        // calling frame the webContents' current main frame?
+        fromMainFrameAtArrival: sameFrame(senderFrame, mainFrame),
         processId: event.processId,
         frameId: event.frameId,
       });
@@ -265,6 +295,11 @@ app.whenReady().then(async () => {
         didFrameNavigateMsAfterDidStartNavigation: stats(pick((n) => n.msFromDidStartNavigation.didFrameNavigate)),
         firstNewCallMsAfterCommit: stats(pick((n) => n.newDocument.firstCallMsAfterCommit)),
         senderFrameDistinguishable: pick((n) => n.senderFrame.distinguishable),
+        oldFrameIsMainFrameAtDidStartNavigation: pick((n) => n.senderFrame.oldFrameIsMainFrameAtDidStartNavigation),
+        oldFrameIsMainFrameAtDidFrameNavigate: pick((n) => n.senderFrame.oldFrameIsMainFrameAtDidFrameNavigate),
+        arrivalMainFrameCheck: Object.fromEntries(
+          Object.keys(navigations[0]?.arrivalMainFrameCheck ?? {}).map((key) => [key, navigations.reduce((sum, n) => sum + n.arrivalMainFrameCheck[key], 0)]),
+        ),
         orders: [...new Set(navigations.map((n) => n.order.join(' > ')))],
       },
       perNavigation: navigations,

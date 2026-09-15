@@ -50,7 +50,15 @@ invoke arrived. It reports, per navigation and summarised:
   (`did-frame-navigate` for the main frame, then `did-navigate`);
 - how long after the commit the new document's first call arrived;
 - whether the old and new documents' `senderFrame` identities differ, and the
-  main frame's identity at `did-start-navigation` and at `did-frame-navigate`.
+  main frame's identity at `did-start-navigation` and at `did-frame-navigate`;
+- whether the old document's frame was `webContents.mainFrame` at each of those
+  two events;
+- `arrivalMainFrameCheck`: for each invoke, whether `event.senderFrame` was
+  `event.sender.mainFrame` (same `frameToken` and `processId`) when the call
+  arrived, counted for the old document after `did-start-navigation`, after the
+  commit, and for the new document. `wouldRefuse` is how many calls a handler
+  refusing any call whose frame is not the current main frame would have
+  refused.
 
 A payload carries a document id, a sequence number, an event kind and a clock
 reading. Nothing else.

@@ -218,7 +218,7 @@ section 5:
 ## 5. A hidden worker in a real Electron 44 (BN3)
 
 Build unit BN3 ran real Electron probes for the behaviour the worker host (S5),
-the power clock, the #313 fix and S7c rest on. Nothing under `apps/*/src` or
+the power clock, the change #313 asks for, and S7c rest on. Nothing under `apps/*/src` or
 `src/` changed.
 
 - **Measured on:** 2026-09-14, 23:01 to 23:12 PDT (smoke runs from 22:54), at
@@ -610,6 +610,22 @@ document id:
 Each trigger ran five navigations, with the new document's response held back 0
 or 500 ms, in its own Electron, with 1-minute load 5.3 to 7.5.
 
+**The rerun.** After review, the probe also compared each call's `senderFrame`
+with `event.sender.mainFrame` as the call arrived. All eight scenarios were run
+again, 40 navigations:
+
+- 2026-09-14, 23:30 to 23:31 PDT, on top of `00e8fea`;
+- Electron 44.0.0, 1-minute load 1.7 to 2.4;
+- the runner exited 0.
+
+Figures marked "in the rerun" come from it. The rest, and the table, are from
+the first run. The rerun agreed with the first run on four points:
+
+- the same event order, in 40 of 40;
+- no old-document call after the commit;
+- the old document's last call 0.7 to 3.5 ms before the commit;
+- the new document's first call 1.0 ms or more after it.
+
 Event names were checked first against Electron's docs: ctx7 `/electron/electron`
 and the installed `electron.d.ts`.
 
@@ -661,6 +677,12 @@ Milliseconds are median (range) over five navigations. "dsn" is
 - Its `frameToken` and `routingId` differed between the old and the new
   document, in the same renderer process.
 - `webContents.mainFrame` changed identity at `did-frame-navigate`.
+- In the rerun, the old document's frame was `webContents.mainFrame` at
+  `did-start-navigation` in 40 of 40, and at `did-frame-navigate` in 0 of 40.
+- In the rerun, each call's `senderFrame` was compared with
+  `event.sender.mainFrame` (same `frameToken` and `processId`) as it arrived.
+  All 2681 old-document calls that arrived after `did-start-navigation` came
+  from the current main frame, and so did all 7215 new-document calls.
 
 **NOT MEASURED:**
 
@@ -693,13 +715,29 @@ Consequences:
   - The new document's first call came 0.9 ms or more after it.
   - A teardown on the main frame's `did-frame-navigate`, or on `did-navigate`
     0.1 ms later, falls between the two.
-- **#313, direction 2 (a per-document id):** main already has one without the
-  renderer's help.
+- **#313, direction 2 (a per-document id):** main has one without the
+  renderer's help, but **not as a check made when a call arrives.**
   - `event.senderFrame.frameToken` (with `processId`) differed between old and
     new documents in 40 of 40, and the main frame's token changed at commit.
-  - A handler can refuse a call whose `senderFrame` is not the current
-    `webContents.mainFrame`.
-  - **INFERENCE:** that holds when Chromium gives every cross-document
+  - The old document **is** `webContents.mainFrame` for the whole gap. The main
+    frame changes only at `did-frame-navigate`, and no old-document call arrived
+    after that.
+  - So a handler that refuses a call whose `senderFrame` is not the current
+    `webContents.mainFrame` refuses nothing. Measured in the rerun, it would
+    have refused **0** calls: not one of the 2681 old-document calls in the
+    gap, and not one of the 7215 new-document calls. A first decode of a
+    brand-new turn sent in the gap passes it, and the orphan turn keeps the
+    slot. A change built on that check leaves the gap in #313 open.
+  - The frame identity is useful only as a key for direction 1:
+    - tag each admitted turn with its `senderFrame`'s `frameToken` and
+      `processId` when it is admitted;
+    - at the main frame's `did-frame-navigate`, end every turn of that window
+      whose frame is no longer `webContents.mainFrame`.
+
+    That is direction 1 keyed by frame, not a separate fix. On this evidence it
+    ends the same turns as a plain second teardown at that event, because no
+    new-document call came before it.
+  - **INFERENCE:** the frame key holds when Chromium gives every cross-document
     navigation a new frame host, as it did here within one process. A
     process-changing navigation was not run.
 - **S7c:** none.
