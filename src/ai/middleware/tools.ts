@@ -311,6 +311,87 @@ const CALL_SHAPES: readonly {
 /** A call with nothing inside it at all: `<tool_call></tool_call>`, or `[TOOL_CALLS] name()`. */
 const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/gi;
 
+/** Where a Qwen3-Coder call may start: a `<tool_call>` with `<function=` after it. See {@link xmlCallEnd}. */
+export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
+
+/**
+ * Where a Qwen3-Coder call starting at `at` ends, just past its `</tool_call>`;
+ * `'open'` when the text ends inside one; -1 when what is there is not one.
+ *
+ *     <tool_call>
+ *     <function=NAME>
+ *     <parameter=KEY>
+ *     VALUE
+ *     </parameter>
+ *     </function>
+ *     </tool_call>
+ *
+ * Nothing runs from this form: its body is not JSON. It is still the model's
+ * call, and the lazy pattern `stripToolSyntax` replaced took it out; after that
+ * the call, parameter values included, was kept as the reply's words and sent
+ * back to the model.
+ *
+ * READ BY ITS STRUCTURE, as a JSON call is by its brackets: these tags in this
+ * order, with nothing but whitespace between them outside a parameter's value.
+ * A lazy match from `<tool_call>` to `</tool_call>` takes every word of a
+ * sentence that names both, and prose naming this form's tags stops matching
+ * the structure as soon as it goes on.
+ */
+export function xmlCallEnd(text: string, at: number): number | 'open' {
+  let pos = at;
+  /** Read `word` here, in any case: true; `'open'` when the text ends partway through it; or false. */
+  const read = (word: string): boolean | 'open' => {
+    const piece = text.slice(pos, pos + word.length).toLowerCase();
+    if (piece === word) {
+      pos += word.length;
+      return true;
+    }
+    return pos + piece.length === text.length && word.startsWith(piece) ? 'open' : false;
+  };
+  /** Read `NAME>`: a name with no space or angle bracket in it, and the `>` after it. */
+  const readName = (): boolean | 'open' => {
+    const name = /^[^\s<>]*/.exec(text.slice(pos))?.[0] ?? '';
+    pos += name.length;
+    if (pos === text.length) return 'open';
+    if (name === '' || text.charAt(pos) !== '>') return false;
+    pos += 1;
+    return true;
+  };
+  const skipSpace = (): void => {
+    while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
+  };
+  const notACall = (step: boolean | 'open'): number | 'open' => (step === 'open' ? 'open' : -1);
+
+  let step = read('<tool_call>');
+  if (step !== true) return notACall(step);
+  skipSpace();
+  step = read('<function=');
+  if (step !== true) return notACall(step);
+  step = readName();
+  if (step !== true) return notACall(step);
+  for (;;) {
+    skipSpace();
+    if (pos === text.length) return 'open';
+    step = read('<parameter=');
+    if (step === 'open') return 'open';
+    if (step === true) {
+      step = readName();
+      if (step !== true) return notACall(step);
+      const close = text.toLowerCase().indexOf('</parameter>', pos);
+      // Its value runs to the end of the text: the call is still being written.
+      if (close === -1) return 'open';
+      pos = close + '</parameter>'.length;
+      continue;
+    }
+    step = read('</function>');
+    if (step !== true) return notACall(step);
+    skipSpace();
+    step = read('</tool_call>');
+    if (step !== true) return notACall(step);
+    return pos;
+  }
+}
+
 /**
  * Strip recognised tool-call syntax so the user never sees the plumbing.
  *
@@ -326,9 +407,10 @@ const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/
  *
  * Now a `<tool_call>` or `[TOOL_CALLS] name(` is stripped only when JSON opens
  * right after it, and only through that JSON's closing bracket — read past any
- * bracket inside a string — and the tag or paren that closes the call. An
- * unfinished call has no end, and is left for the caller: see
- * `wordsWithoutCalls` in `state/chat.ts`.
+ * bracket inside a string — and the tag or paren that closes the call. A
+ * `<tool_call>` whose body is Qwen3-Coder's XML is stripped only when it is
+ * whole, by its structure: see {@link xmlCallEnd}. An unfinished call has no
+ * end, and is left for the caller: see `wordsWithoutCalls` in `state/chat.ts`.
  *
  * `offered` is what the turn's request offered, as {@link callNames} gives it.
  * A fenced block is stripped only when it names one of those — the call
@@ -361,6 +443,10 @@ export function stripToolSyntax(
     }
   }
   for (const match of text.matchAll(EMPTY_CALL)) spans.push([match.index, match.index + match[0].length]);
+  for (const match of text.matchAll(XML_CALL_OPENING)) {
+    const end = xmlCallEnd(text, match.index);
+    if (end !== 'open' && end !== -1) spans.push([match.index, end]);
+  }
 
   spans.sort((a, b) => a[0] - b[0]);
   let out = '';

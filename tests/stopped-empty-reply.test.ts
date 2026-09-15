@@ -2134,3 +2134,60 @@ describe('a call written with one closing brace too many', () => {
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
+
+/* ── Round 2: a <tool_call> whose body is Qwen3-Coder's XML ─────────── */
+
+describe('a Qwen3-Coder <tool_call> with an XML body', () => {
+  const XML_CALL = '<tool_call>\n<function=leaky>\n<parameter=path>\ncanary-7f3a\n</parameter>\n</function>\n</tool_call>';
+
+  it('after words: a finished reply stores and sends back none of it', async () => {
+    const id = 'r2_xml_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me check.\n${XML_CALL}`, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.content, 'the stored reply').toBe('Let me check.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped inside a parameter: keeps only the words before it', async () => {
+    const id = 'r2_xml_stopped';
+    const partial = 'Let me check.\n<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me check.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('keeps prose that names the XML form’s tags, stopped or finished', async () => {
+    const id = 'r2_xml_prose';
+    const partial =
+      'Qwen3-Coder opens a call with `<tool_call><function=name>` and closes it with `</function></tool_call>`, and the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('how does qwen3-coder mark a call?', 'the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});

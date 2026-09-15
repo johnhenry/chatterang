@@ -223,6 +223,19 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(prose)).toBe(prose);
   });
 
+  it('strips a Qwen3-Coder call whose body is XML, and keeps prose naming its tags', () => {
+    const call = '<tool_call>\n<function=calculate>\n<parameter=expression>\n2+2\n</parameter>\n</function>\n</tool_call>';
+    expect(stripToolSyntax(`Checking.\n${call}\nDone.`)).toBe('Checking.\n\nDone.');
+    expect(stripToolSyntax('<tool_call><function=now></function></tool_call>')).toBe('');
+    const prose = 'It opens with `<tool_call><function=name>` and ends with `</function></tool_call>`, and the app reads it.';
+    expect(stripToolSyntax(prose)).toBe(prose);
+    const unfinished = 'Checking.\n<tool_call>\n<function=calculate>\n<parameter=expression>\n2+';
+    expect(stripToolSyntax(unfinished), 'an unfinished one is the caller’s to cut').toBe(unfinished);
+    expect(stripToolSyntax(`Qwen3-Coder writes ${call}`, { offered: [] }), 'in a turn that offered nothing').toBe(
+      `Qwen3-Coder writes ${call}`,
+    );
+  });
+
   it('leaves an unfinished call alone, for the caller to cut', () => {
     const text = 'Reading.\n<tool_call>{"name":"leaky","arguments":{"path":"x';
     expect(stripToolSyntax(text)).toBe(text);

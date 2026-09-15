@@ -61,7 +61,7 @@ import type {
   ExecutedTool,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import { callNames, stripToolSyntax } from '@/ai/middleware/tools';
+import { callNames, stripToolSyntax, xmlCallEnd } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1443,7 +1443,7 @@ const CALL_OPENED_AT_END = /<tool_call>\s*\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$/
  * The quote is spelled `\x22`: the source scans in tests/support/source-scan.ts
  * read a bare one in a regex literal as the start of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -1492,6 +1492,13 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
     const open = match.index + match[0].length;
+    if (text.startsWith('<', open)) {
+      // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
+      const end = xmlCallEnd(text, match.index);
+      if (end === 'open') return match.index;
+      if (end !== -1) from = end;
+      continue;
+    }
     const close = endOfObject(text, open);
     if (close === -1) return match.index;
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
