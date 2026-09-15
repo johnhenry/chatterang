@@ -66,9 +66,11 @@ import {
 } from '@/ai/context';
 import {
   installConnectionSwitchedOn,
+  installConnectionSwitchingOn,
   installEgressRevoker,
   installMcpGrantRevoker,
   installMcpServerSwitchedOn,
+  installMcpServerSwitchingOn,
   installMcpToolPruner,
   useApp,
 } from '@/state/app';
@@ -224,6 +226,96 @@ function beginAtLaunch(
 /** End every launch withdrawal of `id`: it has been switched on. */
 function switchedOn(under: Map<string, (() => void)[]>, id: string): void {
   for (const end of [...(under.get(id) ?? [])]) end();
+}
+
+/**
+ * The grants `load` read from disk naming a connection or server that was not
+ * there as granted, by chat, from the moment the write that drops them is queued
+ * until it has landed. A write that failed leaves its entry, marked.
+ *
+ * The store never holds them, so nothing in this session honours them. The table
+ * does until that write lands, and a write can fail — a full disk. A connection
+ * switched on with one still there was on at the next launch, which honoured
+ * the grant, unasked. So switching a connection or server on waits for these,
+ * and makes a failed one again first (`afterStaleGrantsGo`).
+ */
+interface StaleOnDisk {
+  readonly grants: ReadonlySet<EgressGrant>;
+  /** Settles once the write has, however it did. */
+  settled: Promise<void>;
+  failed: boolean;
+  error: unknown;
+}
+
+const staleOnDisk = new Map<string, StaleOnDisk>();
+
+/**
+ * The chat list reads not yet judged: from before `load` makes its reads until it
+ * has queued the writes that drop what it found. A connection read off beside
+ * the list may have grants on disk that nothing has noted yet, so a switch-on
+ * waits for these first (`afterStaleGrantsGo`).
+ */
+const launchReads = new Set<Promise<void>>();
+
+/**
+ * Queue the write that drops `grants`, read from disk by `load`, from one chat:
+ * in the chat's turn, as a function of the chat as it stands when written. It
+ * drops those grant objects and nothing else, so a grant given since is never
+ * touched. The store already holds the chat without them, so it is written even
+ * when there is nothing left to drop. Not activity in the conversation.
+ */
+function writeStaleAway(get: () => ChatState, chatId: string, grants: ReadonlySet<EgressGrant>): Promise<void> {
+  const entry: StaleOnDisk = { grants, settled: Promise.resolve(), failed: false, error: undefined };
+  staleOnDisk.set(chatId, entry);
+  const writing = get().updateChat(chatId, (current) => ({
+    egressGrants: (current.egressGrants ?? []).filter((grant) => !grants.has(grant)),
+    updatedAt: current.updatedAt,
+  }));
+  entry.settled = writing.then(
+    // Written — or nothing to write, which is only once the chat's delete has
+    // landed and taken the row with it.
+    () => {
+      if (staleOnDisk.get(chatId) === entry) staleOnDisk.delete(chatId);
+    },
+    (error: unknown) => {
+      entry.failed = true;
+      entry.error = error;
+    },
+  );
+  return writing;
+}
+
+/**
+ * Make `write` — the write that switches a connection or MCP server on, on disk
+ * — once no grant `load` read from disk that `names` matches is left there, in
+ * the step it finds none. See `connectionSwitchingOn` in state/app.ts.
+ *
+ * Waits for a chat list still being judged, then for each write dropping such a
+ * grant. One that failed is made again, once; when that fails too this rejects
+ * with its error and `write` is not made, so the connection or server stays off
+ * and the next launch withdraws the grant again. FAILS CLOSED: a switch-on
+ * waits as long as those writes do.
+ */
+async function afterStaleGrantsGo(names: (grant: EgressGrant) => boolean, write: () => Promise<void>): Promise<void> {
+  let madeAgain = false;
+  for (;;) {
+    if (launchReads.size > 0) {
+      await Promise.all(launchReads);
+      continue;
+    }
+    const left = [...staleOnDisk].filter(([, entry]) => [...entry.grants].some(names));
+    if (left.length === 0) return write();
+    const underWay = left.filter(([, entry]) => !entry.failed);
+    if (underWay.length > 0) {
+      await Promise.all(underWay.map(([, entry]) => entry.settled));
+      continue;
+    }
+    if (madeAgain) throw left[0]![1].error;
+    madeAgain = true;
+    for (const [chatId, entry] of left) {
+      void writeStaleAway(() => useChats.getState(), chatId, entry.grants).catch(() => {});
+    }
+  }
 }
 
 /**
@@ -600,87 +692,95 @@ export const useChats = create<ChatState>((set, get) => ({
   draftDiscards: 0,
 
   async load() {
-    const [stored, connections, servers] = await Promise.all([
-      db.chats.orderBy('updatedAt').reverse().toArray(),
-      // Read beside the list, so its grants are judged against what was on disk
-      // with them. See `grantsThatStand`.
-      db.connections.toArray(),
-      db.mcpServers.toArray(),
-    ]);
-    // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
-    // the engine is, before this read lands, and ⌘N there starts a chat. A read
-    // taken before that chat was written replaced the store without it, and the
-    // screen was left on a thread nothing could be sent to. What the store holds
-    // was written to the table before it was set, so it is never older than the
-    // read; a chat being deleted is left out, or the read would bring it back.
-    const held = get().chats;
-    const known = new Set(held.map((chat) => chat.id));
-    const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
-    // Without what was withdrawn before this could see it, in the store from
-    // the first moment it holds these chats. See `beforeTheList`.
-    const stripped = unseen.map(withdrawnBeforeTheList);
-    beforeTheList.connections.clear();
-    beforeTheList.servers.clear();
-    beforeTheList.toolPrefixes.clear();
-    // Grants on disk naming a connection or server that is not there as it was
-    // granted, as read. Counted as being withdrawn before the store holds the
-    // chats, as a revocation counts before it reads, so a yes given to one of
-    // those destinations while they go goes with them — until it is switched on
-    // again. See `grantsThatStand` and `launchWithdrawals`.
-    const standing = grantsThatStand(connections, servers, unseen);
-    const stale = new Set(
-      unseen.flatMap((chat) => (chat.egressGrants ?? []).filter((grant) => !standing.stands(grant))),
-    );
-    const finishes = [
-      ...[...standing.connections].map((id) => beginAtLaunch(launchWithdrawals.connections, providerWithdrawals, id)),
-      ...[...standing.servers].map((id) => beginAtLaunch(launchWithdrawals.servers, mcpWithdrawals, id)),
-    ];
-    // NOR DOES THE STORE EVER HOLD THEM. Held until their write landed, a grant
-    // whose connection was switched back on meanwhile was honoured once the
-    // switch had ended the withdrawal. Only the grants read are left out: a
-    // grant given since is another object.
-    const withoutStale = (chat: Chat): Chat => {
-      const grants = chat.egressGrants ?? [];
-      const egressGrants = grants.filter((grant) => !stale.has(grant));
-      return egressGrants.length === grants.length ? chat : { ...chat, egressGrants };
-    };
-    set({
-      loaded: true,
-      chats: sortChats([...held, ...unseen.map((chat, at) => withoutStale(stripped[at] ?? chat))]),
-    });
-    // And on disk, in each chat's turn.
-    const rewritten = stripped.flatMap((chat) =>
-      chat
-        ? [
-            writeInTurn(chat.id, async () => {
-              const current = get().chats.find((entry) => entry.id === chat.id);
-              if (current) await db.chats.put(current);
-            }),
-          ]
-        : [],
-    );
-    // And on disk: queued in the step the store took the chats, each a function
-    // of the chat as it stands when written. It drops the grants read and
-    // nothing else, so one given since is never touched; the store already
-    // holds the chat without them, so it is written even when there is nothing
-    // left to drop. Not activity in the conversation.
-    //
-    // The withdrawals end once EVERY write has settled. Ended at the first that
-    // failed, a yes given to a connection still off, in a chat whose write was
-    // still queued, was kept.
-    const withdrawn = Promise.allSettled(
-      unseen
-        .filter((chat) => (chat.egressGrants ?? []).some((grant) => stale.has(grant)))
-        .map((chat) =>
-          get().updateChat(chat.id, (current) => ({
-            egressGrants: (current.egressGrants ?? []).filter((grant) => !stale.has(grant)),
-            updatedAt: current.updatedAt,
-          })),
-        ),
-    ).then((settled) => {
-      for (const finish of finishes) finish();
-      for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
-    });
+    // Noted BEFORE the reads are made, and until what they found has been
+    // queued to be written: a connection switched on meanwhile waits, since it
+    // may have been read off beside the list. See `launchReads`.
+    let judged = (): void => {};
+    const judging = new Promise<void>((resolve) => (judged = resolve));
+    launchReads.add(judging);
+    let rewritten: Promise<void>[] = [];
+    let withdrawn: Promise<void> = Promise.resolve();
+    try {
+      const [stored, connections, servers] = await Promise.all([
+        db.chats.orderBy('updatedAt').reverse().toArray(),
+        // Read beside the list, so its grants are judged against what was on disk
+        // with them. See `grantsThatStand`.
+        db.connections.toArray(),
+        db.mcpServers.toArray(),
+      ]);
+      // MERGED INTO THE STORE, NOT PUT IN PLACE OF IT. The chat screen is up once
+      // the engine is, before this read lands, and ⌘N there starts a chat. A read
+      // taken before that chat was written replaced the store without it, and the
+      // screen was left on a thread nothing could be sent to. What the store holds
+      // was written to the table before it was set, so it is never older than the
+      // read; a chat being deleted is left out, or the read would bring it back.
+      const held = get().chats;
+      const known = new Set(held.map((chat) => chat.id));
+      const unseen = stored.filter((chat) => !known.has(chat.id) && !removedChats.has(chat.id));
+      // Without what was withdrawn before this could see it, in the store from
+      // the first moment it holds these chats. See `beforeTheList`.
+      const stripped = unseen.map(withdrawnBeforeTheList);
+      beforeTheList.connections.clear();
+      beforeTheList.servers.clear();
+      beforeTheList.toolPrefixes.clear();
+      // Grants on disk naming a connection or server that is not there as it was
+      // granted, as read. Counted as being withdrawn before the store holds the
+      // chats, as a revocation counts before it reads, so a yes given to one of
+      // those destinations while they go goes with them — until it is switched on
+      // again. See `grantsThatStand` and `launchWithdrawals`.
+      const standing = grantsThatStand(connections, servers, unseen);
+      const stale = new Set(
+        unseen.flatMap((chat) => (chat.egressGrants ?? []).filter((grant) => !standing.stands(grant))),
+      );
+      const finishes = [
+        ...[...standing.connections].map((id) => beginAtLaunch(launchWithdrawals.connections, providerWithdrawals, id)),
+        ...[...standing.servers].map((id) => beginAtLaunch(launchWithdrawals.servers, mcpWithdrawals, id)),
+      ];
+      // NOR DOES THE STORE EVER HOLD THEM. Held until their write landed, a grant
+      // whose connection was switched back on meanwhile was honoured once the
+      // switch had ended the withdrawal. Only the grants read are left out: a
+      // grant given since is another object.
+      const withoutStale = (chat: Chat): Chat => {
+        const grants = chat.egressGrants ?? [];
+        const egressGrants = grants.filter((grant) => !stale.has(grant));
+        return egressGrants.length === grants.length ? chat : { ...chat, egressGrants };
+      };
+      set({
+        loaded: true,
+        chats: sortChats([...held, ...unseen.map((chat, at) => withoutStale(stripped[at] ?? chat))]),
+      });
+      // And on disk, in each chat's turn.
+      rewritten = stripped.flatMap((chat) =>
+        chat
+          ? [
+              writeInTurn(chat.id, async () => {
+                const current = get().chats.find((entry) => entry.id === chat.id);
+                if (current) await db.chats.put(current);
+              }),
+            ]
+          : [],
+      );
+      // And on disk, queued in the step the store took the chats, and noted until
+      // each has landed: a connection or server is not switched on while one
+      // naming it is still to land, and one that failed is made again first. See
+      // `writeStaleAway` and `afterStaleGrantsGo`.
+      //
+      // The withdrawals end once EVERY write has settled. Ended at the first that
+      // failed, a yes given to a connection still off, in a chat whose write was
+      // still queued, was kept.
+      withdrawn = Promise.allSettled(
+        unseen.flatMap((chat) => {
+          const grants = new Set((chat.egressGrants ?? []).filter((grant) => stale.has(grant)));
+          return grants.size > 0 ? [writeStaleAway(get, chat.id, grants)] : [];
+        }),
+      ).then((settled) => {
+        for (const finish of finishes) finish();
+        for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
+      });
+    } finally {
+      launchReads.delete(judging);
+      judged();
+    }
     // And the attachment payloads no message names. See `sweepOrphanBlobs`.
     await Promise.all([...rewritten, withdrawn, sweepOrphanBlobs()]);
   },
@@ -2241,6 +2341,12 @@ installMcpGrantRevoker(async (serverId) => {
 // the grants on disk that named it. See `launchWithdrawals`.
 installConnectionSwitchedOn((connectionId) => switchedOn(launchWithdrawals.connections, connectionId));
 installMcpServerSwitchedOn((serverId) => switchedOn(launchWithdrawals.servers, serverId));
+installConnectionSwitchingOn((connectionId, write) =>
+  afterStaleGrantsGo((grant) => grant.kind !== 'mcp' && grant.connectionId === connectionId, write),
+);
+installMcpServerSwitchingOn((serverId, write) =>
+  afterStaleGrantsGo((grant) => grant.kind === 'mcp' && grant.serverId === serverId, write),
+);
 
 // Registered at module load for the same reason. An MCP tool id is
 // `mcp:<server name>.<tool>` (src/ai/mcp/tools.ts), so a server's tools are

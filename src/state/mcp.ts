@@ -46,6 +46,10 @@ async function noticeMcpServerSwitchedOn(serverId: string): Promise<void> {
   (await import('@/state/app')).noticeMcpServerSwitchedOn(serverId);
 }
 
+async function switchMcpServerOn(serverId: string, write: () => Promise<void>): Promise<void> {
+  await (await import('@/state/app')).switchMcpServerOn(serverId, write);
+}
+
 interface McpState {
   servers: McpServerConfig[];
   states: Record<string, McpServerState>;
@@ -136,7 +140,12 @@ export const useMcp = create<McpState>((set, get) => ({
   // reconnect still runs if that write fails, because it is what unregisters
   // the tools.
   async toggle(id, enabled) {
-    await db.mcpServers.update(id, { enabled });
+    const write = async (): Promise<void> => {
+      await db.mcpServers.update(id, { enabled });
+    };
+    // Switched on only once no grant a launch read from disk naming it off is
+    // left there, as a connection is (`toggleConnection`).
+    await (enabled ? switchMcpServerOn(id, write) : write());
     set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
     try {
       // Switched on: a launch still withdrawing the grants on disk that named it
