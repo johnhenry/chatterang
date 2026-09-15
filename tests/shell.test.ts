@@ -802,7 +802,7 @@ describe('chat open is gated like every other mutation', () => {
     // on a command declared `mutating: true`.
     expect(result.exitCode).toBe(130);
     expect(result.stderr).toContain('cancelled');
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('open the conversation'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('open the conversation'), undefined);
     expect(open).not.toHaveBeenCalled();
   });
 
@@ -910,7 +910,7 @@ describe('the confirmation gate', () => {
     const confirm = vi.fn(async () => true);
     const result = await shell('model', confirm).exec('model use qwen');
 
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'), undefined);
     expect(result.exitCode).toBe(0);
   });
 
@@ -934,13 +934,13 @@ describe('the confirmation gate', () => {
     const confirm = vi.fn(async () => true);
     await shell('user', confirm).exec('model install gemma-vision');
     // `model` is marked `network` because installing downloads from Hugging Face.
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Hugging Face'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Hugging Face'), undefined);
   });
 
   it('asks before enabling a provider, and says what that means', async () => {
     const confirm = vi.fn(async () => true);
     await shell('model', confirm).exec('provider enable conn_1');
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('leave this device'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('leave this device'), undefined);
   });
 });
 
@@ -1284,7 +1284,7 @@ describe('model use, for a model that cannot answer a chat', () => {
     const result = await exec;
 
     expect(result.exitCode).toBe(0);
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('switch the active model'), undefined);
     expect(setActive).toHaveBeenCalledWith('qwen');
   });
 });
@@ -1427,7 +1427,7 @@ describe('the mount command', () => {
     const confirm = vi.fn(async () => false);
     const { result } = await run('mount add', mountStores([], { grant }), 'model', confirm);
 
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('folder chooser'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('folder chooser'), undefined);
     expect(grant).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(130);
   });
@@ -1471,7 +1471,7 @@ describe('the mount command', () => {
     const revoke = vi.fn(async () => true);
     const confirm = vi.fn(async () => false);
     const { result } = await run('mount rm notes', mountStores([NOTES], { revoke }), 'model', confirm);
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('/Users/me/notes'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('/Users/me/notes'), undefined);
     expect(revoke).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(130);
   });

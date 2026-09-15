@@ -18,8 +18,12 @@ export function registerShellTool(): void {
   if (registered) return;
   registered = true;
 
-  // Everything the model asks to change stops at a sheet the user reads.
+  // Everything the model asks to change stops at a sheet the user reads — and
+  // the sheet goes when the turn is stopped, as the tool-output and MCP sheets
+  // already do. Without the signal a Stop left it up, and a later yes ran it.
   toolRegistry.register(
-    createBashTool({ confirm: (action) => useApp.getState().requestApproval(action) }),
+    createBashTool({
+      confirm: (action, signal) => useApp.getState().requestApproval(action, undefined, signal),
+    }),
   );
 }

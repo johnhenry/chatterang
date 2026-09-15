@@ -120,7 +120,12 @@ export interface ShellOptions {
   stores: ShellStores;
   /** Who is driving. The model may not run mutating commands unconfirmed. */
   actor: 'user' | 'model';
-  confirm(action: string): Promise<boolean>;
+  /**
+   * `signal` is the signal of the `exec` whose command asked, so a stopped
+   * turn can take its own question down. See `#invoke` for why it is passed
+   * per command and never kept on the instance.
+   */
+  confirm(action: string, signal?: AbortSignal): Promise<boolean>;
   /**
    * Real folders the user has granted, mounted under `/mnt` (#246).
    *
@@ -176,7 +181,11 @@ interface JustBashModule {
     name: string,
     execute: (
       args: string[],
-      ctx: unknown,
+      /**
+       * Only the field this file reads. `just-bash` passes a
+       * `RuntimeCommandContext`, whose `signal` is the one given to `exec`.
+       */
+      ctx: { readonly signal?: AbortSignal },
     ) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
   ) => unknown;
   getCommandNames: () => string[];
@@ -268,9 +277,13 @@ export class ChatterangShell {
     // `just-bash` hands a command its argv and expects stdout/stderr and an
     // exit code back — the same contract as a real binary, which is why pipes
     // and `&&` work on Chatterang's commands exactly as they do on `grep`.
+    //
+    // The context's `signal` is the one handed to `exec` for this command line
+    // (`RuntimeCommandContext.signal`), and it is what lets Stop reach a
+    // confirm sheet the command is waiting on.
     const customCommands = this.#commands.map((command) =>
-      defineCommand(command.name, async (args) => {
-        const result = await this.#invoke(command, args);
+      defineCommand(command.name, async (args, ctx) => {
+        const result = await this.#invoke(command, args, ctx.signal);
         return {
           stdout: result.stdout,
           stderr: result.stderr ?? '',
@@ -493,9 +506,21 @@ export class ChatterangShell {
    * that touches the network, has to be confirmed. When the model is driving,
    * that confirmation is a sheet the user actually sees.
    */
-  async #invoke(command: ShellCommand, args: readonly string[]): Promise<ShellOutput> {
+  async #invoke(
+    command: ShellCommand,
+    args: readonly string[],
+    signal: AbortSignal | undefined,
+  ): Promise<ShellOutput> {
+    /*
+     * THE SIGNAL TRAVELS WITH THE COMMAND, NEVER ON THE INSTANCE. The model's
+     * shell is built once and cached for the life of the app (`shell/tool.ts`),
+     * so two tool calls can be running on it at once. A "current signal" field
+     * would belong to whichever call started last, and stopping one turn would
+     * leave its own sheet up while taking down the other's.
+     */
     const context: ShellContext = {
       actor: this.#options.actor,
+      signal,
       // What THIS shell resolved, not what the process has been granted. A
       // command describing what the shell can reach must not read the grant
       // registry, which knows nothing about whether this shell was wired to a
@@ -506,7 +531,7 @@ export class ChatterangShell {
         // state changes; only egress is worth interrupting them for. The
         // model has expressed nothing, so everything it asks for is gated.
         if (this.#options.actor === 'user' && !options?.network) return true;
-        return this.#options.confirm(action);
+        return this.#options.confirm(action, signal);
       },
     };
 

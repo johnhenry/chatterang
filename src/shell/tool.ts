@@ -31,8 +31,16 @@ import { mountHostPort, shellMounts } from '@/shell/real-fs';
 import { liveStores } from '@/shell/stores';
 
 export interface BashToolOptions {
-  /** Shown to the user when the model asks to change something. */
-  confirm(action: string): Promise<boolean>;
+  /**
+   * Shown to the user when the model asks to change something.
+   *
+   * `signal` is the signal of the tool call that asked. Stopping the turn must
+   * take the question down and answer it no (#92's ruling, #293 item 4): a
+   * sheet left up after Stop asks about something that can no longer happen,
+   * holds the tool call open until someone answers it, and a yes given to it
+   * would run a change for a turn that is over.
+   */
+  confirm(action: string, signal?: AbortSignal): Promise<boolean>;
 }
 
 export function createBashTool(options: BashToolOptions): ChatterangTool {
