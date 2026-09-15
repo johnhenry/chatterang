@@ -1446,8 +1446,8 @@ function carriesReceipt(variant: MessageVariant): boolean {
  *
  * `offered` is the names a call could give in the request, as `callNames` gives
  * them, which decides whether a fenced JSON block naming a tool is one. Only a
- * block the engine would have run is stripped: a tool DEFINITION, a config
- * file, or an example naming a tool the turn did not offer, is words.
+ * block the engine would have run is stripped: a config file, a data record, or
+ * an example naming a tool the turn did not offer, is words. See `fencedCall`.
  *
  * An unfinished call in a fenced block is not cut: nothing tells it from the
  * start of a JSON example.

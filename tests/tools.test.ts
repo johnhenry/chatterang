@@ -275,14 +275,43 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(call)).toBe('Here.');
   });
 
-  it('reads a fenced block as a call only when it holds a name and its arguments, and nothing else', () => {
+  it('reads a fenced call to an offered tool as a call when it carries keys beyond a name and its arguments, and strips it', () => {
+    const withId = 'Here.\n```json\n{"id": "call_0", "name": "calculate", "arguments": {"expression": "2+2"}}\n```';
+    expect(extractTextualToolCalls(withId).map(({ name, input }) => ({ name, input }))).toEqual([
+      { name: 'calculate', input: { expression: '2+2' } },
+    ]);
+    expect(stripToolSyntax(withId)).toBe('Here.');
+    const byIdWithType = '```json\n{"type": "tool_use", "id": "t1", "tool": "calculator", "input": {"expression": "1"}}\n```';
+    expect(extractTextualToolCalls(byIdWithType).map((found) => found.name)).toEqual(['calculator']);
+    expect(stripToolSyntax(byIdWithType)).toBe('');
+  });
+
+  it('keeps a JSON record whose "name" is no offered tool, whatever keys it holds, and reads no call from it', () => {
     const record = '```json\n{"name": "Alice Chen", "email": "alice@example.com", "age": 34}\n```';
     expect(extractTextualToolCalls(record)).toEqual([]);
     expect(stripToolSyntax(record)).toBe(record);
-    const definition =
+    // Shaped like a call in every key, and still words: its name is no tool the turn offered.
+    const shaped = '```json\n{"id": 7, "name": "Alice Chen", "arguments": {"team": "sales"}}\n```';
+    expect(extractTextualToolCalls(shaped)).toEqual([]);
+    expect(stripToolSyntax(shaped)).toBe(shaped);
+  });
+
+  it('reads a flat tool definition naming an offered tool as a call to it, and a nested one as words', () => {
+    // A CALL. The extractor reads a string `name` as the tool and `parameters` as
+    // its arguments, and a block is a call when that name is a tool the turn
+    // offered, whatever other keys (here `description`) sit beside it. Only a
+    // definition with no string tool, name or function — the nested form, whose
+    // `function` is an object — is not one.
+    const flat =
       '```json\n{"name": "calculate", "description": "Evaluate arithmetic", "parameters": {"type": "object"}}\n```';
-    expect(extractTextualToolCalls(definition)).toEqual([]);
-    expect(stripToolSyntax(definition)).toBe(definition);
+    expect(extractTextualToolCalls(flat).map(({ name, input }) => ({ name, input }))).toEqual([
+      { name: 'calculate', input: { type: 'object' } },
+    ]);
+    expect(stripToolSyntax(flat)).toBe('');
+    const nested =
+      '```json\n{"type": "function", "function": {"name": "calculate", "description": "Evaluate arithmetic"}}\n```';
+    expect(extractTextualToolCalls(nested)).toEqual([]);
+    expect(stripToolSyntax(nested)).toBe(nested);
     const call = '```json\n{"name": "calculate", "parameters": {"expression": "2+2"}}\n```';
     expect(extractTextualToolCalls(call).map((found) => found.name)).toEqual(['calculate']);
     expect(stripToolSyntax(call)).toBe('');

@@ -238,30 +238,30 @@ export function extractTextualToolCalls(text: string, offered: readonly string[]
   return calls;
 }
 
-/** Every key a fenced call is written with: the tool it names, and its arguments. */
-const FENCED_CALL_KEYS: ReadonlySet<string> = new Set(['tool', 'name', 'function', 'arguments', 'parameters', 'input']);
-
 /**
  * The call a fenced JSON block's body names, as `extractTextualToolCalls` reads
- * one: an object holding a `tool`, `name` or `function` that is a string, and
- * nothing but that and its arguments. Undefined for any other body — a tool
- * DEFINITION, whose `function` is an object or which has a `description`, a
- * config file, or a data record.
+ * one: an object whose `tool`, `name` or `function` is a string naming a tool
+ * the turn offered, with its arguments in `arguments`, `parameters` or `input`.
+ * Undefined for any other body — a config file, a data record, an example
+ * naming a tool the turn did not offer, or a nested tool definition, whose
+ * `function` is an object.
  *
- * NOTHING BUT A NAME AND ITS ARGUMENTS. `name` is the commonest key a JSON record
- * has, and any object with a string `name` was a call: a sample user record,
- * `{"name": "Alice Chen", "email": …}`, was run as a call to a tool named
- * "Alice Chen", and the record the person asked for was stripped from the reply
- * — from a stopped one too, which was stored with no words and shown as
- * "Stopped before its first word" when the record was all it wrote.
- *
- * AND ONLY A NAME THE TURN OFFERED, by id or by name (`offered`, as
+ * ONLY A NAME THE TURN OFFERED, by id or by name (`offered`, as
  * {@link callNames} gives it). A tag or `[TOOL_CALLS]` is a model's call markup
  * whatever it names, and is run and refused as a name nothing stands behind; a
- * fenced block is the shape of any JSON example. In a chat whose only tool id
- * named a disconnected server, whose requests offer nothing, a generic example
- * `{"tool": "search", "arguments": …}` was run as a call, and stripped from the
- * reply — finished, stopped or failed.
+ * fenced block is the shape of any JSON example. `name` is the commonest key a
+ * JSON record has: a sample user record, `{"name": "Alice Chen", "email": …}`,
+ * was run as a call to a tool named "Alice Chen" and stripped from the reply,
+ * and in a chat whose only tool id named a disconnected server a generic
+ * example `{"tool": "search", "arguments": …}` was run and stripped the same way.
+ * Neither names an offered tool, so neither is a call.
+ *
+ * WHATEVER OTHER KEYS IT HOLDS (the owner's ruling). A model that writes a call
+ * with an `id` or a `type` beside its name and arguments is still calling the
+ * tool, and requiring nothing but a name and its arguments left such a call
+ * unrun and in the reply. So a FLAT tool definition naming an offered tool,
+ * `{"name": "calculate", "description": …, "parameters": {…}}`, IS a call: its
+ * name is an offered tool, and its `parameters` are read as the arguments.
  */
 function fencedCall(
   body: string,
@@ -277,7 +277,6 @@ function fencedCall(
       input?: unknown;
     } | null;
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
-    if (Object.keys(parsed).some((key) => !FENCED_CALL_KEYS.has(key))) return undefined;
     const name = parsed.tool ?? parsed.name ?? parsed.function;
     if (typeof name !== 'string' || !offered.includes(name)) return undefined;
     const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};

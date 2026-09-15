@@ -1865,7 +1865,11 @@ describe('a JSON record with a "name" key, in a chat with a tool on', () => {
     expect(last.content, 'the words the person watched arrive').toBe(text);
   });
 
-  it('a tool definition naming an offered tool is not run, and stays in a finished reply', async () => {
+  it('a flat tool definition naming an offered tool is read as a call to it, run, and stripped from a finished reply', async () => {
+    // A CALL, by the owner's ruling: a fenced block runs when its name is a tool
+    // the request offered, whatever keys beside it. Its `parameters` are read as
+    // the arguments, as the extractor reads them. A nested definition, whose
+    // `function` is an object, names no tool and is words: see tools.test.ts.
     const id = 'r2_offered_definition';
     given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const text =
@@ -1877,8 +1881,55 @@ describe('a JSON record with a "name" key, in a chat with a tool on', () => {
     await useChats.getState().send('what tools do you have?');
 
     const last = assistantRows(id).at(-1)!;
-    expect(last.toolCalls, 'no tool ran').toBeUndefined();
-    expect(last.content, 'the words the person watched arrive').toBe(text);
+    expect(last.toolCalls?.map((call) => call.name), 'the call ran').toEqual(['calculate']);
+    expect(last.content, 'the stored reply').toBe('My calculator is declared like this:\n\nAnything else?');
+  });
+});
+
+/* ── Round 5: a fenced call to an offered tool may carry more keys ─────── */
+
+describe('a fenced call to an offered tool that carries an "id" key', () => {
+  const ID_CANARY = 'call_canary_5e1d';
+  const FENCED_WITH_ID = `\`\`\`json\n{"id": "${ID_CANARY}", "name": "calculate", "arguments": {"expression": "6*7"}}\n\`\`\``;
+
+  it('runs, and none of it is stored in a finished reply or sent in the next request', async () => {
+    const id = 'r5_fenced_id_finished';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me work it out.\n\n${FENCED_WITH_ID}`, 'It is 42.', 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
+      content: 'Let me work it out.\n\nIt is 42.',
+      stopped: undefined,
+    });
+    expect(local.seen, 'the follow-up and the next turn').toHaveLength(3);
+    expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain(ID_CANARY);
+    expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('```');
+  });
+
+  it('runs, and none of it is stored when the follow-up is stopped', async () => {
+    const id = 'r5_fenced_id_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me work it out.\n\n${FENCED_WITH_ID}` },
+      { partial: 'It is fort', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    await stopAfterSome('what is six times seven?', 'It is fort', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+    expect(stopped.stopped, 'called stopped before its first word').not.toBe(true);
+    expect(stopped.content, 'the stored reply').not.toContain(ID_CANARY);
+    expect(stopped.content, 'the stored reply').not.toContain('```');
+    expect(stopped.content, 'the words the person watched arrive').toMatch(/^Let me work it out\.\s+It is fort$/);
   });
 });
 
