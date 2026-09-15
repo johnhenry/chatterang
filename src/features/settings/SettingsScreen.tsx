@@ -5,6 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { Rail } from '@/ui/Rail';
 import { Confirm, Segmented, SettingRow, Sheet, Slider, Switch } from '@/ui/primitives';
 import { clearAllConversations, eraseEverything } from '@/db';
+import { tellOtherWindows } from '@/lib/other-windows';
 import { formatBytes } from '@/domain/manifest';
 import { osVoicesReady, speak, type VoiceOption } from '@/lib/voice';
 import { useApp, type ThemeChoice, type VoiceMode } from '@/state/app';
@@ -441,12 +442,16 @@ export function SettingsScreen(): ReactNode {
           // chip is left naming a payload the clear takes (owner ruling,
           // 2026-09-14). `App.tsx` unmounts the composer while Settings is open,
           // which lets the draft go already, but that is a matter of layout and
-          // this is the guarantee. It stays discarded if the clear fails. A draft
-          // in another tab of the server profile is that tab's and is not
-          // reached: nothing tells that tab, the clear takes its payloads with
-          // every other, and its chips show nothing until it reloads.
+          // this is the guarantee. It stays discarded if the clear fails.
           useChats.getState().discardDraft();
-          void clearAllConversations().then(() => window.location.reload());
+          void clearAllConversations().then(() => {
+            // And every other tab's, once the clear has landed: the server
+            // profile's tabs share the database, and the clear took the images
+            // their drafts still show. Not before it lands: a clear that fails
+            // takes nothing. See lib/other-windows.ts.
+            tellOtherWindows('conversations-cleared');
+            window.location.reload();
+          });
           setConfirmClearChats(false);
         }}
       />

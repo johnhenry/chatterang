@@ -858,6 +858,62 @@ describe('Settings › delete all conversations', () => {
     expect.soft(chips(), 'no chip left pointing at a payload the delete cleared').toHaveLength(0);
     expect.soft(fake.blobs.size, 'the payloads').toBe(0);
   });
+
+  /*
+   * IN ANOTHER TAB OF THE SERVER PROFILE.
+   *
+   * Every tab of one origin shares one database, and the clear takes every
+   * payload, the images a draft in another tab still shows included. That tab's
+   * store and composer are its own, and nothing reached them: its chips named
+   * payloads that were gone, and its text stayed. So once the clear has landed,
+   * the tab that made it tells the others, and each empties its composer. Not
+   * before it lands: a clear that fails takes nothing.
+   */
+  it('empties the composer of another tab once the clear has landed, and not before', async () => {
+    given('all_elsewhere');
+    await render(createElement(ChatScreen));
+    await type('half a thought');
+    const id = await attach();
+
+    const other = await anotherWindow(async () => ({
+      SettingsScreen: (await import('@/features/settings/SettingsScreen')).SettingsScreen,
+      react: await import('react'),
+      client: await import('react-dom/client'),
+    }));
+    const container = document.createElement('div');
+    document.body.append(container);
+    const otherRoot = other.loaded.client.createRoot(container);
+    try {
+      fake.hold('clearAll');
+      await other.loaded.react.act(async () => {
+        otherRoot.render(other.loaded.react.createElement(other.loaded.SettingsScreen));
+      });
+      const row = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+        (element) => element.textContent?.trim() === 'Delete all conversationsModels and personas are kept.',
+      );
+      if (!row) throw new Error('no “Delete all conversations” row in the other tab');
+      await other.loaded.react.act(async () => row.click());
+      const confirm = buttonNamed('Delete all');
+      if (!confirm) throw new Error('the delete-all sheet did not open in the other tab');
+      await other.loaded.react.act(async () => confirm.click());
+      await until('the tables to be cleared', () => fake.clearAllConversations.mock.calls.length === 1);
+      await act(async () => {
+        for (let turn = 0; turn < 5; turn += 1) await macrotask();
+      });
+      expect(field().value, 'the control: nothing is said while the clear is under way').toBe('half a thought');
+
+      // Settled: the other tab then reloads, which jsdom does not do.
+      fake.release('clearAll');
+      await until('this tab’s composer to be emptied', () => field().value === '' && chips().length === 0);
+    } finally {
+      fake.release('clearAll');
+      await other.loaded.react.act(async () => otherRoot.unmount());
+      container.remove();
+      other.close();
+    }
+
+    expect(fake.blobs.has(id), 'the control: the clear took this tab’s image').toBe(false);
+  });
 });
 
 /* ── A write still waiting to join ───────────────────────────────────── */

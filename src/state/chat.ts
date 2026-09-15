@@ -9,6 +9,7 @@
 import { create } from 'zustand';
 
 import { blobToBase64, deleteBlobs, holdBlobs, sweepOrphanBlobs } from '@/lib/blobs';
+import { onOtherWindows } from '@/lib/other-windows';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
@@ -2367,6 +2368,11 @@ installConnectionSwitchingOn((connectionId, write) =>
 installMcpServerSwitchingOn((serverId, write) =>
   afterStaleGrantsGo((grant) => grant.kind === 'mcp' && grant.serverId === serverId, write),
 );
+
+// Another tab of the server profile deleted every conversation, and with them the
+// payloads of the images this draft shows (owner ruling, 2026-09-14). See
+// lib/other-windows.ts.
+onOtherWindows('conversations-cleared', () => useChats.getState().discardDraft());
 
 // Registered at module load for the same reason. An MCP tool id is
 // `mcp:<server name>.<tool>` (src/ai/mcp/tools.ts), so a server's tools are

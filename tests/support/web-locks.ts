@@ -18,6 +18,8 @@
 
 import { vi } from 'vitest';
 
+import { installedChannels, setBroadcastChannel } from './broadcast-channel';
+
 type Mode = 'exclusive' | 'shared';
 
 interface Entry {
@@ -188,10 +190,11 @@ export function setNavigatorLocks(manager: LockManager | undefined): void {
 
 /**
  * Load modules as a second window of this origin loads them: its own module
- * graph, the same database, and locks of its own. `load` runs with a fresh
- * module registry, while `navigator.locks` reads as the new window's.
- * `close` shuts the window. Pass `{ locks: false }` for a window on an origin
- * with no Web Locks at all.
+ * graph, the same database, and locks and BroadcastChannels of its own. `load`
+ * runs with a fresh module registry, while `navigator.locks` and
+ * `BroadcastChannel` read as the new window's. `close` shuts the window, letting
+ * go of its locks and closing its channels. Pass `{ locks: false }` for a
+ * window on an origin with no Web Locks at all.
  */
 export async function anotherWindow<T>(
   load: () => Promise<T>,
@@ -200,12 +203,22 @@ export async function anotherWindow<T>(
   const all = installedLocks();
   const own = globalThis.navigator.locks;
   const manager = locks ? all.window() : undefined;
+  const channels = installedChannels().window();
+  const ownChannels = (globalThis as { BroadcastChannel?: typeof BroadcastChannel }).BroadcastChannel;
   setNavigatorLocks(manager);
+  setBroadcastChannel(channels.BroadcastChannel);
   try {
     vi.resetModules();
     const loaded = await load();
-    return { loaded, close: () => (manager ? all.close(manager) : undefined) };
+    return {
+      loaded,
+      close: () => {
+        if (manager) all.close(manager);
+        channels.close();
+      },
+    };
   } finally {
     setNavigatorLocks(own);
+    setBroadcastChannel(ownChannels);
   }
 }
