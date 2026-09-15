@@ -128,11 +128,25 @@ export interface TunnelFrameEvent {
 }
 
 /**
+ * Why the PLUGIN ended a connection before it opened, when that was not a host
+ * answering and not a host missing.
+ *
+ * `PEER_MISMATCH`: the TLS handshake completed with a key whose SPKI SHA-256
+ * is not `expectedPeer`, and the plugin aborted before writing the upgrade
+ * request. That is a desktop that reset its identity, or something else
+ * answering at its address. Either way nothing was sent to it, and the screen
+ * that explains it is not the one for a host that is not there.
+ */
+export type TunnelCloseFailure = 'PEER_MISMATCH';
+
+/**
  * The connection is over. EXACTLY ONE per connection `connect` resolved,
  * whether or not it ever opened, and nothing about that connection after it.
  *
  * A refused upgrade, an unreachable host, a failed pin, a cut and a close frame
- * all end here, told apart by the fields below and not by a second event.
+ * all end here, told apart by the fields below and not by a second event: a
+ * status is a host that answered, a `failure` is the plugin refusing the peer,
+ * and neither is a host nobody reached.
  */
 export interface TunnelCloseEvent {
   readonly connectionId: string;
@@ -151,7 +165,30 @@ export interface TunnelCloseEvent {
    * of them looks like a host that is not there.
    */
   readonly httpStatus?: number;
+  /**
+   * Why the plugin itself ended the connection before it opened. Present only
+   * then, with `code` 1006 and no `httpStatus`: the plugin wrote no request, so
+   * nothing answered one. See {@link TunnelCloseFailure}.
+   */
+  readonly failure?: TunnelCloseFailure;
 }
+
+/**
+ * The `code` on a `connect` rejection. A Capacitor plugin rejects with
+ * `call.reject(message, code)` (Android `PluginCall.reject(String, String)`,
+ * iOS `CAPPluginCall.reject(_:_:)`), and that code reaches JavaScript on the
+ * error.
+ *
+ * - `CREDENTIAL_MISSING`: `credentialRef` names nothing in the platform store.
+ *   A phone restored from a backup does this, because an item kept
+ *   this-device-only does not travel. It needs pairing again, which is a
+ *   different screen from "cannot reach".
+ * - `OPTIONS_REFUSED`: any other refusal listed on {@link TunnelSocketPlugin.connect}.
+ *   A bug in the caller, not a fault a person can fix.
+ *
+ * The message is for a log and never carries the credential.
+ */
+export type TunnelConnectRejectionCode = 'CREDENTIAL_MISSING' | 'OPTIONS_REFUSED';
 
 /** The plugin's events, by name. */
 export interface TunnelSocketEvents {
@@ -173,8 +210,15 @@ export interface TunnelSocketPlugin {
    *
    * Rejects, with no socket made and no event to follow, when the options are
    * refused: an unparseable `url`, a credential somewhere unsafe, a `wss:`
-   * credential with no `expectedPeer`, both credential forms at once, or a
-   * `credentialRef` that names nothing. See {@link TunnelConnectOptions}.
+   * credential with no `expectedPeer`, or both credential forms at once
+   * (`OPTIONS_REFUSED`); or a `credentialRef` that names nothing
+   * (`CREDENTIAL_MISSING`). See {@link TunnelConnectOptions} and
+   * {@link TunnelConnectRejectionCode}.
+   *
+   * A REJECTION IS STILL AN ENDING. Because no event follows it, an adapter
+   * from this plugin to the tunnel client's transport must report it as that
+   * transport's one close, with its failure, and never leave the client
+   * waiting for an event that will not come.
    */
   connect(options: TunnelConnectOptions): Promise<{ readonly connectionId: string }>;
 

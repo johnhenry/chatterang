@@ -235,6 +235,11 @@ export interface TunnelTransportTarget {
  *   `httpStatus` only when the server answered the upgrade with a status other
  *   than 101. That status is what tells a refused credential from a host that
  *   is not there.
+ * - EVEN WHEN NO CONNECTION WAS EVER MADE. A transport that failed before any
+ *   host could answer (a pin that did not match, a stored credential that is
+ *   gone, a plugin that refused to start) says so with `failure`, still through
+ *   `onClose`, still once. A transport that says nothing leaves the client
+ *   waiting; one that says only 1006 tells a person to look for a network fault.
  * - No event is delivered from inside the factory call. `createTunnelClient`
  *   registers its listeners after the factory returns, in the same turn.
  * - `send` after the connection has closed writes nothing. `close` is
@@ -248,9 +253,29 @@ export interface TunnelTransport {
   send(bytes: Uint8Array): void;
   onOpen(listener: () => void): void;
   onFrame(listener: (bytes: Uint8Array) => void): void;
-  onClose(listener: (code: number, reason: string, httpStatus?: number) => void): void;
+  onClose(
+    listener: (code: number, reason: string, httpStatus?: number, failure?: TunnelTransportFailure) => void,
+  ): void;
   close(code?: number, reason?: string): void;
 }
+
+/**
+ * Why a transport ended a connection before it opened, when no host answered
+ * and it was not for want of one. Only before open; after it, the close code
+ * decides.
+ *
+ * - `PEER_MISMATCH`: the handshake showed a key other than the paired one, and
+ *   the transport wrote nothing to it.
+ * - `CREDENTIAL_MISSING`: the store a `credentialRef` names holds nothing under
+ *   it, so there was nothing to present.
+ * - `TRANSPORT_FAILED`: the transport would not or could not start at all.
+ *
+ * The socket plugin's `TunnelCloseFailure` and its `connect` rejection codes
+ * map onto these by the same names, with `OPTIONS_REFUSED` as
+ * `TRANSPORT_FAILED`. This file imports nothing from the contract, so the
+ * names are repeated rather than shared.
+ */
+export type TunnelTransportFailure = 'PEER_MISMATCH' | 'CREDENTIAL_MISSING' | 'TRANSPORT_FAILED';
 
 /** Open a connection to `target`. Called once per client, after the credential check. */
 export type TunnelTransportFactory = (target: TunnelTransportTarget) => TunnelTransport;
@@ -310,9 +335,10 @@ export interface TunnelClientOptions {
 /**
  * Why a tunnel never opened.
  *
- * `UNREACHABLE` is the only one that means "not there". The rest are a host
- * that answered the upgrade with an HTTP status, and they need different
- * screens:
+ * `UNREACHABLE` is the only one that means "not there". Each of the rest needs
+ * a different screen.
+ *
+ * A host that answered the upgrade with an HTTP status:
  *
  * - `CREDENTIAL_REFUSED` (401, a credential presented): revoked, or never
  *   issued there. Pair again.
@@ -324,6 +350,17 @@ export interface TunnelClientOptions {
  *   exactly this reason (`packages/tunnel/src/host/index.ts`).
  * - `UPGRADE_REFUSED`: any other status, carried in `httpStatus`.
  *
+ * A transport that stopped before any host could answer
+ * ({@link TunnelTransportFailure}), with no status:
+ *
+ * - `PEER_MISMATCH`: the address answered with a key other than the paired
+ *   desktop's, and nothing was sent to it. A desktop whose identity was reset
+ *   needs pairing again.
+ * - `CREDENTIAL_MISSING`: this device no longer holds its credential. Pair
+ *   again.
+ * - `TRANSPORT_FAILED`: the transport would not start, or named a failure this
+ *   build does not know. Not "cannot reach": nothing says the host is missing.
+ *
  * The `WebSocket` default can only ever say `UNREACHABLE`: a WHATWG socket
  * reports a refused upgrade as `error` then `close` 1006, with no status
  * (measured on Node 24). The status comes from a transport that can see it.
@@ -333,7 +370,10 @@ export type TunnelConnectFault =
   | 'CREDENTIAL_REFUSED'
   | 'PAIRING_NOT_OPEN'
   | 'HOST_COULD_NOT_CHECK'
-  | 'UPGRADE_REFUSED';
+  | 'UPGRADE_REFUSED'
+  | 'PEER_MISMATCH'
+  | 'CREDENTIAL_MISSING'
+  | 'TRANSPORT_FAILED';
 
 export class TunnelConnectError extends Error {
   override readonly name = 'TunnelConnectError';
@@ -378,9 +418,44 @@ function targetOf(options: TunnelClientOptions): TunnelTransportTarget {
   return { url: options.url, ...presented };
 }
 
-/** Why a connection closed before it opened, as a fault a screen can explain. */
-function refusalOfUpgrade(target: TunnelTransportTarget, httpStatus: number | undefined): TunnelConnectError {
+/**
+ * Why a connection closed before it opened, as a fault a screen can explain.
+ *
+ * A FAILURE IS READ BEFORE A STATUS. A transport that refused the peer wrote
+ * no request, so no status can be the host's answer to this device; and a
+ * failed pin reported as "credential refused" would send a person to re-pair
+ * with whatever answered. A failure this build has no name for is
+ * `TRANSPORT_FAILED`: read as `UNREACHABLE`, a newer transport's fault would be
+ * the misdirection these faults exist to end.
+ */
+function refusalBeforeOpen(
+  target: TunnelTransportTarget,
+  httpStatus: number | undefined,
+  failure: TunnelTransportFailure | undefined,
+): TunnelConnectError {
   const { url } = target;
+  if (failure === 'PEER_MISMATCH') {
+    return new TunnelConnectError(
+      'PEER_MISMATCH',
+      `tunnel client: ${url} did not present the key of the desktop this device paired with, so nothing was sent to it. ` +
+        "If that desktop's identity was reset, pair again.",
+      undefined,
+    );
+  }
+  if (failure === 'CREDENTIAL_MISSING') {
+    return new TunnelConnectError(
+      'CREDENTIAL_MISSING',
+      `tunnel client: this device no longer holds the credential it paired with, so nothing was presented to ${url}. Pair again.`,
+      undefined,
+    );
+  }
+  if (failure !== undefined) {
+    return new TunnelConnectError(
+      'TRANSPORT_FAILED',
+      `tunnel client: the transport could not start a connection to ${url}`,
+      undefined,
+    );
+  }
   if (httpStatus === undefined) {
     return new TunnelConnectError('UNREACHABLE', `tunnel client: cannot reach ${url}`, undefined);
   }
@@ -642,7 +717,7 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
     wake?.();
   });
 
-  transport.onClose((code, _reason, httpStatus) => {
+  transport.onClose((code, _reason, httpStatus, failure) => {
     // Exactly one terminal; a second is the transport's bug, not a new ending.
     if (state === 'closed') {
       ignore('close');
@@ -650,19 +725,22 @@ export async function createTunnelClient(options: TunnelClientOptions): Promise<
     }
     state = 'closed';
     /*
-     * CLOSED BEFORE IT OPENED: the host answered the upgrade with a status, or
-     * nothing answered at all. A 401 read as "cannot reach" sends a person
-     * looking for a network fault when their phone has been revoked, and a 503
-     * read as 401 tells a paired phone it was revoked when it was not.
+     * CLOSED BEFORE IT OPENED: the transport refused the peer or could not
+     * start, the host answered the upgrade with a status, or nothing answered
+     * at all. A 401 read as "cannot reach" sends a person looking for a network
+     * fault when their phone has been revoked, a 503 read as 401 tells a paired
+     * phone it was revoked when it was not, and a failed pin read as either
+     * hides that something other than the paired desktop answered.
      */
     if (!opened) {
-      const refusal = refusalOfUpgrade(target, httpStatus);
+      const refusal = refusalBeforeOpen(target, httpStatus, failure);
       finish({ kind: 'abnormal', code: refusal.code, message: refusal.message });
       refuse(refusal);
       return;
     }
-    // Open, a status means nothing: the upgrade already succeeded. The close
-    // code decides, and the latch holds any earlier answer (`bye`, a fault).
+    // Open, a status or a failure means nothing: the upgrade already succeeded.
+    // The close code decides, and the latch holds any earlier answer (`bye`, a
+    // fault).
     finish(closeOf(code));
   });
 

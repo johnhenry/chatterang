@@ -180,8 +180,14 @@ faults run over it unchanged. The plugin's contract is
 imported by `client/`. A connection that closes before it opens rejects with a
 `TunnelConnectError`: `CREDENTIAL_REFUSED` (401 with a credential),
 `PAIRING_NOT_OPEN` (401 without one), `HOST_COULD_NOT_CHECK` (503),
-`UPGRADE_REFUSED` (any other status) or `UNREACHABLE`. The `WebSocket` default
-can only say `UNREACHABLE`, because a WHATWG socket hides the status.
+`UPGRADE_REFUSED` (any other status) or `UNREACHABLE`. A transport that stopped
+before any host could answer says why, and that reads first: `PEER_MISMATCH`
+(the handshake showed a key other than the paired desktop's, and nothing was
+sent), `CREDENTIAL_MISSING` (the stored credential a `credentialRef` names is
+gone) or `TRANSPORT_FAILED` (it would not start). A socket plugin's rejected
+`connect` is still the transport's one close; its adapter reports it with that
+failure. The `WebSocket` default can only say `UNREACHABLE`, because a WHATWG
+socket hides the status.
 
 ## The TLS identity (#179, #180)
 
