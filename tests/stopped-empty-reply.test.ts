@@ -2516,3 +2516,160 @@ describe('a finished tool turn whose calling round ended inside a second call', 
     expect(ran.thinking, 'the reasoning').toContain('A call opens');
   });
 });
+
+/* ── Round 3: a stopped or failed turn read round by round ──────────── */
+
+describe('a stopped follow-up after a calling round that ended inside a second call', () => {
+  for (const [form, tail] of [
+    ['half-written', HALF_CALL],
+    ['with no closing tag', UNTAGGED_CALL],
+  ] as const) {
+    it(`${form}: keeps both rounds’ words, and stores and sends none of the call`, async () => {
+      const id = `r3_round_stopped_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([
+        { reply: roundEndingIn(tail) },
+        { partial: 'They mention a pass', stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      engineWith(local);
+
+      let stopped: Message | undefined;
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(stopped?.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Reading both.\n\nThey mention a pass',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps the calling round’s words written after a call with a closing brace too few', async () => {
+    const id = 'r3_round_stopped_short_brace_words';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me look.\n${SHORT_BRACE}\nI have asked for your notes.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(
+      'Let me look.\n\nI have asked for your notes.\nThey mention a pass',
+    );
+  });
+
+  it('keeps the calling round’s words when its reasoning named a call it did not finish', async () => {
+    const id = 'r3_round_stopped_reasoning_names_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `<think>A call opens [TOOL_CALLS] leaky({"path": "</think>Let me look.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'Let me look.\nThey mention a pass',
+      stopped: undefined,
+    });
+    expect(stopped.thinking, 'the reasoning').toContain('A call opens');
+  });
+});
+
+describe('a local turn whose stream died inside a call, diverted to the cloud fallback', () => {
+  const LOCAL_PARTIAL = 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a';
+
+  /**
+   * Send; once the local model has written its partial call, let its stream die;
+   * wait for the cloud's words. The send is handed back in an object: returned
+   * bare from an async function, it would be awaited here, before Stop.
+   */
+  async function divertedUntil(cloudWords: string, dies: () => void): Promise<{ sending: Promise<void> }> {
+    const sending = useChats.getState().send('read my notes');
+    await until(() => useChats.getState().messages.some((message) => message.content.includes('canary-7f3a')));
+    dies();
+    await until(() => useChats.getState().messages.some((message) => message.content.includes(cloudWords)));
+    return { sending };
+  }
+
+  it('stopped: keeps the cloud’s words, and stores and sends none of the call', async () => {
+    const id = 'r3_fallback_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const gate = held();
+    const local = scriptedBackend([{ partial: LOCAL_PARTIAL, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: 'From the cloud: your notes mention', stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      const { sending } = await divertedUntil('your notes mention', dies.release);
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(cloud.seen, 'the diverted request, then the next send').toHaveLength(2);
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Checking.\nFrom the cloud: your notes mention',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('failed in the cloud too: the failed row keeps the cloud’s words and none of the call', async () => {
+    const id = 'r3_fallback_failed';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const cloudDies = held();
+    const local = scriptedBackend([{ partial: LOCAL_PARTIAL, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: 'From the cloud: your notes mention', stall: cloudDies.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      const { sending } = await divertedUntil('your notes mention', dies.release);
+      cloudDies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect(failed.content, 'the failed row’s words').toBe('Checking.\nFrom the cloud: your notes mention');
+  });
+});

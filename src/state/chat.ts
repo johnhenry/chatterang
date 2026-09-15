@@ -1727,6 +1727,34 @@ async function runGeneration(
       signal: controller.signal,
     });
 
+    // WHAT THE THREAD SHOWS, AND WHAT A TURN'S WORDS ARE READ FROM.
+    //
+    // `shown` is every delta, the turn's rounds back to back, as the thread
+    // shows it while the turn streams.
+    //
+    // `raw` is what the words of a turn that ends stopped, failed, or killed
+    // after a receipt are read from: the same deltas, except that each round
+    // that has ended is cut where a call it ended inside starts, as it ends —
+    // when a tool it called runs, or when its local stream dies and the turn
+    // diverts to the fallback. The cut used to run once over every round
+    // joined, anchored to the end of the last. A call a round ended inside was
+    // no longer at the end: one cut off in its arguments took every word after
+    // it, the follow-up's or the cloud's, because its string ran on into them;
+    // one whose JSON closed with no tag after it had those words after it and
+    // was kept, its arguments stored and sent back. See `cutUnfinishedCall`.
+    let shown = '';
+    /** Where in `raw` the round being written starts. */
+    let roundStart = 0;
+    const endRound = (): void => {
+      // Only in a turn that could have written a call, as `wordsWithoutCalls`
+      // is told for a failed turn: a round that ran no tool and was offered
+      // none ends on an example, not a call.
+      if (offersTools || toolCalls.length > 0) {
+        raw = raw.slice(0, roundStart) + cutUnfinishedCall(raw.slice(roundStart), { stopped: false });
+      }
+      roundStart = raw.length;
+    };
+
     for await (const event of stream) {
       switch (event.type) {
         case 'delta': {
@@ -1735,7 +1763,8 @@ async function runGeneration(
             app.setActivity(runsOnThisDevice(target) ? 'running' : 'remote');
           }
           raw += event.text;
-          const split = splitThinking(raw);
+          shown += event.text;
+          const split = splitThinking(shown);
           patch((message) => ({
             ...message,
             content: split.content,
@@ -1744,7 +1773,7 @@ async function runGeneration(
 
           const elapsed = performance.now() - started;
           if (elapsed > 400) {
-            app.setLiveRate(Number(((raw.length / 3.6 / elapsed) * 1000).toFixed(1)));
+            app.setLiveRate(Number(((shown.length / 3.6 / elapsed) * 1000).toFixed(1)));
           }
           break;
         }
@@ -1754,6 +1783,7 @@ async function runGeneration(
           // with it: what the follow-up writes is its answer, on screen and in
           // a turn stopped or killed from here on. See `closeReasoning`.
           raw = closeReasoning(raw);
+          shown = closeReasoning(shown);
           toolCalls = [
             ...toolCalls,
             {
@@ -1769,6 +1799,8 @@ async function runGeneration(
             },
           ];
           patch((message) => ({ ...message, toolCalls }));
+          // And so has any call it was writing beside the one that ran.
+          endRound();
 
           // A receipt that says bytes may have left the device is written down
           // NOW. A withheld one waits for the turn to end like any other text.
@@ -1813,6 +1845,9 @@ async function runGeneration(
         }
 
         case 'fallback':
+          // A local round whose stream died has ended where it died, and the
+          // fallback's words follow it: see `endRound`.
+          endRound();
           app.setActivity('remote');
           break;
 
