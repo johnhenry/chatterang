@@ -74,7 +74,14 @@
  * before the Router ever sees them", and a busy desktop is "not a failure at
  * all". The correction to this unit's brief adds a quitting and a sleeping
  * desktop: WAIT_LIST_FULL, DESKTOP_QUITTING and HOST_SUSPENDED leave the
- * circuit closed.
+ * circuit closed. The same ruling classes an unreachable desktop (asleep,
+ * off the network) as "retry cheaply": a refused connection arrives in
+ * milliseconds, so three of them and a thirty-second pause is noise, and the
+ * pause's sentence tells the person to re-enter a key a paired device does
+ * not have. So PEER_UNREACHABLE, a `connect` that rejects, leaves the circuit
+ * closed too, and the next turn simply tries again. No retry is made inside a
+ * turn: #186 keeps the numbers for that to a measurement on a real sleeping
+ * laptop, and none has been made.
  *
  * A CHUNK CANNOT SAY THAT, measured against aimatey-core 0.4.0. The Router's
  * `trackStream` (dist/esm/router.js:1381-1411) records a failure for the first
@@ -89,7 +96,9 @@
  * So the classification is acted on where the count is kept. A refusal of kind
  * `busy`, `quitting` or `suspended` is the desktop ANSWERING: a coherent,
  * defined reply over a working tunnel, which is the evidence a success gives.
- * Once the Router has counted its `error` chunk — this adapter's `finally`
+ * An unreachable desktop is not evidence of anything wrong with the backend
+ * this registration names; it is a device that is not there right now. Once
+ * the Router has counted either one's `error` chunk — this adapter's `finally`
  * runs when the Router closes the stream, which is after it counted and before
  * the engine reports the turn — the consecutive-failure run for THIS adapter's
  * registration is reset, as a success would reset it. Only its own entry, and
@@ -432,8 +441,12 @@ export class TunnelBackendAdapter implements BackendAdapter<TunnelTurnFrame, Tun
     const { device, onWaiting } = this.#options;
     let sequence = 0;
     let text = '';
-    /** The turn ended in a refusal that is the desktop answering. See the header. */
-    let answered = false;
+    /**
+     * The turn ended in a way #186 says is not a failure of this backend: a
+     * refusal that is the desktop answering, or a desktop that is not there.
+     * See the header.
+     */
+    let notAFault = false;
     let client: TunnelClient | null = null;
 
     const failed =(code: string, message = sentence(code, device.name)): IRStreamChunk => ({
@@ -471,6 +484,8 @@ export class TunnelBackendAdapter implements BackendAdapter<TunnelTurnFrame, Tun
       try {
         opened = await Promise.race([connecting, stop.promise]);
       } catch {
+        // #186: unreachable is "retry cheaply", so the next turn tries again.
+        notAFault = true;
         yield failed('PEER_UNREACHABLE');
         return;
       }
@@ -577,7 +592,7 @@ export class TunnelBackendAdapter implements BackendAdapter<TunnelTurnFrame, Tun
             }
             // PROMPT_EXPIRED closes a prompt, not the turn.
             if (!refusal.endsTurn) break;
-            answered = ANSWERS.has(refusal.kind);
+            notAFault = ANSWERS.has(refusal.kind);
             yield failed(code);
             return;
           }
@@ -588,7 +603,7 @@ export class TunnelBackendAdapter implements BackendAdapter<TunnelTurnFrame, Tun
       }
     } finally {
       stop.dispose();
-      if (answered) this.#settleBreaker();
+      if (notAFault) this.#settleBreaker();
       if (client) await client.close().catch(() => undefined);
     }
   }

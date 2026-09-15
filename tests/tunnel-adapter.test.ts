@@ -287,6 +287,29 @@ describe('TunnelBackendAdapter', () => {
     });
   });
 
+  // #186's "unreachable (desktop asleep) — retry cheaply": a refused connection
+  // arrives in milliseconds, so three of them and a thirty-second pause is
+  // noise. Each turn tries the desktop again, and the engine never tells the
+  // person to re-enter a key for a device that has none.
+  it('a desktop that cannot be reached, turn after turn, leaves the circuit closed and every turn tries it again', async () => {
+    const { engine, tunnel } = rig(replies('never'), { unreachable: true });
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const events = await drainEvents(engine.stream({ messages: history, target: paired }));
+      expect(tunnel.connectAttempts()).toBe(attempt);
+      expect(lastError(events)).toBe(`${DEVICE.name} could not be reached.`);
+      expect(engine.router.getBackendInfo(TUNNEL)?.circuitBreakerState).toBe('closed');
+      expect(engine.router.isBackendAvailable(TUNNEL)).toBe(true);
+    }
+    expect(tunnel.phoneSent).toEqual([]);
+  });
+
+  it('a desktop that cannot be reached is one PEER_UNREACHABLE error chunk', async () => {
+    const { adapter } = rig(replies('never'), { unreachable: true });
+    const chunks = await chunksOf(adapter.executeStream(request()));
+    expect(errorCode(theTerminal(chunks))).toBe('PEER_UNREACHABLE');
+  });
+
   describe.each([
     ['a cut', (async (desk) => desk.cut()) satisfies DesktopScript],
     ['a refusal this build does not know', ((desk) => desk.refuse('FROM_A_NEWER_BUILD')) satisfies DesktopScript],

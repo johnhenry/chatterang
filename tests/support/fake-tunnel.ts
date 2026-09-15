@@ -88,6 +88,8 @@ export interface FakeTunnel {
   readonly connect: () => Promise<TunnelClient>;
   /** How many connections `connect` opened. */
   readonly connections: () => number;
+  /** How many times `connect` was called, including the calls that rejected. */
+  readonly connectAttempts: () => number;
   /** Every frame handed to the phone end's `send`, including any its gate threw on. */
   readonly phoneSent: readonly TunnelFrame[];
   /** Every frame the desktop end read and accepted. */
@@ -101,6 +103,7 @@ export function fakeTunnel(script: DesktopScript, options: FakeTunnelOptions = {
   const desktopRead: TunnelFrame[] = [];
   const scriptErrors: unknown[] = [];
   let connections = 0;
+  let connectAttempts = 0;
 
   const open = (): TunnelClient => {
     connections += 1;
@@ -310,10 +313,12 @@ export function fakeTunnel(script: DesktopScript, options: FakeTunnelOptions = {
 
   return {
     connect: async () => {
+      connectAttempts += 1;
       if (options.unreachable === true) throw new Error('fake tunnel: nothing is listening');
       return open();
     },
     connections: () => connections,
+    connectAttempts: () => connectAttempts,
     phoneSent,
     desktopRead,
     scriptErrors,
