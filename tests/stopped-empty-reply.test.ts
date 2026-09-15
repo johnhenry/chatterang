@@ -1990,3 +1990,80 @@ describe('a reply that shows a model’s tool-call format, in a chat with no too
     expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
   });
 });
+
+/* ── Round 2: a tool round's reasoning ends with the round ──────────── */
+
+describe('a tool round whose reasoning was left open', () => {
+  it('keeps the follow-up’s answer as the finished reply’s words, and sends it back', async () => {
+    const id = 'r2_open_think_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`<think>I should read the notes first.\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: ran.content, thinking: ran.thinking, stopped: ran.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      thinking: 'I should read the notes first.',
+      stopped: undefined,
+    });
+    expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', 'They mention a passphrase.']);
+  });
+
+  it('keeps the follow-up’s answer when the calling round named <think> in its words', async () => {
+    const id = 'r2_named_think_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Qwen reasons inside a <think> block. Let me check.\n${CALL}`, 'They mention a passphrase.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toContain('They mention a passphrase.');
+  });
+
+  it('keeps the words a stopped follow-up wrote, and is not called stopped', async () => {
+    const id = 'r2_open_think_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `<think>I should read the notes first.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      const sending = useChats.getState().send('read my notes');
+      await until(() => {
+        const live = useChats.getState().messages.at(-1);
+        return `${live?.content ?? ''}${live?.thinking ?? ''}`.includes('They mention a pass');
+      });
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a pass',
+      stopped: undefined,
+    });
+    expect(stopped.thinking, 'the reasoning').toContain('I should read the notes first.');
+  });
+});

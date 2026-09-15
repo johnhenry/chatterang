@@ -13,6 +13,7 @@ import { onOtherWindows } from '@/lib/other-windows';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
+  closeReasoning,
   currentVariant,
   deriveTitle,
   displaysUnrecorded,
@@ -1838,6 +1839,10 @@ async function runGeneration(
         }
 
         case 'tool': {
+          // The round that called it has ended, and any reasoning it left open
+          // with it: what the follow-up writes is its answer, on screen and in
+          // a turn stopped or killed from here on. See `closeReasoning`.
+          raw = closeReasoning(raw);
           toolCalls = [
             ...toolCalls,
             {

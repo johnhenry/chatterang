@@ -62,7 +62,7 @@ import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/pro
 import { CliBackendAdapter } from '@/ai/backends/cli';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
-import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
+import { REACH_DEVICE, REACH_REMOTE, closeReasoning, newId, type Reach } from '@/domain/chat';
 
 /**
  * Execute → tools → execute round trips permitted per turn.
@@ -1216,7 +1216,9 @@ export class ChatterangEngine {
       // The round's words stay in the answer, and the next round's follow them.
       // A fenced call is stripped as one only when it names an offered tool, as
       // `findToolCalls` read it just above.
-      const words = stripToolSyntax(text, { offered: callNames(offered), ran: true });
+      // Its reasoning ends with it: a tag it left open would take the next
+      // round's words into reasoning once the rounds are joined.
+      const words = closeReasoning(stripToolSyntax(text, { offered: callNames(offered), ran: true }));
       if (words) said.push(words);
       text = '';
     }

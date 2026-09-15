@@ -771,3 +771,18 @@ export function splitThinking(raw: string): { content: string; thinking: string;
     open: tail.open,
   };
 }
+
+/**
+ * One generation's text with any reasoning block it left open closed where the
+ * generation ended.
+ *
+ * FOR A TOOL ROUND, whose text is followed by the next round's. A model can
+ * write its call before it closes its reasoning — `<think>I should read the
+ * notes first.` then the call — or name `<think>` in its words, and the round
+ * ends there. Joined to what the follow-up wrote, the open tag made
+ * {@link splitThinking} file the follow-up's whole answer as reasoning: the
+ * reply was stored with no words and left out of every later request.
+ */
+export function closeReasoning(text: string): string {
+  return splitThinking(text).open ? `${text}</think>` : text;
+}
