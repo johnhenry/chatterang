@@ -1518,9 +1518,14 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
  * ran and was never shown on a send sheet, and its arguments were still sent
  * back.
  *
- * NOT IN A TURN THAT OFFERED NO TOOL, and no tool ran. There is no call to
- * strip, and a call's opening shape at the end of the text is as likely a
- * marker named in prose. A chat can name tools and offer none: an MCP tool's id
+ * FINISHED CALLS ARE STRIPPED FROM EVERY TURN'S WORDS, a malformed one
+ * included: a reply that was only `<tool_call>{…,}}</tool_call>` ran no tool,
+ * and its call and arguments were still stored and sent back.
+ *
+ * THE UNFINISHED ONE IS CUT only when `cutsUnfinished` says so — not in a turn
+ * that offered no tool, and no tool ran. There is no call being written, and a
+ * call's opening shape at the end of the text is as likely a marker named in
+ * prose. A chat can name tools and offer none: an MCP tool's id
  * stays on it after its server is removed or disconnected.
  *
  * `readForCalls` is whether the engine read the turn for calls, which decides
@@ -1532,9 +1537,14 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
  */
 function wordsWithoutCalls(
   content: string,
-  { readForCalls, stopped }: { readonly readForCalls: boolean; readonly stopped: boolean },
+  {
+    readForCalls,
+    stopped,
+    cutsUnfinished,
+  }: { readonly readForCalls: boolean; readonly stopped: boolean; readonly cutsUnfinished: boolean },
 ): string {
   const finished = stripToolSyntax(content, { readForCalls });
+  if (!cutsUnfinished) return finished;
   const unfinished = unfinishedCallAt(finished, stopped);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
 }
@@ -1896,10 +1906,13 @@ async function runGeneration(
           //       - the turn was stopped: a call it was writing or waiting to
           //         send.
           // Otherwise a call was stored as the reply's words and sent back to
-          // the model as history. A turn nobody stopped, in which no tool ran
-          // and the engine handed back no text, keeps its deltas as before: a
-          // reply that was only a fenced JSON example naming a "function",
-          // which the engine strips.
+          // the model as history. That is when an unfinished call is CUT;
+          // finished calls are stripped from every turn's words, as the engine
+          // strips them from its own text. A turn nobody stopped, in which no
+          // tool ran and the engine handed back no text, used to keep its
+          // deltas whole — for a fenced JSON example the engine then stripped,
+          // and no longer does — and so kept a malformed call, arguments and
+          // all, that the engine had stripped.
           //
           // OFFERED, NOT NAMED ON THE CHAT. A chat keeps an MCP tool's id after
           // its server is gone, and its requests offer no tool: nothing such a
@@ -1909,11 +1922,11 @@ async function runGeneration(
           const split = splitThinking(aborted ? raw : event.text || raw);
           const readsCalls =
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
-          const content = (
-            readsCalls
-              ? wordsWithoutCalls(split.content, { readForCalls: chat.tools.length > 0, stopped: aborted })
-              : split.content
-          ).trim();
+          const content = wordsWithoutCalls(split.content, {
+            readForCalls: chat.tools.length > 0,
+            stopped: aborted,
+            cutsUnfinished: readsCalls,
+          }).trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown
           //           as stopped, and left out of every later request.

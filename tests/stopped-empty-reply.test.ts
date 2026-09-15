@@ -1689,3 +1689,28 @@ describe('words a model writes before a tool call that runs, when the follow-up 
   });
 });
 
+describe('a finished reply that is only a malformed <tool_call>', () => {
+  it('stores and sends back none of its markup or arguments', async () => {
+    const id = 'r1_malformed_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const malformed = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a",}}</tool_call>';
+    const local = recordingBackend([malformed, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = assistantRows(id)[1]!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect({ content: last.content, stopped: last.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(refusals()).toEqual([]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
