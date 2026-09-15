@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import {
   DEFAULT_POLICY,
   HANDLE_LOST,
-  HOST_TIMEOUT,
+  LLAMA_PLUGIN,
   LOCAL_EXECUTOR,
   PEER_TURN_ENGINE,
   PEER_TURN_EVENTS,
@@ -22,12 +22,14 @@ import {
   WorkBroker,
   createHostRuntime,
   createWorkerHost,
+  withTurnProgress,
 } from '@chatterang/desktop/bridge';
 import type {
   BrokerNotice,
   HostMessage,
   HostedUnitOf,
   MessageLink,
+  PromptOutcome,
   SupervisorPolicy,
   SupervisorTimers,
   UnitTerminal,
@@ -245,6 +247,8 @@ const PHONE = { kind: 'device', id: 'phone-1' } as const;
 /** A visible window's webContents id. Never a worker's. */
 const VISIBLE_WINDOW = 1;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** A phone turn that runs a long time with no PeerTurn frame: far past any deadline a frame alone could reset. */
+const LONG_TURN_MS = 20 * 60_000;
 
 interface RigOptions {
   readonly policy?: Partial<SupervisorPolicy>;
@@ -327,6 +331,12 @@ function rig(options: RigOptions = {}) {
     },
     phoneTerminals(unitId: string): BrokerNotice[] {
       return phoneNotices.filter((notice) => notice.kind === 'terminal' && notice.terminal.unitId === unitId);
+    },
+    /** The prompt ids relayed to the phone for this unit, in order. */
+    phonePrompts(unitId: string): string[] {
+      return phoneNotices.flatMap((notice) =>
+        notice.kind === 'prompt' && notice.unitId === unitId ? [notice.promptId] : [],
+      );
     },
     /** Wait until worker `index` has been asked to run `count` turns; the last one's requestId. */
     async started(index: number, count = 1): Promise<string> {
@@ -773,18 +783,70 @@ describe('BN4 WorkerHost: the rest of what it promises', { timeout: 30_000 }, ()
     expect((await unit.settled).end).toBe('COMPLETED');
   });
 
-  it('a worker silent past PEER_TURN_IDLE_TIMEOUT_MS is stopped before its unit ends HOST_TIMEOUT, so a run never ends while its worker may still be working', async () => {
-    // FAULT INJECTED: settling HOST_TIMEOUT without ending the life left the
-    // worker running and failed on `killed`.
+  it('a phone unit the broker keeps running on the worker’s own hosted decode (withTurnProgress through hostedUnitOf) is not cut off by a peer-turn deadline the broker cannot see, however long it decodes without a frame', async () => {
+    // REVIEW REPRODUCTION: with a finite peer-turn deadline in the Supervisor
+    // (UNIT_IDLE + PROMPT_ANSWER + UNIT_DRAIN + one tick, 241 s), reset only by
+    // a PeerTurn frame, the worker was killed at 241 s while the broker still
+    // had the unit running, and the unit ended HOST_TIMEOUT / WORKER_LOST.
     const r = rig();
-    const unit = r.run('silent');
-    await r.started(0);
-    await r.advance(PEER_TURN_IDLE_TIMEOUT_MS - 1);
-    expect(unit.ends).toEqual([]);
-    await r.advance(DEFAULT_POLICY.tickMs);
-    await until(() => unit.ends.length === 1, 'the run to end');
-    expect(unit.ends[0]).toMatchObject({ kind: 'failed', code: HOST_TIMEOUT });
-    expect(r.workers[0]?.killed).toBe(true);
+    const unit = r.admitPhone('decoding');
+    const requestId = await r.started(0);
+    const worker = r.workers[0]!;
+    // main.ts's fleet notify, as S5 wires it: the worker window's own LlamaCpp
+    // tokens are progress for the unit it runs, and never a PeerTurn frame.
+    const fleetNotify = withTurnProgress(r.broker, () => undefined, r.host.hostedUnitOf);
+    for (let elapsed = 100_000; elapsed <= LONG_TURN_MS; elapsed += 100_000) {
+      await r.advance(100_000);
+      expect({ elapsed, running: r.broker.isRunning(PHONE, 'decoding'), killed: worker.killed, ends: unit.ends.map(endOf) }).toEqual({
+        elapsed,
+        running: true,
+        killed: false,
+        ends: [],
+      });
+      fleetNotify(LLAMA_PLUGIN.name, 'llamaToken', { requestId: 'hosted-decode', token: 'x' }, worker.senderId);
+    }
+    worker.end(requestId, 'end decoding');
+    const terminal = await unit.settled;
+    expect(terminal.end).toBe('COMPLETED');
+    expect(endOf(terminal.value as WorkerTurnEnd)).toBe('end decoding');
+    expect(unit.frames).toEqual([]);
+    expect(r.spawnCalls).toBe(1);
+  });
+
+  it('a phone unit whose relayed confirms are answered in time, with the tool each one guards running between them, is not cut off by a peer-turn deadline the broker cannot see', async () => {
+    // REVIEW REPRODUCTION: with the finite 241 s peer-turn deadline, the second
+    // cycle's bash run crossed it: the worker was killed while the broker had
+    // the unit running, the next confirm was refused NOT_RUNNING, and the unit
+    // ended WORKER_LOST.
+    const r = rig();
+    const unit = r.admitPhone('confirms');
+    const requestId = await r.started(0);
+    const worker = r.workers[0]!;
+    const outcomes: PromptOutcome[] = [];
+    const cycleMs = 100_000 + PROMPT_ANSWER_TIMEOUT_MS - 1_000;
+    for (let elapsed = cycleMs; elapsed <= LONG_TURN_MS + cycleMs; elapsed += cycleMs) {
+      // The confirmed bash runs on the desktop's own shell: no frame, and
+      // nothing the Supervisor sees.
+      await r.advance(100_000);
+      const asked = r.broker.requestPrompt(PHONE, 'confirms', { tool: 'bash' });
+      const prompts = r.phonePrompts('confirms');
+      await r.advance(PROMPT_ANSWER_TIMEOUT_MS - 1_000);
+      const promptId = prompts[outcomes.length];
+      const answered = promptId !== undefined && r.broker.answerPrompt(PHONE, 'confirms', promptId, true);
+      outcomes.push(await asked);
+      expect({ elapsed, answered, killed: worker.killed, terminals: r.phoneTerminals('confirms').length }).toEqual({
+        elapsed,
+        answered: true,
+        killed: false,
+        terminals: 0,
+      });
+    }
+    expect(outcomes.every((outcome) => outcome.answered)).toBe(true);
+    worker.end(requestId, 'end confirms');
+    const terminal = await unit.settled;
+    expect(terminal.end).toBe('COMPLETED');
+    expect(endOf(terminal.value as WorkerTurnEnd)).toBe('end confirms');
+    expect(r.spawnCalls).toBe(1);
   });
 
   it('runs one unit at a time; a pre-aborted run, a run beside another, and a run after dispose build no worker', async () => {
@@ -813,11 +875,13 @@ describe('BN4 WorkerHost: the rest of what it promises', { timeout: 30_000 }, ()
     expect(r.spawnCalls).toBe(1);
   });
 
-  it('PeerTurn passes the Supervisor’s name check, and its deadline is longer than every broker deadline that can end its unit', () => {
+  it('PeerTurn passes the Supervisor’s name check, and has no deadline of its own: the broker’s are the only ones that end its unit', () => {
     // FAULT INJECTED: dropping `idleTimeoutMs` from PEER_TURN_ENGINE failed here
-    // (and 5b, 5c and the HOST_TIMEOUT test); naming an undeclared terminal in
-    // PEER_TURN_STREAM made the Supervisor refuse the engine and failed every
-    // test here except the main.ts control.
+    // (and 5b, 5c and both long-turn tests above); naming an undeclared
+    // terminal in PEER_TURN_STREAM made the Supervisor refuse the engine and
+    // failed every test here except the main.ts control; a finite
+    // PEER_TURN_IDLE_TIMEOUT_MS of 241 s failed both long-turn tests, and one
+    // of an hour failed here.
     expect(PEER_TURN_PLUGIN).toEqual({
       name: 'PeerTurn',
       methods: ['peerTurnStart', 'peerTurnCancel'],
@@ -845,11 +909,10 @@ describe('BN4 WorkerHost: the rest of what it promises', { timeout: 30_000 }, ()
     expect(supervisor.engines).toEqual(['PeerTurn']);
     supervisor.dispose();
 
-    // The broker decides a phone unit's end: its idle deadline, a relayed
-    // prompt's wait and the drain all fit inside the peer turn's own deadline.
-    expect(PEER_TURN_IDLE_TIMEOUT_MS).toBeGreaterThan(
-      UNIT_IDLE_TIMEOUT_MS + PROMPT_ANSWER_TIMEOUT_MS + UNIT_DRAIN_TIMEOUT_MS,
-    );
+    // The broker decides a phone unit's end. Every answered confirm and every
+    // hosted token buys its unit more time, which the Supervisor cannot see,
+    // so no finite peer-turn deadline stays behind the broker's.
+    expect(PEER_TURN_IDLE_TIMEOUT_MS).toBe(Number.POSITIVE_INFINITY);
     expect(WORKER_EXECUTOR).toBe('worker');
     expect(WORKER_EXECUTOR).not.toBe(LOCAL_EXECUTOR);
     expect(WORKER_IDLE_MS).toBeGreaterThan(0);

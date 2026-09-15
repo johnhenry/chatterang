@@ -50,13 +50,19 @@
  * a unit was running, so the broker ends it `WORKER_LOST` and frees the slot
  * at once.
  *
- * A RUN NEVER ENDS WHILE ITS WORKER MAY STILL BE WORKING. The broker frees the
- * slot when a unit's work returns, and the work is `run`. So a `HOST_TIMEOUT`
- * from the `Supervisor` ends the life (kills the worker) before the run
- * resolves, and the peer turn's own deadline is longer than every broker
- * deadline that can end its unit (`PEER_TURN_IDLE_TIMEOUT_MS`): the broker is
- * the authority on a device's unit, and the `Supervisor`'s deadline is only
- * the backstop.
+ * A RUN NEVER ENDS WHILE ITS WORKER MAY STILL BE WORKING, AND THE BROKER IS
+ * THE ONLY DEADLINE. The broker frees the slot when a unit's work returns, and
+ * the work is `run`. The broker also sees progress this file never does: the
+ * worker window's own `LlamaCpp` tokens (`withTurnProgress` through
+ * `hostedUnitOf`) and every relayed prompt answered or refused. So the peer
+ * turn has no deadline of its own in the `Supervisor`
+ * (`PEER_TURN_IDLE_TIMEOUT_MS` is infinite): a finite one, reset only by a
+ * PeerTurn frame, killed a worker the broker still counted as running. A
+ * silent unit is ended by the broker (`DEADLINE`, its drain, then `condemn`),
+ * and a silent worker by the `Supervisor`'s ping. Were a `HOST_TIMEOUT` ever
+ * to reach a run, it ends the life (kills the worker) before the run resolves.
+ * `run` is a broker unit's work: one started outside the broker has no
+ * deadline but the ping, its signal and `dispose`.
  *
  * PLATFORM-FREE, like the rest of the bridge (`tests/layering.test.ts`): no
  * Electron, no Node builtin, timers injected. `main.ts` wraps a hidden window
@@ -70,12 +76,6 @@ import { HANDLE_LOST, HOST_TIMEOUT, PEER_TURN_PLUGIN, PEER_TURN_STREAM } from '.
 import type { EngineSpec, NotifyListeners, SupervisorPolicy, SupervisorTimers } from './supervisor.js';
 import { DEFAULT_POLICY, Supervisor, systemTimers } from './supervisor.js';
 import type { WorkBroker } from './work-broker.js';
-import {
-  BROKER_TICK_MS,
-  PROMPT_ANSWER_TIMEOUT_MS,
-  UNIT_DRAIN_TIMEOUT_MS,
-  UNIT_IDLE_TIMEOUT_MS,
-} from './work-broker.js';
 
 /** The executor name a device's units run on, for `WorkBroker.workerLost` and `condemnExecutor`. */
 export const WORKER_EXECUTOR = 'worker';
@@ -92,19 +92,23 @@ export const WORKER_EXECUTOR = 'worker';
 export const WORKER_IDLE_MS = 2 * 60_000;
 
 /**
- * The peer turn's inactivity deadline in the `Supervisor`, reset by each
- * frame.
+ * The peer turn's inactivity deadline in the `Supervisor`: none.
  *
- * LONGER THAN EVERY BROKER DEADLINE THAT CAN END ITS UNIT, so the broker
- * decides first: a unit silent for `UNIT_IDLE_TIMEOUT_MS` after a relayed
- * prompt waited `PROMPT_ANSWER_TIMEOUT_MS`, then given
- * `UNIT_DRAIN_TIMEOUT_MS` to stop, plus one broker tick. A prompt pauses the
- * broker's deadline and the `Supervisor` cannot see it, so the default
- * `generateIdleTimeoutMs` (120 s) would end a phone's turn while it waits on a
- * person, and free the slot while the worker is still working.
+ * THE BROKER IS THE AUTHORITY ON A DEVICE'S UNIT, and it resets that unit's
+ * idle deadline on progress the `Supervisor` never sees: the worker window's
+ * own hosted decode (`withTurnProgress`, `local-turns.ts`) and each relayed
+ * prompt answered or refused (`WorkBroker.answerPrompt`). A finite deadline
+ * here is reset only by a `peerTurnFrame`. It was 241 s (unit idle, prompt
+ * answer, drain and one tick), and it killed a worker mid-turn, ending the
+ * unit `WORKER_LOST` while the broker had it running: a decode that streamed
+ * no frame, or two confirms answered in time with a bash run between them. No
+ * finite value is safe, since each answered confirm buys the broker's unit
+ * another `UNIT_IDLE_TIMEOUT_MS`. The default `generateIdleTimeoutMs` (120 s)
+ * would be worse. The broker ends a silent unit itself (`DEADLINE`, then
+ * `UNIT_DRAIN_TIMEOUT_MS`, then `condemn`), and the `Supervisor`'s ping still
+ * ends a silent worker.
  */
-export const PEER_TURN_IDLE_TIMEOUT_MS =
-  UNIT_IDLE_TIMEOUT_MS + PROMPT_ANSWER_TIMEOUT_MS + UNIT_DRAIN_TIMEOUT_MS + BROKER_TICK_MS;
+export const PEER_TURN_IDLE_TIMEOUT_MS = Number.POSITIVE_INFINITY;
 
 /** A zeroed end, for a peer turn the worker never got to end itself. Never a frame. */
 function synthesisePeerTurnEnd(requestId: string, error: string): PeerTurnEndEvent {
@@ -125,7 +129,10 @@ export const PEER_TURN_ENGINE: EngineSpec = Object.freeze({
 export type WorkerFailure =
   /** The worker went away mid-unit: its port closed, or it stopped answering pings. */
   | 'HANDLE_LOST'
-  /** The worker sent nothing for `PEER_TURN_IDLE_TIMEOUT_MS`; it was stopped. */
+  /**
+   * The `Supervisor` gave up waiting on the start call; the worker was stopped
+   * first. Not reached while `PEER_TURN_IDLE_TIMEOUT_MS` is infinite.
+   */
   | 'HOST_TIMEOUT'
   /** The broker condemned it: its work did not stop after its abort. */
   | 'WORKER_CONDEMNED'
