@@ -1859,4 +1859,164 @@ describe('a connection or server switched back on while the launch withdraws the
       vi.mocked(tables.mcpServers.update).mockImplementation((async () => 1) as never);
     }
   });
+
+  describe('after it was switched off while the chat list was being read', () => {
+    /*
+     * Read on beside the list, then switched off before the list landed. The
+     * launch takes the grants naming it out of what it read (`beforeTheList`),
+     * and does not judge them stale: as read, the connection was on. Only the
+     * write that drops them took them off disk, and a switch-on did not wait for
+     * it. When it failed — a full disk — or was still under way, the connection
+     * was on on disk beside the grant, and the next launch honoured it.
+     */
+    const SERVER_ON = { id: 'mcp_off', name: 'off', url: OFF_URL, enabled: true, createdAt: 1 };
+    const CONNECTION_ON = { ...OPENAI, id: 'conn_off', label: 'Off', enabled: true };
+
+    beforeEach(() => {
+      disk.connections.mockImplementation(async () => [CONNECTION_ON]);
+      disk.servers.mockImplementation(async () => [SERVER_ON]);
+      useApp.setState({ connections: [CONNECTION_ON] });
+      useMcp.setState({ servers: [SERVER_ON], states: {} });
+    });
+
+    /** Start a launch whose chat list read lands only once `release` is called. */
+    function launchingHeld(rows: Chat[]) {
+      let release = (): void => {};
+      const listing = new Promise<void>((resolve) => (release = resolve));
+      chatsTable.listed.mockClear();
+      chatsTable.listed.mockImplementationOnce(async () => {
+        const read = rows.map((row) => structuredClone(row));
+        await listing;
+        return read;
+      });
+      useChats.setState({ loaded: false, chats: [], activeChatId: null, messages: [] });
+      const loading = useChats.getState().load();
+      void loading.catch(() => {});
+      return {
+        loading,
+        release,
+        read: () => vi.waitFor(() => expect(chatsTable.listed).toHaveBeenCalled()),
+      };
+    }
+
+    it('writes away a grant whose write failed before the connection is switched on again, so the next launch asks', async () => {
+      const table = new Map<string, Chat>([['swept', chatOnDisk('swept', [PROVIDER_ON_DISK])]]);
+      const order: string[] = [];
+      let full = true;
+      chatsTable.put.mockImplementation((async (chat: Chat) => {
+        if (full) throw new Error('The disk is full.');
+        table.set(chat.id, structuredClone(chat));
+        order.push(`chat ${chat.id}`);
+      }) as never);
+      vi.mocked(tables.connections.put).mockImplementation((async (connection: { id: string; enabled: boolean }) => {
+        order.push(`connection ${connection.id} ${connection.enabled ? 'on' : 'off'}`);
+      }) as never);
+      const launch = launchingHeld([...table.values()]);
+      try {
+        await launch.read();
+        await useApp.getState().toggleConnection('conn_off', false);
+        launch.release();
+        await expect(launch.loading).rejects.toThrow('The disk is full.');
+        expect(table.get('swept')?.egressGrants, 'the control: the grant is still on disk').toEqual([PROVIDER_ON_DISK]);
+        expect(grantsOf('swept'), 'the control: the store does not hold it').toEqual([]);
+
+        full = false;
+        await useApp.getState().toggleConnection('conn_off', true);
+        expect(order, 'the grant written away, then the connection switched on').toEqual([
+          'connection conn_off off',
+          'chat swept',
+          'connection conn_off on',
+        ]);
+        expect(table.get('swept')?.egressGrants, 'the table').toEqual([]);
+
+        // The next launch reads the connection on.
+        await launching([...table.values()]);
+        expect(grantsOf('swept'), 'the next launch').toEqual([]);
+        const { secretSent, asked } = await aTurn();
+        expect(asked, 'asked at the next launch').toHaveLength(1);
+        expect(secretSent, 'tool output sent unasked').toBe(false);
+      } finally {
+        launch.release();
+        chatsTable.put.mockImplementation(async () => {});
+        vi.mocked(tables.connections.put).mockImplementation((async () => {}) as never);
+      }
+    });
+
+    it('is not written on again while the write dropping that grant is still under way', async () => {
+      const order: string[] = [];
+      let releasePut = (): void => {};
+      const putReleased = new Promise<void>((resolve) => (releasePut = resolve));
+      chatsTable.put.mockImplementation((async (chat: Chat) => {
+        order.push(`chat ${chat.id} made`);
+        await putReleased;
+        order.push(`chat ${chat.id} landed`);
+      }) as never);
+      vi.mocked(tables.connections.put).mockImplementation((async (connection: { id: string; enabled: boolean }) => {
+        order.push(`connection ${connection.id} ${connection.enabled ? 'on' : 'off'}`);
+      }) as never);
+      const launch = launchingHeld([chatOnDisk('swept', [PROVIDER_ON_DISK])]);
+      let switching: Promise<void> = Promise.resolve();
+      try {
+        await launch.read();
+        await useApp.getState().toggleConnection('conn_off', false);
+        launch.release();
+        await stage('the write dropping the grant to be made', vi.waitFor(() => expect(order).toContain('chat swept made')));
+
+        switching = useApp.getState().toggleConnection('conn_off', true);
+        await macrotask();
+        expect(order, 'nothing switched on while that write is under way').toEqual([
+          'connection conn_off off',
+          'chat swept made',
+        ]);
+
+        releasePut();
+        await launch.loading;
+        await stage('the connection to be switched on', switching);
+      } finally {
+        launch.release();
+        releasePut();
+        chatsTable.put.mockImplementation(async () => {});
+        vi.mocked(tables.connections.put).mockImplementation((async () => {}) as never);
+        await Promise.allSettled([launch.loading, switching]);
+      }
+      expect(order).toEqual(['connection conn_off off', 'chat swept made', 'chat swept landed', 'connection conn_off on']);
+    });
+
+    it('writes away an MCP grant whose write failed before the server is switched on again', async () => {
+      const table = new Map<string, Chat>([['swept', chatOnDisk('swept', [SERVER_ON_DISK])]]);
+      const order: string[] = [];
+      let full = true;
+      chatsTable.put.mockImplementation((async (chat: Chat) => {
+        if (full) throw new Error('The disk is full.');
+        table.set(chat.id, structuredClone(chat));
+        order.push(`chat ${chat.id}`);
+      }) as never);
+      vi.mocked(tables.mcpServers.update).mockImplementation((async (id: string, changes: { enabled: boolean }) => {
+        order.push(`server ${id} ${changes.enabled ? 'on' : 'off'}`);
+        return 1;
+      }) as never);
+      const launch = launchingHeld([...table.values()]);
+      try {
+        await launch.read();
+        await useMcp.getState().toggle('mcp_off', false);
+        launch.release();
+        await expect(launch.loading).rejects.toThrow('The disk is full.');
+        expect(table.get('swept')?.egressGrants, 'the control: the grant is still on disk').toEqual([SERVER_ON_DISK]);
+
+        full = false;
+        await useMcp.getState().toggle('mcp_off', true);
+        expect(order, 'the grant written away, then the server switched on').toEqual([
+          'server mcp_off off',
+          'chat swept',
+          'server mcp_off on',
+        ]);
+        expect(table.get('swept')?.egressGrants, 'the table').toEqual([]);
+      } finally {
+        launch.release();
+        chatsTable.put.mockImplementation(async () => {});
+        vi.mocked(tables.mcpServers.update).mockImplementation((async () => 1) as never);
+      }
+    });
+  });
+
 });

@@ -230,9 +230,11 @@ function switchedOn(under: Map<string, (() => void)[]>, id: string): void {
 }
 
 /**
- * The grants `load` read from disk naming a connection or server that was not
- * there as granted, by chat, from the moment the write that drops them is queued
- * until it has landed. A write that failed leaves its entry, marked.
+ * The grants `load` read from disk and left out of the store, by chat, from the
+ * moment the write that drops them is queued until it has landed: those naming a
+ * connection or server that was not there as granted, and those withdrawn before
+ * the list had loaded (`beforeTheList`). A write that failed leaves its entry,
+ * marked.
  *
  * The store never holds them, so nothing in this session honours them. The table
  * does until that write lands, and a write can fail — a full disk. A connection
@@ -753,34 +755,36 @@ export const useChats = create<ChatState>((set, get) => ({
         const egressGrants = grants.filter((grant) => !stale.has(grant));
         return egressGrants.length === grants.length ? chat : { ...chat, egressGrants };
       };
-      set({
-        loaded: true,
-        chats: sortChats([...held, ...unseen.map((chat, at) => withoutStale(stripped[at] ?? chat))]),
-      });
-      // And on disk, in each chat's turn.
-      rewritten = stripped.flatMap((chat) =>
-        chat
-          ? [
-              writeInTurn(chat.id, async () => {
-                const current = get().chats.find((entry) => entry.id === chat.id);
-                if (current) await db.chats.put(current);
-              }),
-            ]
-          : [],
-      );
+      const inStore = unseen.map((chat, at) => withoutStale(stripped[at] ?? chat));
+      set({ loaded: true, chats: sortChats([...held, ...inStore]) });
       // And on disk, queued in the step the store took the chats, and noted until
       // each has landed: a connection or server is not switched on while one
       // naming it is still to land, and one that failed is made again first. See
       // `writeStaleAway` and `afterStaleGrantsGo`.
       //
-      // The withdrawals end once EVERY write has settled. Ended at the first that
-      // failed, a yes given to a connection still off, in a chat whose write was
-      // still queued, was kept.
+      // EVERY GRANT THE STORE LEFT OUT, those withdrawn before the list included.
+      // Those name somewhere that was there as read, so they are not stale, and
+      // were once written by a put nothing noted. A switch-on did not wait for it,
+      // and when it failed — a full disk — or was still under way, the connection
+      // was on on disk beside the grant, and the next launch honoured it.
+      const writes = unseen.flatMap((chat, at) => {
+        const kept = inStore[at];
+        if (kept === undefined || kept === chat) return [];
+        const holds = new Set(kept.egressGrants ?? []);
+        const dropped = new Set((chat.egressGrants ?? []).filter((grant) => !holds.has(grant)));
+        return [
+          {
+            stale: (chat.egressGrants ?? []).some((grant) => stale.has(grant)),
+            writing: writeStaleAway(get, chat.id, dropped),
+          },
+        ];
+      });
+      rewritten = writes.flatMap(({ stale: withdrawing, writing }) => (withdrawing ? [] : [writing]));
+      // The withdrawals end once EVERY write of a stale grant has settled. Ended
+      // at the first that failed, a yes given to a connection still off, in a
+      // chat whose write was still queued, was kept.
       withdrawn = Promise.allSettled(
-        unseen.flatMap((chat) => {
-          const grants = new Set((chat.egressGrants ?? []).filter((grant) => stale.has(grant)));
-          return grants.size > 0 ? [writeStaleAway(get, chat.id, grants)] : [];
-        }),
+        writes.flatMap(({ stale: withdrawing, writing }) => (withdrawing ? [writing] : [])),
       ).then((settled) => {
         for (const finish of finishes) finish();
         for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
