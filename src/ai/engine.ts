@@ -1216,7 +1216,7 @@ export class ChatterangEngine {
       // The round's words stay in the answer, and the next round's follow them.
       // A fenced call is stripped as one only when it names an offered tool, as
       // `findToolCalls` read it just above.
-      const words = stripToolSyntax(text, { offered: callNames(offered) });
+      const words = stripToolSyntax(text, { offered: callNames(offered), ran: true });
       if (words) said.push(words);
       text = '';
     }
@@ -1226,7 +1226,8 @@ export class ChatterangEngine {
       type: 'done',
       // Every tool round's words, then the last round's. A fenced JSON block is
       // a call only when it names a tool the request offered; see `fencedCall`.
-      text: [...said, stripToolSyntax(text, { offered: callNames(offered) })]
+      // A turn that offered no tool and ran none has nothing stripped.
+      text: [...said, stripToolSyntax(text, { offered: callNames(offered), ran: tools.length > 0 })]
         .filter((part) => part !== '')
         .join('\n\n'),
       stats: {

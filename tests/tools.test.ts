@@ -13,8 +13,10 @@ const OFFERED = ['calculator', 'calculate'];
 
 /** Read as a turn offering the calculator reads it, unless `offered` says otherwise. */
 const extractTextualToolCalls = (text: string, offered: readonly string[] = OFFERED) => extractFrom(text, offered);
-const stripToolSyntax = (text: string, reading: { offered: readonly string[] } = { offered: OFFERED }) =>
-  stripFrom(text, reading);
+const stripToolSyntax = (
+  text: string,
+  reading: { offered: readonly string[]; ran?: boolean } = { offered: OFFERED },
+) => stripFrom(text, { ran: false, ...reading });
 
 describe('evaluateExpression', () => {
   it('evaluates arithmetic with correct precedence', () => {
@@ -245,10 +247,13 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(text)).toBe(text);
   });
 
-  it('keeps a fenced block that reads as a call in text from a turn that offered no tool, and still strips a tagged one', () => {
+  it('strips nothing from a turn that offered no tool and ran none, and only tagged calls from one in which a tool ran', () => {
     const fenced = '```json\n{"tool": "calculate", "arguments": {}}\n```';
+    const tagged = 'Qwen writes <tool_call>{"name":"a","arguments":{}}</tool_call> and Mistral [TOOL_CALLS] a({"b": 1}).';
     expect(stripToolSyntax(fenced, { offered: [] })).toBe(fenced);
-    expect(stripToolSyntax('<tool_call>{"name":"a","arguments":{}}</tool_call>', { offered: [] })).toBe('');
+    expect(stripToolSyntax(tagged, { offered: [] })).toBe(tagged);
+    expect(stripToolSyntax(fenced, { offered: [], ran: true })).toBe(fenced);
+    expect(stripToolSyntax(tagged, { offered: [], ran: true })).toBe('Qwen writes  and Mistral .');
   });
 
   it('reads a fenced block as a call only when it names a tool the turn offered, by name or by id', () => {

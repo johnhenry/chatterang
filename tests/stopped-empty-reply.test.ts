@@ -1951,3 +1951,42 @@ describe('a fenced block naming a tool the chat does not offer, in a chat with a
     expect(last.content, 'the words the person watched arrive').toBe(text);
   });
 });
+
+/* ── Round 2: in a turn that offered no tool, a call's format is words ─ */
+
+describe('a reply that shows a model’s tool-call format, in a chat with no tools', () => {
+  const EXAMPLES = [
+    'Qwen formats a call like this:\n\n```\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>\n```\n\nThe app reads the JSON between the tags.',
+    'The chat template says:\n\n```\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>\n```\n\nand fills in both.',
+    'Mistral writes a call as `[TOOL_CALLS] get_weather({"city": "Paris"})`, and the app reads the JSON inside the parentheses.',
+  ];
+
+  for (const [index, text] of EXAMPLES.entries()) {
+    it(`keeps the example in a finished reply, and sends it back: ${JSON.stringify(text.slice(0, 24))}`, async () => {
+      const id = `r2_no_tools_format_${index}`;
+      given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('how does a model format a tool call?');
+      await useChats.getState().send('thanks');
+
+      expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+      expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(text);
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+    });
+  }
+
+  it('keeps the example in a reply stopped after it', async () => {
+    const id = 'r2_no_tools_format_stopped';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `${EXAMPLES[0]!} Each call`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('how does a model format a tool call?', 'Each call', gate.release);
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});

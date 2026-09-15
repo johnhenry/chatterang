@@ -1518,9 +1518,11 @@ function unfinishedCallAt(text: string, stopped: boolean): number {
  * ran and was never shown on a send sheet, and its arguments were still sent
  * back.
  *
- * FINISHED CALLS ARE STRIPPED FROM EVERY TURN'S WORDS, a malformed one
- * included: a reply that was only `<tool_call>{…,}}</tool_call>` ran no tool,
- * and its call and arguments were still stored and sent back.
+ * FINISHED CALLS ARE STRIPPED FROM THE WORDS OF EVERY TURN THAT OFFERED A TOOL
+ * OR RAN ONE (`ran`), a malformed one included: a reply that was only
+ * `<tool_call>{…,}}</tool_call>` ran no tool, and its call and arguments were
+ * still stored and sent back. A turn that offered none and ran none wrote no
+ * call, and one showing a model's call format keeps it.
  *
  * THE UNFINISHED ONE IS CUT only when `cutsUnfinished` says so — not in a turn
  * that offered no tool, and no tool ran. There is no call being written, and a
@@ -1540,11 +1542,17 @@ function wordsWithoutCalls(
   content: string,
   {
     offered,
+    ran,
     stopped,
     cutsUnfinished,
-  }: { readonly offered: readonly string[]; readonly stopped: boolean; readonly cutsUnfinished: boolean },
+  }: {
+    readonly offered: readonly string[];
+    readonly ran: boolean;
+    readonly stopped: boolean;
+    readonly cutsUnfinished: boolean;
+  },
 ): string {
-  const finished = stripToolSyntax(content, { offered });
+  const finished = stripToolSyntax(content, { offered, ran });
   if (!cutsUnfinished) return finished;
   const unfinished = unfinishedCallAt(finished, stopped);
   return unfinished === -1 ? finished : finished.slice(0, unfinished);
@@ -1871,6 +1879,7 @@ async function runGeneration(
               // arguments that went to the server, to the model.
               content: wordsWithoutCalls(split.content, {
                 offered,
+                ran: toolCalls.length > 0,
                 stopped: false,
                 cutsUnfinished: true,
               }),
@@ -1943,6 +1952,7 @@ async function runGeneration(
             toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
           const content = wordsWithoutCalls(split.content, {
             offered,
+            ran: toolCalls.length > 0,
             stopped: aborted,
             cutsUnfinished: readsCalls,
           }).trim();
@@ -2045,6 +2055,7 @@ async function runGeneration(
             // that ran, arguments and all, to the model.
             content: wordsWithoutCalls(partial.content, {
               offered,
+              ran: toolCalls.length > 0,
               stopped: false,
               cutsUnfinished: offersTools || toolCalls.length > 0,
             }).trim(),

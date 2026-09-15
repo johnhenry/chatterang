@@ -328,9 +328,21 @@ const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/
  * `offered` is what the turn's request offered, as {@link callNames} gives it.
  * A fenced block is stripped only when it names one of those — the call
  * `extractTextualToolCalls` would have read and run — and is an example
- * otherwise. The tag forms are stripped whatever they name, as they always were.
+ * otherwise. The tag forms are stripped whatever they name.
+ *
+ * `ran` is whether a tool ran in the turn. A TURN THAT OFFERED NO TOOL AND RAN
+ * NONE HAS NOTHING STRIPPED: nothing it wrote can be a call. The tag forms were
+ * stripped from every reply, and one explaining how a model formats a call —
+ * Qwen's `<tool_call>{"name": "get_weather", …}</tool_call>` in a code block,
+ * or "Mistral writes `[TOOL_CALLS] get_weather({…})`" — lost its example. In a
+ * turn that offered a tool, or ran one, they are markup whatever their body,
+ * malformed ones included.
  */
-export function stripToolSyntax(text: string, { offered }: { readonly offered: readonly string[] }): string {
+export function stripToolSyntax(
+  text: string,
+  { offered, ran }: { readonly offered: readonly string[]; readonly ran: boolean },
+): string {
+  if (offered.length === 0 && !ran) return text.trim();
   const spans: [number, number][] = [];
   for (const { open, close, fenced } of CALL_SHAPES) {
     if (fenced && offered.length === 0) continue;
@@ -885,7 +897,7 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
 
     // Hand the executed tools to the UI via response metadata, and clean the
     // model's tool syntax out of the visible answer.
-    const stripped = stripToolSyntax(messageToText(response.message), { offered: callNames(declared) });
+    const stripped = stripToolSyntax(messageToText(response.message), { offered: callNames(declared), ran: true });
     // If stripping leaves nothing, the model's whole reply was a tool call and
     // the follow-up turn did not happen. An empty message is never the right
     // thing to show, so keep the raw text and let the caller decide.
