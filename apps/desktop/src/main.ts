@@ -49,7 +49,18 @@ import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
-import { BrowserWindow, Menu, app, dialog, ipcMain, protocol, session, shell, utilityProcess } from 'electron';
+import {
+  BrowserWindow,
+  Menu,
+  app,
+  dialog,
+  ipcMain,
+  powerMonitor,
+  protocol,
+  session,
+  shell,
+  utilityProcess,
+} from 'electron';
 
 import { installPermissionHandlers } from './permissions.js';
 import { utilityHostHandle } from './utility-host.js';
@@ -85,6 +96,7 @@ import type {
   LocalTurns,
   RendererTeardownEvent,
 } from './bridge/index.js';
+import { wirePowerEvents } from './bridge/power-events.js';
 import {
   APP_ORIGIN,
   APP_SCHEME,
@@ -448,6 +460,12 @@ function start(): void {
     notifyWindow: notices,
     warn: (message) => console.warn(`[main:broker] ${message}`),
   });
+  // SLEEP AND WAKE REACH THE BROKER (#7 ruling 7: no keep-awake). On suspend it
+  // stops admitting and ends every waiting and running generation, the desktop's
+  // own included, HOST_SUSPENDED; on resume it admits again. Here, in start(),
+  // because `broker` is built here and start() runs after `app.whenReady()`.
+  // Nothing in this app may hold the machine awake instead.
+  const stopPowerEvents = wirePowerEvents(powerMonitor, broker);
 
   /*
    * ONE HOST PER ENGINE, and the per-host liveness budget the split makes safe.
@@ -625,8 +643,10 @@ function start(): void {
   //
   // The broker first: every waiting and running generation ends
   // DESKTOP_QUITTING, and a running one is cancelled in its host, before the
-  // fleet stops supervising the hosts.
+  // fleet stops supervising the hosts. And before the broker, the power events:
+  // a sleep during shutdown has nothing left to end.
   app.once('will-quit', () => {
+    stopPowerEvents();
     broker.quit();
     fleet.dispose();
   });
