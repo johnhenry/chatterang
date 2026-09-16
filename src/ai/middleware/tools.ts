@@ -311,6 +311,15 @@ export async function runToolCalls(
     declared?: readonly ChatterangTool[];
     signal?: AbortSignal;
     onToolExecuted?: (tool: ExecutedTool) => void;
+    /*
+     * This batch was read from a turn past the turn's limit on tool rounds
+     * (#293). Nothing in it runs — the limit means no more tool rounds, full
+     * stop — but a call with a destination still gets a `withheld` receipt,
+     * why `round-limit`, so it is not a call the thread and the export never
+     * heard of. Skips `refusedDestinations` entirely: nobody is asked about a
+     * call that was never going to run regardless of the answer.
+     */
+    roundLimitReached?: boolean;
   },
 ): Promise<{ results: MessageContent[]; executed: ExecutedTool[] }> {
   const results: MessageContent[] = [];
@@ -356,12 +365,11 @@ export async function runToolCalls(
     );
     // Asked BEFORE any call in the batch runs, so a sheet lists every call its
     // answer covers, and a destructive call's own confirm comes after it.
-    const { refused, onHeldGrant } = await refusedDestinations(
-      calls,
-      tools,
-      options.destinations,
-      options.signal,
-    );
+    // Skipped entirely past the round limit: nothing in this batch runs
+    // whatever the answer, so nobody is asked (see `roundLimitReached`).
+    const { refused, onHeldGrant } = options.roundLimitReached
+      ? { refused: new Map<number, Refusal>(), onHeldGrant: new Set<number>() }
+      : await refusedDestinations(calls, tools, options.destinations, options.signal);
 
     /*
      * A HELD GRANT IS READ AGAIN AT THE CALL, not only when the batch was asked
@@ -421,15 +429,33 @@ export async function runToolCalls(
       };
     };
 
+    /*
+     * PAST THE ROUND LIMIT, every call with a destination is withheld, and
+     * nothing runs (#293). There is no sheet to have answered no — the limit
+     * itself is the reason — so this checks `options.roundLimitReached`
+     * directly rather than reading `refused`, which `refusedDestinations` was
+     * never asked to fill in for this batch.
+     */
+    const overLimit = (index: number): Refusal | undefined => {
+      const destination = tools[index]?.destination;
+      if (!destination || !options.roundLimitReached) return undefined;
+      return {
+        output: `This call’s arguments were not sent to ${destination.host}: the turn had already used every tool round it was allowed.`,
+        why: 'round-limit',
+      };
+    };
+
     for (const [index, call] of calls.entries()) {
-      const refusal = refused.get(index) ?? withdrawn(index) ?? changed(index) ?? stopped(index);
-      // Nothing runs once the turn is stopped. A refused call is still written
-      // down below, whatever refused it: a refusal sends nothing, and a call the
-      // person declined before Stop came is as much not sent as one Stop held
-      // back (owner ruling OD7). What is skipped here without a record is only a
-      // call with no destination — a tool that runs on this device, or a name
-      // the request did not declare — which has no server it was not sent to.
-      if (options.signal?.aborted && !refusal) continue;
+      const refusal =
+        refused.get(index) ?? withdrawn(index) ?? changed(index) ?? stopped(index) ?? overLimit(index);
+      // Nothing runs once the turn is stopped or past the round limit. A
+      // refused call is still written down below, whatever refused it: a
+      // refusal sends nothing, and a call the person declined before Stop
+      // came is as much not sent as one Stop held back (owner ruling OD7).
+      // What is skipped here without a record is only a call with no
+      // destination — a tool that runs on this device, or a name the request
+      // did not declare — which has no server it was not sent to.
+      if ((options.signal?.aborted || options.roundLimitReached) && !refusal) continue;
 
       const tool = tools[index];
       // What a record names: the live tool, or the one the request declared when
@@ -588,10 +614,16 @@ async function refusedDestinations(
     }
     if (decision === 'calls' || decision === 'conversation') continue;
 
-    const output = policy.request
-      ? `The user did not allow sending this call’s arguments to ${destination.host}.`
-      : `This call’s arguments were not sent to ${destination.host}: this conversation has not allowed that server, and nobody could be asked.`;
-    for (const index of indices) refused.set(index, { output, why: 'not-allowed' });
+    // No `request` hook means no person to ask (#293): distinct from a person
+    // answering no, so it is named `unattended` rather than folded into
+    // `not-allowed`. Only reachable once an unattended caller exists (#199).
+    if (policy.request) {
+      const output = `The user did not allow sending this call’s arguments to ${destination.host}.`;
+      for (const index of indices) refused.set(index, { output, why: 'not-allowed' });
+    } else {
+      const output = `This call’s arguments were not sent to ${destination.host}: this conversation has not allowed that server, and nobody could be asked.`;
+      for (const index of indices) refused.set(index, { output, why: 'unattended' });
+    }
   }
 
   return { refused, onHeldGrant };

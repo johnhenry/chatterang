@@ -695,8 +695,9 @@ export function chatterangCommands(stores: ShellStores): ShellCommand[] {
                 '    from the conversation. Each call handed to a server is recorded',
                 '    in the thread and in an exported transcript: the server, its',
                 '    host, when, and how many bytes of arguments. A call that did',
-                '    not go — declined, stopped, or refused because its server',
-                '    changed — is recorded there as not sent.',
+                '    not go — declined, stopped, refused because its server',
+                '    changed, or refused because nobody was there to be asked —',
+                '    is recorded there as not sent.',
               ]
             : []),
           '  - tool output, when a tool runs in a chat served by a remote model:',
@@ -1063,12 +1064,16 @@ function receiptClause(receipt: McpCallReceipt): string {
       switch (receipt.why) {
         case 'not-allowed':
           return `${receipt.toolName} was not sent to ${where} at ${when} — it was not allowed`;
+        case 'unattended':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — this conversation had not allowed that server, and nobody was there to be asked`;
         case 'declined':
           return `${receipt.toolName} was not sent to ${where} at ${when} — it could change data there, and was declined`;
         case 'server-changed':
           return `${receipt.toolName} was not sent to ${where} at ${when} — the server changed before it went`;
         case 'stopped':
           return `${receipt.toolName} was not sent to ${where} at ${when} — the reply was stopped before it went`;
+        case 'round-limit':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the turn had already used every tool round it was allowed`;
         default:
           return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
       }

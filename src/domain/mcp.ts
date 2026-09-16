@@ -145,8 +145,13 @@ export interface McpCallFields {
 /**
  * Why a call's arguments were withheld (#92, owner ruling OD7).
  *
- * - `not-allowed`: this conversation did not allow the server — the person said
- *   no to the send sheet, or nobody could be asked (#6).
+ * - `not-allowed`: this conversation did not allow the server — the person
+ *   said no to the send sheet.
+ * - `unattended`: the server was not allowed, and nobody could be asked — the
+ *   caller that ran this turn passed no `request` hook (#199, #293). Distinct
+ *   from `not-allowed` because "a person said no" and "there was no person to
+ *   ask" are different facts, and only the first is a decision anyone made.
+ *   Latent until an unattended caller exists to reach it.
  * - `declined`: the server was allowed, and the person said no when asked about
  *   a call the server does not call read-only changing data there.
  * - `server-changed`: nobody refused it. The server record it was prepared for
@@ -160,19 +165,34 @@ export interface McpCallFields {
  *   batch: one waiting on a person, at the send sheet or the data-change
  *   confirm, whatever was answered after; one whose own send sheet was never
  *   raised, because Stop came at an earlier sheet or before the batch was
- *   dispatched; and one already allowed — by a grant the conversation held or
- *   an answer given in this batch — that had not yet run when Stop came, at
- *   another server's sheet or while an earlier call ran.
+ *   dispatched; one already allowed — by a grant the conversation held or an
+ *   answer given in this batch — that had not yet run when Stop came, at
+ *   another server's sheet or while an earlier call ran; and one already
+ *   complete in text the model was still streaming when Stop landed — read
+ *   after the fact, from the partial text the abort left behind, the same way
+ *   a finished turn's text is read (#293).
+ * - `round-limit`: the call was read from a model turn's finished text, but
+ *   that turn came after the turn's limit on tool rounds (`TOOL_ITERATIONS`),
+ *   so it was never dispatched (#293). `stripToolSyntax` still removes it from
+ *   the displayed text; this is the record that says why nothing happened.
  *
- * A call here is one read from a model turn that finished, under the turn's
- * limit on tool rounds. A call in text the model was still writing when Stop
- * came, or written in a turn past that limit, was never read as a call: it was
- * not sent, and it has no record.
+ * A call here is one whose text was complete enough for {@link findToolCalls}
+ * or its textual forms to read it as a call — whether that text came from a
+ * turn that finished normally, one cut short by Stop, or one run past the
+ * round limit. Text that never became a complete call — an argument still
+ * streaming when Stop landed — was never read as a call at all: it was not
+ * sent, and it has no record, because there is nothing named yet to record.
  *
  * Each reads differently in the thread and the export, because each is a
  * different thing to have happened.
  */
-export type WithheldWhy = 'not-allowed' | 'declined' | 'server-changed' | 'stopped';
+export type WithheldWhy =
+  | 'not-allowed'
+  | 'unattended'
+  | 'declined'
+  | 'server-changed'
+  | 'stopped'
+  | 'round-limit';
 
 /**
  * Could this call's arguments have reached the server?

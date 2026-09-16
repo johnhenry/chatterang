@@ -1123,9 +1123,11 @@ describe('an MCP receipt survives the turn it was taken in (#92)', () => {
    */
   it.each([
     ['not-allowed', 'it was not allowed'],
+    ['unattended', 'this conversation had not allowed that server, and nobody was there to be asked'],
     ['declined', 'it could change data there, and was declined'],
     ['server-changed', 'the server changed before it went'],
     ['stopped', 'the reply was stopped before it went'],
+    ['round-limit', 'the turn had already used every tool round it was allowed'],
   ] as const)('is kept when a turn whose only record says a call was not sent (%s) is regenerated', async (why, reason) => {
     const withheld: ToolInvocation = { ...SENT, isError: true, receipt: { ...RECEIPT, outcome: 'withheld', why } };
     // A turn that wrote nothing but the record, as a stopped or refused one does.

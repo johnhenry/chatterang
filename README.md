@@ -119,7 +119,8 @@ What can leave the device, each only when you turn it on:
    screen or for the whole conversation, and a server on localhost is asked
    about the same way. Each call handed to a server is recorded in the thread
    and in an exported transcript. A call that did not go — declined, stopped,
-   or refused because its server changed — is recorded there as not sent.
+   refused because its server changed, or refused because nobody was there to
+   be asked — is recorded there as not sent.
 5. **Benchmark runs you publish**, if you turn that on. It is off by default,
    each run is confirmed individually, and the consent sheet shows the literal
    JSON — which contains no install id, device serial, account, or

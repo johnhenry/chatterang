@@ -307,7 +307,8 @@ const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 19).r
  * halves).
  */
 const NOT_SENT_SENTENCE =
-  'A call that did not go — declined, stopped, or refused because its server changed — is recorded there as not sent.';
+  'A call that did not go — declined, stopped, refused because its server changed, or refused because ' +
+  'nobody was there to be asked — is recorded there as not sent.';
 
 /**
  * What that sentence claims, measured: one call of each kind it names, each
@@ -366,6 +367,9 @@ async function expectEachCallThatDidNotGoRecordedAsNotSent(): Promise<void> {
     isGranted: () => false,
     request: async () => 'deny',
   });
+  // Refused because nobody could be asked: no `request` hook at all, the
+  // unattended caller's shape (#293 item 3). Distinct from a person's own no.
+  const unattended = await dispatch([toolOn('notes', true, async () => true)], { isGranted: () => false });
   // Declined at the data-change confirm, its server allowed.
   const atConfirm = await dispatch([toolOn('notes', false, async () => false)], { isGranted: () => true });
   // Stopped at one server's sheet, beside a call to a server already allowed.
@@ -405,6 +409,13 @@ async function expectEachCallThatDidNotGoRecordedAsNotSent(): Promise<void> {
 
   const expected = [
     { record: atSheet[0], host: 'notes.example', server: 'notes', why: 'not-allowed', says: 'it was not allowed' },
+    {
+      record: unattended[0],
+      host: 'notes.example',
+      server: 'notes',
+      why: 'unattended',
+      says: 'this conversation had not allowed that server, and nobody was there to be asked',
+    },
     {
       record: atConfirm[0],
       host: 'notes.example',
@@ -1101,17 +1112,16 @@ describe('the privacy command', () => {
 
   /*
    * THE OTHER HALF OF THE RECEIPT SENTENCE (#92, owner ruling that the copy
-   * says both). Beside "each call handed to a server is recorded", a call that
-   * did not go — declined, stopped, or refused because its server changed — is
+   * says both). Beside "each call handed to a server is recorded", a call
+   * that did not go — declined, stopped, refused because its server changed,
+   * or refused because nobody was there to be asked (#293 item 3) — is
    * recorded as not sent. The sentence above is still pinned whole.
    */
   it('says a call that did not go is recorded as not sent — and each kind is', async () => {
     const output = await privacyOutput({
       mcp: [{ name: 'notes', host: 'notes.example', enabled: true }],
     });
-    expect(output).toContain(
-      'how many bytes of arguments. A call that did not go — declined, stopped, or refused because its server changed — is recorded there as not sent.',
-    );
+    expect(output).toContain('how many bytes of arguments. ' + NOT_SENT_SENTENCE);
     expect(output).toContain(NOT_SENT_SENTENCE);
 
     await expectEachCallThatDidNotGoRecordedAsNotSent();
