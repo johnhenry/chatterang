@@ -52,6 +52,7 @@ import { readFile } from 'node:fs/promises';
 import {
   BrowserWindow,
   Menu,
+  MessageChannelMain,
   app,
   dialog,
   ipcMain,
@@ -84,6 +85,8 @@ import {
   WorkBroker,
   admitLocalTurns,
   createMainRouter,
+  createPeerTurnWorkerSpawner,
+  createWorkerHost,
   localTurnNotices,
   releaseRendererOn,
   withTurnProgress,
@@ -160,6 +163,20 @@ protocol.registerSchemesAsPrivileged([
 /** `apps/desktop/app` — a verbatim copy of `dist/`, written by `scripts/sync.mjs`. */
 function appRoot(): string {
   return join(app.getAppPath(), 'app');
+}
+
+/**
+ * The URL every window of ours loads: the dev server in development, the
+ * bundle served from disk otherwise.
+ *
+ * A FUNCTION BECAUSE THERE ARE TWO CALLERS NOW. `createWindow` had this
+ * expression inline while it was the only window there was; the hidden
+ * peer-turn worker (#7 S5) loads the SAME app the same way, with one query
+ * parameter added by `createPeerTurnWorkerSpawner`. Two copies of it is how the
+ * worker ends up loading a different build from the window beside it.
+ */
+function appUrl(): string {
+  return DEV_SERVER_URL !== '' ? DEV_SERVER_URL : `${APP_ORIGIN}/index.html`;
 }
 
 /* ── The filesystem the renderer is allowed to see ────────────────────── */
@@ -448,18 +465,31 @@ function start(): void {
    * first-come-first-served wait list, and whoever waits is told. The broker
    * is built before the fleet because the fleet's events are proof of progress
    * for it. No listener is started here: phone turns reach this broker only
-   * once #7's listener wiring (S7) lands, so today every unit it holds is a
-   * window's.
+   * once #7's listener wiring (S7) lands, so nothing yet CALLS `workerHost.run`
+   * — but the worker it would build is wired below, so that when a listener
+   * does, there is something to run the turn on.
    */
   const notices = localTurnNotices((pluginName, eventName, data, ownerId) =>
     pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
   );
-  // No `condemnExecutor`. The only executor today is the llama host, and its
-  // Supervisor ends every call it serves on its own deadlines, so work the
-  // broker has stopped always returns and the slot is freed then. S5's worker
-  // window is the executor that will need one.
+  /*
+   * `condemnExecutor` IS THE WORKER, AND ONLY THE WORKER (#7 S5).
+   *
+   * The llama host needs none: its Supervisor ends every call it serves on its
+   * own deadlines, so work the broker has stopped always returns and the slot
+   * is freed then. A worker window does not — the broker can stop a phone's
+   * unit while a page keeps decoding, and the only way to be sure that work is
+   * over is to destroy the window. `WorkerHost.condemn` answers true only once
+   * it has, and the broker then calls `workerLost` itself (`worker-host.ts`).
+   *
+   * It names `workerHost` before the line that builds it. That is safe and not
+   * an accident: the hook is called from `WorkBroker#drainExpired`, long after
+   * this function has returned, and the two cannot be built in one order — the
+   * host needs the broker, and the broker needs the host's condemn.
+   */
   const broker = new WorkBroker({
     notifyWindow: notices,
+    condemnExecutor: (executor) => workerHost.condemn(executor),
     warn: (message) => console.warn(`[main:broker] ${message}`),
   });
   // SLEEP AND WAKE REACH THE BROKER (#7 ruling 7: no keep-awake). On suspend it
@@ -468,6 +498,37 @@ function start(): void {
   // because `broker` is built here and start() runs after `app.whenReady()`.
   // Nothing in this app may hold the machine awake instead.
   const stopPowerEvents = wirePowerEvents(powerMonitor, broker);
+
+  /*
+   * The hidden worker a paired device's turn runs in (#7 ruling 1, S5).
+   *
+   * BUILDS NOTHING HERE. `createWorkerHost` spawns on the first `run` and not
+   * before, so an app that never serves a phone never opens a window; an idle
+   * worker is destroyed after `WORKER_IDLE_MS`. Nothing yet CALLS `run` — the
+   * listener that would is S7's — so today this costs one object.
+   *
+   * AFTER `wirePowerEvents`, and not between the broker and it: the power
+   * events belong to the broker, and `tests/desktop-security.test.ts` pins
+   * them as adjacent so nothing can drift in between. The worker host needs
+   * only that the broker exists.
+   *
+   * The spawner is the one piece that knows what a worker IS on Electron, and
+   * it is handed the two constructors rather than importing them, which is what
+   * keeps `bridge/peer-turn-window.ts` inside the platform-free directory and
+   * under test. It loads `appUrl()` — the same bundle this app's own windows
+   * load, at the same origin, so the worker's `webContents.id` is a trusted
+   * sender like any other — with the worker flag added, and
+   * `build/peer-turn-preload.cjs` beside `build/preload.cjs`.
+   */
+  const workerHost = createWorkerHost({
+    spawnWorker: createPeerTurnWorkerSpawner({
+      appUrl: appUrl(),
+      preloadPath: join(app.getAppPath(), 'build', 'peer-turn-preload.cjs'),
+      electron: { BrowserWindow, MessageChannelMain },
+    }),
+    broker,
+    warn: (message) => console.warn(`[main:worker-host] ${message}`),
+  });
 
   /*
    * ONE HOST PER ENGINE, and the per-host liveness budget the split makes safe.
@@ -513,8 +574,16 @@ function start(): void {
     //
     // Wrapped so a turn's tokens also reset the broker's deadline for it; the
     // event itself is forwarded unchanged, and a throw still propagates.
+    //
+    // `hostedUnitOf` IS THE THIRD ARGUMENT FOR A REASON. Without it, tokens
+    // decoded for the WORKER window would be recorded as progress on a unit
+    // `{kind:'window', id:<the worker>}` that the broker has never heard of,
+    // and the phone's unit — the one actually running — would look silent and
+    // be ended on its idle deadline mid-turn (`local-turns.ts`,
+    // `withTurnProgress`).
     notify: withTurnProgress(broker, (pluginName, eventName, data, ownerId) =>
       pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+      workerHost.hostedUnitOf,
     ),
     onBoot: (hostName, status) => {
       console.log(
@@ -535,6 +604,11 @@ function start(): void {
   // is told it is waiting, and a benchmark, which decodes too, is refused while
   // anything holds or waits for the slot. Registering the facade directly would
   // let a local turn decode on the same sequence as a phone's.
+  //
+  // `hostedUnitOf` is what tells this apart from a user's window: a `generate`
+  // from the worker window is the phone's unit, already admitted, so it goes
+  // straight to the host rather than asking the broker for a slot the phone is
+  // already holding (`local-turns.ts`).
   const localTurns = admitLocalTurns({
     broker,
     facade: fleet.plugin(LLAMA_PLUGIN.name),
@@ -542,6 +616,7 @@ function start(): void {
     notices,
     notify: (pluginName, eventName, data, ownerId) =>
       pluginHost.notifyListeners(pluginName, eventName, data, ownerId),
+    hostedUnitOf: workerHost.hostedUnitOf,
   });
   pluginHost.register(LOCAL_TURNS_PLUGIN, localTurns.plugin);
   pluginHost.register(ONNX_PLUGIN, fleet.plugin(ONNX_PLUGIN.name));
@@ -670,9 +745,16 @@ function start(): void {
   // DESKTOP_QUITTING, and a running one is cancelled in its host, before the
   // fleet stops supervising the hosts. And before the broker, the power events:
   // a sleep during shutdown has nothing left to end.
+  //
+  // The worker between the two: `broker.quit()` has already ended its unit, so
+  // `dispose` destroys a window with no turn left in it, and it happens before
+  // the fleet stops supervising the hosts the worker's `generate` was decoding
+  // on. A `dispose` after the fleet would leave a window alive, briefly,
+  // talking to hosts that were going away.
   app.once('will-quit', () => {
     stopPowerEvents();
     broker.quit();
+    workerHost.dispose();
     fleet.dispose();
   });
 
@@ -780,7 +862,7 @@ function createWindow(
   });
 
   window.once('ready-to-show', () => window.show());
-  void window.loadURL(DEV_SERVER_URL !== '' ? DEV_SERVER_URL : `${APP_ORIGIN}/index.html`);
+  void window.loadURL(appUrl());
   return window;
 }
 

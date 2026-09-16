@@ -728,7 +728,10 @@ describe('main.ts wiring', () => {
     expect(source).toMatch(/const notices = localTurnNotices\(/);
     expect(source).toMatch(/notifyWindow:\s*notices,/);
     // 4. On quit the broker ends every generation before the fleet stops.
-    expect(source).toMatch(/broker\.quit\(\);\s*fleet\.dispose\(\);/);
+    //    The worker host is disposed between the two (#7 S5): `broker.quit()`
+    //    has already ended its unit, so its window is destroyed with no turn
+    //    left in it, and before the hosts that window was decoding on go away.
+    expect(source).toMatch(/broker\.quit\(\);\s*workerHost\.dispose\(\);\s*fleet\.dispose\(\);/);
     // 5. No listener: #169 ruled a turn-carrying listener waits for #7.
     expect(source).not.toMatch(/createTunnel(?:Host|Listener)\s*\(|@chatterang\/tunnel\/host/);
   });
@@ -756,7 +759,9 @@ describe('main.ts wiring', () => {
     expect(source).toMatch(/import \{ wirePowerEvents \} from '\.\/bridge\/power-events\.js';/);
     // 4. On quit the listeners go first, and the broker still ends every
     //    generation before the fleet stops.
-    expect(source).toMatch(/app\.once\('will-quit', \(\) => \{\s*stopPowerEvents\(\);\s*broker\.quit\(\);\s*fleet\.dispose\(\);/);
+    expect(source).toMatch(
+      /app\.once\('will-quit', \(\) => \{\s*stopPowerEvents\(\);\s*broker\.quit\(\);\s*workerHost\.dispose\(\);\s*fleet\.dispose\(\);/,
+    );
   });
 
   it('#7 ruling 7: nothing keeps the computer awake', () => {

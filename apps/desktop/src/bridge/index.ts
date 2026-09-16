@@ -93,6 +93,29 @@ export {
   createWorkerHost,
 } from './worker-host.js';
 export type { WorkerFailure, WorkerHost, WorkerHostOptions, WorkerSpawn, WorkerTurnEnd } from './worker-host.js';
+export {
+  PEER_TURN_PORT_CHANNEL,
+  PEER_TURN_WORKER_PARAM,
+  PEER_TURN_WORKER_VALUE,
+  WORKER_DESTROYED,
+  WORKER_LOAD_FAILED,
+  WORKER_PORT_CLOSED,
+  WORKER_RENDERER_GONE,
+  createPeerTurnWorkerSpawner,
+  peerTurnWorkerUrl,
+} from './peer-turn-window.js';
+export type {
+  PeerTurnElectron,
+  PeerTurnWebPreferences,
+  PeerTurnWindowConstructorOptions,
+  PeerTurnWindowOptions,
+  WorkerChannelLike,
+  WorkerPortLike,
+  WorkerWebContentsLike,
+  WorkerWindowLike,
+} from './peer-turn-window.js';
+export { wireDeviceTunnel, wirePeerTunnels } from './peer-turns.js';
+export type { PeerTurnsOptions } from './peer-turns.js';
 export { HostRuntime, createHostRuntime } from './host-runtime.js';
 export type {
   CallGuard,
