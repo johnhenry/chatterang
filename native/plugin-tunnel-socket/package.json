@@ -1,0 +1,21 @@
+{
+  "name": "@chatterang/plugin-tunnel-socket",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Capacitor plugin package that makes the tunnel's native socket plugin (#181, #295) discoverable by `cap sync`. The TypeScript contract lives in packages/contracts/src/tunnel-socket.ts and src/plugins/tunnel-socket; this package carries only the native halves.",
+  "license": "Apache-2.0",
+  "files": [
+    "ios/Sources",
+    "android/build.gradle",
+    "android/src/main/",
+    "Package.swift"
+  ],
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}

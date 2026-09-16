@@ -17,7 +17,8 @@
     "@chatterang/contracts": "*",
     "@chatterang/cordis-aimatey": "*",
     "@chatterang/inference-node": "*",
-    "@chatterang/onnx-node": "*"
+    "@chatterang/onnx-node": "*",
+    "ws": "8.21.3"
   },
   "devDependencies": {
     "electron": "44.0.0",
