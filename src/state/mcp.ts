@@ -20,6 +20,7 @@ import { create } from 'zustand';
 
 import { db } from '@/db';
 import { newId } from '@/domain/chat';
+import { serializedByKey, withoutOne } from '@/lib/serialize';
 import {
   McpNotSent,
   validateServerUrl,
@@ -58,6 +59,13 @@ interface McpState {
   servers: McpServerConfig[];
   states: Record<string, McpServerState>;
   connecting: boolean;
+  /**
+   * Server ids with a `toggle` call in flight or queued, so a panel can show a
+   * pending state and refuse another click while one is already waiting, and
+   * a refused switch-on is not silent (#315). See `state/app.ts`'s
+   * `pendingConnections`, which this mirrors.
+   */
+  pendingServers: string[];
 
   load: () => Promise<void>;
   add: (input: { name: string; url: string; token?: string }) => Promise<string | null>;
@@ -70,10 +78,23 @@ interface McpState {
 /** Tool ids this module owns, so a reconnect removes exactly what it added. */
 let registeredIds: string[] = [];
 
+/**
+ * The `toggle` call in flight or queued for each server id, so overlapping
+ * calls for the SAME id run one at a time, in the order they were made. See
+ * `serializedByKey` and `state/app.ts`'s `connectionToggles`, which this
+ * mirrors for the reason given there (#318): without it, a switch-on made
+ * while a switch-off's own `db.mcpServers.update` is still in flight reads
+ * the server as still enabled — `toggle`'s own `set` has not run yet — skips
+ * the withdrawal a genuine off→on transition has to make, and keeps a grant
+ * the switch-off could not write away.
+ */
+const serverToggles = new Map<string, Promise<void>>();
+
 export const useMcp = create<McpState>((set, get) => ({
   servers: [],
   states: {},
   connecting: false,
+  pendingServers: [],
 
   async load() {
     const servers = await db.mcpServers.orderBy('createdAt').toArray();
@@ -144,22 +165,38 @@ export const useMcp = create<McpState>((set, get) => ({
   // reconnect still runs if that write fails, because it is what unregisters
   // the tools.
   async toggle(id, enabled) {
-    const write = async (): Promise<void> => {
-      await db.mcpServers.update(id, { enabled });
-    };
-    // Switched on only once no grant a launch read from disk naming it off is
-    // left there, nor one a switch-off could not write away, as a connection is
-    // (`toggleConnection`).
-    const isOn = (): boolean => get().servers.find((server) => server.id === id)?.enabled === true;
-    await (enabled ? switchMcpServerOn(id, write, isOn) : write());
-    set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
+    // Marked pending from the moment this is CALLED, not once its turn in the
+    // queue below comes up — a second click made while an earlier call for the
+    // same id is still queued must see it too (#315).
+    set({ pendingServers: [...get().pendingServers, id] });
     try {
-      // Switched on: a launch still withdrawing the grants on disk that named it
-      // off stops counting a yes given from here on as one it withdraws.
-      if (enabled) await noticeMcpServerSwitchedOn(id);
-      if (!enabled) await revokeMcpGrantsFor(id);
+      await serializedByKey(serverToggles, id, async () => {
+        const write = async (): Promise<void> => {
+          await db.mcpServers.update(id, { enabled });
+        };
+        // Switched on only once no grant a launch read from disk naming it off
+        // is left there, nor one a switch-off could not write away, as a
+        // connection is (`toggleConnection`).
+        //
+        // SAFE TO READ `get().servers` HERE, unlike before this queued: a
+        // switch-off for this same id has either not started, or has already
+        // run to completion — `set` included — because it went through this
+        // same queue first (#318).
+        const isOn = (): boolean => get().servers.find((server) => server.id === id)?.enabled === true;
+        await (enabled ? switchMcpServerOn(id, write, isOn) : write());
+        set({ servers: get().servers.map((s) => (s.id === id ? { ...s, enabled } : s)) });
+        try {
+          // Switched on: a launch still withdrawing the grants on disk that
+          // named it off stops counting a yes given from here on as one it
+          // withdraws.
+          if (enabled) await noticeMcpServerSwitchedOn(id);
+          if (!enabled) await revokeMcpGrantsFor(id);
+        } finally {
+          await get().reconnect();
+        }
+      });
     } finally {
-      await get().reconnect();
+      set({ pendingServers: withoutOne(get().pendingServers, id) });
     }
   },
 

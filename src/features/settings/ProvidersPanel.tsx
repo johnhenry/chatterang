@@ -19,6 +19,8 @@ export function ProvidersPanel(): ReactNode {
   const connections = useApp((state) => state.connections);
   const settings = useApp((state) => state.settings);
   const update = useApp((state) => state.updateSettings);
+  const pending = useApp((state) => state.pendingConnections);
+  const toast = useApp((state) => state.toast);
 
   const [adding, setAdding] = useState<ProviderDescriptor | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<ProviderConnection | null>(null);
@@ -49,9 +51,24 @@ export function ProvidersPanel(): ReactNode {
                   </div>
                   <Switch
                     checked={connection.enabled}
-                    onChange={(enabled) =>
-                      void useApp.getState().toggleConnection(connection.id, enabled)
-                    }
+                    disabled={pending.includes(connection.id)}
+                    onChange={(enabled) => {
+                      // A refused switch-on used to be silent: the switch just
+                      // stayed off, with no toast and no pending state while it
+                      // waited (#315). `disabled` above covers the wait; this
+                      // covers the refusal, whichever way it fails.
+                      void useApp
+                        .getState()
+                        .toggleConnection(connection.id, enabled)
+                        .catch((error: unknown) => {
+                          toast(
+                            error instanceof Error
+                              ? error.message
+                              : `Could not ${enabled ? 'enable' : 'disable'} ${connection.label}.`,
+                            'crit',
+                          );
+                        });
+                    }}
                     label={`Enable ${connection.label}`}
                   />
                   <button

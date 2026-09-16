@@ -370,6 +370,14 @@ export function Composer({
             send();
           }}
           onPaste={(event) => {
+            // NOT WHILE DISABLED (#316). A real browser still dispatches
+            // `paste` to a disabled textarea that holds the caret selection —
+            // measured in real Chromium, unlike keydown and typed characters,
+            // which do not reach it — so `disabled` on the element is not
+            // enough on its own. Without this check, a paste made while the
+            // open chat's delete is under way added a chip to a composer that
+            // was about to belong to whichever chat opened next.
+            if (disabled) return;
             if (!acceptsImages) return;
             const files = event.clipboardData.files;
             if (files.length > 0) {

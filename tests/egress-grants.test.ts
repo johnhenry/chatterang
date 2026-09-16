@@ -2143,4 +2143,133 @@ describe('a connection or server switched back on while the launch withdraws the
       }
     });
   });
+
+  describe('a switch-on made while a switch-off’s own write for the same id is still in flight (#318)', () => {
+    /*
+     * `toggleConnection`'s off branch calls `db.connections.put` (and
+     * `useMcp`'s `toggle` calls `db.mcpServers.update`) BEFORE it sets the
+     * store. A switch-on for the SAME id, made while that write is still open,
+     * used to read the connection or server as still on — the store had not
+     * caught up yet — and so skipped the withdrawal a genuine off→on transition
+     * makes, keeping a grant the switch-off could not (yet) write away.
+     *
+     * Calls for one id now queue (`serializedByKey`, lib/serialize.ts): the
+     * switch-on does not even read the store until the switch-off's whole
+     * call — its write AND the grant withdrawal that follows it — has settled.
+     * Driven with the writes actually held open, not merely made to fail, so
+     * this measures the ordering rather than assuming the race away.
+     */
+    const CONNECTION_ON = { ...OPENAI, id: 'conn_off', label: 'Off', enabled: true };
+    const SERVER_ON = { id: 'mcp_off', name: 'off', url: OFF_URL, enabled: true, createdAt: 1 };
+    const mcpServersOf = (id: string): string[] =>
+      grantsOf(id).flatMap((grant) => (grant.kind === 'mcp' ? [grant.serverId] : []));
+
+    beforeEach(() => {
+      useApp.setState({ connections: [CONNECTION_ON] });
+      useMcp.setState({ servers: [SERVER_ON], states: {} });
+      useChats.setState({ loaded: true, chats: [chatOnDisk('swept', [])], activeChatId: null, messages: [] });
+    });
+
+    /** Holds every `db.connections.put`, in call order, until released one at a time. */
+    function holdingConnectionWrites() {
+      const held: { connection: { id: string; enabled: boolean }; finish: () => void }[] = [];
+      vi.mocked(tables.connections.put).mockImplementation((async (connection: { id: string; enabled: boolean }) => {
+        await new Promise<void>((finish) => held.push({ connection: structuredClone(connection), finish }));
+      }) as never);
+      return {
+        held,
+        release: (): void => {
+          const call = held.shift();
+          if (!call) throw new Error('no connections.put is being held');
+          call.finish();
+        },
+        restore: () => {
+          for (const call of held.splice(0)) call.finish();
+          vi.mocked(tables.connections.put).mockImplementation((async () => {}) as never);
+        },
+      };
+    }
+
+    /** Holds every `db.mcpServers.update`, in call order, until released one at a time. */
+    function holdingServerWrites() {
+      const held: { id: string; changes: { enabled: boolean }; finish: () => void }[] = [];
+      vi.mocked(tables.mcpServers.update).mockImplementation((async (id: string, changes: { enabled: boolean }) => {
+        await new Promise<void>((finish) => held.push({ id, changes: structuredClone(changes), finish }));
+        return 1;
+      }) as never);
+      return {
+        held,
+        release: (): void => {
+          const call = held.shift();
+          if (!call) throw new Error('no mcpServers.update is being held');
+          call.finish();
+        },
+        restore: () => {
+          for (const call of held.splice(0)) call.finish();
+          vi.mocked(tables.mcpServers.update).mockImplementation((async () => 1) as never);
+        },
+      };
+    }
+
+    it('does not read the connection as on, and does not keep the grant the switch-off means to drop', async () => {
+      await useChats.getState().grantEgress('swept', 'conn_off');
+      const writes = holdingConnectionWrites();
+      try {
+        const switchingOff = useApp.getState().toggleConnection('conn_off', false);
+        await vi.waitFor(() => expect(writes.held).toHaveLength(1));
+
+        // Made while the switch-off's own put is still open — before calls for
+        // one id were queued, this read the connection as still enabled and
+        // skipped the withdrawal.
+        const switchingOn = useApp.getState().toggleConnection('conn_off', true);
+        await macrotask();
+        expect(writes.held, 'queued behind the switch-off: no second put yet').toHaveLength(1);
+        expect(connectionsOf('swept'), 'the grant stands until the switch-off’s write lands').toEqual([
+          'conn_off',
+        ]);
+
+        writes.release(); // the switch-off's put lands
+        await switchingOff;
+        expect(connectionsOf('swept'), 'withdrawn once the switch-off has fully landed').toEqual([]);
+
+        await vi.waitFor(() => expect(writes.held).toHaveLength(1));
+        writes.release(); // the switch-on's put
+        await switchingOn;
+
+        expect(useApp.getState().connections[0]).toMatchObject({ id: 'conn_off', enabled: true });
+        expect(connectionsOf('swept'), 'the stale grant does not survive being switched back on').toEqual([]);
+      } finally {
+        writes.restore();
+      }
+    });
+
+    it('does the same for an MCP server', async () => {
+      await useChats.getState().grantMcpEgress('swept', { serverId: 'mcp_off', url: OFF_URL });
+      const writes = holdingServerWrites();
+      try {
+        const switchingOff = useMcp.getState().toggle('mcp_off', false);
+        await vi.waitFor(() => expect(writes.held).toHaveLength(1));
+
+        const switchingOn = useMcp.getState().toggle('mcp_off', true);
+        await macrotask();
+        expect(writes.held, 'queued behind the switch-off: no second write yet').toHaveLength(1);
+        expect(mcpServersOf('swept'), 'the grant stands until the switch-off’s write lands').toEqual([
+          'mcp_off',
+        ]);
+
+        writes.release();
+        await switchingOff;
+        expect(mcpServersOf('swept'), 'withdrawn once the switch-off has fully landed').toEqual([]);
+
+        await vi.waitFor(() => expect(writes.held).toHaveLength(1));
+        writes.release();
+        await switchingOn;
+
+        expect(useMcp.getState().servers[0]).toMatchObject({ id: 'mcp_off', enabled: true });
+        expect(mcpServersOf('swept'), 'the stale grant does not survive being switched back on').toEqual([]);
+      } finally {
+        writes.restore();
+      }
+    });
+  });
 });

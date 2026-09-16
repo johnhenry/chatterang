@@ -12,6 +12,7 @@ import { db, readSetting, writeSetting } from '@/db';
 import type { ProviderConnection } from '@/ai/providers';
 import { DEFAULT_SAMPLER, type ModelManifest, type SamplerSettings } from '@/domain/manifest';
 import { newId } from '@/domain/chat';
+import { serializedByKey, withoutOne } from '@/lib/serialize';
 
 export type ThemeChoice = 'system' | 'light' | 'dark';
 export type VoiceMode = 'os' | 'neural' | 'off';
@@ -111,6 +112,13 @@ interface AppState {
   device: DeviceCapabilities | null;
   thermal: ThermalState | null;
   connections: ProviderConnection[];
+  /**
+   * Connection ids with a `toggleConnection` call in flight or queued, so a
+   * panel can show a pending state and refuse another click while one is
+   * already waiting — and so a refused switch-on is not silent (#315): the
+   * switch stays disabled, rather than merely staying off, until this settles.
+   */
+  pendingConnections: string[];
   toasts: Toast[];
   /** Queued confirmations from the model's shell tool. */
   approvals: PendingApproval[];
@@ -348,12 +356,74 @@ async function afterDisconnecting(get: () => AppState, id: string): Promise<void
   }
 }
 
+/**
+ * The `toggleConnection` call in flight or queued for each connection id, so
+ * overlapping calls for the SAME id run one at a time, in the order they were
+ * made. See `serializedByKey`.
+ */
+const connectionToggles = new Map<string, Promise<void>>();
+
+/** The body of `toggleConnection`, run once it is this id's turn in the queue. */
+async function runToggleConnection(
+  set: (partial: Partial<AppState>) => void,
+  get: () => AppState,
+  id: string,
+  enabled: boolean,
+): Promise<void> {
+  const listed = () => {
+    const all = get().connections.map((connection) =>
+      connection.id === id ? { ...connection, enabled } : connection,
+    );
+    return { all, changed: all.find((connection) => connection.id === id) };
+  };
+  let { all: connections, changed } = listed();
+  if (!changed) return;
+
+  if (enabled) {
+    // Switched on only once no grant a launch read from disk naming it off is
+    // left there, nor one a switch-off could not write away, from the list as
+    // it stands then. See `connectionSwitchingOn`.
+    //
+    // SAFE TO READ `get().connections` HERE, unlike before this queued: a
+    // switch-off for this same id has either not started — nothing to race —
+    // or has already run to completion, `set` included, because it went
+    // through this same queue first (#318).
+    await connectionSwitchingOn(
+      id,
+      async () => {
+        ({ all: connections, changed } = listed());
+        if (changed) await db.connections.put(changed);
+      },
+      () => get().connections.find((connection) => connection.id === id)?.enabled === true,
+    );
+    if (!changed) return;
+  } else {
+    // A switch-off is written as it always was: its withdrawal waits on none
+    // of this, and a turn's held answer is measured against its timing.
+    await db.connections.put(changed);
+  }
+  set({ connections });
+
+  if (enabled) {
+    connectionSwitchedOn(id);
+    await get()
+      .engine?.connectProvider(changed)
+      .catch((error: unknown) => {
+        get().toast(error instanceof Error ? error.message : 'Connection failed.', 'crit');
+      });
+  } else {
+    get().engine?.disconnectProvider(id);
+    await afterDisconnecting(get, id);
+  }
+}
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   settings: DEFAULT_SETTINGS,
   device: null,
   thermal: null,
   connections: [],
+  pendingConnections: [],
   toasts: [],
   approvals: [],
   activity: 'idle',
@@ -460,45 +530,15 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   async toggleConnection(id, enabled) {
-    const listed = () => {
-      const all = get().connections.map((connection) =>
-        connection.id === id ? { ...connection, enabled } : connection,
-      );
-      return { all, changed: all.find((connection) => connection.id === id) };
-    };
-    let { all: connections, changed } = listed();
-    if (!changed) return;
-
-    if (enabled) {
-      // Switched on only once no grant a launch read from disk naming it off is
-      // left there, nor one a switch-off could not write away, from the list as
-      // it stands then. See `connectionSwitchingOn`.
-      await connectionSwitchingOn(
-        id,
-        async () => {
-          ({ all: connections, changed } = listed());
-          if (changed) await db.connections.put(changed);
-        },
-        () => get().connections.find((connection) => connection.id === id)?.enabled === true,
-      );
-      if (!changed) return;
-    } else {
-      // A switch-off is written as it always was: its withdrawal waits on none
-      // of this, and a turn's held answer is measured against its timing.
-      await db.connections.put(changed);
-    }
-    set({ connections });
-
-    if (enabled) {
-      connectionSwitchedOn(id);
-      await get()
-        .engine?.connectProvider(changed)
-        .catch((error: unknown) =>
-          get().toast(error instanceof Error ? error.message : 'Connection failed.', 'crit'),
-        );
-    } else {
-      get().engine?.disconnectProvider(id);
-      await afterDisconnecting(get, id);
+    // Marked pending from the moment this is CALLED, not once its turn in the
+    // queue below comes up — a second click made while an earlier call for the
+    // same id is still queued must see it too, or it would queue a second
+    // switch-on behind the first (#315).
+    set({ pendingConnections: [...get().pendingConnections, id] });
+    try {
+      await serializedByKey(connectionToggles, id, () => runToggleConnection(set, get, id, enabled));
+    } finally {
+      set({ pendingConnections: withoutOne(get().pendingConnections, id) });
     }
   },
 

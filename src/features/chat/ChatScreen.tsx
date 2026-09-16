@@ -30,6 +30,10 @@ export function ChatScreen(): ReactNode {
   const deletingOpenChat = useChats(
     (state) => state.activeChatId !== null && state.deleting.includes(state.activeChatId),
   );
+  // Every chat whose delete has been asked for and has not landed. Read here,
+  // not just inside the effect below, so a delete landing — which changes
+  // `chats` or this — re-runs the effect that opens a chat (#317).
+  const deletingIds = useChats((state) => state.deleting);
 
   const [drawer, setDrawer] = useState<'none' | 'chats' | 'settings' | 'model'>('none');
   const [editing, setEditing] = useState<Message | null>(null);
@@ -49,15 +53,27 @@ export function ChatScreen(): ReactNode {
   // Open the most recent chat, or start one. Gated on both stores having
   // loaded: starting a chat before the model store is ready would create it
   // with no model attached, and would also hide the user's existing chats.
+  //
+  // THE FIRST CHAT NOT ITSELF BEING DELETED (#317). `store.chats[0]` can be one
+  // whose delete has already been asked for — queued behind an earlier write,
+  // say — and `openChat` refuses one of those outright (`removedChats` in
+  // state/chat.ts). Picking it anyway left `activeChatId` null with nothing to
+  // open: once that delete landed, `chats` and `deletingIds` both changed,
+  // which is exactly what re-runs this effect below, but the picked chat was
+  // never retried because the effect's own deps — `activeChatId` included —
+  // had not changed FROM this effect's point of view when it first ran.
+  // Skipping it here instead means there is nothing to retry unless every
+  // chat is mid-delete, in which case `chats` or `deletingIds` changing when
+  // one of them lands does retry it.
   useEffect(() => {
     if (activeChatId || !chatsLoaded || !modelsLoaded) return;
     void (async () => {
       const store = useChats.getState();
-      const first = store.chats[0];
+      const first = store.chats.find((entry) => !store.deleting.includes(entry.id));
       if (first) await store.openChat(first.id);
-      else await store.newChat();
+      else if (store.chats.length === 0) await store.newChat();
     })();
-  }, [activeChatId, chatsLoaded, modelsLoaded]);
+  }, [activeChatId, chatsLoaded, modelsLoaded, chats, deletingIds]);
 
   // Keep the context readout honest as the thread, model, or persona changes.
   // Cheap (a character-count estimate), and it is the only thing that warns
@@ -231,7 +247,14 @@ export function ChatScreen(): ReactNode {
           )}
 
           <Composer
-            disabled={!hasTarget || deletingOpenChat}
+            // NO CHAT OPEN IS ITS OWN REASON, distinct from `!hasTarget`
+            // (#317). `hasTarget` is computed from `chat?.modelId ??
+            // activeModelId` and stays true with `chat` null whenever a model
+            // is active globally, so without this the composer offered Send
+            // while nothing was open to send into: the store's `send` returns
+            // at `if (!chatId) return`, after the composer had already
+            // cleared the field and let go of any attached image's holds.
+            disabled={!chat || !hasTarget || deletingOpenChat}
             generating={generating}
             acceptsImages={acceptsImages}
             /*
