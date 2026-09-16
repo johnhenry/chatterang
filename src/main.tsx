@@ -34,6 +34,18 @@ registerShellTool();
 registerServiceWorker();
 captureInstallPrompt();
 
+/*
+ * S4 (#296): a hidden Electron window loads this exact bundle with
+ * `?peerTurnWorker=1` to run a paired phone's turns
+ * (`apps/desktop/src/bridge/peer-turn-window.ts` sets the flag;
+ * `apps/desktop/src/bridge/peer-turns.ts` is the far end). Dynamically
+ * imported so the mobile bundle, which never sets this flag, never fetches
+ * `peer-turn-worker.ts` or the desktop-only bridge modules it reaches into.
+ */
+if (new URLSearchParams(window.location.search).get('peerTurnWorker') === '1') {
+  void import('@/peer-turn-worker').then((worker) => worker.startPeerTurnWorker());
+}
+
 const container = document.getElementById('root');
 if (!container) throw new Error('Missing #root element.');
 

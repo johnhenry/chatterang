@@ -1,5 +1,5 @@
 /**
- * Bundle the three Electron entry points.
+ * Bundle the four Electron entry points.
  *
  * `packages/inference-node` exports raw TypeScript (`"exports": {".":
  * "./src/index.ts"}`) with no `dist/` and no build step, so Electron cannot
@@ -120,6 +120,24 @@ await esbuild.build({
 });
 
 /*
+ * The hidden peer-turn worker's preload (#7 S5), built exactly like the one
+ * above and for the same reason: Electron loads a preload as a real file from
+ * disk, so a `.ts` one has to become a `.cjs` one before `main.ts` can name it.
+ *
+ * A SECOND FILE rather than a branch inside `preload.ts`, because a window gets
+ * one preload and these two do different jobs — see the header of
+ * `src/peer-turn-preload.ts`. `main.ts` names this output at
+ * `build/peer-turn-preload.cjs`.
+ */
+await esbuild.build({
+  ...shared,
+  entryPoints: [join(desktop, 'src/peer-turn-preload.ts')],
+  outfile: join(out, 'peer-turn-preload.cjs'),
+  format: 'cjs',
+  external: ['electron'],
+});
+
+/*
  * The inference host, CODE-SPLIT — and the splitting is load-bearing.
  *
  * One entry point, forked twice with different arguments; `entry.ts` picks its
@@ -151,4 +169,4 @@ await esbuild.build({
   external: ['node-llama-cpp', 'onnxruntime-node', '@deepseek-ai/*', '@johnhenry/*'],
 });
 
-console.log('desktop: built main.cjs, preload.cjs, host.mjs');
+console.log('desktop: built main.cjs, preload.cjs, peer-turn-preload.cjs, host.mjs');
