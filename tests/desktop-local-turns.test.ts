@@ -998,6 +998,107 @@ describe('a desktop turn holds the one slot from its first decode until the page
     expect(r.broker.slotCount).toBe(0);
   });
 
+  it('a brand-new turn the old page opens after its window’s teardown, but before the new document commits, is ended by that commit and never blocks another turn (#313)', async () => {
+    // The requestId list a teardown leaves behind only refuses a LATER decode
+    // of a turn it already knew about. In the gap between the teardown and
+    // the new document's commit, the old document can send the FIRST decode
+    // of a turn main has never heard of — indistinguishable, at admission,
+    // from the new document's own first turn, because both arrive on the same
+    // webContents.
+    // FAULT INJECTED: with no second teardown at the new document's commit,
+    // that turn was admitted and kept the slot with no idle deadline between
+    // steps and no page able to end it: a phone turn queued behind it waited
+    // forever ("the phone starts once the stray turn is gone": phone.starts 0
+    // forever).
+    const r = rig();
+    r.subscribe(1);
+    r.localTurns.releaseRenderer(1, 'The page that started this generation navigated away.');
+    await settle();
+    expect(r.broker.slotCount, 'nothing held before the gap').toBe(0);
+
+    // The old document, still running in the gap, opens a turn main has never
+    // seen. It takes the free slot at once, so a phone turn queued after it
+    // finds it busy.
+    const stray = r.generate(1, 'stray', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'the stray turn reached the host').toEqual(['stray']);
+    expect(r.broker.isRunning(WINDOW_1, 'stray'), 'it holds the slot').toBe(true);
+    const phone = r.phoneTurn('phone-1');
+    expect(phone.starts, 'the phone waits behind a turn no page can ever end').toBe(0);
+
+    // The new document commits.
+    r.localTurns.closeReloadGap(1);
+    await settle();
+    expect(r.cancelled(), 'the stray decode is cancelled in the host').toEqual(['stray']);
+    expect(phone.starts, 'the slot is not given back while the host still decodes').toBe(0);
+
+    r.finish('stray', 'cancelled');
+    await expect(stray).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    await settle();
+    expect(r.broker.isRunning(WINDOW_1, 'stray'), 'the stray turn no longer holds the slot').toBe(false);
+    expect(phone.starts, 'the phone starts once the stray turn is gone').toBe(1);
+
+    // Asked again, that requestId is refused too, exactly like a later decode
+    // after any other teardown.
+    await expect(r.generate(1, 'stray', { wholeTurn: true })).rejects.toMatchObject({ code: 'OWNER_LOST' });
+    expect(r.generated()).toEqual(['stray']);
+
+    phone.resolve('done');
+    await settle();
+    expect(r.broker.slotCount).toBe(0);
+  });
+
+  it('closing the reload gap on a window holding nothing stray does nothing, and the reloaded page’s own first turn afterwards starts normally', async () => {
+    // The real Electron order pairs every `did-navigate` with a preceding
+    // `did-start-navigation` teardown for the SAME navigation, and `did-navigate`
+    // fires before the new document runs a line of script — so closing the gap
+    // never has a legitimate turn of the new document's own to see. This pins
+    // the ordinary case, with nothing sent in the gap: a no-op, not a second
+    // teardown that could reach a turn the new page starts after it.
+    const r = rig();
+    r.subscribe(1);
+    r.localTurns.releaseRenderer(1, 'The page that started this generation navigated away.');
+    await settle();
+
+    // The new document commits, with nothing sent in the gap.
+    r.localTurns.closeReloadGap(1);
+    await settle();
+    expect(r.broker.slotCount, 'closing an empty gap holds nothing').toBe(0);
+    expect(r.cancelled()).toEqual([]);
+
+    // Its own first turn starts at once, and holds the slot for the whole of it.
+    const next = r.generate(1, 'next', { wholeTurn: true });
+    await settle();
+    expect(r.generated()).toEqual(['next']);
+    expect(r.broker.isRunning(WINDOW_1, 'next')).toBe(true);
+
+    r.finish('next');
+    await next;
+    await r.endTurn(1, 'next');
+  });
+
+  it('forgetting a window once it is destroyed drops the requestIds its teardown ended, so a reused window id is not refused forever (#313)', async () => {
+    const r = rig();
+    r.subscribe(1);
+    await decoded(r, 1, 'reloaded');
+    r.localTurns.releaseRenderer(1, 'The page that started this generation navigated away.');
+    await settle();
+
+    // Remembered: refused while it is still held against window 1.
+    await expect(r.generate(1, 'reloaded', { wholeTurn: true })).rejects.toMatchObject({ code: 'OWNER_LOST' });
+
+    r.localTurns.forgetWindow(1);
+
+    // Forgotten: nothing will ever ask main about the old one again once the
+    // window itself is destroyed, so the same requestId opens a fresh turn.
+    const fresh = r.generate(1, 'reloaded', { wholeTurn: true });
+    await settle();
+    expect(r.generated(), 'a forgotten requestId opens a fresh turn').toEqual(['reloaded', 'reloaded']);
+    r.finish('reloaded');
+    await expect(fresh).resolves.toMatchObject({ requestId: 'reloaded', stopReason: 'stop' });
+    await r.endTurn(1, 'reloaded');
+  });
+
   it('a first decode still waiting when its window is torn down is refused OWNER_LOST if the old page asks for it again', async () => {
     const r = rig();
     r.subscribe(1);

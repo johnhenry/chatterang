@@ -711,7 +711,14 @@ function createWindow(
       // `tests/desktop-local-turns.test.ts` drives it, and this call site cannot
       // name one host.
       releaseRenderer: (id, reason) => localTurns.releaseRenderer(id, reason),
-      forget: (id) => senders.delete(id),
+      forget: (id) => {
+        senders.delete(id);
+        // Only after `destroyed`: the requestIds this window's teardowns
+        // ended are refused for as long as they are remembered (#313), and
+        // nothing will ever ask main about them again once the window itself
+        // is gone for good.
+        localTurns.forgetWindow(id);
+      },
     });
 
   contents.on('did-start-navigation', (event) => {
@@ -720,6 +727,18 @@ function createWindow(
     if (!event.isMainFrame || event.isSameDocument) return;
     teardown('did-start-navigation');
   });
+  // The new document's commit after a reload. Not a departure — the same
+  // webContents goes on being this window's renderer — but the OLD document
+  // kept running in the gap between `did-start-navigation`'s teardown above
+  // and this event, and main cannot tell a turn it opened there from the new
+  // document's own first turn: both arrive on this same webContents (#313).
+  // `did-navigate` fires only for a committed, cross-document, main-frame
+  // navigation (never for `did-navigate-in-page`). MEASURED, not assumed
+  // (`docs/BACKGROUND-WORK-MEASUREMENTS.md` §5.5): across 40 real reloads, the
+  // old document's last call always arrived before this event and the new
+  // document's first call always arrived after it, so closing the gap here
+  // never reaches a turn the new document has started.
+  contents.on('did-navigate', () => localTurns.closeReloadGap(contents.id));
   contents.on('render-process-gone', () => teardown('render-process-gone'));
   contents.once('destroyed', () => teardown('destroyed'));
 

@@ -74,7 +74,33 @@
  * requestIds its teardown ended, and a later decode of one of them is refused
  * `OWNER_LOST` and never reaches the host. The page's `endTurn` for that turn
  * removes the requestId. A page replaced before it could send one leaves its
- * requestId behind: one string per turn, kept for as long as main runs.
+ * requestId behind: one string per turn, kept for as long as main runs (until
+ * `forgetWindow`, below, forgets it).
+ *
+ * BUT THE OLD DOCUMENT CAN ALSO OPEN A TURN MAIN HAS NEVER SEEN (#313). The
+ * requestId list above only refuses a LATER decode of a turn the teardown
+ * already knew about. If, in the gap between `did-start-navigation`'s teardown
+ * and the new document's commit, the old document sends the FIRST decode of a
+ * brand-new turn — `wholeTurn: true` with a requestId the teardown never held —
+ * main cannot tell that decode from the reloaded page's own first one: both
+ * arrive on the same `webContents`. Admitted, it would hold the slot with no
+ * idle deadline between steps and no page able to end it, so every later turn,
+ * local or phone, would wait behind it until the window was torn down again.
+ *
+ * `closeReloadGap` is the second teardown that closes this: called once the
+ * main frame's navigation commits (`did-navigate`), it ends whatever whole
+ * turn this window is still holding, exactly as `releaseRenderer` would, and
+ * remembers it the same way, so a further decode of it is refused `OWNER_LOST`
+ * too. MEASURED, not inferred (`docs/BACKGROUND-WORK-MEASUREMENTS.md` §5.5,
+ * `dev/probe-electron-reload-order/`): across 40 navigations and four kinds of
+ * trigger, the old document's last call arrived 0.7 to 3.5 ms before the
+ * commit and the new document's first call 0.9 ms or more after it, so a plain
+ * second teardown at that event — ending every turn this window holds,
+ * without checking which document opened it — never reaches a turn the new
+ * document has started; there is no evidence a call from the new document can
+ * arrive before its own commit. It does not touch subscriptions or sessions:
+ * those are unaffected by a reload that has not yet torn the window down for
+ * good, and re-releasing them here is not needed to close this gap.
  *
  * A WORKER'S GENERATIONS RUN UNDER THE UNIT IT RUNS. Ruling 1 puts a phone's
  * turn in a hidden worker window (S5), whose engine calls `LlamaCpp.generate`
@@ -197,6 +223,23 @@ export interface LocalTurns {
    * held stays ended: a later decode of that turn is refused `OWNER_LOST`.
    */
   releaseRenderer(senderId: number, reason: string): void;
+  /**
+   * The window's new document committed after a reload (`did-navigate`). The
+   * old document could still have opened a turn between its window's teardown
+   * and this point — main cannot tell that decode from the new document's own
+   * first one, since both arrive on the same `webContents` (#313) — so end
+   * whatever whole turn this window still holds now, the same way the teardown
+   * would have, before the new document runs a line of script. A window with
+   * nothing stray held does nothing here.
+   */
+  closeReloadGap(senderId: number): void;
+  /**
+   * The window is gone for good (`destroyed`). Forgets the requestIds its
+   * teardown ended that no page ever sent `endTurn` for: nothing will ever ask
+   * main about them again, so keeping them would be a leak with no bound but
+   * the process's lifetime.
+   */
+  forgetWindow(senderId: number): void;
 }
 
 const REFUSED: Readonly<Record<AdmitRefusal, string>> = {
@@ -637,19 +680,37 @@ export function admitLocalTurns(options: LocalTurnsOptions): LocalTurns {
   // cancel, and the facade has no turn to end.
   implementation[SENDER_SCOPED] = [stream.start, stream.cancel, BENCHMARK, TURN_END_METHOD];
 
+  /**
+   * End whatever whole turn this window still holds, and remember its
+   * requestId as teardown-ended so a further decode of it is refused. Shared
+   * by `releaseRenderer` (the window going away) and `closeReloadGap` (the
+   * window staying, but its old document's gap now closed): both are "this
+   * document can no longer end what it started", differing only in whether
+   * the window itself is gone too.
+   */
+  const endStrayTurns = (senderId: number): void => {
+    broker.releaseWindow(senderId);
+    for (const [key, turn] of wholeTurns) {
+      if (turn.senderId !== senderId) continue;
+      wholeTurns.delete(key);
+      const ended = endedByTeardown.get(senderId) ?? new Set<string>();
+      ended.add(turn.requestId);
+      endedByTeardown.set(senderId, ended);
+    }
+  };
+
   return {
     plugin: implementation as unknown as PluginImplementation,
     releaseRenderer(senderId, reason) {
-      broker.releaseWindow(senderId);
-      for (const [key, turn] of wholeTurns) {
-        if (turn.senderId !== senderId) continue;
-        wholeTurns.delete(key);
-        const ended = endedByTeardown.get(senderId) ?? new Set<string>();
-        ended.add(turn.requestId);
-        endedByTeardown.set(senderId, ended);
-      }
+      endStrayTurns(senderId);
       notices.release(senderId);
       fleet.releaseRenderer(senderId, reason);
+    },
+    closeReloadGap(senderId) {
+      endStrayTurns(senderId);
+    },
+    forgetWindow(senderId) {
+      endedByTeardown.delete(senderId);
     },
   };
 }
