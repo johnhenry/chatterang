@@ -402,12 +402,16 @@ function receiptSentence(receipt: McpCallReceipt): string {
       switch (receipt.why) {
         case 'not-allowed':
           return `Not sent to ${where} — it was not allowed.`;
+        case 'unattended':
+          return `Not sent to ${where} — this conversation had not allowed that server, and nobody was there to be asked.`;
         case 'declined':
           return `Not sent to ${where} — it could change data there, and was declined.`;
         case 'server-changed':
           return `Not sent to ${where} — the server changed before it went.`;
         case 'stopped':
           return `Not sent to ${where} — the reply was stopped before it went.`;
+        case 'round-limit':
+          return `Not sent to ${where} — the turn had already used every tool round it was allowed.`;
         default:
           return `Not sent to ${where} — ${unhandledWhy(receipt.why)}.`;
       }

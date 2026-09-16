@@ -8,6 +8,7 @@ import {
   runsOnThisDevice,
   targetFor,
   type EngineTarget,
+  type GenerationEvent,
   type ToolEgressPolicy,
   type ToolEgressRequest,
 } from '@/ai/engine';
@@ -685,9 +686,12 @@ describe('MCP arguments do not leave the device without a grant', () => {
       const tool = events.find((event) => event.type === 'tool');
       expect(tool?.type === 'tool' && tool.tool.output).toContain('were not sent to notes.example');
       // Recorded as not sent, and sized as what would have gone (#92, OD7).
+      // `why` is `unattended`, not `not-allowed`: no policy means nobody was
+      // there to ask, which is a different fact from a person saying no
+      // (#293 item 3).
       expect(tool?.type === 'tool' && tool.tool.receipt).toMatchObject({
         outcome: 'withheld',
-        why: 'not-allowed',
+        why: 'unattended',
         serverId: PROBE_SERVER.serverId,
         serverName: 'notes',
         host: 'notes.example',
@@ -1535,6 +1539,128 @@ describe('MCP arguments do not leave the device without a grant', () => {
     expect(stopped.tools.map((tool) => tool.name)).toEqual(['x.y', 'notes.note']);
     expect(stopped.tools[1]!.output).toBe(output);
     expect(stopped.tools[1]!.receipt).toMatchObject(notSent);
+  });
+
+  /*
+   * #293 item 1: A CALL ALREADY COMPLETE IN THE TEXT THAT STREAMED, WHEN STOP
+   * LANDS BEFORE THE TURN'S OWN `done`.
+   *
+   * The bridge (`aimatey-core`'s real one, not a stand-in) checks the signal
+   * before yielding each chunk and simply stops yielding once it is aborted —
+   * it does not throw and does not emit an `error` chunk. So `#runTurn`'s
+   * `for await` ends with no terminal chunk seen, which the engine already
+   * treats as a failed turn (#260), and that failure used to end the whole
+   * loop before anything asked whether the partial text it had already
+   * accumulated contained a finished call. Driven through the real
+   * `ChatterangEngine` and the real bridge: nothing about Stop's propagation
+   * here is mocked, only the backend's timing, which is what lets the test
+   * choose the exact moment Stop lands.
+   */
+  it('records a call already complete in the text that streamed when Stop lands before the turn ends', async () => {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const controller = new AbortController();
+      let release: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.register(
+        'scripted',
+        new FunctionBackendAdapter({
+          execute: async () => {
+            throw new Error('this backend only streams');
+          },
+          executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+            yield { type: 'start', sequence: 0, metadata: request.metadata };
+            // The whole call arrives in one piece and is already COMPLETE —
+            // the exact shape item 1 describes: a finished call sitting in
+            // text Stop catches before the turn's own `done`.
+            yield { type: 'content', sequence: 1, delta: MCP_CALL };
+            // Held open until the test has seen that delta and called Stop,
+            // so the abort lands strictly between the content chunk and the
+            // terminal one — never before the call was complete.
+            await held;
+            yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          },
+        }),
+      );
+
+      const events: GenerationEvent[] = [];
+      for await (const event of engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        if (event.type === 'delta' && event.text.includes('notes.note')) {
+          controller.abort();
+          release();
+        }
+      }
+
+      expect(probe.call, 'the call was still streaming when Stop landed').not.toHaveBeenCalled();
+      const tool = events.find((event): event is Extract<GenerationEvent, { type: 'tool' }> => event.type === 'tool');
+      expect(tool, 'the call Stop caught mid-stream has no record').toBeDefined();
+      expect(tool?.tool.receipt).toMatchObject({
+        outcome: 'withheld',
+        why: 'stopped',
+        serverId: PROBE_SERVER.serverId,
+        serverName: 'notes',
+        host: 'notes.example',
+        toolName: 'notes.note',
+      });
+      expect(tool?.tool.output).toBe(
+        'This call’s arguments were not sent to notes.example: the reply was stopped.',
+      );
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+
+  /*
+   * #293 item 2: A CALL WRITTEN PAST THE TURN'S LIMIT ON TOOL ROUNDS.
+   *
+   * Reproduced exactly as the issue describes it: a model that calls a tool
+   * every turn runs five turns before the engine's own `TOOL_ITERATIONS`
+   * bound ends the loop. The first four dispatch and send; the fifth used to
+   * vanish — `stripToolSyntax` still took it out of the visible reply, but
+   * nothing recorded that it had ever been written. The server here is
+   * GRANTED throughout, so a missing record on that fifth call could only be
+   * the round limit, never a consent gate.
+   */
+  it('records a call written past the turn’s limit on tool rounds as not sent, and does not run it', async () => {
+    const { probe, run } = setUp([MCP_CALL]);
+    const events = await run(GRANTED_PROBE);
+
+    const toolEvents = events.filter(
+      (event): event is Extract<GenerationEvent, { type: 'tool' }> => event.type === 'tool',
+    );
+    // Four rounds actually ran; the fifth is read but never dispatched.
+    expect(probe.call).toHaveBeenCalledTimes(4);
+    expect(toolEvents).toHaveLength(5);
+    expect(toolEvents.slice(0, 4).map((event) => event.tool.receipt?.outcome)).toEqual([
+      'sent',
+      'sent',
+      'sent',
+      'sent',
+    ]);
+
+    const last = toolEvents[4]!.tool;
+    expect(last.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'round-limit',
+      serverId: PROBE_SERVER.serverId,
+      serverName: 'notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+    });
+    expect(last.output).toBe(
+      'This call’s arguments were not sent to notes.example: the turn had already used every tool round it was allowed.',
+    );
   });
 
   it('hands a conversation answer back to be kept, naming the server and its address', async () => {

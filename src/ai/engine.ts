@@ -975,7 +975,36 @@ export class ChatterangEngine {
       }
 
       if (failure) {
-        if (request.signal?.aborted) break;
+        if (request.signal?.aborted) {
+          /*
+           * STOPPED MID-STREAM, with a call already complete in the text that
+           * had streamed (#293). `turn.text` is whatever arrived before the
+           * abort cut the turn short — that is why `failure` is set at all,
+           * either as the thrown abort or as `#runTurn`'s own EMPTY_RESPONSE.
+           * `findToolCalls` only reads a call whose syntax is finished: an
+           * argument still being written when Stop landed fails to parse and
+           * is left alone, so reading it here cannot turn an interruption
+           * into a call that never happened. Every call found is dispatched
+           * through the same path a finished turn's calls take, with the
+           * turn's own (already aborted) signal — so `runToolCalls` records
+           * each one as `stopped` and none of them run (owner ruling that
+           * "not sent" covers every call that did not leave).
+           */
+          const strandedCalls = request.toolIds?.length
+            ? findToolCalls({ role: 'assistant', content: turn.text })
+            : [];
+          if (strandedCalls.length > 0) {
+            const batch = await runToolCalls(toolRegistry, strandedCalls, {
+              enabledIds: request.toolIds ?? [],
+              destinations: this.#mcpDestinations(request.mcpEgress),
+              declared: offered,
+              signal: request.signal,
+            });
+            tools.push(...batch.executed);
+            for (const tool of batch.executed) yield { type: 'tool', tool };
+          }
+          break;
+        }
 
         // A local failure can still divert: announced just below, then through
         // the egress gate at the top of the loop. This used to say "exactly as
@@ -1015,11 +1044,16 @@ export class ChatterangEngine {
       text = turn.text;
       stats = { ...stats, ...turn.stats };
 
+      // Past the turn's limit on tool rounds, a call is still read — the
+      // model did write it, complete, in a turn that finished — but it is
+      // never dispatched: the limit means no more tool rounds (#293). Reading
+      // it is what lets `runToolCalls` below record it as `round-limit`
+      // rather than let it vanish with only `stripToolSyntax` as a witness.
+      const roundLimitReached = iteration >= TOOL_ITERATIONS;
       // Tool calls only become readable once the turn has finished.
-      const calls =
-        request.toolIds?.length && iteration < TOOL_ITERATIONS
-          ? findToolCalls({ role: 'assistant', content: turn.text })
-          : [];
+      const calls = request.toolIds?.length
+        ? findToolCalls({ role: 'assistant', content: turn.text })
+        : [];
 
       if (calls.length === 0) break;
 
@@ -1035,6 +1069,7 @@ export class ChatterangEngine {
         destinations: this.#mcpDestinations(request.mcpEgress),
         declared: offered,
         signal: request.signal,
+        roundLimitReached,
       });
       tools.push(...batch.executed);
       for (const tool of batch.executed) yield { type: 'tool', tool };
@@ -1043,6 +1078,11 @@ export class ChatterangEngine {
       // asked or sent: the model is not run again over those refusals, which
       // for a remote one would first raise the tool-output sheet after Stop.
       if (request.signal?.aborted) break;
+      // PAST THE ROUND LIMIT. What it held back is recorded above; there is no
+      // further round for a follow-up to run in, so the loop ends here exactly
+      // as it did when `calls` was forced empty, before any of this could be
+      // read.
+      if (roundLimitReached) break;
       if (batch.results.length === 0) break;
 
       const assistantTurn: IRMessage = { role: 'assistant', content: [...calls] };

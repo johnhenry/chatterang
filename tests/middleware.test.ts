@@ -7,7 +7,7 @@ import type {
   MiddlewareContext,
 } from '@johnhenry/aimatey-types';
 
-import { createToolMiddleware, type ExecutedTool } from '@/ai/middleware/tools';
+import { createToolMiddleware, runToolCalls, type ExecutedTool } from '@/ai/middleware/tools';
 import {
   classifyFailure,
   createResilienceMiddleware,
@@ -604,11 +604,14 @@ describe('tool enablement is enforced', () => {
     };
     const notSent = { outcome: 'withheld', serverId: 'mcp_notes', host: 'notes.example', toolName: 'notes.note' };
 
-    // The control: this path sends to no server, so a tool still registered is
-    // refused as not allowed. Only the reason differs once it has left.
+    // The control: this path (`createToolMiddleware`'s, `NO_DESTINATIONS`) has
+    // no conversation and no moment to raise a sheet in, so a tool still
+    // registered is refused as unattended — nobody was there to ask (#293
+    // item 3) — rather than as a person's no. Only the reason differs once it
+    // has left.
     const stayed = await dispatch(false);
     expect(stayed.spy.execute).not.toHaveBeenCalled();
-    expect(stayed.calls.map((call) => call.receipt)).toMatchObject([{ ...notSent, why: 'not-allowed' }]);
+    expect(stayed.calls.map((call) => call.receipt)).toMatchObject([{ ...notSent, why: 'unattended' }]);
 
     const left = await dispatch(true);
     expect(left.spy.execute).not.toHaveBeenCalled();
@@ -647,7 +650,9 @@ describe('tool enablement is enforced', () => {
       const calls = (result.metadata.custom?.toolCalls as ExecutedTool[] | undefined) ?? [];
       return { spy, calls, execute: backend.execute as ReturnType<typeof vi.fn> };
     };
-    const notSent = { outcome: 'withheld', why: 'not-allowed', serverId: 'mcp_notes', host: 'notes.example' };
+    // `NO_DESTINATIONS` has no `request` hook, so this is `unattended` (#293
+    // item 3): nobody was there to ask, whether or not Stop lands.
+    const notSent = { outcome: 'withheld', why: 'unattended', serverId: 'mcp_notes', host: 'notes.example' };
 
     // The control: not stopped, the model reads the refusal once.
     const running = await dispatch(false);
@@ -659,6 +664,64 @@ describe('tool enablement is enforced', () => {
     expect(stopped.spy.execute).not.toHaveBeenCalled();
     expect(stopped.execute, 'no request is handed to the backend after Stop').not.toHaveBeenCalled();
     expect(stopped.calls.map((call) => call.receipt)).toMatchObject([notSent]);
+  });
+
+  it('records a call past the round limit as not sent, and asks nobody about it (#293 item 2)', async () => {
+    // `roundLimitReached` is read directly by `runToolCalls` rather than through
+    // the engine's loop, so this pins the dispatcher's own contract: nothing
+    // runs, nobody is asked — even a destination the policy would otherwise
+    // grant without a question — and a destination-bearing call still gets a
+    // receipt so the thread and the export are not silent about it (#293).
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const spy = spyTool('mcp:notes.note', 'notes.note');
+    const tool: ChatterangTool = { ...spy.tool, destination };
+    const isGranted = vi.fn(() => true);
+    const request = vi.fn(async (): Promise<'calls'> => 'calls');
+
+    const { results, executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'notes.note', input: { text: 'x' } }],
+      { enabledIds: [tool.id], destinations: { isGranted, request }, roundLimitReached: true },
+    );
+
+    expect(spy.execute, 'nothing runs past the round limit').not.toHaveBeenCalled();
+    expect(isGranted, 'nobody is asked whether the destination is already granted').not.toHaveBeenCalled();
+    expect(request, 'nobody is asked past the round limit').not.toHaveBeenCalled();
+    expect(executed).toHaveLength(1);
+    expect(executed[0]?.receipt).toMatchObject({
+      outcome: 'withheld',
+      why: 'round-limit',
+      serverId: 'mcp_notes',
+      host: 'notes.example',
+      toolName: 'notes.note',
+    });
+    expect(executed[0]?.output).toBe(
+      'This call’s arguments were not sent to notes.example: the turn had already used every tool round it was allowed.',
+    );
+    // The model still reads a `tool_result` saying so, the same as any other
+    // refusal — it is a refusal, not a call silently dropped.
+    expect(results).toHaveLength(1);
+  });
+
+  it('drops a round-limit call with no destination silently, as a local tool always has been', async () => {
+    // Only a call with a destination gets a receipt: a local tool has no
+    // server it was not sent to, and past the round limit it simply does not
+    // run — exactly as it did not before this batch existed.
+    const local = spyTool('calculator');
+    const { results, executed } = await runToolCalls(
+      new ToolRegistry([local.tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'calculator', input: {} }],
+      { enabledIds: [local.tool.id], destinations: { isGranted: () => false }, roundLimitReached: true },
+    );
+    expect(local.execute).not.toHaveBeenCalled();
+    expect(executed).toHaveLength(0);
+    expect(results).toHaveLength(0);
   });
 
   it('runs nothing when the request does not say which tools are enabled', async () => {
