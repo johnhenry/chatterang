@@ -2671,18 +2671,51 @@ describe('a listening socket forces the privacy copy to change', () => {
     }
   });
 
-  it('is exactly the headless server’s bridge, and anything more moves the copy with it', () => {
+  it('is exactly the headless server’s bridge, plus the tunnel CLIENT #295 added, and anything more moves the copy with it', () => {
     const inventory = scanned
       .filter((file) => !sanctioned(file))
       .flatMap((file) =>
         listenSites(readFileSync(file, 'utf8')).map((site) => `${repoPath(file)} -> ${site}`),
       )
       .sort();
-    // The bridge's socket, and the one place that opens it.
+    /*
+     * `apps/desktop/src/net/tunnel-socket.ts` (#181, #295) is the two new
+     * entries below, and BOTH are the bare `import 'ws'` this scan cannot look
+     * past — `LISTENING_MODULE` flags the whole module because it bundles a
+     * server, and this file only ever imports the CLIENT half of it
+     * (`await import('ws')`, destructured to `{ WebSocket }`, never
+     * `WebSocketServer`). The next `it` proves that positively: the file has
+     * no `.listen(`, no `WebSocketServer` and no `'upgrade'` handler, which is
+     * what the CHECKLIST above is actually about — code that ACCEPTS a
+     * connection. This file only ever DIALS one, outbound, to a desktop the
+     * person on this device already paired with — the same shape as
+     * ChatScreen's "unless you explicitly connect a remote provider", not a
+     * new way for anything to reach this device.
+     *
+     * So the CHECKLIST's five copy locations do not change, and are not
+     * touched here. What WOULD force them: `src/lib/pairing.ts` turning
+     * `pairingController().available` true, which is a separate, later
+     * change — its own header already says as much, and nothing in this
+     * change flips that flag. Two apps import `ws`'s client this way and
+     * for the same reason: `packages/tunnel/src/host/index.ts` is exempted
+     * outright (`SANCTIONED`) because it genuinely listens and is reviewed on
+     * its own terms; this file is not exempted, and instead named here,
+     * because unlike the host it never does.
+     */
     expect(inventory, CHECKLIST).toEqual([
+      'apps/desktop/src/net/tunnel-socket.ts -> import \'ws\'',
+      'apps/desktop/src/net/tunnel-socket.ts -> import \'ws\'',
       'apps/server/src/index.ts -> .listen(',
       'apps/server/src/main.ts -> startServer(',
     ]);
+  });
+
+  it("the tunnel client #295 added never listens: no .listen(, no WebSocketServer, no 'upgrade' handler", () => {
+    const file = scanned.find((f) => repoPath(f) === 'apps/desktop/src/net/tunnel-socket.ts');
+    expect(file, 'apps/desktop/src/net/tunnel-socket.ts was not read').toBeDefined();
+    const sites = listenSites(readFileSync(file!, 'utf8'));
+    expect(sites.filter((site) => site !== "import 'ws'")).toEqual([]);
+    expect(sites).toEqual(["import 'ws'", "import 'ws'"]);
   });
 });
 

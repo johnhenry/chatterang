@@ -133,6 +133,9 @@ export {
   PEER_TURN_PLUGIN,
   PEER_TURN_STREAM,
   SENDER_SCOPED,
+  TUNNEL_SOCKET_EVENTS,
+  TUNNEL_SOCKET_METHODS,
+  TUNNEL_SOCKET_PLUGIN,
   fromWireError,
   toWireError,
 } from './protocol.js';

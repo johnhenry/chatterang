@@ -80,6 +80,7 @@ import {
   ONNX_ENGINE,
   ONNX_PLUGIN,
   PluginHost,
+  TUNNEL_SOCKET_PLUGIN,
   WorkBroker,
   admitLocalTurns,
   createMainRouter,
@@ -106,6 +107,7 @@ import {
 } from './security.js';
 import { createFilesystemPlugin } from './fs/filesystem.js';
 import { createMountPlugin } from './fs/mounts.js';
+import { createTunnelSocketPlugin } from './net/tunnel-socket.js';
 import { buildMenuTemplate } from './menu.js';
 import type { MenuTemplateItem } from './menu.js';
 
@@ -613,6 +615,29 @@ function start(): void {
       providers: fleet.statusOf(LLAMA_PLUGIN.name).routes,
     }),
   });
+
+  /*
+   * `TunnelSocket` — the desktop's own leg of #181's ruling (#295).
+   *
+   * The owner's ruling on #295 makes this shell a tunnel CLIENT too, not only
+   * a host: "the desktop app can open a tunnel to another desktop." This
+   * renderer is a Chromium webview exactly like a phone's, so it gets the
+   * same plugin boundary a phone does — here served from real Node, in this
+   * process, rather than from native Swift or Kotlin.
+   *
+   * No `credentials` store is injected yet: nothing on the desktop persists a
+   * paired device's credential today, so every `credentialRef` this plugin is
+   * asked for answers `CREDENTIAL_MISSING` honestly rather than pretending to
+   * hold one. Wiring a real store is the pairing/credential-storage work this
+   * ticket does not own.
+   */
+  pluginHost.register(
+    TUNNEL_SOCKET_PLUGIN,
+    createTunnelSocketPlugin({
+      notify: (eventName, data, ownerId) =>
+        pluginHost.notifyListeners(TUNNEL_SOCKET_PLUGIN.name, eventName, data, ownerId),
+    }),
+  );
 
   const router = createMainRouter(pluginHost);
   const manifest = router.bootstrap();

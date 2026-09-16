@@ -41,6 +41,7 @@
     "@capacitor/share": "8.0.1",
     "@capacitor/status-bar": "8.0.3",
     "@chatterang/plugin-llama-cpp": "file:./native/plugin-llama-cpp",
+    "@chatterang/plugin-tunnel-socket": "file:./native/plugin-tunnel-socket",
     "@johnhenry/aimatey": "0.1.0",
     "@johnhenry/aimatey-backend": "0.3.1",
     "@johnhenry/aimatey-backend-browser": "0.1.4",

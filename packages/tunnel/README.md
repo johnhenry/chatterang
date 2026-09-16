@@ -2,8 +2,13 @@
 
 Transport code for two Chatterangs on one network (epic #153). This package is
 the **boundary**; the transport that goes inside it is a **native socket
-plugin on both platforms** (#181, ruled 2026-09-11), built by #156 (client)
-and #157/#158 (listener).
+plugin on iOS and Android, and a real Node implementation for the Electron
+desktop client** (#181, ruled 2026-09-11; #295 built it — the plugin's
+contract, iOS, Android, the web refusal, and the desktop's own leg). Rung 0
+over loopback `ws://` — `createTunnelClient`, `createTunnelHost` and
+`createTunnelListener` speaking the real wire format through the credential
+gate — was built by #156 (client) and #157/#158 (listener), and is still what
+every transport, including the real plugin, runs its protocol over.
 
 ## The split, and why it is one package with three entry points
 
@@ -334,14 +339,28 @@ without bound.
 
 ## What is deliberately not here
 
-- **A production transport.** #181 chose a native socket plugin on both
-  platforms, and that plugin is not built. Its contract is declared
-  (`packages/contracts/src/tunnel-socket.ts`) and the client accepts a transport,
-  but no plugin, web shim or adapter exists yet (#295). What exists is rung 0 (#156):
-  `createTunnelClient`, `createTunnelHost` and `createTunnelListener` speak the
-  real wire format over loopback `ws://`, through the credential gate. **No app
-  starts a listener** (#158). A listener that carries turns waits on #7, per
-  #169's ruling.
+- **A production transport now exists** (#295): `packages/contracts/src/tunnel-socket.ts`
+  declares the plugin's whole contract (`connect`, `send`, `close`,
+  `negotiatedPeer`, and the three events); `native/plugin-tunnel-socket/`
+  carries the iOS (`URLSessionWebSocketTask`, the pin checked in
+  `didReceive challenge`) and Android (OkHttp, a per-connection
+  `X509TrustManager`) implementations; `src/plugins/tunnel-socket/web.ts`
+  refuses, honestly, because a browser cannot see a peer certificate;
+  `apps/desktop/src/net/tunnel-socket.ts` is the Electron desktop's OWN client
+  leg, run in Node in the main process, for the same reason a phone needs one —
+  the owner's ruling on #295 makes the desktop a tunnel client too, not only a
+  host. `src/lib/tunnel-socket-transport.ts` is the adapter from any of these to
+  `createTunnelClient`'s `TunnelTransportFactory`. **The iOS and Android native
+  sources have not been compiled or run** — no Xcode or Android SDK toolchain
+  built them; verify them, the negative-pin test in particular, on a simulator
+  and an emulator before they ship. Nothing yet calls this adapter from
+  `src/ai/backends/tunnel.ts` — wiring pairing, credential storage and this
+  transport together into a real `TunnelBackendAdapter` is separate work.
+- **Rung 0** (#156, #157, #158) is what every transport above, including the
+  real plugin, runs its protocol over: `createTunnelClient`, `createTunnelHost`
+  and `createTunnelListener` speak the real wire format through the credential
+  gate. **No app starts a listener** (#158). A listener that carries turns
+  waits on #7, per #169's ruling.
 - **Where the paired-device registry persists** (#133). `CredentialStore` is
   the seam. The only implementation forgets every phone when the process ends.
 - **Handing the identity to a listener.** `identity.ts` makes the key and its

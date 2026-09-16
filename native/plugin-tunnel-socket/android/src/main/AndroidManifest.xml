@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    INTERNET is the one permission this plugin needs: it opens a WebSocket to
+    the address `connect()` is given, which the Capacitor app's own manifest
+    already declares (every app that reaches a network does). Declared here
+    too so this module is honest on its own about what it does — unlike
+    `plugin-llama-cpp`, which is in-process and declares nothing.
+
+    No `ACCESS_NETWORK_STATE`, no `ACCESS_WIFI_STATE`: this plugin dials the
+    address it is given and reports what happened: it does not enumerate
+    interfaces or discover peers. That is `#170`'s concern (what the tunnel may
+    reach), not this plugin's.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

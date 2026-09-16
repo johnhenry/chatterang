@@ -319,6 +319,36 @@ export const DSH_PLUGIN: PluginDefinition = Object.freeze({
 });
 
 /**
+ * The four invocable methods of `TunnelSocketPlugin` (#295, refs #181, #256).
+ *
+ * THE DESKTOP RENDERER IS A CLIENT TOO, per the owner's ruling on #295: "the
+ * Electron desktop is a tunnel client too, in v1 — not only a host. Besides
+ * iOS and Android, the desktop app can open a tunnel to another desktop." A
+ * Chromium renderer cannot check a TLS peer certificate any better than a
+ * phone's WebView can, so it needs the same native-side plugin a phone does —
+ * here, "native" means the real thing this boundary already gives every other
+ * plugin: Node in the main process, which `apps/desktop/src/bridge/
+ * tunnel-socket.ts` uses to run real TLS, pinned the same way #178 pins it on
+ * iOS and Android.
+ *
+ * `negotiatedPeer` is here despite reading no argument that names a renderer,
+ * because {@link TunnelSocketPlugin.negotiatedPeer}'s contract is per
+ * `connectionId`, and `connect` is what ties a `connectionId` to the renderer
+ * that opened it. `addListener` and `removeAllListeners` are absent for the
+ * reason recorded above `LLAMA_METHODS`: the bridge serves them.
+ */
+export const TUNNEL_SOCKET_METHODS = Object.freeze(['connect', 'send', 'close', 'negotiatedPeer'] as const);
+
+/** The three event names `TunnelSocketPlugin` emits — see `packages/contracts/src/tunnel-socket.ts`. */
+export const TUNNEL_SOCKET_EVENTS = Object.freeze(['tunnelOpen', 'tunnelFrame', 'tunnelClose'] as const);
+
+export const TUNNEL_SOCKET_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'TunnelSocket',
+  methods: TUNNEL_SOCKET_METHODS,
+  events: TUNNEL_SOCKET_EVENTS,
+});
+
+/**
  * The two invocable methods of a paired device's turn, run in the hidden
  * worker (#7 ruling 1).
  *
