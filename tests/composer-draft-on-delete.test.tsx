@@ -646,6 +646,54 @@ describe('deleting the chat the draft is being written in', () => {
     expect(field().value).toBe('');
   });
 
+  /*
+   * A PASTE REACHES THE DISABLED COMPOSER TOO (#316).
+   *
+   * Real Chromium dispatches `paste` to a disabled textarea that still holds
+   * the caret selection — measured at 926151b — even though keydown and typed
+   * characters do not reach it. `onPaste` used to call `addImages` without
+   * checking `disabled`, so an image pasted here added a chip that then moved
+   * into whichever chat opened next, breaking the same "nothing carries over"
+   * rule the file input and dictation are already held to above.
+   *
+   * Driven the same way this file already drives the disabled file input: a
+   * synthetic DOM event dispatched straight at the field, which — as the
+   * comment above this describe block notes — a disabled control does not by
+   * itself stop. What has to stop it now is `Composer`'s own check.
+   */
+  async function pasteImage(): Promise<void> {
+    const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent;
+    const file = new File([new Uint8Array([137, 80, 78, 71])], 'pasted.png', { type: 'image/png' });
+    Object.defineProperty(event, 'clipboardData', {
+      configurable: true,
+      value: { files: { 0: file, length: 1 } },
+    });
+    await act(async () => {
+      field().dispatchEvent(event);
+    });
+  }
+
+  it('ignores a paste made while the chat’s delete is being carried out, and nothing carries over', async () => {
+    const { next } = given('pasted_while_deleting');
+    await render(createElement(ChatScreen));
+    fake.hold('deleteChat');
+
+    await deleteFromList('pasted_while_deleting');
+    expect(field().disabled, 'the control: still disabled while the delete is under way').toBe(true);
+
+    await pasteImage();
+    expect(fake.db.blobs.put, 'the paste is ignored: nothing is written for it').not.toHaveBeenCalled();
+    expect(chips()).toHaveLength(0);
+
+    fake.release('deleteChat');
+    await until('the next chat to open', () => useChats.getState().activeChatId === next);
+    await act(async () => {
+      await macrotask();
+    });
+    expect(chips(), 'nothing carried over into the chat opened next').toHaveLength(0);
+    expect(field().value, 'in the chat opened next').toBe('');
+  });
+
   it('discards what reached the draft meanwhile once the delete lands, text, image and payload', async () => {
     const { next } = given('reached_meanwhile');
     await render(createElement(ChatScreen));
@@ -715,6 +763,135 @@ describe('deleting the chat the draft is being written in', () => {
     expect(inStore('failed_meanwhile'), 'the control: the chat stays').toBe(true);
     expect(field().disabled, 'the field').toBe(false);
     await type('still here');
+  });
+});
+
+/*
+ * THE CHAT OPENED AFTER ONE DELETE LANDS IS ITSELF STILL BEING DELETED (#317).
+ *
+ * `ChatScreen`'s effect opens `store.chats[0]` once no chat is open. That row
+ * can be one whose own delete is queued behind an earlier write — a rename,
+ * say — and `openChat` refuses it outright (`removedChats` in state/chat.ts):
+ * nothing happens, and because nothing the effect depends on changes when
+ * that queued delete eventually lands, no chat is ever opened again. The
+ * composer stayed enabled throughout, because `hasTarget` never looked at
+ * whether a chat was actually open, so typing and Send both looked live while
+ * writing to nothing.
+ */
+describe('reopening after one delete lands while the next candidate is itself being deleted (#317)', () => {
+  /** Hold the next `chats.put` open, standing in for a slow rename. */
+  function holdingNextChatsPut(): { land: () => void } {
+    let land = (): void => {};
+    fake.db.chats.put.mockImplementationOnce(async (row: Row) => {
+      await new Promise<void>((resolve) => (land = resolve));
+      fake.chats.set(row.id, structuredClone(row));
+    });
+    return { land: () => land() };
+  }
+
+  it('skips the newest chat while it is mid-delete and opens the next one instead', async () => {
+    const pb = chat('pb', 3);
+    const pa = chat('pa', 2);
+    const pc = chat('pc', 1);
+    for (const entry of [pb, pa, pc]) fake.chats.set(entry.id, structuredClone(entry));
+    useChats.setState({
+      loaded: true,
+      chats: [pb, pa, pc],
+      activeChatId: 'pa',
+      messages: [],
+      generating: false,
+      controller: null,
+      context: null,
+    });
+    await render(createElement(ChatScreen));
+
+    // pb's delete is queued behind a slow rename, so it lands well after pa's.
+    const rename = holdingNextChatsPut();
+    let renaming: Promise<void> = Promise.resolve();
+    await act(async () => {
+      renaming = useChats.getState().renameChat('pb', 'Renamed');
+      await macrotask();
+    });
+    let removingPb: Promise<void> = Promise.resolve();
+    await act(async () => {
+      removingPb = useChats.getState().removeChat('pb').catch(() => undefined);
+      await macrotask();
+    });
+    expect(inStore('pb'), 'the control: pb’s delete has not landed').toBe(true);
+    expect(useChats.getState().deleting, 'the control: pb is mid-delete').toContain('pb');
+
+    // pa (open) is deleted and lands at once — nothing holds its write. Its
+    // landing clears `activeChatId`, which is exactly what re-runs the effect
+    // below inside the same `act`, so by the time this resolves it may already
+    // have picked pc — that IS the fix, not a race this test needs to freeze.
+    await act(async () => {
+      await useChats.getState().removeChat('pa');
+    });
+
+    // BEFORE THE FIX: `store.chats[0]` was pb, `openChat` refused it, and
+    // nothing ever opened. pc is next in the list and is not being deleted.
+    await until('pc to open', () => useChats.getState().activeChatId === 'pc');
+    await act(async () => {
+      await macrotask();
+    });
+    expect(field().disabled, 'a chat is open again, so the composer wakes up').toBe(false);
+
+    // Landing pb afterwards disturbs nothing it opened.
+    await act(async () => {
+      rename.land();
+      await renaming;
+      await removingPb;
+    });
+    expect(inStore('pb'), 'pb’s delete finally landed').toBe(false);
+    expect(useChats.getState().activeChatId, 'pc stays open').toBe('pc');
+  });
+
+  it('keeps the composer inert, and Send clears nothing, while every remaining chat is mid-delete', async () => {
+    const pb = chat('lonely_pb', 2);
+    const pa = chat('lonely_pa', 1);
+    for (const entry of [pb, pa]) fake.chats.set(entry.id, structuredClone(entry));
+    useChats.setState({
+      loaded: true,
+      chats: [pb, pa],
+      activeChatId: 'lonely_pa',
+      messages: [],
+      generating: false,
+      controller: null,
+      context: null,
+    });
+    await render(createElement(ChatScreen));
+
+    const rename = holdingNextChatsPut();
+    await act(async () => {
+      void useChats.getState().renameChat('lonely_pb', 'Renamed');
+      await macrotask();
+    });
+    await act(async () => {
+      void useChats.getState().removeChat('lonely_pb').catch(() => undefined);
+      await macrotask();
+    });
+    await act(async () => {
+      await useChats.getState().removeChat('lonely_pa');
+    });
+
+    expect(useChats.getState().activeChatId, 'nothing is open: the only other chat is mid-delete').toBeNull();
+    expect(field().disabled, 'the composer stays inert with no chat open').toBe(true);
+
+    // Driven straight at the field, as the disabled-input tests above do:
+    // proving the APPLICATION refuses to send, not merely that a disabled
+    // control stops a real keypress.
+    await type('typed with nothing open');
+    const sendButton = document.querySelector<HTMLButtonElement>('button[aria-label="Send"]');
+    expect(sendButton?.disabled, 'Send is disabled too').toBe(true);
+    await act(async () => sendButton?.click());
+
+    // BEFORE THE FIX: `hasTarget` alone drove `disabled`, so with a model
+    // active this was clickable, and Composer's own `send()` clears the field
+    // unconditionally once it calls `onSend` — before the store's `send` had
+    // even checked whether a chat was open to write to.
+    expect(field().value, 'nothing was sent, so nothing was cleared').toBe('typed with nothing open');
+
+    rename.land();
   });
 });
 

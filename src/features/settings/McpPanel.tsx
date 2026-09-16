@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react';
 import { Icon } from '@/ui/Icon';
 import { Confirm, Sheet, Switch } from '@/ui/primitives';
 import { destinationHost, type McpServerConfig } from '@/domain/mcp';
+import { useApp } from '@/state/app';
 import { useMcp } from '@/state/mcp';
 
 /**
@@ -16,9 +17,11 @@ export function McpPanel(): ReactNode {
   const servers = useMcp((state) => state.servers);
   const states = useMcp((state) => state.states);
   const connecting = useMcp((state) => state.connecting);
+  const pending = useMcp((state) => state.pendingServers);
   const add = useMcp((state) => state.add);
   const remove = useMcp((state) => state.remove);
   const toggle = useMcp((state) => state.toggle);
+  const toast = useApp((state) => state.toast);
 
   const [adding, setAdding] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<McpServerConfig | null>(null);
@@ -72,7 +75,21 @@ export function McpPanel(): ReactNode {
                     </div>
                     <Switch
                       checked={server.enabled}
-                      onChange={(next) => void toggle(server.id, next)}
+                      disabled={pending.includes(server.id)}
+                      onChange={(next) => {
+                        // A refused switch-on used to be silent: the switch
+                        // just stayed off, with no toast and no pending state
+                        // while it waited (#315). `disabled` above covers the
+                        // wait; this covers the refusal, whichever way it fails.
+                        void toggle(server.id, next).catch((error: unknown) => {
+                          toast(
+                            error instanceof Error
+                              ? error.message
+                              : `Could not ${next ? 'enable' : 'disable'} ${server.name}.`,
+                            'crit',
+                          );
+                        });
+                      }}
                       label={`Enable ${server.name}`}
                     />
                     <button
