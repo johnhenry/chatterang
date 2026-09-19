@@ -563,6 +563,52 @@ describe('a <tool_call> whose body is calls, but not one JSON object', () => {
   });
 });
 
+describe('a call written as Python writes one: name(key=value, …)', () => {
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+
+  it('is read and stripped in a tag and after [TOOL_CALLS], each value read as Python writes it', () => {
+    for (const [text, input] of [
+      ['<tool_call>calculate(expression="6*7")</tool_call>', { expression: '6*7' }],
+      [
+        "<tool_call>calculate(expression='6*7', exact=True, note=None, tags=['a', 'b'], scale=-1.5, extra={'k': False},)</tool_call>",
+        { expression: '6*7', exact: true, note: null, tags: ['a', 'b'], scale: -1.5, extra: { k: false } },
+      ],
+      ['[TOOL_CALLS] calculate(expression="(1+2) * 3")', { expression: '(1+2) * 3' }],
+      ['<tool_call>now()</tool_call>', {}],
+    ] as const) {
+      expect(stripToolSyntax(`Ok.\n${text}\nDone.`), text).toBe('Ok.\n\nDone.');
+      expect(extractTextualToolCalls(text).map((call) => call.input), text).toEqual([input]);
+    }
+  });
+
+  it('keeps prose, and a call whose arguments name no parameter', () => {
+    for (const words of [
+      'Qwen writes <tool_call>get_weather(city) </tool_call> for it.',
+      'Mistral emits [TOOL_CALLS] before (not after) the function name.',
+      'Ok <tool_call>calculate("6*7")</tool_call> end',
+      'Ok [TOOL_CALLS] calculate(expression = two) end',
+    ]) {
+      expect(stripToolSyntax(words), words).toBe(words);
+      expect(extractTextualToolCalls(words), words).toEqual([]);
+      expect(cut(words), words).toBe(words);
+      expect(cut(words, true), `${words} (stopped)`).toBe(words);
+    }
+  });
+
+  it('is cut where it starts when the text ends inside it', () => {
+    for (const call of [
+      '<tool_call>calculate(expression="one plus',
+      '[TOOL_CALLS] calculate(expression="one plus',
+      '[TOOL_CALLS] calculate(exact=True, expression=[1, 2',
+      '<tool_call>calculate(expr',
+      '[TOOL_CALLS] calculate(expr',
+    ]) {
+      expect(cut(`Ok.\n${call}`), call).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`, true), `${call} (stopped)`).toBe('Ok.\n');
+    }
+  });
+});
+
 describe('a call written as this app writes one in a text prompt’s history: [tool name({…})]', () => {
   const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
 

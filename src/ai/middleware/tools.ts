@@ -583,7 +583,9 @@ const CALL_OPENED_AT_END =
  * Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`. One
  * whose body is a name and its JSON opens `<tool_call>`, the name, and a `(` or
  * `{`: see `taggedCallsEnd`, which reads an array of calls too. This app's own
- * rendering opens `[tool`, the name, `(` and a `{`: see `APP_CALL_OPENING`.
+ * rendering opens `[tool`, the name, `(` and a `{`: see `APP_CALL_OPENING`. A
+ * `[TOOL_CALLS]` call written as Python writes one opens its name, `(` and a
+ * keyword: see `readKeywordArguments`, which the tag form's reading uses too.
  *
  * NOT ONLY `{"`. A small model's call is often single-quoted, leaves its keys
  * unquoted, or is an array of calls, and the opening this read — the `{"` of
@@ -596,7 +598,7 @@ const CALL_OPENED_AT_END =
  * tests/support/source-scan.ts read a bare one in a regex literal as the start
  * of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -793,6 +795,13 @@ export function unfinishedCallAt(
       if (end !== -1) from = end;
       continue;
     }
+    if (form === CALL_END.paren && text.charAt(open) !== '{') {
+      // Python's keyword arguments: see `readKeywordArguments`.
+      const { end } = readKeywordArguments(text, open);
+      if (end === 'open') return match.index;
+      if (end !== -1) from = end;
+      continue;
+    }
     const short = shortCallEnd(text, open, form.token);
     if (short !== -1) {
       from = short;
@@ -956,6 +965,12 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
       calls: name ? [{ name, input: {} }] : [],
       copy: false,
     });
+  }
+  for (const match of text.matchAll(KEYWORD_CALL_OPENING)) {
+    const { end, input } = readKeywordArguments(text, match.index + match[0].length);
+    if (typeof end === 'number' && end !== -1) {
+      found.push({ start: match.index, end, calls: [{ name: match[1] ?? '', input }], copy: false });
+    }
   }
   for (const match of text.matchAll(XML_CALL_OPENING)) {
     const { end, calls } = readXmlCall(text, match.index);
@@ -1212,6 +1227,15 @@ function readTaggedCalls(
       // A name the text ends on is as likely a word; with its paren, a call begun.
       if (pos === text.length) return reading(paren ? 'open' : -1);
     }
+    // Python's keyword arguments in its parens: see `readKeywordArguments`.
+    if (name !== undefined && paren && text.charAt(pos) !== '{') {
+      const keywords = readKeywordArguments(text, pos);
+      if (keywords.end === 'open' || keywords.end === -1) return reading(keywords.end);
+      calls.push({ name, input: keywords.input });
+      written += 1;
+      pos = keywords.end;
+      continue;
+    }
     const opener = text.charAt(pos);
     if (opener !== '{' && !(name === undefined && opener === '[')) return reading(-1);
     const read = (json: string): WrittenCall[] =>
@@ -1240,6 +1264,104 @@ function readTaggedCalls(
     calls.push(...read(json));
     written += 1;
   }
+}
+
+/**
+ * Where a `[TOOL_CALLS]` call written as Python writes one opens: the marker,
+ * its name and `(`, with a word after it. The group is the name. See
+ * {@link readKeywordArguments}.
+ */
+const KEYWORD_CALL_OPENING = /\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(?=[A-Za-z_])/gi;
+/** A keyword argument's name and its `=`, as Python writes one. */
+const KEYWORD = /([A-Za-z_]\w*)\s*=(?!=)\s*/y;
+
+/**
+ * Where a call's arguments written as Python writes them, from `start` just
+ * inside its `(`, end: just past the `)`; `'open'` when the text ends inside
+ * them; -1 when what is there is not such arguments. `input` is what they give.
+ *
+ *     <tool_call>notes.note(text="Call Ana", pinned=True)</tool_call>
+ *     [TOOL_CALLS] note(text='Call Ana', tags=['work'])
+ *
+ * The body `stripToolSyntax` read was JSON alone, so a finished reply kept such
+ * a call, arguments and all, and sent it back in every later request; the lazy
+ * patterns it replaced had removed it. It is a call, and runs, each value read
+ * as a call's JSON is: see {@link looseJson}.
+ *
+ * NAMED ARGUMENTS ONLY, as every model format that writes a call this way
+ * names them. A call written positionally, `note("Call Ana")`, names no
+ * parameter its value is for: nothing can run it, and it is left as words.
+ * Neither is a word that is no value, so "[TOOL_CALLS] before (not after)" is
+ * prose.
+ */
+function readKeywordArguments(
+  text: string,
+  start: number,
+): { end: number | 'open'; input: Record<string, unknown> } {
+  const input: Record<string, unknown> = {};
+  let pos = start;
+  const reading = (end: number | 'open'): { end: number | 'open'; input: Record<string, unknown> } => ({
+    end,
+    input,
+  });
+  const skipSpace = (): void => {
+    while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
+  };
+  for (;;) {
+    skipSpace();
+    if (pos === text.length) return reading('open');
+    if (text.charAt(pos) === ')') return reading(pos + 1);
+    KEYWORD.lastIndex = pos;
+    const keyword = KEYWORD.exec(text);
+    // A name the text ends inside or on is a keyword being written.
+    if (!keyword) return reading(/^[A-Za-z_]\w*\s*$/.test(text.slice(pos)) ? 'open' : -1);
+    pos += keyword[0].length;
+    const end = valueEnd(text, pos);
+    if (end === 'open' || end === -1) return reading(end);
+    const value = looseJson(text.slice(pos, end));
+    if (value === undefined) return reading(-1);
+    Object.defineProperty(input, keyword[1] ?? '', { value, enumerable: true, writable: true, configurable: true });
+    pos = end;
+    skipSpace();
+    if (pos === text.length) return reading('open');
+    if (text.charAt(pos) === ',') pos += 1;
+    else if (text.charAt(pos) !== ')') return reading(-1);
+  }
+}
+
+/**
+ * Where the value a keyword argument gives, from `start`, ends: a string in
+ * either quote, a list or dict read past the brackets in its strings, or a bare
+ * word. `'open'` when the text ends inside it; -1 when it is none of these.
+ */
+function valueEnd(text: string, start: number): number | 'open' {
+  let depth = 0;
+  let quote = '';
+  for (let at = start; at < text.length; at += 1) {
+    const char = text.charAt(at);
+    if (quote !== '') {
+      if (char === '\\') {
+        at += 1;
+      } else if (char === quote) {
+        quote = '';
+        if (depth === 0) return at + 1;
+      }
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === '{' || char === '[') {
+      depth += 1;
+    } else if (char === '}' || char === ']') {
+      depth -= 1;
+      if (depth < 0) return -1;
+      if (depth === 0) return at + 1;
+    } else if (depth === 0) {
+      BARE_WORD.lastIndex = at;
+      const word = BARE_WORD.exec(text)?.[0];
+      if (word === undefined) return -1;
+      return at + word.length === text.length ? 'open' : at + word.length;
+    }
+  }
+  return 'open';
 }
 
 /**

@@ -3725,3 +3725,96 @@ describe('a call in a shape the stripper took out and the reader did not read', 
     }
   });
 });
+
+/* ── A call whose body is not JSON: Python's keyword arguments ────────── */
+
+describe('a call written as Python writes one, name(key=value, …), in a tag or after [TOOL_CALLS]', () => {
+  // The stripper read only a JSON body, so a finished reply kept such a call,
+  // arguments and all, and sent it back in every later request. Main's lazy
+  // strips had removed it. A tag body holding Python's None, or two calls one
+  // of which holds True, was kept the same way until a8e19ea.
+  const FINISHED = [
+    ['a tag call', '<tool_call>calculate(expression="6*7", note="canary-7f3a")</tool_call>'],
+    ['a [TOOL_CALLS] call', '[TOOL_CALLS] calculate(expression="6*7", note="canary-7f3a")'],
+    ['single quotes and Python’s literals', "<tool_call>calculate(expression='6*7', exact=True, note='canary-7f3a', unit=None)</tool_call>"],
+    ['a name before a dict holding None', "<tool_call>calculate({'expression': '6*7', 'note': 'canary-7f3a', 'unit': None})</tool_call>"],
+  ] as const;
+
+  for (const [form, call] of FINISHED) {
+    it(`${form}, finished: runs, and none of it is stored or sent back`, async () => {
+      const id = `rv6_python_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}\nOne moment.`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nOne moment.\n\nIt is 42.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('two calls in a tag, one holding True, finished: both run, and none of them is stored or sent back', async () => {
+    const id = 'rv6_python_two_calls';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const call =
+      '<tool_call>\n{"name": "calculate", "arguments": {"expression": "6*7", "exact": True, "note": "canary-7f3a"}}\n{"name": "calculate", "arguments": {"expression": "6*8"}}\n</tool_call>';
+    const local = recordingBackend([`Working it out.\n${call}`, 'Done.']);
+    engineWith(local);
+
+    await useChats.getState().send('six times seven, and six times eight?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42', '6*8 = 48']);
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  for (const [form, partial] of [
+    ['a tag call', 'Filing it now.\n<tool_call>notes.note(text="canary-7f3a'],
+    ['a [TOOL_CALLS] call', 'Filing it now.\n[TOOL_CALLS] note(pinned=True, text="canary-7f3a'],
+  ] as const) {
+    it(`${form}, stopped inside its arguments: keeps the words before it, and sends none of it back`, async () => {
+      const id = `rv6_python_stopped_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a tag call Stop caught complete: is recorded as not sent, and none of it is stored (refs #293)', async () => {
+    const id = 'rv6_python_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n<tool_call>notes.note(text="canary-7f3a")</tool_call>\nWaiting', stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+  });
+});
