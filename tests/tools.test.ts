@@ -1058,3 +1058,125 @@ describe('a call whose string argument names a reasoning tag', () => {
     for (const ended of ['cut', 'stopped'] as const) expect(words(text, ended), ended).toBe('Ok.');
   });
 });
+
+describe('a call the model ended its reply on, written without its close', () => {
+  // A model that ends its reply has ended any call it wrote, as the next
+  // call's opening ends one written without its close. Read as a call still
+  // being written, it was cut from the reply and never ran: no follow-up, no
+  // record, and a reply saying it was doing something that never happened. A
+  // text Stop landed in, or one cut short, could have gone on to its close.
+  const calc = '{"name": "calculate", "arguments": {"expression": "6*7"}}';
+  const FORMS = [
+    ['a tag', `<tool_call>${calc}`],
+    ['a tag, a line break after it', `<tool_call>\n${calc}\n`],
+    ['a tag, partway into its closing tag', `<tool_call>${calc}</tool_`],
+    ['a tag, a closing brace too few', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}'],
+    [
+      'a tag, a closing brace too few, partway into its closing tag',
+      '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}</tool_',
+    ],
+    ['this app’s history form, a closing brace too few', '[tool calculate({"expression": "6*7")'],
+    ['a fenced call in a tag', `<tool_call>\n\`\`\`json\n${calc}\n\`\`\``],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] calculate({"expression": "6*7"}'],
+    ['[TOOL_CALLS], Python’s keyword arguments', '[TOOL_CALLS] calculate(expression="6*7"'],
+    ['a name and its JSON in a tag', '<tool_call>calculate({"expression": "6*7"})'],
+    ['this app’s history form', '[tool calculate({"expression": "6*7"})'],
+    ['Qwen3-Coder’s XML', '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>\n</function>\n'],
+    ['Qwen3-Coder’s XML, partway into </function>', '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>\n</func'],
+  ] as const;
+  /** A round's words as the engine and the store read them: cut where it ended, then stripped. */
+  const words = (text: string, ended: 'model' | 'cut' | 'stopped'): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+  const read = (text: string, ended: 'model' | 'cut' | 'stopped') =>
+    extractFrom(text, OFFERED, [], { ended }).map((call) => [call.name, call.input['expression']]);
+
+  it('is read as the call it is, and none of it is left in the words', () => {
+    for (const [form, call] of FORMS) {
+      const text = `Working it out. ${call}`;
+      expect(read(text, 'model'), form).toEqual([['calculate', '6*7']]);
+      expect(words(text, 'model'), form).toBe('Working it out.');
+    }
+  });
+
+  it('is not read as a call when the text was stopped or cut short there, and none of it is left', () => {
+    for (const [form, call] of FORMS) {
+      const text = `Working it out. ${call}`;
+      for (const ended of ['stopped', 'cut'] as const) {
+        // Its closing fence written, the fenced block inside the tag is a whole
+        // fenced call, and is read as one however the text ended.
+        const whole = form === 'a fenced call in a tag' ? [['calculate', '6*7']] : [];
+        expect(read(text, ended), `${form} (${ended})`).toEqual(whole);
+        expect(words(text, ended), `${form} (${ended})`).toBe('Working it out.');
+      }
+    }
+  });
+
+  it('reads a call the text ends partway, or wholly, into the opening after', () => {
+    // Nothing follows that opening, so it ends nothing: the call before it
+    // ends where the text does. Both are cut from the words, as 5cef541 cuts
+    // them however the text ended.
+    for (const opening of ['<tool_c', '<tool_call>', '[TOOL_CA', '[TOOL_CALLS]']) {
+      const text = `Ok.\n<tool_call>${calc}\n${opening}`;
+      expect(read(text, 'model'), opening).toEqual([['calculate', '6*7']]);
+      expect(words(text, 'model'), opening).toBe('Ok.');
+    }
+  });
+
+  it('reads both of two calls written without their close, however far into the second’s close the text ends', () => {
+    for (const end of ['', '\n', '</tool_call']) {
+      const text = `Both.\n<tool_call>${calc}\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*8"}}${end}`;
+      expect(read(text, 'model'), JSON.stringify(end)).toEqual([
+        ['calculate', '6*7'],
+        ['calculate', '6*8'],
+      ]);
+      expect(words(text, 'model'), JSON.stringify(end)).toBe('Both.');
+    }
+  });
+
+  it('is read and cut whole when its string names a reasoning tag, or it stands in reasoning the model left open', () => {
+    // A reasoning tag in its string is its words, as in a call closed by its
+    // tag; and a round the model ended with its reasoning open wrote its call
+    // there. Read as reasoning, it ran and kept its markup, arguments and all,
+    // in the words or the stored reasoning.
+    const noted = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where I reason"}}';
+    expect(read(`Ok. ${noted}`, 'model')).toEqual([['calculate', '6*7']]);
+    expect(words(`Ok. ${noted}`, 'model')).toBe('Ok.');
+    const open = `Ok. <think>I will work it out.\n<tool_call>${calc}`;
+    expect(read(open, 'model')).toEqual([['calculate', '6*7']]);
+    expect(words(open, 'model')).toBe('Ok. <think>I will work it out.');
+    // Stopped there, reasoning left open is still reasoning, and keeps its words.
+    expect(read(open, 'stopped')).toEqual([]);
+    expect(words(open, 'stopped')).toBe(open);
+  });
+
+  it('keeps an example the reply ends on that names no tool the request offered, and reads no call from it', () => {
+    // The end of the text is not the model's markup as a closing tag is: a call
+    // it closes is ambiguous with an example the reply ends on, and is read as
+    // a fenced block is, a call when it names an offered tool.
+    for (const example of [
+      'Qwen’s format:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}',
+      'Qwen’s format, a brace short:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}',
+      'Mistral’s: [TOOL_CALLS] get_weather({"city": "Paris"}',
+      'Qwen3-Coder’s: <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>',
+    ]) {
+      expect(read(example, 'model'), example).toEqual([]);
+      expect(words(example, 'model'), example).toBe(example);
+    }
+  });
+
+  it('is still cut, and not read, when the model ended it on an opening with nothing written inside', () => {
+    for (const opening of [
+      '<tool_call>{',
+      '<tool_call>\n```json\n{',
+      '[TOOL_CALLS] calculate(',
+      '[TOOL_CALLS] calculate({',
+      '[TOOL_CALLS] get_weather({',
+      '[tool calculate({',
+      '<tool_call>calculate(',
+      '<tool_call>calculate({',
+    ]) {
+      expect(read(`Ok.\n${opening}`, 'model'), opening).toEqual([]);
+      expect(words(`Ok.\n${opening}`, 'model'), opening).toBe('Ok.');
+    }
+  });
+});

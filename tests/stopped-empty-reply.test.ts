@@ -2542,10 +2542,11 @@ describe('a finished tool turn whose calling round ended inside a second call', 
   // A round ends inside a call's arguments only when it is cut off, at its
   // limit on tokens: a round the model ended that runs on from inside a value
   // is prose. One whose call's JSON closed with no tag after it is a call
-  // however the round ended.
-  for (const [form, tail, cutShort] of [
-    ['half-written, cut off at its limit on tokens', HALF_CALL, true],
-    ['with no closing tag', UNTAGGED_CALL, false],
+  // however the round ended, and the model that ended the round there ended
+  // the call: it runs, beside the first.
+  for (const [form, tail, cutShort, ran] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true, ['leaky']],
+    ['with no closing tag', UNTAGGED_CALL, false, ['leaky', 'leaky']],
   ] as const) {
     it(`${form}: keeps the follow-up’s answer, and stores and sends none of the call`, async () => {
       const id = `r3_round_${form.length}`;
@@ -2562,9 +2563,9 @@ describe('a finished tool turn whose calling round ended inside a second call', 
         toolRegistry.unregister(leakyTool.id);
       }
 
-      const ran = assistantRows(id)[1]!;
-      expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
-      expect(ran.content, 'the stored reply').toBe('Reading both.\n\nThey mention a passphrase.');
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(ran);
+      expect(stored.content, 'the stored reply').toBe('Reading both.\n\nThey mention a passphrase.');
       expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual([
         'assistant',
         'Reading both.\n\nThey mention a passphrase.',
@@ -2623,10 +2624,11 @@ describe('a finished tool turn whose calling round ended inside a second call', 
 /* ── Round 3: a stopped or failed turn read round by round ──────────── */
 
 describe('a stopped follow-up after a calling round that ended inside a second call', () => {
-  // As above: half-written, the calling round was cut off at its limit on tokens.
-  for (const [form, tail, cutShort] of [
-    ['half-written, cut off at its limit on tokens', HALF_CALL, true],
-    ['with no closing tag', UNTAGGED_CALL, false],
+  // As above: half-written, the calling round was cut off at its limit on
+  // tokens; with no closing tag, the model ended it, and both calls ran.
+  for (const [form, tail, cutShort, ran] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true, ['leaky']],
+    ['with no closing tag', UNTAGGED_CALL, false, ['leaky', 'leaky']],
   ] as const) {
     it(`${form}: keeps both rounds’ words, and stores and sends none of the call`, async () => {
       const id = `r3_round_stopped_${form.length}`;
@@ -2650,7 +2652,7 @@ describe('a stopped follow-up after a calling round that ended inside a second c
         toolRegistry.unregister(leakyTool.id);
       }
 
-      expect(stopped?.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(stopped?.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(ran);
       expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
         content: 'Reading both.\n\nThey mention a pass',
         stopped: undefined,
@@ -4921,4 +4923,225 @@ describe('a call with a closing brace too few, stopped or cut short partway into
     expect(stopped?.content, 'the stored reply').toBe('Let me file it.');
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
   });
+});
+
+describe('a call the model ended its reply on, written without its close', () => {
+  // A model that ends its reply has ended any call it wrote, as the next
+  // call's opening ends one written without its close. Read as a call still
+  // being written, it was cut from the reply and never ran: the server was
+  // never called, nothing recorded it, no follow-up was asked for, and the
+  // stored reply said "Filing it now." of a note that never went.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const NOTE = '{"name":"notes.note","arguments":{"text":"canary-r9"}}';
+
+  for (const [form, call] of [
+    ['a tag', `<tool_call>${NOTE}`],
+    ['a tag, a line break after it', `<tool_call>\n${NOTE}\n`],
+    ['a tag, partway into its closing tag', `<tool_call>${NOTE}</tool_`],
+    ['a tag, a closing brace too few', '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r9"}'],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] notes.note({"text":"canary-r9"}'],
+    ['[TOOL_CALLS], Python’s keyword arguments', '[TOOL_CALLS] notes.note(text="canary-r9"'],
+    ['a name and its JSON in a tag', '<tool_call>notes.note({"text":"canary-r9"})'],
+    ['this app’s history form', '[tool notes.note({"text":"canary-r9"})'],
+    ['Qwen3-Coder’s XML', '<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-r9\n</parameter>\n</function>\n'],
+  ] as const) {
+    it(`${form}: is sent once, recorded, and none of it is stored or sent back`, async () => {
+      const id = `rv9_model_ended_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Filing it now. ${call}`, 'Filed.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-r9' });
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(local.seen, 'the turn, its follow-up, and the next send').toHaveLength(3);
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r9');
+    });
+  }
+
+  it('two calls, each written without its close: both are sent, and none of either is stored', async () => {
+    const id = 'rv9_model_ended_two';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      'Filing both.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-1"}}\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-2"}}',
+      'Filed both.',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call.mock.calls.map((sent) => sent[2]), 'sent to the server').toEqual([
+      { text: 'canary-1' },
+      { text: 'canary-2' },
+    ]);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing both.\n\nFiled both.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary');
+  });
+
+  it('that was all the reply wrote: runs, and the follow-up’s answer is the reply', async () => {
+    const id = 'rv9_model_ended_only_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}', 'They mention a passphrase.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      stopped: undefined,
+    });
+  });
+
+  it('its string naming a reasoning tag, sent under a grant, the follow-up stopped: the row written mid-turn and the stopped reply keep none of it', async () => {
+    // The store closed the "reasoning" the tag opened where the round ended,
+    // and the call, split there, was never cut: its markup and arguments were
+    // the row's words.
+    const id = 'rv9_model_ended_reasoning_tag';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: 'Filing it.\n<tool_call>{"name": "notes.note", "arguments": {"text": "Reason inside <thinking> tags. canary-r9"}}' },
+      { partial: 'Filed it', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let midTurn: Message | undefined;
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('save that prompt tip to my notes');
+      await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+      midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true));
+      await until(() => (useChats.getState().messages.at(-1)?.content ?? '').includes('Filed it'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+    expect({ content: midTurn?.content, thinking: midTurn?.thinking }, 'the row written mid-turn').toEqual({
+      content: 'Filing it.',
+      thinking: undefined,
+    });
+    expect(stopped?.content, 'the stopped reply').toMatch(/^Filing it\.\s+Filed it$/);
+    expect(stopped?.thinking, 'the stopped reply’s reasoning').toBeUndefined();
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('tool_call');
+    expect(next, 'the next request').not.toContain('canary-r9');
+  });
+
+  it('in reasoning it left open: runs, and none of it is stored in the reply’s reasoning', async () => {
+    const id = 'rv9_model_ended_open_reasoning';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<think>I need their notes first.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}',
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stored.content, thinking: stored.thinking }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      thinking: 'I need their notes first.',
+    });
+  });
+
+  it('an example the reply ends on, naming no tool the request offered: is not run, and stays in the reply and the next request', async () => {
+    const id = 'rv9_model_ended_example';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'Qwen’s format looks like this:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}';
+    const local = recordingBackend([words, 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does Qwen call a tool?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+      content: words,
+      toolCalls: undefined,
+    });
+    expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+  });
+
+  for (const [how, step] of [
+    ['stopped there', 'stopped'],
+    ['cut off at its limit on tokens there', 'cut'],
+  ] as const) {
+    it(`${how}, as a guard: is not sent nor recorded, and none of it is stored`, async () => {
+      const id = `rv9_model_ended_guard_${step}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const text = `Filing it now. <tool_call>${NOTE}`;
+      const gate = held();
+      const local =
+        step === 'stopped'
+          ? scriptedBackend([{ partial: text, stall: gate.promise }, { reply: 'Fine.' }])
+          : scriptedBackend([{ cutOff: text }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        if (step === 'stopped') await stopAfterSome('file a note', 'canary-r9"}}', gate.release);
+        else await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+      expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        toolCalls: undefined,
+      });
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r9');
+    });
+  }
 });

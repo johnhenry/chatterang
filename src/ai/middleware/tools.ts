@@ -382,11 +382,24 @@ export function extractTextualToolCalls(
   // ran; stopped, it vanished from the words with no record that it had not
   // gone, which is the record #331 writes for a call it reads.
   //
+  //
+  // AND, IN A ROUND THE MODEL ENDED, A CALL TO OFFERED TOOLS THE END OF THE TEXT
+  // CLOSES: one whose arguments are written, with nothing after them but what
+  // is left of its close (see `callEndingInItsClose`). A model that ends its
+  // reply has ended any call it wrote, as the next call's opening ends one
+  // written without its close. Read as one still being written, it was cut
+  // from the reply and never ran: no server was called, no record written, no
+  // follow-up asked for, and the reply said "Filing it now." of a note that
+  // never went. The cut takes it out of the words: see `unfinishedCallAt`.
+  const every = callMarkup(text, offered);
+  const closing = ended === 'model' ? callEndingInItsClose(text, offered) : undefined;
+  if (closing !== undefined && callsOnlyTo(closing, offered)) every.push(closing);
+
   // THE OUTERMOST MARKUP ONLY: a call inside another's string, or the fenced
   // block inside a tag, is part of that call, not one of its own.
   const markup: CallMarkup[] = [];
   let end = 0;
-  for (const found of callMarkup(text, offered).sort((a, b) => a.start - b.start || b.end - a.end)) {
+  for (const found of every.sort((a, b) => a.start - b.start || b.end - a.end)) {
     if (found.start < end) continue;
     end = found.end;
     if (!inReasoning(found.start)) markup.push(found);
@@ -893,6 +906,14 @@ function writesJson(
  * landed in, or cut short — a stream that died, one at its limit on tokens —
  * ended wherever it was, and is cut from the call. Where the text ends in a
  * call's structure, it is a call being written however the text ended.
+ *
+ * WHERE IT ENDS IN A CALL'S CLOSE — its arguments written, and nothing after
+ * them but none, or part, of what closes the call (see
+ * `callEndingInItsClose`) — it asks how the text ended too. Stopped or cut
+ * short, it is a call being written, a closing bracket too few included. The
+ * model that ended it there ended the call: a call to offered tools is read
+ * and runs, and is cut here from the words; anything else is an example the
+ * reply ends on, and is kept (see `callsOnlyTo`).
  */
 export function unfinishedCallAt(
   text: string,
@@ -910,20 +931,32 @@ export function unfinishedCallAt(
   let next = -1;
   /** The call the text ends in the close of, once looked for: see `callEndingInItsClose`. */
   let closing: { readonly markup: CallMarkup | undefined } | undefined;
-  const endsInCloseOf = (at: number): boolean => {
+  const closingCall = (): CallMarkup | undefined => {
     closing ??= { markup: callEndingInItsClose(text, offered) };
-    return closing.markup?.start === at;
+    return closing.markup;
   };
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
     if (match.index !== next) chain = undefined;
     const cutFrom = chain ?? match.index;
     // THE TEXT ENDS IN THIS CALL'S CLOSE, what is left of it unwritten, as
-    // `callEndingInItsClose` reads it: a call still being written, when the
-    // text was stopped or cut short, whatever its brackets. A call with a
-    // closing bracket too few was cut by nothing here — its JSON never closes,
-    // and its close was not whole — and kept, arguments and all.
-    if (ended !== 'model' && endsInCloseOf(match.index)) return cutFrom;
+    // `callEndingInItsClose` reads it.
+    const ending = closingCall();
+    if (ending?.start === match.index) {
+      // Stopped or cut short, a call still being written, whatever its
+      // brackets. A call with a closing bracket too few was cut by nothing
+      // here — its JSON never closes, and its close was not whole — and kept,
+      // arguments and all.
+      if (ended !== 'model') return cutFrom;
+      // THE MODEL ENDED IT, and so ended the call. A call to offered tools
+      // runs (see `extractTextualToolCalls`) and is cut here, with the calls
+      // written without their close that it ends: it was cut as a call still
+      // being written and never ran, and the reply said it was doing what it
+      // never did. Anything else is an example the reply ends on, and is kept:
+      // see `callsOnlyTo`.
+      if (callsOnlyTo(ending, offered)) return cutFrom;
+      if (ending.calls.length > 0) return -1;
+    }
     const open = match.index + match[0].length;
     if (text.startsWith('<', open)) {
       // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
@@ -1026,27 +1059,43 @@ export function unfinishedCallAt(
  * reasoning names is not one the round was writing. See `maskReasoning`. Its
  * reasoning is read outside its finished calls: see
  * {@link reasoningOutsideCalls}.
+ *
+ * UNLESS THE MODEL ENDED IT ON A CALL TO OFFERED TOOLS INSIDE REASONING IT
+ * LEFT OPEN. The reader reads such reasoning as the round's own words (a round
+ * the model ended with its reasoning open wrote its call there: see
+ * `extractTextualToolCalls`), so a call the end of the text closes there runs;
+ * masked here, it was never cut, and its markup, arguments and all, stayed in
+ * the stored reasoning, where a call closed by its tag is stripped.
  */
 export function cutUnfinishedCall(
   text: string,
   reading: { readonly ended: TextEnding; readonly offered: readonly string[] },
 ): string {
-  const at = unfinishedCallAt(maskReasoning(text, reasoningOutsideCalls(text, reading.offered)), reading);
+  const closing = reading.ended === 'model' ? callEndingInItsClose(text, reading.offered) : undefined;
+  const unclosed = closing === undefined || !callsOnlyTo(closing, reading.offered);
+  const spans = reasoningOutsideCalls(text, reading.offered, { unclosed });
+  const at = unfinishedCallAt(maskReasoning(text, spans), reading);
   return at === -1 ? text : text.slice(0, at);
 }
 
 /**
  * `text` with each finished call's markup, as `callMarkup` finds it, blanked to
- * spaces. Every other character stays where it was.
+ * spaces, and the markup of a call the text ends in the close of (see
+ * `callEndingInItsClose`): a reasoning tag in its string argument is its
+ * words, however the text ended. Every other character stays where it was.
  */
 function blankCalls(text: string, offered: readonly string[]): string {
+  const closing = callEndingInItsClose(text, offered);
   let out = '';
   let at = 0;
-  for (const { start, end } of callMarkup(text, offered).sort((a, b) => a.start - b.start)) {
-    if (end <= at) continue;
+  for (const { start, end } of [...callMarkup(text, offered), ...(closing ? [closing] : [])].sort(
+    (a, b) => a.start - b.start,
+  )) {
+    const stop = Math.min(end, text.length);
+    if (stop <= at) continue;
     const from = Math.max(start, at);
-    out += text.slice(at, from) + ' '.repeat(end - from);
-    at = end;
+    out += text.slice(at, from) + ' '.repeat(stop - from);
+    at = stop;
   }
   return out + text.slice(at);
 }
@@ -1244,12 +1293,21 @@ const CLOSES: readonly string[] = [
 const ANY_OPENING = /<tool_call>|\[TOOL_CALLS?\]|\[tool\s/i;
 
 /**
+ * A call's opening at the end of a text with nothing written inside it: the
+ * marker, a name and its paren where the form writes them, and at most the
+ * bracket its arguments open with. Closed there, it would read as a call with
+ * no arguments that the text never wrote.
+ */
+const NOTHING_WRITTEN_AT_END =
+  /(?:<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*|[\w.:-]+\s*\(?\s*)?|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*|\[tool\s+[^()[\]{}\n]+?\s*\(\s*)[{[]?\s*$/i;
+
+/**
  * The markup of the call a text ends in the close of, as `callMarkup` reads it
  * with the rest of that close written: a call whose arguments are written,
  * followed by nothing but what is left of its close — none of it, or part.
  * Undefined when the text ends anywhere else, or on an opening with nothing
- * written inside it (`CALL_OPENED_AT_END`). The markup's `end` is past the end
- * of the text, where the close would end.
+ * written inside it (`NOTHING_WRITTEN_AT_END`). The markup's `end` is past the
+ * end of the text, where the close would end.
  *
  * READ BY APPENDING WHAT IS LEFT OF EACH FORM'S CLOSE (see {@link CLOSES}), so
  * that what counts as the call is what counts once its close is written:
@@ -1258,14 +1316,25 @@ const ANY_OPENING = /<tool_call>|\[TOOL_CALLS?\]|\[tool\s/i;
  * closes, so it was not JSON still being written once the close began, and its
  * close was not whole — and a turn stopped there kept it, arguments and all,
  * where the same call with its brace was cut.
+ *
+ * IN A TEXT THE MODEL ENDED, THE END CLOSES IT, as the next call's opening
+ * closes one written without its close (`CALL_SHAPES`): a model that ends its
+ * reply has ended any call it wrote. When it is a call to tools the request
+ * offered ({@link callsOnlyTo}) it is read, runs and is cut from the words;
+ * see `extractTextualToolCalls` and {@link unfinishedCallAt}.
  */
 function callEndingInItsClose(text: string, offered: readonly string[]): CallMarkup | undefined {
-  if (!ANY_OPENING.test(text) || CALL_OPENED_AT_END.test(text)) return undefined;
-  const lower = text.toLowerCase();
+  if (!ANY_OPENING.test(text) || NOTHING_WRITTEN_AT_END.test(text)) return undefined;
   const closed = new Set<string>();
-  for (const close of CLOSES) {
-    for (let written = Math.min(close.length - 1, text.length); written >= 0; written -= 1) {
-      if (lower.endsWith(close.slice(0, written))) closed.add(text + close.slice(written));
+  // Read with a next call's opening the text ends on, partway or whole, taken
+  // off too: nothing follows it, so it ends nothing, and the call before it
+  // ends where the text does (see `openingAtEnd`).
+  for (const written of new Set([text, text.slice(0, openingAtEnd(text))])) {
+    const lower = written.toLowerCase();
+    for (const close of CLOSES) {
+      for (let part = Math.min(close.length - 1, written.length); part >= 0; part -= 1) {
+        if (lower.endsWith(close.slice(0, part))) closed.add(written + close.slice(part));
+      }
     }
   }
   let found: CallMarkup | undefined;
@@ -1274,7 +1343,43 @@ function callEndingInItsClose(text: string, offered: readonly string[]): CallMar
       if (markup.end === candidate.length && (found === undefined || markup.start < found.start)) found = markup;
     }
   }
-  return found;
+  return found && { ...found, end: Math.max(found.end, text.length) };
+}
+
+/** The openings a next call can start with, lower-cased: see {@link openingAtEnd}. */
+const OPENINGS: readonly string[] = ['<tool_call>', '[tool_calls]', '[tool_call]'];
+
+/**
+ * Where a next call's opening, some or all of `<tool_call>` or `[TOOL_CALLS]`,
+ * starts at the end of a text; the text's length when it ends on none. The
+ * cut reads a call written without its close as unfinished when the text ends
+ * so (see {@link unfinishedCallAt}); in a text the model ended, that opening
+ * ends nothing, and the call before it ends where the text does.
+ */
+function openingAtEnd(text: string): number {
+  const lower = text.toLowerCase();
+  for (let from = Math.max(0, text.length - OPENINGS[1]!.length); from < text.length; from += 1) {
+    const rest = lower.slice(from);
+    if (OPENINGS.some((opening) => opening.startsWith(rest))) return from;
+  }
+  return text.length;
+}
+
+/**
+ * Whether markup is a call to tools the request offered: it reads at least one
+ * call, and every call it reads names an offered tool, by id or by name, as
+ * `offered` gives them (see {@link callNames}).
+ *
+ * WHAT DECIDES A CALL THE END OF A TEXT THE MODEL ENDED CLOSES, as it decides a
+ * fenced block (`fencedCall`). A closing tag or paren is the model's markup
+ * whatever the call names; the end of a reply is also where an example ends —
+ * "Qwen's format: `<tool_call>{"name": "get_weather", …}`" — and read as a
+ * call, such an example was dispatched, refused as a name nothing stands
+ * behind, and taken out of the words the person had watched arrive. One that
+ * names no offered tool is words, and kept.
+ */
+function callsOnlyTo(markup: CallMarkup, offered: readonly string[]): boolean {
+  return markup.calls.length > 0 && markup.calls.every((call) => offered.includes(call.name));
 }
 
 /**
