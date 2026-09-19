@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
 import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -135,7 +135,25 @@ function mustCreateMcpTool(...args: Parameters<typeof createMcpTool>) {
 
 /** A source file, with its wrapping collapsed so a sentence matches whole. */
 function shipped(path: string): string {
-  return readFileSync(resolve(process.cwd(), 'src', path), 'utf8')
+  return collapsed(readFileSync(resolve(process.cwd(), 'src', path), 'utf8'));
+}
+
+/**
+ * The headless server's own words: its header comments and its README.
+ *
+ * `shipped()` reads `src/` only, and the server's account of what it owns is
+ * written under `apps/server` (#249). One {@link collapsed} behind both
+ * readers, so a sentence wrapped inside a JSDoc block or a Markdown paragraph
+ * matches here exactly as it would there.
+ */
+const SERVER_APP = resolve(process.cwd(), 'apps/server');
+
+function serverShipped(path: string): string {
+  return collapsed(readFileSync(resolve(SERVER_APP, path), 'utf8'));
+}
+
+function collapsed(source: string): string {
+  return source
     // Drop the leading `*` of a JSDoc line, so a sentence that wraps inside a
     // block comment matches the same way one that wraps inside JSX does.
     .replace(/^[ \t]*\*[ \t]?/gm, '')
@@ -2726,6 +2744,935 @@ describe('a listening socket forces the privacy copy to change', () => {
     const sites = listenSites(readFileSync(file!, 'utf8'));
     expect(sites.filter((site) => site !== "import 'ws'")).toEqual([]);
     expect(sites).toEqual(["import 'ws'", "import 'ws'"]);
+  });
+});
+
+/* ── The server's own account of what it owns (#249) ─────────────────── */
+
+/**
+ * THE HEADLESS SERVER SAYS IT OWNS NO USER DATA, AND UNTIL THIS BLOCK NOTHING
+ * READ THE SENTENCE.
+ *
+ * `shipped()` reads `src/`. The server's account of itself is in
+ * `apps/server/src/index.ts`'s header ("WHAT IT OWNS") and in
+ * `apps/server/README.md`, and both are true today for a measurable reason:
+ * nothing under `apps/server/src` names the tunnel host's device-credential
+ * registry, the only things the server creates are the three directories
+ * `main.ts`'s `layout()` makes and the operator token beside them, and the
+ * only code outside `apps/server` it hands a place to write is the Filesystem
+ * plugin, the inference fleet and the tunnel key store, each listed below with
+ * what it is handed.
+ *
+ * #124 rules that the headless server pairs and keeps its paired-device
+ * records as files under `--root`. The change that adds that registry makes
+ * both sentences false, and #249 asks for a correction of both in the same
+ * commit, not a narrowing. This block is what makes that commit touch the
+ * copy: each pin sits in the same `it` as the measurement that makes it true,
+ * so the registry fails the pin's own test.
+ *
+ * What the corrected sentence says is not settled here. It is the owner's to
+ * approve (#221), and its pin replaces these.
+ *
+ * IT IS A LEXICAL SCAN, NOT A PARSE. A green run means the spellings below are
+ * absent from `apps/server/src`, not that the server owns no user data. It
+ * cannot see: a registry kept by another process; one reached through a
+ * wrapper, an alias, a computed name, `import()` or `require()`; a file
+ * system's `open`, `link` or `cp` called on a file system held under a name
+ * that is neither a static import from `fs` nor `fs` itself — one from
+ * `import()`, `require()` or `process.getBuiltinModule()`, or one a
+ * dependency returns — which (ii) takes for someone else's; a place to
+ * write handed over under a name none of (iii)'s spellings match — a layout
+ * renamed or destructured on the way, a directory passed as
+ * `options.directory`, a path typed out in full; what a dependency does with
+ * what it is handed, which (iii) lists but does not read (the tunnel key's
+ * directory is the one it checks, below); a quote inside a regular-expression
+ * literal, which these readers, like `codeOf`, take for the start of a string;
+ * and any other spelling the patterns miss.
+ */
+describe('the headless server’s claim that it owns no user data (#249)', () => {
+  const SERVER_SOURCE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
+
+  /**
+   * The tunnel host's registry of paired devices and its store
+   * (`packages/tunnel/src/host/credential.ts`). Calling either factory, or
+   * naming either type — an `implements`, an annotation, a `satisfies`, an
+   * import — is apps/server keeping device credentials.
+   */
+  const CREDENTIAL_NAMES = [
+    'createDeviceCredentials',
+    'createMemoryCredentialStore',
+    'CredentialStore',
+    'DeviceCredentials',
+  ] as const;
+
+  /**
+   * Calls that create a file or a directory, counted wherever they are called:
+   * each name says what it does. A registry kept as files under `--root`
+   * (#124) is one more of these, or one of {@link FILE_SYSTEM_CREATES},
+   * whatever the registry is named.
+   */
+  const CREATES = [
+    'mkdirSync',
+    'mkdir',
+    'mkdtempSync',
+    'mkdtemp',
+    'mkdtempDisposableSync',
+    'mkdtempDisposable',
+    'writeFileSync',
+    'writeFile',
+    'appendFileSync',
+    'appendFile',
+    'createWriteStream',
+    'copyFileSync',
+    'copyFile',
+    'cpSync',
+    'renameSync',
+    'rename',
+    'symlinkSync',
+    'symlink',
+    'linkSync',
+    'openSync',
+  ] as const;
+
+  /**
+   * The file system's creating calls whose names are ordinary words: `open`,
+   * counted whatever its flags, as `openSync` is; `link`; `cp`. A session's
+   * `open(` is not the file system, so these count only where the file system
+   * makes the call: a binding imported from {@link FILE_SYSTEM_MODULE}, under
+   * any local name, or a member of one or of anything named `fs`
+   * (`fsPromises.open(`, `fs.promises.cp(`, `options.fs.link(`). A
+   * {@link CREATES} name imported under another name counts the same way.
+   */
+  const FILE_SYSTEM_CREATES = ['open', 'link', 'cp'] as const;
+
+  /**
+   * What a `FileHandle` writes with (`@types/node`, `fs/promises`), counted on
+   * the name a counted `open(` was assigned to: `const handle = await
+   * open(…)`, then `handle.write(`. The open already counts. This names the
+   * write beside it, so a failure shows what was written as well as what was
+   * opened.
+   */
+  const HANDLE_WRITES = [
+    'write',
+    'writev',
+    'writer',
+    'writeFile',
+    'appendFile',
+    'createWriteStream',
+    'truncate',
+  ] as const;
+
+  /**
+   * Where Node's file system is imported from. A binding from one of these that
+   * is handed on as a value, rather than called, is a file system the server
+   * has given to code this block does not read.
+   */
+  const FILE_SYSTEM_MODULE = /^(?:node:)?fs(?:\/promises)?$/;
+
+  /**
+   * Modules a call into is NOT a hand-off: path arithmetic, and the file system
+   * itself, whose creating calls (ii) counts where they are made.
+   */
+  const STAYS_IN_THE_SERVER = /^(?:node:)?(?:fs(?:\/promises)?|path(?:\/posix|\/win32)?)$/;
+
+  /**
+   * Measurement (iii): EVERYTHING APPS/SERVER HANDS A PLACE TO WRITE, AND WHAT
+   * IT HANDS IT.
+   *
+   * (i) and (ii) read apps/server/src, so a write made inside a dependency is
+   * invisible to both. `tunnel-identity.ts` has that shape: it hands `--root`
+   * and `node:fs/promises` to the key store in `packages/tunnel`, and the store
+   * does the writing. A paired-device registry written the same way — a store
+   * in `packages/tunnel` handed `dataDirectory: options.root, fs: options.fs ??
+   * fsPromises` — names no credential type and makes no creating call here, and
+   * it left both pins green until this measurement (#249). So the hand-off is
+   * measured where the server makes it.
+   *
+   * An entry is either a call out of apps/server whose arguments spell a place
+   * to write, or a file-system binding handed on as a value anywhere. A call
+   * out is one to a name imported from a package or a Node built-in (not `fs`
+   * or `path`), or to a name a server file re-exports from one, as `binding.ts`
+   * re-exports `asTlsMaterial`. A place to write is `root` or `fs` as a name, a
+   * key or a member, the object `layout()` returned, or a file-system binding
+   * as a value. Each entry below says what the code it reaches writes there.
+   */
+  const HANDED_A_PLACE_TO_WRITE = [
+    // <root>/files/data and <root>/files/cache, which peers address as
+    // Directory.Data and Directory.Cache: the model directory index.ts and the
+    // README name as the one shared resource. (ii) reads these paths in layout().
+    'apps/server/src/main.ts -> createFilesystemPlugin( <- paths, paths.cache, paths.data',
+    // <root>/files/data/models, through the `spawn` main.ts hands the fleet:
+    // it is the argv of each inference host forked, which confines `load` to it.
+    'apps/server/src/main.ts -> new HostFleet( <- paths.models',
+    // <root>/tunnel-identity/key (#179). The store is handed `--root` and names
+    // the subdirectory itself; (ii) reads both halves of that.
+    'apps/server/src/tunnel-identity.ts -> fsPromises, handed on as a value',
+    'apps/server/src/tunnel-identity.ts -> loadOrCreateTunnelKey( <- fs, fsPromises, options.fs, options.root',
+  ] as const;
+
+  const REGISTRY_CHECKLIST = [
+    'a paired-device registry in apps/server falsifies index.ts:15-37 and README.md:85-89; correct both in the SAME commit (#249)',
+    '',
+    'apps/server now names the tunnel host’s device-credential registry, creates or opens a file or',
+    'a directory, or hands --root, its layout or a file system to code outside apps/server, and this',
+    'block has not accounted for it. In the same change:',
+    '',
+    '  - apps/server/src/index.ts, "WHAT IT OWNS": "THE SERVER IS STATELESS WITH RESPECT TO USER',
+    '    DATA", and the three conclusions under it, each re-derived or dropped.',
+    '  - apps/server/README.md: "The server owns no user data."',
+    '',
+    'A correction, not a narrowing (#249). The registry lives outside <root>/files, which the served',
+    'bundle addresses as Directory.Data and Directory.Cache (#249). The new sentence is the owner’s',
+    'to approve (#221); replace each pin in this block with a pin of it. If the new write or',
+    'hand-off keeps no user data, add it to the inventory here and say in the commit what it holds.',
+  ].join('\n');
+
+  /** Every source file of the server, from the same root the sentence reader uses. */
+  function serverFiles(): string[] {
+    return sourceFiles(resolve(SERVER_APP, 'src'), SERVER_SOURCE);
+  }
+
+  /** Every mention of the credential registry in one file's code. */
+  function credentialSites(source: string): string[] {
+    const code = codeOf(source);
+    return CREDENTIAL_NAMES.flatMap((name) =>
+      [...code.matchAll(new RegExp(String.raw`\b${name}\b`, 'g'))].map(() => name),
+    );
+  }
+
+  /**
+   * Every call in one file's code that creates a file or a directory, and
+   * every write through a handle a counted `open(` returned, in source order.
+   *
+   * A {@link CREATES} name counts as `name(` wherever it is called. A call the
+   * file system makes (see {@link FILE_SYSTEM_CREATES}) counts as its callee,
+   * spelled out. A call two rules see is one site.
+   */
+  function creationSites(source: string): string[] {
+    const code = codeOf(source);
+    // Keyed by where each call's `(` is.
+    const sites = new Map<number, string>();
+    for (const name of CREATES) {
+      for (const match of code.matchAll(new RegExp(String.raw`(?<![\w$])${name}\s*\(`, 'g'))) {
+        sites.set((match.index ?? 0) + match[0].length - 1, `${name}(`);
+      }
+    }
+
+    const fileSystems = fileSystemBindings(code);
+    const creating = new Set<string>([...CREATES, ...FILE_SYSTEM_CREATES]);
+    const calls = [
+      ...code.matchAll(
+        new RegExp(
+          String.raw`${NAME_START}([\w$]+(?:\s*\??\.\s*[\w$]+)*)\s*(?:\?\.\s*)?(?:<[^<>()]*>\s*)?\(`,
+          'g',
+        ),
+      ),
+    ].map((match) => ({
+      chain: (match[1] ?? '').replace(/[\s?]/g, '').split('.'),
+      start: match.index ?? 0,
+      paren: (match.index ?? 0) + match[0].length - 1,
+    }));
+
+    // The file system's own calls, and the names what its `open(` returned is kept under.
+    const handles = new Set<string>();
+    for (const { chain, start, paren } of calls) {
+      const receiver = chain.slice(0, -1);
+      const name =
+        receiver.length === 0
+          ? fileSystems.get(chain[0] ?? '')
+          : fileSystems.has(receiver[0] ?? '') || receiver.includes('fs')
+            ? chain.at(-1)
+            : undefined;
+      if (name === undefined || !creating.has(name)) continue;
+      if (!sites.has(paren)) sites.set(paren, `${chain.join('.')}(`);
+      if (name !== 'open') continue;
+      const kept = /(?<![\w$.])([\w$]+(?:\s*\.\s*[\w$]+)*)\s*(?::\s*[\w$.<>|\s]*)?=\s*(?:await\s+)?$/.exec(
+        code.slice(Math.max(0, start - 200), start),
+      );
+      if (kept !== null) handles.add((kept[1] ?? '').replace(/\s/g, ''));
+    }
+
+    for (const { chain, paren } of calls) {
+      const method = chain.at(-1) ?? '';
+      if (!handles.has(chain.slice(0, -1).join('.'))) continue;
+      if (!(HANDLE_WRITES as readonly string[]).includes(method)) continue;
+      if (!sites.has(paren)) sites.set(paren, `${chain.join('.')}(`);
+    }
+
+    return [...sites].sort(([a], [b]) => a - b).map(([, site]) => site);
+  }
+
+  /**
+   * One file's bindings from Node's file system, each local name mapped to the
+   * name it imports: `open` for `{ open }` and for `{ open as openFile }`,
+   * `default` for a default import, `*` for a namespace.
+   */
+  function fileSystemBindings(code: string): Map<string, string> {
+    return new Map(
+      importsOf(code)
+        .filter(({ specifier }) => FILE_SYSTEM_MODULE.test(specifier))
+        .map(({ local, imported }) => [local, imported] as const),
+    );
+  }
+
+  /**
+   * The directories `layout()` creates, relative to `--root`, read as source.
+   *
+   * It follows `const x = join(parent, 'segment' | CONSTANT)` from `root` down
+   * and reads the list the `mkdirSync` loop walks. Anything it cannot follow
+   * comes back as a marker rather than being dropped, so an unreadable layout
+   * fails the comparison instead of passing it.
+   */
+  function layoutDirectories(source: string): string[] {
+    const code = codeOf(source);
+    const start = code.indexOf('function layout(');
+    const end = start === -1 ? -1 : code.indexOf('\n}\n', start);
+    if (end === -1) return ['<no function layout( in main.ts>'];
+    const body = code.slice(start, end);
+    const literals = new Map(
+      [...code.matchAll(/\bconst\s+([\w$]+)\s*=\s*'([^']*)'\s*;/g)].map(
+        (match) => [match[1] ?? '', match[2] ?? ''] as const,
+      ),
+    );
+    const under = new Map<string, string>([['root', '']]);
+    for (const match of body.matchAll(
+      /\bconst\s+([\w$]+)\s*=\s*join\(\s*([\w$]+)\s*,\s*(?:'([^']*)'|([\w$]+))\s*\)/g,
+    )) {
+      const parent = under.get(match[2] ?? '');
+      const segment = match[3] ?? literals.get(match[4] ?? '');
+      under.set(
+        match[1] ?? '',
+        parent === undefined || segment === undefined
+          ? `<unresolved ${match[0]}>`
+          : [parent, segment].filter((part) => part !== '').join('/'),
+      );
+    }
+    const made = [
+      ...body.matchAll(
+        /\bfor\s*\(\s*const\s+([\w$]+)\s+of\s+\[([^\]]*)\]\s*\)\s*mkdirSync\s*\(\s*([\w$]+)/g,
+      ),
+    ]
+      .filter((match) => match[1] === match[3])
+      .flatMap((match) => (match[2] ?? '').split(','))
+      .map((name) => name.trim())
+      .filter((name) => name !== '')
+      .map((name) => under.get(name) ?? `<unresolved ${name}>`);
+    return made.length === 0 ? ['<layout() creates nothing this can read>'] : made.sort();
+  }
+
+  /**
+   * Code with each string's text taken out and each template's `${…}` kept: a
+   * word or a bracket inside a message is not a name or a nesting, and a path
+   * built as `${root}/devices` is still the root.
+   */
+  function withoutStringText(code: string): string {
+    let out = '';
+    let at = 0;
+    // For each `${` still open, the brace depth it opened at.
+    const open: number[] = [];
+    let depth = 0;
+    const templateText = (): void => {
+      while (at < code.length) {
+        const c = code[at]!;
+        at += c === '\\' ? 2 : 1;
+        if (c === '`') {
+          out += '`';
+          return;
+        }
+        if (c === '$' && code[at] === '{') {
+          at += 1;
+          out += '${';
+          open.push(depth);
+          depth += 1;
+          return;
+        }
+      }
+    };
+    while (at < code.length) {
+      const c = code[at]!;
+      at += 1;
+      if (c === "'" || c === '"') {
+        while (at < code.length && code[at] !== c) at += code[at] === '\\' ? 2 : 1;
+        at += 1;
+        out += c + c;
+      } else if (c === '`') {
+        out += '`';
+        templateText();
+      } else if (c === '}' && open.at(-1) === depth - 1) {
+        open.pop();
+        depth -= 1;
+        out += '}';
+        templateText();
+      } else {
+        if (c === '{') depth += 1;
+        if (c === '}') depth -= 1;
+        out += c;
+      }
+    }
+    return out;
+  }
+
+  /** A module a call into leaves apps/server: a package, or a Node built-in other than `fs` and `path`. */
+  function isOutside(specifier: string): boolean {
+    return !/^[./]/.test(specifier) && !STAYS_IN_THE_SERVER.test(specifier);
+  }
+
+  /**
+   * The value bindings one import or re-export clause names, as `{ local,
+   * imported }`: `x` is a default import, `* as x` a namespace, and `{ a, b as
+   * c }` names; a `type` entry binds no value.
+   */
+  function clauseBindings(clause: string): { local: string; imported: string }[] {
+    const listed = (/\{([^}]*)\}/.exec(clause)?.[1] ?? '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== '' && !/^type\s/.test(entry))
+      .map((entry) => {
+        const [imported = entry, local = imported] = entry.split(/\s+as\s+/);
+        return { local, imported };
+      });
+    const bare = [...clause.replace(/\{[^}]*\}/, '').matchAll(/(\*\s*as\s+)?([\w$]+)/g)].map(
+      (match) => ({ local: match[2] ?? '', imported: match[1] === undefined ? 'default' : '*' }),
+    );
+    return [...listed, ...bare];
+  }
+
+  /** Every value one file binds with a static `import`, and where from. `import type` binds none. */
+  function importsOf(code: string): { local: string; imported: string; specifier: string }[] {
+    return [
+      ...code.matchAll(/\bimport\s+(?!type\s)([\w$\s{},*]+?)\s*from\s*['"`]([^'"`]+)['"`]/g),
+    ].flatMap((match) =>
+      clauseBindings(match[1] ?? '').map((binding) => ({ ...binding, specifier: match[2] ?? '' })),
+    );
+  }
+
+  /** For each file, the names it re-exports from outside apps/server; `*` for all of a module. */
+  function reExportsOf(sources: ReadonlyMap<string, string>): Map<string, Set<string>> {
+    return new Map(
+      [...sources].map(([file, source]) => {
+        const names = new Set<string>();
+        for (const match of codeOf(source).matchAll(
+          /\bexport\s*(\*\s*(?:as\s+[\w$]+\s*)?|\{[^}]*\}\s*)from\s*['"`]([^'"`]+)['"`]/g,
+        )) {
+          if (!isOutside(match[2] ?? '')) continue;
+          const clause = match[1] ?? '';
+          if (clause.startsWith('*')) names.add('*');
+          else for (const { local } of clauseBindings(clause)) names.add(local);
+        }
+        return [file, names] as const;
+      }),
+    );
+  }
+
+  /**
+   * The names one file can call out of apps/server through: its imports from
+   * outside, and its imports of a name a sibling re-exports from outside.
+   */
+  function outsideNames(
+    file: string,
+    code: string,
+    reExports: ReadonlyMap<string, ReadonlySet<string>>,
+  ): Set<string> {
+    const names = new Set<string>();
+    for (const { local, imported, specifier } of importsOf(code)) {
+      if (isOutside(specifier)) {
+        names.add(local);
+        continue;
+      }
+      if (!specifier.startsWith('.')) continue;
+      const target = resolve(dirname(file), specifier);
+      const stem = target.replace(/\.[cm]?[jt]sx?$/, '');
+      const sibling = [target, `${stem}.ts`, `${stem}.tsx`, resolve(stem, 'index.ts')]
+        .map((path) => reExports.get(path))
+        .find((found) => found !== undefined);
+      if (sibling === undefined || sibling.size === 0) continue;
+      if (sibling.has('*') || sibling.has(imported) || imported === '*') names.add(local);
+    }
+    return names;
+  }
+
+  /**
+   * What one call's arguments hand over that could locate or write a file:
+   * `root` or `fs` as a name, a key or a member, the object `layout()`
+   * returned, or a file-system binding as a value. A name that is called is the
+   * server doing something itself, not handing it over.
+   */
+  function placesToWrite(
+    args: string,
+    fileSystems: ReadonlySet<string>,
+    layouts: ReadonlySet<string>,
+  ): string[] {
+    const handed = valueChains(args).filter((chain) => {
+      const segments = chain.split('.');
+      const head = segments[0] ?? '';
+      return (
+        segments.some((segment) => segment === 'root' || segment === 'fs') ||
+        layouts.has(head) ||
+        fileSystems.has(head)
+      );
+    });
+    return [...new Set(handed)].sort();
+  }
+
+  /**
+   * Where a name starts: not inside another, and not after a member's `.` —
+   * though after a spread's `...`, which hands the whole thing over.
+   */
+  const NAME_START = String.raw`(?<![\w$])(?<!(?<!\.\.)\.)`;
+
+  /** Every `a.b.c` in some code that is not itself called, `?.` read as `.`. */
+  function valueChains(code: string): string[] {
+    return [
+      ...code.matchAll(
+        new RegExp(String.raw`${NAME_START}([\w$]+(?:\s*\??\.\s*[\w$]+)*)(\s*(?:\?\.)?\s*\()?`, 'g'),
+      ),
+    ]
+      .filter((match) => match[2] === undefined)
+      .map((match) => (match[1] ?? '').replace(/[\s?]/g, ''));
+  }
+
+  /** The text from `open` to just before the bracket that closes the one before it. */
+  function bracketed(code: string, open: number): string {
+    let depth = 1;
+    let at = open;
+    for (; at < code.length && depth > 0; at += 1) {
+      if ('([{'.includes(code[at]!)) depth += 1;
+      else if (')]}'.includes(code[at]!)) depth -= 1;
+    }
+    return code.slice(open, depth === 0 ? at - 1 : at);
+  }
+
+  /**
+   * Every place the given server files hand a place to write out of
+   * apps/server, one entry per site: `file -> callee( <- what it is handed`,
+   * or `file -> binding, handed on as a value`.
+   */
+  function handOffs(sources: ReadonlyMap<string, string>): string[] {
+    const reExports = reExportsOf(sources);
+    return [...sources].flatMap(([file, source]) => {
+      const code = codeOf(source);
+      const outside = outsideNames(file, code, reExports);
+      const fileSystems = new Set(fileSystemBindings(code).keys());
+      const layouts = new Set(
+        [...code.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*layout\s*\(/g)].map(
+          (match) => match[1] ?? '',
+        ),
+      );
+      // Declarations out, so the name an import binds is not read as the name handed on.
+      const body = withoutStringText(code).replace(
+        /\b(?:import|export)\s+(?:type\s+)?[\w$\s{},*]*?\s*from\s*(?:''|"")/g,
+        '',
+      );
+      const calls = [
+        ...body.matchAll(
+          new RegExp(
+            String.raw`${NAME_START}(new\s+)?([\w$]+(?:\s*\.\s*[\w$]+)*)\s*(?:<[^<>()]*>\s*)?\(`,
+            'g',
+          ),
+        ),
+      ]
+        .filter((match) => outside.has((match[2] ?? '').split('.')[0]?.trim() ?? ''))
+        .flatMap((match) => {
+          const callee = `${match[1] === undefined ? '' : 'new '}${(match[2] ?? '').replace(/\s/g, '')}(`;
+          const handed = placesToWrite(
+            bracketed(body, (match.index ?? 0) + match[0].length),
+            fileSystems,
+            layouts,
+          );
+          return handed.length === 0 ? [] : [`${repoPath(file)} -> ${callee} <- ${handed.join(', ')}`];
+        });
+      const escapes = valueChains(body)
+        .filter((chain) => fileSystems.has(chain.split('.')[0] ?? ''))
+        .map((chain) => `${repoPath(file)} -> ${chain}, handed on as a value`);
+      return [...calls, ...escapes];
+    });
+  }
+
+  /** Every source file of the server, read. */
+  function serverSources(): Map<string, string> {
+    return new Map(serverFiles().map((file) => [file, readFileSync(file, 'utf8')] as const));
+  }
+
+  /** Measurement (i): no file under apps/server/src names the registry. */
+  function expectNoDeviceCredentialKept(): void {
+    const sites = serverFiles().flatMap((file) =>
+      credentialSites(readFileSync(file, 'utf8')).map((site) => `${repoPath(file)} -> ${site}`),
+    );
+    expect(sites, REGISTRY_CHECKLIST).toEqual([]);
+  }
+
+  /**
+   * Measurement (ii): what the server creates is its layout and its token, and
+   * the one other thing kept under `--root`, the tunnel key (#179), is beside
+   * `files/`, not in it.
+   */
+  function expectOnlyTheLayoutCreated(): void {
+    const sites = serverFiles()
+      .flatMap((file) =>
+        creationSites(readFileSync(file, 'utf8')).map((site) => `${repoPath(file)} -> ${site}`),
+      )
+      .sort();
+    expect(sites, REGISTRY_CHECKLIST).toEqual([
+      'apps/server/src/main.ts -> mkdirSync(',
+      'apps/server/src/token.ts -> writeFileSync(',
+    ]);
+
+    const main = readFileSync(resolve(SERVER_APP, 'src/main.ts'), 'utf8');
+    expect(layoutDirectories(main), REGISTRY_CHECKLIST).toEqual([
+      'files/cache',
+      'files/data',
+      'files/data/models',
+    ]);
+    // token.ts's one write is the operator token, at <root>/server-token.
+    expect(codeOf(main), REGISTRY_CHECKLIST).toContain("tokenFile: join(root, 'server-token')");
+
+    // The tunnel key's directory is <root>/tunnel-identity: the server hands
+    // the store `--root` itself, and the store names the subdirectory.
+    expect(
+      codeOf(readFileSync(resolve(SERVER_APP, 'src/tunnel-identity.ts'), 'utf8')),
+      REGISTRY_CHECKLIST,
+    ).toContain('dataDirectory: options.root,');
+    const keyStore = codeOf(
+      readFileSync(resolve(process.cwd(), 'packages/tunnel/src/host/identity-store.ts'), 'utf8'),
+    );
+    expect(keyStore, REGISTRY_CHECKLIST).toContain("const KEY_DIRECTORY = 'tunnel-identity';");
+    expect(keyStore, REGISTRY_CHECKLIST).toContain('join(options.dataDirectory, KEY_DIRECTORY)');
+  }
+
+  /**
+   * Measurement (iii): what the server hands a place to write out of
+   * apps/server is exactly {@link HANDED_A_PLACE_TO_WRITE}.
+   */
+  function expectOnlyTheKnownHandOffs(): void {
+    expect(handOffs(serverSources()).sort(), REGISTRY_CHECKLIST).toEqual(
+      [...HANDED_A_PLACE_TO_WRITE].sort(),
+    );
+  }
+
+  it('reads apps/server itself, so a clean scan and a found sentence are about the server', () => {
+    // A scan of an empty or wrong directory finds no registry and proves
+    // nothing, and a reader pointed at `src/` finds a README that is not this one.
+    const files = serverFiles().map(repoPath);
+    expect(files, 'apps/server/src was not read').toEqual(
+      expect.arrayContaining([
+        'apps/server/src/index.ts',
+        'apps/server/src/main.ts',
+        'apps/server/src/token.ts',
+        'apps/server/src/tunnel-identity.ts',
+      ]),
+    );
+    expect(
+      files.filter((file) => !file.startsWith('apps/server/src/')),
+      'the scan read files outside apps/server/src',
+    ).toEqual([]);
+
+    // The reader returns the server's own files, collapsed exactly as `shipped()` collapses.
+    expect(serverShipped('src/index.ts')).toBe(
+      collapsed(readFileSync(resolve(process.cwd(), 'apps/server/src/index.ts'), 'utf8')),
+    );
+    expect(serverShipped('README.md')).toBe(
+      collapsed(readFileSync(resolve(process.cwd(), 'apps/server/README.md'), 'utf8')),
+    );
+    expect(serverShipped('src/index.ts')).toContain('`apps/server` — the headless profile');
+    expect(serverShipped('README.md')).toContain('# chatterang server');
+
+    // (iii) reads the real imports: a package's name, a Node built-in's, and
+    // one a sibling re-exports (`asTlsMaterial`, through binding.ts) are ways
+    // out; `fs`, `path`, a type and a local function are not.
+    const sources = serverSources();
+    const reExports = reExportsOf(sources);
+    const outOf = (name: string): Set<string> => {
+      const file = resolve(SERVER_APP, 'src', name);
+      return outsideNames(file, codeOf(sources.get(file) ?? ''), reExports);
+    };
+    const main = outOf('main.ts');
+    for (const name of ['HostFleet', 'PluginHost', 'createFilesystemPlugin', 'fork', 'asTlsMaterial']) {
+      expect(main, `main.ts -> ${name}`).toContain(name);
+    }
+    for (const name of ['mkdirSync', 'join', 'resolveBinding', 'readOrCreateToken', 'DshStatus']) {
+      expect(main, `main.ts -> ${name}`).not.toContain(name);
+    }
+    expect([...outOf('tunnel-identity.ts')].sort()).toEqual(['loadOrCreateTunnelKey']);
+
+    // (ii) and (iii) read the real file-system imports, each under its local name.
+    const fileSystemsOf = (name: string): string[] =>
+      [...fileSystemBindings(codeOf(sources.get(resolve(SERVER_APP, 'src', name)) ?? ''))]
+        .map(([local, imported]) => `${local} <- ${imported}`)
+        .sort();
+    expect(fileSystemsOf('main.ts')).toEqual([
+      'existsSync <- existsSync',
+      'mkdirSync <- mkdirSync',
+      'readFileSync <- readFileSync',
+      'realpathSync <- realpathSync',
+    ]);
+    expect(fileSystemsOf('tunnel-identity.ts')).toEqual(['fsPromises <- *']);
+  });
+
+  it('the matchers see a registry, a write and a layout, and not a comment', () => {
+    for (const form of [
+      'const credentials = createDeviceCredentials(store);',
+      'createDeviceCredentials ({ get, set, delete: forget })',
+      'const store = createMemoryCredentialStore();',
+      'class DiskStore implements CredentialStore {}',
+      'const store: CredentialStore = { get, set, delete: forget };',
+      'export const store = { get, set, delete: forget } satisfies CredentialStore;',
+      "import type { CredentialStore } from '@chatterang/tunnel/host';",
+      'let registry: DeviceCredentials | undefined;',
+    ]) {
+      expect(credentialSites(form).length, form).toBeGreaterThan(0);
+    }
+    for (const opensNothing of [
+      '// createDeviceCredentials(store)',
+      '/* class DiskStore implements CredentialStore {} */',
+      "import { loadOrCreateTunnelKey } from '@chatterang/tunnel/host';",
+      'readOrCreateToken(paths.tokenFile)',
+    ]) {
+      expect(credentialSites(opensNothing), opensNothing).toEqual([]);
+    }
+
+    for (const form of [
+      'mkdirSync(directory, { recursive: true })',
+      'await mkdir(devices, { recursive: true })',
+      "writeFileSync(path, `${token.value}\\n`, { mode: 0o600 })",
+      'await fs.writeFile(join(root, "devices.json"), body)',
+      'await fsPromises.rename(temporary, path)',
+      'createWriteStream(log)',
+    ]) {
+      expect(creationSites(form).length, form).toBeGreaterThan(0);
+    }
+    for (const createsNothing of [
+      '// writeFileSync(path, body)',
+      'readFileSync(path, "utf8")',
+      'existsSync(join(bundleRoot, "index.html"))',
+      'realpathSync(data)',
+      "method: 'writeFile'",
+    ]) {
+      expect(creationSites(createsNothing), createsNothing).toEqual([]);
+    }
+
+    const fixture = [
+      "const MODEL_DIR = 'models';",
+      'function layout(root: string): Layout {',
+      "  const files = join(root, 'files');",
+      "  const data = join(files, 'data');",
+      '  const models = join(data, MODEL_DIR);',
+      "  const devices = join(root, 'devices');",
+      '  for (const directory of [data, models, devices]) mkdirSync(directory, { recursive: true });',
+      '  return paths;',
+      '}',
+      '',
+    ].join('\n');
+    expect(layoutDirectories(fixture)).toEqual(['devices', 'files/data', 'files/data/models']);
+    expect(layoutDirectories('function other() {}\n')).toEqual(['<no function layout( in main.ts>']);
+  });
+
+  it('(ii) sees the file system’s open, link and cp and a write through an opened handle, and not a session’s open or a response’s write', () => {
+    // The paired-device store a later change could write in apps/server
+    // itself, with the FileHandle API packages/tunnel's key store uses. Before
+    // (ii) read the file system's own `open(`, this left both pins green.
+    expect(
+      creationSites(
+        [
+          "import { open } from 'node:fs/promises';",
+          "import { join } from 'node:path';",
+          'export async function recordPairedDevice(root: string, record: PairedDeviceRecord): Promise<void> {',
+          '  const handle = await open(join(root, `paired-device-${record.id}.json`), \'wx\', 0o600);',
+          '  try {',
+          '    await handle.write(JSON.stringify(record));',
+          '  } finally {',
+          '    await handle.close();',
+          '  }',
+          '}',
+        ].join('\n'),
+      ),
+    ).toEqual(['open(', 'handle.write(']);
+
+    for (const [form, expected] of [
+      [
+        "import * as fsPromises from 'node:fs/promises';\nawait using file = await fsPromises.open(path, 'a');\nawait file.writev([head, body]);",
+        ['fsPromises.open(', 'file.writev('],
+      ],
+      [
+        "import { link, cp } from 'node:fs/promises';\nawait link(temporary, path);\nawait cp(staged, devices, { recursive: true });",
+        ['link(', 'cp('],
+      ],
+      [
+        "import fs from 'node:fs';\nfs.open(path, 'w', done);\nfs.link(temporary, path, done);\nawait fs.promises.cp(staged, devices);",
+        ['fs.open(', 'fs.link(', 'fs.promises.cp('],
+      ],
+      [
+        "import { promises as fsp } from 'node:fs';\nconst out: FileHandle = await fsp.open(path, 'wx');\nawait out.truncate(0);",
+        ['fsp.open(', 'out.truncate('],
+      ],
+      [
+        "import { open as openFile, writeFile as put } from 'node:fs/promises';\nawait openFile(path, 'wx');\nawait put(path, body);",
+        ['openFile(', 'put('],
+      ],
+      [
+        "this.handle = await options.fs?.open(path, 'wx');\nawait this.handle.write(body);",
+        ['options.fs.open(', 'this.handle.write('],
+      ],
+      [
+        "await using dir = await fsPromises.mkdtempDisposable(join(root, 'devices-'));",
+        ['mkdtempDisposable('],
+      ],
+      [
+        "const dir = mkdtempDisposableSync(join(root, 'devices-'));",
+        ['mkdtempDisposableSync('],
+      ],
+      // A creating name is one site, however many rules see it.
+      [
+        "import { mkdirSync } from 'node:fs';\nmkdirSync(directory, { recursive: true });",
+        ['mkdirSync('],
+      ],
+    ] as const) {
+      expect(creationSites(form), form).toEqual(expected);
+    }
+
+    for (const createsNothing of [
+      // apps/server's own words: a session opened on an event stream, and what it writes to.
+      "const session = routes.sessions.open({ write: (chunk) => response.write(chunk) });",
+      'open(sink: SessionSink): Session {\n  sink.write(encodeFrame(frame));\n}',
+      "process.stdout.write(`${tag} ${chunk.toString()}`);",
+      "if (!response.writableEnded) response.write(': keep-alive');",
+      // Not the file system: a local `open`, `link` and `cp`, and what a local open returns.
+      "import { link, open } from './graph.js';\nconst session = await open(sink);\nsession.write(frame);\nlink(a, b);\ncp(a, b);",
+      // The file system, but nothing created or written.
+      "import { readFile } from 'node:fs/promises';\nconst body = await readFile(path, 'utf8');",
+      "import * as fsPromises from 'node:fs/promises';\nawait fsPromises.readFile(path);\nawait fsPromises.stat(path);",
+      // A handle's write is counted only on what a counted open returned.
+      "import { open } from './sessions.js';\nconst handle = await open(sink);\nawait handle.write(frame);",
+      '// await open(join(root, "devices.json"), "wx")',
+    ]) {
+      expect(creationSites(createsNothing), createsNothing).toEqual([]);
+    }
+  });
+
+  it('the hand-off reader sees a place to write handed out of apps/server, and not one kept in it', () => {
+    const TUNNEL = "import { openDeviceRegistry } from '@chatterang/tunnel/host';\n";
+    const read = (files: Readonly<Record<string, string>>): string[] =>
+      handOffs(
+        new Map(Object.entries(files).map(([name, source]) => [resolve(SERVER_APP, 'src', name), source])),
+      ).sort();
+
+    // The registry the #249 review described, as it would sit beside tunnel-identity.ts.
+    expect(
+      read({
+        'device-registry.ts': [
+          "import * as fsPromises from 'node:fs/promises';",
+          "import { loadOrCreateDeviceRegistry } from '@chatterang/tunnel/host';",
+          "import type { DeviceRecordFileSystem } from '@chatterang/tunnel/host';",
+          'export function loadServerDeviceRegistry(options: { root: string; fs?: DeviceRecordFileSystem }) {',
+          '  return loadOrCreateDeviceRegistry({',
+          '    dataDirectory: options.root,',
+          '    fs: options.fs ?? fsPromises,',
+          '  });',
+          '}',
+        ].join('\n'),
+      }),
+    ).toEqual([
+      'apps/server/src/device-registry.ts -> fsPromises, handed on as a value',
+      'apps/server/src/device-registry.ts -> loadOrCreateDeviceRegistry( <- fs, fsPromises, options.fs, options.root',
+    ]);
+
+    for (const [files, expected] of [
+      [
+        { 'x.ts': `${TUNNEL}await openDeviceRegistry({ dataDirectory: root });` },
+        'openDeviceRegistry( <- root',
+      ],
+      [
+        { 'x.ts': `${TUNNEL}await openDeviceRegistry(\`\${root}/paired-devices\`);` },
+        'openDeviceRegistry( <- root',
+      ],
+      [
+        { 'x.ts': `${TUNNEL}const paths = layout(root);\nopenDeviceRegistry(paths.devices);` },
+        'openDeviceRegistry( <- paths.devices',
+      ],
+      [
+        {
+          'x.ts': `import * as fsPromises from 'node:fs/promises';\n${TUNNEL}openDeviceRegistry({ ...fsPromises, directory });`,
+        },
+        'openDeviceRegistry( <- fsPromises',
+      ],
+      [
+        {
+          'x.ts': "import * as host from '@chatterang/tunnel/host';\nhost . openDeviceRegistry<Records>({ fs });",
+        },
+        'host.openDeviceRegistry( <- fs',
+      ],
+      [
+        {
+          'x.ts': "import { DeviceRegistry } from '@chatterang/tunnel/host';\nnew DeviceRegistry(join(root, 'devices'));",
+        },
+        'new DeviceRegistry( <- root',
+      ],
+      [
+        {
+          'x.ts': "import { Worker } from 'node:worker_threads';\nnew Worker(script, { workerData: { root } });",
+        },
+        'new Worker( <- root',
+      ],
+      [
+        {
+          'tunnel.ts': "export { openDeviceRegistry as openRegistry } from '@chatterang/tunnel/host';",
+          'x.ts': "import { openRegistry } from './tunnel.js';\nopenRegistry(options.root);",
+        },
+        'openRegistry( <- options.root',
+      ],
+      [
+        {
+          'tunnel.ts': "export * from '@chatterang/tunnel/host';",
+          'x.ts': "import { openDeviceRegistry } from './tunnel.js';\nopenDeviceRegistry({ root });",
+        },
+        'openDeviceRegistry( <- root',
+      ],
+    ] as const) {
+      expect(read(files), JSON.stringify(files)).toContain(`apps/server/src/x.ts -> ${expected}`);
+    }
+    // A file system kept in a variable is handed on, whoever it is handed to later.
+    expect(
+      read({
+        'x.ts': "import { rename, writeFile } from 'node:fs/promises';\nconst io = { writeFile, rename };",
+      }),
+    ).toEqual([
+      'apps/server/src/x.ts -> rename, handed on as a value',
+      'apps/server/src/x.ts -> writeFile, handed on as a value',
+    ]);
+
+    for (const keepsIt of [
+      `${TUNNEL}// openDeviceRegistry({ dataDirectory: root })`,
+      `${TUNNEL}openDeviceRegistry('root', "fs", \`fs\`);`,
+      `${TUNNEL}openDeviceRegistry(bundleRoot, rootless, options.roots);`,
+      "import { join } from 'node:path';\nimport { mkdirSync } from 'node:fs';\nmkdirSync(join(root, 'files'));",
+      "import { readOrCreateToken } from './token.js';\nreadOrCreateToken(join(root, 'server-token'));\nlayout(root);",
+      "import * as fsPromises from 'node:fs/promises';\nimport { asTlsMaterial } from '@chatterang/tunnel/host';\nasTlsMaterial(await fsPromises.readFile(keyPath, 'utf8'));",
+      "import type { KeyFileSystem } from '@chatterang/tunnel/host';\nexport function keyStore(fs: KeyFileSystem, root: string) { return { fs, root }; }",
+      "import { PluginHost } from '@chatterang/desktop/bridge';\nnew PluginHost(deliver, 'server');",
+    ]) {
+      expect(
+        read({ 'token.ts': 'export function readOrCreateToken(path: string) {}', 'x.ts': keepsIt }),
+        keepsIt,
+      ).toEqual([]);
+    }
+  });
+
+  it('index.ts says THE SERVER IS STATELESS WITH RESPECT TO USER DATA, and apps/server keeps no device credential, creates only its layout and hands a place to write only where it says', () => {
+    const header = serverShipped('src/index.ts');
+    expect(header).toContain('THE SERVER IS STATELESS WITH RESPECT TO USER DATA.');
+    expect(header).toContain(
+      '`liveStores()`/`buildVfs` have no principal to take, and need none: they project the ' +
+        'browser\'s OWN Dexie tables, in the browser, and nothing they touch crosses this wire.',
+    );
+    expectNoDeviceCredentialKept();
+    expectOnlyTheLayoutCreated();
+    expectOnlyTheKnownHandOffs();
+  });
+
+  it('README.md says "The server owns no user data.", measured the same three ways', () => {
+    expect(serverShipped('README.md')).toContain('The server owns no user data.');
+    expectNoDeviceCredentialKept();
+    expectOnlyTheLayoutCreated();
+    expectOnlyTheKnownHandOffs();
   });
 });
 
