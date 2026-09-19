@@ -574,20 +574,38 @@ describe('main.ts wiring', () => {
     expect(source).toContain('function createWindow');
   });
 
+  /*
+   * main.ts with comments stripped, so commenting a line out is a deletion
+   * too. `source` still holds commented-out text, and a guard that reads it is
+   * satisfied by a registration that no longer runs.
+   */
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('//'))
+    .join('\n');
+
   it('[6] registers a handler for EVERY renderer departure, crash included', () => {
     // The list lives in `bridge/renderer-lifecycle.ts`, which is testable; this
     // is the join between that list and the file that has to act on it. Adding
     // a name there without wiring it here fails this test, and so does deleting
-    // the `render-process-gone` line that closes [6].
+    // or commenting out the `render-process-gone` line that closes [6].
+    //
+    // Read from `code`, not `source`. FAULT INJECTED against main.ts, one at a
+    // time, each failing this test and passing it when read from `source`:
+    // commenting out `contents.once('destroyed', …)`, the first link of
+    // `destroyed` → `forgetWindow` (#313); commenting out
+    // `contents.on('render-process-gone', …)`; and commenting out
+    // `teardown('did-start-navigation')` inside its handler.
     const missing = RENDERER_TEARDOWN_EVENTS.filter(
       (event) =>
-        !new RegExp(`contents\\.(on|once)\\(\\s*'${event}'`).test(source) ||
-        !source.includes(`teardown('${event}')`),
+        !new RegExp(`contents\\.(on|once)\\(\\s*'${event}'`).test(code) ||
+        !code.includes(`teardown('${event}')`),
     );
     expect(missing).toEqual([]);
     // And specifically the one that was absent, spelled out so the reason this
     // test exists survives a refactor of the loop above.
-    expect(source).toContain("contents.on('render-process-gone'");
+    expect(code).toContain("contents.on('render-process-gone'");
   });
 
   /*
@@ -598,15 +616,8 @@ describe('main.ts wiring', () => {
    * event of its own. `tests/desktop-local-turns.test.ts` drives both methods
    * directly and cannot see whether this file ever calls them, so before these
    * two tests, deleting either line (#330's wiring) left every test file green.
-   *
-   * Read with comments stripped, so commenting a line out is a deletion too.
+   * Both read `code` above.
    */
-  const code = source
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter((line) => !line.trimStart().startsWith('//'))
-    .join('\n');
-
   it('#313: closes the reload gap when each new document commits, on `did-navigate` and nowhere else', () => {
     // `did-navigate` is where closing the gap was MEASURED safe
     // (`docs/BACKGROUND-WORK-MEASUREMENTS.md` §5.5): across 40 navigations the
