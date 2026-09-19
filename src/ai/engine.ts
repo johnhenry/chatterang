@@ -1288,6 +1288,32 @@ export class ChatterangEngine {
           ran: tools.length > 0,
           ended: 'cut',
         });
+
+        // AND A CALL IT HAD WRITTEN IN FULL is recorded as not sent, exactly as
+        // the no-fallback path above records one. `endedRoundWords` has just
+        // taken that call's markup out of the words the person keeps, so with
+        // no record nothing at all was left of it: the reply says "Filing it
+        // now." above the cloud's answer, the server was never reached, and the
+        // thread and the export say nothing about a call that did not go.
+        // Read as `'cut'`, as those words were: its stream died wherever it was.
+        const unsent =
+          offered.length > 0
+            ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages), {
+                ended: 'cut',
+              })
+            : [];
+        if (unsent.length > 0) {
+          const batch = await runToolCalls(toolRegistry, unsent, {
+            enabledIds: request.toolIds ?? [],
+            destinations: this.#mcpDestinations(request.mcpEgress),
+            declared: offered,
+            signal: request.signal,
+            replyFailed: true,
+          });
+          tools.push(...batch.executed);
+          for (const tool of batch.executed) yield { type: 'tool', tool, ended: 'cut' };
+        }
+
         if (deadWords) said.push(deadWords);
 
         const { reason, detail } = classifyFailure(failure);

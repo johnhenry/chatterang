@@ -5366,3 +5366,86 @@ describe('a call to an offered tool written without its close, with words after 
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r10');
   });
 });
+
+/* ── Round 10: the dead local round's call, on the fallback divert ──── */
+
+describe('a call a dead local round had written in full, on a turn that diverts to the cloud fallback', () => {
+  // The dead round's words stay in the answer, and `stripToolSyntax` takes the
+  // call's markup out of them. Nothing else read that call on this one path, so
+  // the MCP server was never reached and no receipt said so: the thread and the
+  // export held a reply saying "Filing it now." of a note nothing recorded as
+  // not sent. The sibling path — the same failure with no fallback configured —
+  // already writes that record.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const DEAD_CALL = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r10f"}}</tool_call>';
+
+  it('is recorded as not sent, and the kept words say nothing of it', async () => {
+    const id = 'r10_fallback_dead_call';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: `Filing it now.\n${DEAD_CALL}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ reply: 'The cloud finished it.' }, { reply: 'Next.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('Filing it now.')));
+      dies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect(stored.content, 'the dead round’s words and the cloud’s').toBe('Filing it now.\n\nThe cloud finished it.');
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'the call the dead round wrote').toEqual([
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'reply-failed',
+    });
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the request that diverted').not.toContain('canary-r10f');
+  });
+
+  it('written without its close, with words after it: is recorded too', async () => {
+    const id = 'r10_fallback_dead_unclosed';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-r10f"}}\nAll done.',
+        stall: dies.promise,
+      },
+    ]);
+    const cloud = scriptedBackend([{ reply: 'The cloud finished it.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('All done.')));
+      dies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect(stored.content, 'the dead round’s words and the cloud’s').toBe(
+      'Filing it now.\n\nAll done.\n\nThe cloud finished it.',
+    );
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'the call the dead round wrote').toEqual([
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'reply-failed',
+    });
+  });
+});
