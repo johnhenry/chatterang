@@ -1333,6 +1333,31 @@ describe('a reply in a chat whose tool ids name nothing connected', () => {
     expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
     expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
   });
+
+  it('does not run a complete <tool_call> example, and keeps it in a finished reply and the next request', async () => {
+    // The request offered no tool, so nothing the turn wrote is a call. The
+    // engine read it for calls anyway, because the chat still named a tool id:
+    // the example was dispatched, answered "No tool named", followed by a
+    // second request, and stripped from the reply the person watched arrive.
+    const id = 'gone_finished_tag_example';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'Qwen writes a call as <tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call> and then waits.';
+    const local = recordingBackend([text, 'Follow-up.']);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen call a tool?');
+    const requests = local.seen.length;
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(
+      { requests, content: stored.content, tools: stored.toolCalls?.map((call) => call.output) },
+      'the finished reply',
+    ).toEqual({ requests: 1, content: text, tools: undefined });
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+  });
 });
 
 /* ── Words that name, show or explain a call, in a chat with tools ──── */

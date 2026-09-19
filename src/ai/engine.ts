@@ -1119,9 +1119,12 @@ export class ChatterangEngine {
            * took it out as a call — so the reply lost it and no record said
            * it had not gone.
            */
-          const strandedCalls = request.toolIds?.length
-            ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
-            : [];
+          // Only in a round whose request offered a tool, as a finished round
+          // is read below.
+          const strandedCalls =
+            offered.length > 0
+              ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
+              : [];
           if (strandedCalls.length > 0) {
             const batch = await runToolCalls(toolRegistry, strandedCalls, {
               enabledIds: request.toolIds ?? [],
@@ -1184,9 +1187,17 @@ export class ChatterangEngine {
       // `messages` is the history this round was shown, which holds every call
       // the turn's earlier rounds made: a copy of one in this app's history form
       // is the model recounting it, not calling the tool again. See `shownCalls`.
-      const calls = request.toolIds?.length
-        ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
-        : [];
+      //
+      // ONLY IN A ROUND WHOSE REQUEST OFFERED A TOOL. A chat keeps an MCP tool's
+      // id after its server is removed or disconnected, and its requests then
+      // offer none: nothing such a round writes is a call. Read because the chat
+      // still named a tool id, a reply showing Qwen's call format had its example
+      // dispatched, answered "No tool named", followed by a second request, and
+      // stripped from the words the person had watched arrive.
+      const calls =
+        offered.length > 0
+          ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
+          : [];
 
       if (calls.length === 0) break;
 
