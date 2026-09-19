@@ -4842,3 +4842,83 @@ describe('a round cut short on a bare call opening', () => {
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
   });
 });
+
+describe('a call with a closing brace too few, stopped or cut short partway into its close', () => {
+  // Its JSON never closes and its close is not whole, so it was neither cut
+  // nor stripped: its arguments were stored and sent back, where the same
+  // call with its brace was cut at the same character. A small model's
+  // `</tool_call>` can arrive in pieces, and a fence and a line break come
+  // before it whatever the tokenizer makes of the tag.
+  const SHORT = '{"name": "leaky", "arguments": {"path": "canary-7f3a"}';
+  for (const [form, partial, marker] of [
+    ['in its closing tag', `Let me read your notes.\n<tool_call>${SHORT}</tool_`, '</tool_'],
+    ['after its closing fence', `Let me read your notes.\n<tool_call>\n\`\`\`json\n${SHORT}\n\`\`\`\n`, '"}\n```'],
+    ['with its brace, as a guard', `Let me read your notes.\n<tool_call>\n\`\`\`json\n${SHORT}}\n\`\`\`\n`, '"}}\n```'],
+    [
+      'in its closing tag, after a call written without its close',
+      `Let me read your notes.\n<tool_call>{"name": "leaky", "arguments": {"path": "canary-first"}}\n<tool_call>${SHORT}</tool_`,
+      '</tool_',
+    ],
+  ] as const) {
+    it(`stopped ${form}: keeps only the words before it, and sends none of it back`, async () => {
+      const id = `rv9_short_close_stopped_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', marker, gate.release);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stopped = assistantRows(id)[1]!;
+      expect({ content: stopped.content, toolCalls: stopped.toolCalls }, 'the stored reply').toEqual({
+        content: 'Let me read your notes.',
+        toolCalls: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary');
+    });
+  }
+
+  it('cut off at its limit on tokens in its closing tag: stores and sends none of it', async () => {
+    const id = 'rv9_short_close_cut';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([cutOff(`Let me read your notes.\n<tool_call>${SHORT}</tool_`), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('in this app’s history form, stopped before its `]`: keeps only the words before it, and sends none of it back', async () => {
+    const id = 'rv9_short_close_app_form';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Let me file it.\n[tool notes.note({"text":"canary-7f3a")', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'canary-7f3a")', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.content, 'the stored reply').toBe('Let me file it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});

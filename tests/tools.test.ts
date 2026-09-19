@@ -905,6 +905,40 @@ describe('an unfinished call, by how the text ended', () => {
       expect(cut(`Ok.\n${marker}`, 'model'), `${JSON.stringify(marker)} (model)`).toBe(`Ok.\n${marker}`);
     }
   });
+
+  it('cuts a stopped or cut-short text ending partway into the close of a call with a closing bracket too few', () => {
+    // Its JSON never closes, so it is not JSON being written once the close
+    // begins, and the close is not whole, so it is not a finished call either:
+    // the same call with its brace was cut here, and this one kept, arguments
+    // and all. Its close may arrive in pieces, a fence and a line break before
+    // `</tool_call>` whatever the tokenizer makes of the tag.
+    const short = '{"name": "calculate", "arguments": {"expression": "6*7"}';
+    for (const call of [
+      `<tool_call>${short}</tool_`,
+      `<tool_call>${short}\n</tool_call`,
+      `<tool_call>\n\`\`\`json\n${short}\n\`\`\`\n`,
+      `<tool_call>\n\`\`\`json\n${short}\n\`\``,
+      `<tool_call>\n\`\`\`json\n${short}\n\`\`\`\n</tool`,
+      '[tool calculate({"expression": "6*7")',
+      '[TOOL_CALLS] calculate({"expression": "6*7", "exact": {"digits": 2}',
+      // After a call written without its close, which only this one's opening
+      // ends: cut with it, or it is left with nothing after it to end it.
+      `<tool_call>{"name": "calculate", "arguments": {"expression": "6*8"}}\n<tool_call>${short}</tool_`,
+    ]) {
+      for (const ended of ['stopped', 'cut'] as const) {
+        expect(cut(`Ok.\n${call}`, ended), `${call} (${ended})`).toBe('Ok.\n');
+      }
+    }
+  });
+
+  it('keeps prose after a call’s opening that names its closing tag, stopped or cut short', () => {
+    for (const words of [
+      'Qwen writes <tool_call>{"name": "calculate", "arguments": {} and then the tag </tool_',
+      'Write <tool_call>{"name": "calculate"} then close it with </tool_',
+    ]) {
+      for (const ended of ['stopped', 'cut'] as const) expect(cut(words, ended), `${words} (${ended})`).toBe(words);
+    }
+  });
 });
 
 describe('two calls, the first written without its closing tag or paren', () => {

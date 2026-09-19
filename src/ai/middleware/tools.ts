@@ -908,10 +908,22 @@ export function unfinishedCallAt(
   // stripped nor cut: its arguments were stored and sent back.
   let chain: number | undefined;
   let next = -1;
+  /** The call the text ends in the close of, once looked for: see `callEndingInItsClose`. */
+  let closing: { readonly markup: CallMarkup | undefined } | undefined;
+  const endsInCloseOf = (at: number): boolean => {
+    closing ??= { markup: callEndingInItsClose(text, offered) };
+    return closing.markup?.start === at;
+  };
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
     if (match.index !== next) chain = undefined;
     const cutFrom = chain ?? match.index;
+    // THE TEXT ENDS IN THIS CALL'S CLOSE, what is left of it unwritten, as
+    // `callEndingInItsClose` reads it: a call still being written, when the
+    // text was stopped or cut short, whatever its brackets. A call with a
+    // closing bracket too few was cut by nothing here — its JSON never closes,
+    // and its close was not whole — and kept, arguments and all.
+    if (ended !== 'model' && endsInCloseOf(match.index)) return cutFrom;
     const open = match.index + match[0].length;
     if (text.startsWith('<', open)) {
       // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
@@ -1208,6 +1220,59 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
   for (const match of text.matchAll(TAG_OPENING)) {
     const { end, calls } = readTaggedCalls(text, match.index, offered);
     if (typeof end === 'number' && end !== -1) found.push({ start: match.index, end, calls, copy: false });
+  }
+  return found;
+}
+
+/**
+ * What closes a call once its arguments are written, as text, in each form:
+ * `</tool_call>`; a fence and `</tool_call>`; `)`; `)]`, or its `]` alone after
+ * the `)`; a name's `)` and `</tool_call>` inside a tag; and Qwen3-Coder's
+ * `</function>` and `</tool_call>`. See {@link callEndingInItsClose}.
+ */
+const CLOSES: readonly string[] = [
+  '</tool_call>',
+  '\x60\x60\x60</tool_call>',
+  ')',
+  ')]',
+  ']',
+  ')</tool_call>',
+  '</function></tool_call>',
+];
+
+/** Any call's opening marker, for skipping a text that has none. */
+const ANY_OPENING = /<tool_call>|\[TOOL_CALLS?\]|\[tool\s/i;
+
+/**
+ * The markup of the call a text ends in the close of, as `callMarkup` reads it
+ * with the rest of that close written: a call whose arguments are written,
+ * followed by nothing but what is left of its close — none of it, or part.
+ * Undefined when the text ends anywhere else, or on an opening with nothing
+ * written inside it (`CALL_OPENED_AT_END`). The markup's `end` is past the end
+ * of the text, where the close would end.
+ *
+ * READ BY APPENDING WHAT IS LEFT OF EACH FORM'S CLOSE (see {@link CLOSES}), so
+ * that what counts as the call is what counts once its close is written:
+ * `shortCall`'s closing bracket too few included. That call was found in no
+ * reading at all when the text ended partway into its close — its JSON never
+ * closes, so it was not JSON still being written once the close began, and its
+ * close was not whole — and a turn stopped there kept it, arguments and all,
+ * where the same call with its brace was cut.
+ */
+function callEndingInItsClose(text: string, offered: readonly string[]): CallMarkup | undefined {
+  if (!ANY_OPENING.test(text) || CALL_OPENED_AT_END.test(text)) return undefined;
+  const lower = text.toLowerCase();
+  const closed = new Set<string>();
+  for (const close of CLOSES) {
+    for (let written = Math.min(close.length - 1, text.length); written >= 0; written -= 1) {
+      if (lower.endsWith(close.slice(0, written))) closed.add(text + close.slice(written));
+    }
+  }
+  let found: CallMarkup | undefined;
+  for (const candidate of closed) {
+    for (const markup of callMarkup(candidate, offered)) {
+      if (markup.end === candidate.length && (found === undefined || markup.start < found.start)) found = markup;
+    }
   }
   return found;
 }
