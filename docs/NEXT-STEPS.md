@@ -57,7 +57,7 @@ Merged between #300 and #335, grouped by what they give the goal.
   - The desktop's leg checks the pin before it writes the upgrade request or
     the credential, tested against a real listener.
   - The iOS and Android sources check it during the TLS handshake, but neither
-    has been compiled or run.
+    has been compiled or run (#342).
   - `src/ai/backends/tunnel.ts` does not use the transport yet.
 
 **Pairing codes**
@@ -179,13 +179,21 @@ desktop's llama.cpp adapter, without the tool middleware and outside
 - **Phone tools are not built.** No tool runs on the desktop for a phone, and
   no confirm is relayed: #334's handler can send a broker `prompt` notice as a
   `prompt` frame and hand an `answer` back, but nothing raises one. Host-run
-  tools and relayed confirms remain to be built (wave 3).
+  tools and relayed confirms remain to be built (wave 3; #339). The phone side
+  is unbuilt too: it always sends `'requester'` and refuses every relayed prompt
+  itself.
 - **Cloud reach is not built.** A phone's turn never reaches the desktop's
   nominated fallback, and #334 clears the request as local because, as built,
   the reply never leaves the machine. Following the fallback, and carrying the
-  reach back to the phone, remain to be built (wave 2).
-- **The desktop's not-sent store** has nothing to hold yet, because no tool
-  runs there for a phone.
+  reach back to the phone, remain to be built (wave 2; #340). No wire frame
+  carries a reach yet, so the phone's label comes from its own choice of target
+  (#213). The worker already loads the desktop's provider connections through
+  `initialize()`, as a snapshot taken when it boots; nothing on the phone-turn
+  path uses them.
+- **The desktop's not-sent store** does not exist yet, and neither does the
+  persisted paired-devices record it is to sit beside: the host's credential
+  store forgets every device when the process ends (#133). No tool runs on the
+  desktop for a phone, so there is nothing to record yet (#339).
 - #334's code comments call #170's tool question open. The #170 rulings above
   answer it.
 
@@ -199,7 +207,8 @@ opens.
 ### 1. `pairing-negotiated-spki`
 
 A pairing connection is bound to the certificate that connection negotiated
-(#295 U6). #295 itself is no longer open; #332 completed it. Built and reviewed
+(#295 U6). #295 itself is no longer open; #332 completed it, and what it left
+unbuilt is tracked in #342. Built and reviewed
 before the pause at `8a5fae9`, with low findings only.
 
 **State: in progress.** This run rebases it onto `3e72abb` and corrects three
@@ -306,7 +315,7 @@ in the same wave can be built in parallel once their inputs are merged.
   the registry.
 - **Tunnel surface declaration** (#170). It is asserted before the listener
   binds, and it is a required option of the listener. Waits on the registry.
-- **Turn runner: the desktop's fallback** (S4, refs #296). #334 built the core:
+- **Turn runner: the desktop's fallback** (S4; #340, refs #296). #334 built the core:
   a decoded turn comes in and frames go out, with no chat row, and the
   tool-loop owner is honoured by refusing `'host'`. It runs the request on
   `engine.llama.executeStream()`, so the desktop's fallback never applies. What
@@ -331,7 +340,7 @@ in the same wave can be built in parallel once their inputs are merged.
 
 ### Wave 3: policy, controllers and the first native plugin
 
-- **Phone policy and relay hook** (S4 U2). A phone turn uses the desktop's own
+- **Phone policy and relay hook** (S4 U2; #339). A phone turn uses the desktop's own
   bash, with every confirm relayed. MCP needs the desktop grant plus a relayed
   answer. Refused calls are recorded in full on both sides.
   - This is the `toolLoop: 'host'` path, built on both sides (#152's ruling).
@@ -357,7 +366,7 @@ in the same wave can be built in parallel once their inputs are merged.
 - **Android socket plugin** (#295 U5). #332 wrote it: OkHttp, with a trust
   manager that checks the pin in `checkServerTrusted`. Left: compile it and run
   it on an emulator that reaches the desktop at `10.0.2.2`, with the
-  negative-pin test.
+  negative-pin test (#342).
 
 ### Wave 4: assemble
 
@@ -368,12 +377,14 @@ in the same wave can be built in parallel once their inputs are merged.
   - `main.ts` passing `hostedUnitOf` and `condemnExecutor`;
   - the worker's provider connections, loaded by `initialize()`.
 
-  It differs from the plan. The plan's worker entry never imported `App` or
-  `initialize()`, and its preload reset per unit. #334's hidden window loads
-  the whole bundle, so `src/main.tsx` renders `App` there too, the worker runs
-  `initialize()`, and nothing resets the page between units. Check before the
-  rung whether that matters; if it does, a worker-only entry is what is left of
-  this unit.
+  What #334 does not do (#341): the hidden window loads the whole bundle, so
+  `src/main.tsx` mounts `App` there. Mounting it reads every desktop chat,
+  rewrites stale grants, runs the blob sweep, connects every enabled MCP server,
+  and opens or creates a chat; `initialize()` connects the desktop's providers.
+  Nothing resets the page between phone turns. None of this is reachable yet,
+  because no listener starts. The planning pass recommended a worker-only entry
+  that never mounts `App`, with per-unit resets; that is what is left of this
+  unit.
 - **Revocation composition:** credentials, the broker and the registry, in one
   path.
 - **Phone registration** (S10 U7). Tunnel backends are never fallback-eligible,
@@ -388,7 +399,7 @@ in the same wave can be built in parallel once their inputs are merged.
   Left: compile it, run it on a simulator with the negative-pin test, and
   measure the Local Network prompt on hardware. #332 names its riskiest spot:
   rebuilding the SPKI DER from `SecKeyCopyExternalRepresentation`'s raw EC
-  point.
+  point. Tracked in #342.
 
 ### Wave 5: turn it on, and the rung
 
@@ -464,6 +475,14 @@ Filed during this work and not on the critical path:
   the shared slot. #330 repaired it; `test-313-teardown-coverage` (above)
   guards its wiring in `main.ts`.
 - #315, #316, #317 and #318: all four are done by #333 (above).
+- #339: a phone's turn runs no desktop tool and relays no confirm, though #170
+  ruled it may (wave 3).
+- #340: a phone's turn never follows the desktop's cloud fallback, though #296
+  ruled it may (wave 2).
+- #341: the hidden worker mounts the whole app, runs its launch work, and is
+  not reset between phone turns (wave 4).
+- #342: the native socket plugin's iOS and Android legs have not been built or
+  run (waves 3 and 4).
 
 Found in review, not yet filed:
 
