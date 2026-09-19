@@ -31,6 +31,7 @@ import {
   type WithheldWhy,
 } from '@/domain/mcp';
 import { maskReasoning } from '@/domain/chat';
+import { encodeUntrusted } from '@/ai/taint';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
 export interface ExecutedTool {
@@ -158,8 +159,58 @@ export function callNames(tools: readonly Pick<ChatterangTool, 'id' | 'name'>[])
  * forms read it, so the call never ran, and its arguments — which the first
  * tool's output could have written — stayed in the stored reply and were sent
  * back in every later request.
+ *
+ * A model RECOUNTING what it did copies the same thing: "I filed it:
+ * [tool notes.note({…})]". That copy repeats a call the history showed, name
+ * and arguments, and is not run again; it is stripped as any call is. See
+ * {@link shownCalls}. Only this form is read that way: a model's own call
+ * markup is its call, the same arguments again or not.
  */
 const APP_CALL_OPENING = /\[tool\s+([^()[\]{}\n]+?)\s*\(\s*(?=\{)/gi;
+
+/**
+ * The calls a request's history shows the model: every `tool_use` block in its
+ * messages, as `messageText` in ai/prompt.ts writes each into a text template's
+ * prompt, `[tool NAME({…})]`. In a turn's tool loop these are the calls its
+ * earlier rounds made. See {@link extractTextualToolCalls}'s `shown`.
+ */
+export function shownCalls(messages: readonly IRMessage[]): ToolUseContent[] {
+  return messages.flatMap((message) => structuredToolCalls(message));
+}
+
+/**
+ * A call's name and arguments as a text template's history shows them, for
+ * telling a recount of that call from a new one: every string in them, keys
+ * included, as `sanitiseMessages` in ai/prompt.ts encodes a tool block's
+ * (`encodeUntrusted`), and each object's keys in one order. A model copies
+ * what it was shown — `10∶30` for the `10:30` the call was written with — or
+ * writes the value as it first did; both read the same here, because encoding
+ * an encoded string leaves it as it is.
+ */
+function asShown(name: string, input: unknown): string {
+  const encode = (value: unknown): unknown => {
+    if (typeof value === 'string') return encodeUntrusted(value);
+    if (Array.isArray(value)) return value.map(encode);
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value)
+          .map(([key, inner]) => [encodeUntrusted(key), encode(inner)] as const)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify([encodeUntrusted(name), encode(input)]);
+}
+
+/** `raw` parsed as JSON, or undefined when it is not JSON. */
+function parsedJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Recognise a textual tool call. Local models produce these in a handful of
@@ -168,8 +219,17 @@ const APP_CALL_OPENING = /\[tool\s+([^()[\]{}\n]+?)\s*\(\s*(?=\{)/gi;
  * `offered` is what the request offered, as {@link callNames} gives it. A
  * fenced JSON block is a call only when it names one of those: see
  * `fencedCall`.
+ *
+ * `shown` is the calls the request's history showed the model, as
+ * {@link shownCalls} gives them. A call in this app's own history form that
+ * repeats one of them, name and arguments, is the model recounting what it
+ * did, not a call: see `APP_CALL_OPENING`.
  */
-export function extractTextualToolCalls(text: string, offered: readonly string[]): ToolUseContent[] {
+export function extractTextualToolCalls(
+  text: string,
+  offered: readonly string[],
+  shown: readonly ToolUseContent[],
+): ToolUseContent[] {
   const calls: ToolUseContent[] = [];
   let index = 0;
 
@@ -227,12 +287,22 @@ export function extractTextualToolCalls(text: string, offered: readonly string[]
   // [tool name({...})]                                   (this app's own history)
   // Read through its arguments' JSON, as `stripToolSyntax` reads a call, so a
   // string holding `)]` does not end it. See `APP_CALL_OPENING`.
+  //
+  // NOT ONE THE HISTORY SHOWED. This is the form the follow-up's history shows
+  // the model its own call in, and a model recounting what it did — "I filed
+  // it: [tool notes.note({…})]" — copies it. Read as a call, it ran again: a
+  // second note filed on the server, a second message sent. The copy is
+  // stripped from the words as any call is, and runs nothing.
+  const recounts = new Set(shown.map((call) => asShown(call.name, call.input)));
   for (const match of text.matchAll(APP_CALL_OPENING)) {
     const name = match[1]?.trim();
     const from = match.index + match[0].length;
     const end = endOfJson(text, from);
     if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end))) continue;
-    push(name, text.slice(from, end));
+    const raw = text.slice(from, end);
+    const input = recounts.size > 0 ? parsedJson(raw) : undefined;
+    if (input !== undefined && recounts.has(asShown(name, input))) continue;
+    push(name, raw);
   }
 
   return calls;
@@ -963,9 +1033,18 @@ export function stripToolSyntax(
  * `Bridge.use()` middleware does not run for streamed requests
  * (johnhenry/ai.matey#46), and a tool call cannot be executed mid-stream in
  * any case — the arguments are not complete until the turn ends.
+ *
+ * `offered` and `shown` are REQUIRED, as `enabledIds` is on `runToolCalls`: a
+ * reading that left out `offered` took a data record for a call, and one that
+ * left out `shown` ran a call again when the model recounted it. `shown` is
+ * {@link shownCalls} of the messages the reply answers.
  */
-export function findToolCalls(message: IRMessage, offered: readonly string[]): ToolUseContent[] {
-  return [...structuredToolCalls(message), ...extractTextualToolCalls(messageToText(message), offered)];
+export function findToolCalls(
+  message: IRMessage,
+  offered: readonly string[],
+  shown: readonly ToolUseContent[],
+): ToolUseContent[] {
+  return [...structuredToolCalls(message), ...extractTextualToolCalls(messageToText(message), offered, shown)];
 }
 
 /** Run a batch of tool calls, returning both IR results and UI records. */
@@ -1426,7 +1505,9 @@ export function createToolMiddleware(options: ToolMiddlewareOptions): Middleware
     let messages: IRMessage[] = [...context.request.messages];
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      const calls = findToolCalls(response.message, callNames(declared));
+      // `messages` is what this response answers: a follow-up's holds the calls
+      // earlier rounds made, which a model recounting them copies.
+      const calls = findToolCalls(response.message, callNames(declared), shownCalls(messages));
       if (calls.length === 0) break;
 
       const batch = await runToolCalls(options.registry, calls, {

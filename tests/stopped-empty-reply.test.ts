@@ -3101,3 +3101,138 @@ describe('a JSON record whose "name" is an offered tool’s id, carrying no argu
     expect(stopped.content, 'the words the person watched arrive').toBe(partial);
   });
 });
+
+/* ── Round 6: a follow-up recounting the call its history shows ─────── */
+
+const { sanitiseMessages } = await import('@/ai/prompt');
+const { GRANTED_PROBE, drainEvents } = await import('./support/egress-probe');
+
+type GenerationEvent = import('@/ai/engine').GenerationEvent;
+
+/** A call as a text template's history shows it: `messageText` over `sanitiseMessages`. */
+function asHistoryShows(name: string, input: Record<string, unknown>): string {
+  const [message] = sanitiseMessages([{ role: 'assistant', content: [{ type: 'tool_use', id: 'call_0', name, input }] }]);
+  return messageText(message!);
+}
+
+describe('a follow-up that recounts the call its history shows, as the history shows it', () => {
+  it('does not run the tool a second time, and stores and sends none of the recount', async () => {
+    const id = 'r6_recount_local';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const recount = asHistoryShows('leaky', {});
+    const local = recordingBackend([
+      `Reading your notes.\n${CALL}`,
+      `I read them with ${recount} and they mention a passphrase.`,
+      'Should not be asked for.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(local.seen[1]!.messages.map(messageText).join('\n'), 'the follow-up’s history').toContain(recount);
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(['leaky']);
+    expect(local.seen, 'no follow-up after the recount').toHaveLength(2);
+    expect(ran.content, 'the stored reply').not.toContain('[tool');
+  });
+
+  it('does not send an MCP call a second time, recounted as its encoded history shows it or as the model first wrote it', async () => {
+    const input = { text: 'call Ana at 10:30' };
+    const shown = asHistoryShows('notes.note', input);
+    // The history encodes a tool block's strings: the colon is not the one the model wrote.
+    expect(shown).not.toContain('10:30');
+    for (const recount of [shown, `[tool notes.note(${JSON.stringify(input)})]`]) {
+      const probe = mcpProbe();
+      toolRegistry.register(probe.tool);
+      try {
+        const local = recordingBackend([
+          `<tool_call>${JSON.stringify({ name: 'notes.note', arguments: input })}</tool_call>`,
+          `Filed: ${recount}. Anything else?`,
+          'Should not be asked for.',
+        ]);
+        const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+        engine.router.replace(QWEN.engine, local.adapter as never);
+        const events = await drainEvents(
+          engine.stream({
+            messages: [{ role: 'user', content: 'note that I should call Ana at 10:30' }],
+            target: ON_DEVICE,
+            toolIds: [probe.tool.id],
+            mcpEgress: GRANTED_PROBE,
+          }),
+        );
+
+        expect(sanitiseMessages(local.seen[1]!.messages).map(messageText).join('\n'), recount).toContain(shown);
+        expect(probe.call, `sent to the server, recounted as ${recount}`).toHaveBeenCalledTimes(1);
+        expect(local.seen, recount).toHaveLength(2);
+        const done = events.find((event) => event.type === 'done');
+        expect(done?.type === 'done' && done.text, recount).toBe('Filed: . Anything else?');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+    }
+  });
+
+  it('stopped after the recount: records no second call as not sent (refs #293)', async () => {
+    // #331 records a complete call in the text Stop caught. A recount is not a
+    // call, so it is not recorded as one that did not go: the one call went.
+    const input = { text: 'call Ana at 10:30' };
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const controller = new AbortController();
+      const gate = held();
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      let turn = 0;
+      engine.router.replace(
+        QWEN.engine,
+        new FunctionBackendAdapter({
+          execute: async () => {
+            throw new Error('this rig only streams');
+          },
+          executeStream: async function* (request: IRChatRequest): AsyncGenerator<IRStreamChunk> {
+            yield { type: 'start', sequence: 0, metadata: request.metadata };
+            if (turn++ === 0) {
+              yield {
+                type: 'content',
+                sequence: 1,
+                delta: `<tool_call>${JSON.stringify({ name: 'notes.note', arguments: input })}</tool_call>`,
+              };
+            } else {
+              yield { type: 'content', sequence: 1, delta: `Filed: ${asHistoryShows('notes.note', input)}. And` };
+              await gate.promise;
+            }
+            yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          },
+        }) as never,
+      );
+
+      const events: GenerationEvent[] = [];
+      for await (const event of engine.stream({
+        messages: [{ role: 'user', content: 'note that I should call Ana at 10:30' }],
+        target: ON_DEVICE,
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        if (event.type === 'delta' && event.text.includes('. And')) {
+          controller.abort();
+          gate.release();
+        }
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(
+        events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt?.outcome] : [])),
+        'the calls recorded',
+      ).toEqual(['sent']);
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+});

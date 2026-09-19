@@ -16,8 +16,8 @@ import { messageText } from '@/ai/prompt';
 /** What a chat with the calculator on offers, as `callNames` gives it. */
 const OFFERED = ['calculator', 'calculate'];
 
-/** Read as a turn offering the calculator reads it, unless `offered` says otherwise. */
-const extractTextualToolCalls = (text: string, offered: readonly string[] = OFFERED) => extractFrom(text, offered);
+/** Read as a turn offering the calculator, with no call in its history, reads it, unless `offered` says otherwise. */
+const extractTextualToolCalls = (text: string, offered: readonly string[] = OFFERED) => extractFrom(text, offered, []);
 const stripToolSyntax = (
   text: string,
   reading: { offered: readonly string[]; ran?: boolean } = { offered: OFFERED },
@@ -481,6 +481,33 @@ describe('a call written as this app writes one in a text prompt’s history: [t
     }
     const call = '[tool calculate({"expression": "2"})]';
     expect(stripToolSyntax(call, { offered: [] })).toBe(call);
+  });
+
+  it('is not read as a call when it recounts one the history showed, as the history showed it', () => {
+    // `messageText` writes a call that ran into a text template's history in this
+    // form, its strings encoded as `sanitiseMessages` encodes a tool block's. A
+    // follow-up that recounts it is not calling the tool again.
+    const shown = [
+      { type: 'tool_use' as const, id: 'call_1', name: 'calculate', input: { expression: '6*7', note: 'at 10:30' } },
+    ];
+    const recounts = [
+      'I worked it out with [tool calculate({"expression":"6*7","note":"at 10∶30"})] and it is 42.',
+      'I worked it out with [tool calculate({"note": "at 10:30", "expression": "6*7"})] and it is 42.',
+    ];
+    for (const text of recounts) {
+      expect(extractFrom(text, OFFERED, shown), text).toEqual([]);
+      expect(stripToolSyntax(text), text).toBe('I worked it out with  and it is 42.');
+    }
+    // A call in that form with other arguments is a call.
+    expect(
+      extractFrom('Now [tool calculate({"expression":"6*8","note":"at 10:30"})].', OFFERED, shown).map(
+        (call) => call.input,
+      ),
+    ).toEqual([{ expression: '6*8', note: 'at 10:30' }]);
+    // Only this app's form is a recount: a model's own call markup is its call.
+    expect(
+      extractFrom('<tool_call>{"name":"calculate","arguments":{"expression":"6*7","note":"at 10:30"}}</tool_call>', OFFERED, shown),
+    ).toHaveLength(1);
   });
 
   it('is cut where it starts when the text ends inside it, or on its opening', () => {

@@ -236,6 +236,35 @@ describe('tool middleware', () => {
     // the text of an error path rather than of the answer.
     expect((result.metadata.custom?.toolCalls as ExecutedTool[])[0]?.output).toBe('42');
   });
+
+  it('does not run a call again when the follow-up recounts it as a text template’s history shows it', async () => {
+    // `messageText` in ai/prompt.ts writes the call that ran into the
+    // follow-up's history as `[tool multiply({"a":6,"b":7})]`.
+    const middleware = createToolMiddleware({ registry });
+    const backend = {
+      execute: vi
+        .fn()
+        .mockResolvedValueOnce(response('I ran [tool multiply({"a":6,"b":7})] and it is 42.'))
+        .mockResolvedValue(response('Should not be asked for.')),
+    } as unknown as BackendAdapter;
+    const next = vi.fn(async () =>
+      response('<tool_call>{"name":"multiply","arguments":{"a":6,"b":7}}</tool_call>'),
+    );
+
+    const result = await middleware(
+      context({
+        request: request({
+          tools: [{ name: 'multiply', description: 'x', parameters: { type: 'object' } }],
+        }),
+        backend,
+      }),
+      next,
+    );
+
+    expect(result.metadata.custom?.toolCalls as ExecutedTool[], 'the calls that ran').toHaveLength(1);
+    expect(backend.execute, 'follow-ups').toHaveBeenCalledTimes(1);
+    expect(result.message.content).toBe('I ran  and it is 42.');
+  });
 });
 
 /* ── Resilience middleware ──────────────────────────────────────────── */

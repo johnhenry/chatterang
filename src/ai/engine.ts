@@ -38,6 +38,7 @@ import {
   cutUnfinishedCall,
   findToolCalls,
   runToolCalls,
+  shownCalls,
   stripToolSyntax,
   unlessStopped,
   type ExecutedTool,
@@ -1119,7 +1120,7 @@ export class ChatterangEngine {
            * it had not gone.
            */
           const strandedCalls = request.toolIds?.length
-            ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered))
+            ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
             : [];
           if (strandedCalls.length > 0) {
             const batch = await runToolCalls(toolRegistry, strandedCalls, {
@@ -1180,8 +1181,11 @@ export class ChatterangEngine {
       // rather than let it vanish with only `stripToolSyntax` as a witness.
       const roundLimitReached = iteration >= effectiveMaxRounds;
       // Tool calls only become readable once the turn has finished.
+      // `messages` is the history this round was shown, which holds every call
+      // the turn's earlier rounds made: a copy of one in this app's history form
+      // is the model recounting it, not calling the tool again. See `shownCalls`.
       const calls = request.toolIds?.length
-        ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered))
+        ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
         : [];
 
       if (calls.length === 0) break;
