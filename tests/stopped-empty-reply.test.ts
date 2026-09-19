@@ -4735,3 +4735,110 @@ describe('a complete call in a round whose stream then failed', () => {
     ).toEqual({ content: 'Working it out.', error: 'not enough memory', toolCalls: undefined });
   });
 });
+
+/* ── Review round 9 ─────────────────────────────────────────────────── */
+
+describe('a round cut short on a bare call opening', () => {
+  // A round cut short ended wherever it was, as one Stop landed in did, and a
+  // bare opening at its end may be a call begun. Read as a round the model
+  // ended, it kept the opening: at its limit on tokens, in a failed row Try
+  // again kept as a version, and in a dead local round the cloud fallback
+  // finished, the stored reply ended on `<tool_call>` and the next request
+  // carried it. Stop at the same character cut it.
+  const OPENED = 'Let me read your notes.\n<tool_call>';
+
+  it('cut off at its limit on tokens: stores and sends none of the opening', async () => {
+    const id = 'rv9_cut_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([cutOff(OPENED), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', 'Let me read your notes.']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('failed, tried again and flipped back to: the failed version stores and sends none of the opening', async () => {
+    const id = 'rv9_failed_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { partial: OPENED, stall: Promise.resolve() },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      const failed = assistantRows(id).at(-1)!;
+      expect({ content: failed.content, failed: failed.error !== undefined }, 'the failed row').toEqual({
+        content: 'Let me read your notes.',
+        failed: true,
+      });
+
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Let me read your notes.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+  });
+
+  it('a dead local round the cloud fallback finished: stores and sends none of the opening', async () => {
+    const id = 'rv9_fallback_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: OPENED, stall: dies.promise }]);
+    const cloud = recordingBackend(['From the cloud: they mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      const sending = useChats.getState().send('read my notes');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('<tool_call>')));
+      dies.release();
+      await sending;
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const words = 'Let me read your notes.\n\nFrom the cloud: they mention a passphrase.';
+    expect(assistantRows(id)[1]?.content, 'the finished reply').toBe(words);
+    expect(spoken(cloud.seen.at(-1)).at(-2), 'the next request').toEqual(['assistant', words]);
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('stopped on it, as a guard: stores and sends none of the opening', async () => {
+    const id = 'rv9_stopped_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: OPENED, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', '<tool_call>', gate.release);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+});

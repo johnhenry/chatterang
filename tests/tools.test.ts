@@ -887,10 +887,22 @@ describe('an unfinished call, by how the text ended', () => {
     }
   });
 
-  it('cuts only a stopped text on a bare marker', () => {
-    expect(cut('Ok.\n<tool_call>', 'stopped')).toBe('Ok.\n');
-    for (const ended of ['cut', 'model'] as const) {
-      expect(cut('Ok.\n<tool_call>', ended), ended).toBe('Ok.\n<tool_call>');
+  it('cuts a stopped or cut-short text on a bare marker, and keeps a model-ended one’s', () => {
+    // A text cut short ended wherever it was, as one Stop landed in did: a
+    // bare marker there may be a call begun. The model ends its reply outside
+    // one, so a marker it ended on is a word naming it.
+    for (const marker of [
+      '<tool_call>',
+      '<tool_call>\n',
+      '<tool_call>\n```json\n',
+      '<tool_call>\n<function',
+      '[TOOL_CALLS]',
+      '[TOOL_CALLS] calculate',
+    ]) {
+      for (const ended of ['stopped', 'cut'] as const) {
+        expect(cut(`Ok.\n${marker}`, ended), `${JSON.stringify(marker)} (${ended})`).toBe('Ok.\n');
+      }
+      expect(cut(`Ok.\n${marker}`, 'model'), `${JSON.stringify(marker)} (model)`).toBe(`Ok.\n${marker}`);
     }
   });
 });

@@ -624,12 +624,19 @@ const CALL_END = {
 const NEXT_CALL = /^(?:<tool_call>|\[TOOL_CALLS?\])/i;
 
 /**
- * A tool call's opening marker with nothing after it, in a STOPPED turn:
- * `<tool_call>` followed by the end of the text or a lone `{`; `[TOOL_CALL]`
- * or `[TOOL_CALLS]` followed by the end, by a tool name the text ends in, or
- * by `name(`. A stopped turn's text ends wherever Stop landed, so a bare marker
- * there may be a call begun; that it may also be a marker named in prose is
- * the accepted limit.
+ * A tool call's opening marker with nothing after it, in a text STOPPED OR CUT
+ * SHORT: `<tool_call>` followed by the end of the text or a lone `{`;
+ * `[TOOL_CALL]` or `[TOOL_CALLS]` followed by the end, by a tool name the text
+ * ends in, or by `name(`. A stopped turn's text ends wherever Stop landed, so a
+ * bare marker there may be a call begun; that it may also be a marker named in
+ * prose is the accepted limit.
+ *
+ * SO DOES A TEXT CUT SHORT (see {@link TextEnding}): at its limit on tokens, in
+ * a stream that failed, or in a local round that died before the cloud
+ * fallback finished the turn. Read as a reply the model ended, a round cut off
+ * on `<tool_call>` kept it: in the stored reply, in a failed row Try again keeps
+ * as a version, and in a finished turn's words beside the cloud's, and in every
+ * later request. Stop at the same character cut it.
  *
  * A NAME AFTER `[TOOL_CALLS]`, HERE AND IN EVERY FORM THAT WRITES ONE BEFORE
  * ITS ARGUMENTS, is a tool's name or id as `CALL_NAME` reads one: word
@@ -643,7 +650,7 @@ const CALL_MARKER_AT_END =
   /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
- * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
+ * A call visibly opened with nothing inside it, in a reply THE MODEL ENDED:
  * `<tool_call>{` or `[TOOL_CALLS] name(` at the end. A finished reply ended
  * where the model ended it, and one ending on a bare `[TOOL_CALLS]` or
  * `<tool_call>`, or on "[TOOL_CALLS] token", is a sentence naming the marker:
@@ -992,7 +999,8 @@ export function unfinishedCallAt(
     }
     from = close;
   }
-  const at = text.search(ended === 'stopped' ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
+  // A text stopped or cut short ends wherever it was, on a bare marker too.
+  const at = text.search(ended === 'model' ? CALL_OPENED_AT_END : CALL_MARKER_AT_END);
   return chain !== undefined && at === next ? chain : at;
 }
 
