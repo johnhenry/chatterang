@@ -574,20 +574,103 @@ describe('main.ts wiring', () => {
     expect(source).toContain('function createWindow');
   });
 
+  /*
+   * main.ts with comments stripped, so commenting a line out is a deletion
+   * too. `source` still holds commented-out text, and a guard that reads it is
+   * satisfied by a registration that no longer runs.
+   */
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('//'))
+    .join('\n');
+
   it('[6] registers a handler for EVERY renderer departure, crash included', () => {
     // The list lives in `bridge/renderer-lifecycle.ts`, which is testable; this
     // is the join between that list and the file that has to act on it. Adding
     // a name there without wiring it here fails this test, and so does deleting
-    // the `render-process-gone` line that closes [6].
+    // or commenting out the `render-process-gone` line that closes [6].
+    //
+    // Read from `code`, not `source`. FAULT INJECTED against main.ts, one at a
+    // time, each failing this test and passing it when read from `source`:
+    // commenting out `contents.once('destroyed', …)`, the first link of
+    // `destroyed` → `forgetWindow` (#313); commenting out
+    // `contents.on('render-process-gone', …)`; and commenting out
+    // `teardown('did-start-navigation')` inside its handler.
     const missing = RENDERER_TEARDOWN_EVENTS.filter(
       (event) =>
-        !new RegExp(`contents\\.(on|once)\\(\\s*'${event}'`).test(source) ||
-        !source.includes(`teardown('${event}')`),
+        !new RegExp(`contents\\.(on|once)\\(\\s*'${event}'`).test(code) ||
+        !code.includes(`teardown('${event}')`),
     );
     expect(missing).toEqual([]);
     // And specifically the one that was absent, spelled out so the reason this
     // test exists survives a refactor of the loop above.
-    expect(source).toContain("contents.on('render-process-gone'");
+    expect(code).toContain("contents.on('render-process-gone'");
+  });
+
+  /*
+   * #313's TWO CALL SITES, WHICH [6] CANNOT SEE. Neither is a departure, so
+   * neither is in `RENDERER_TEARDOWN_EVENTS`: `did-navigate` leaves the window
+   * where it is and closes only its old document's gap, and `forgetWindow`
+   * runs inside the `destroyed` teardown's `forget` target rather than as an
+   * event of its own. `tests/desktop-local-turns.test.ts` drives both methods
+   * directly and cannot see whether this file ever calls them, so before these
+   * two tests, deleting either line (#330's wiring) left every test file green.
+   * Both read `code` above.
+   */
+  it('#313: closes the reload gap when each new document commits, on `did-navigate` and nowhere else', () => {
+    // `did-navigate` is where closing the gap was MEASURED safe
+    // (`docs/BACKGROUND-WORK-MEASUREMENTS.md` §5.5): across 40 navigations the
+    // old document's last call arrived before it and the new document's first
+    // call after it. So the registration is pinned whole:
+    //  - `on`, not `once`. A window reloads more than once; `once` closes the
+    //    first reload's gap and leaves every later one open.
+    //  - `'did-navigate'` itself, not `did-navigate-in-page`, which is a
+    //    same-document route change with no new document behind it.
+    //  - this window's own id.
+    // And ONE call site. The measurement covers this event and no other, and
+    // a second call at a later one (`dom-ready`, `did-finish-load`) runs after
+    // the new document can have opened a turn of its own, which it would end.
+    //
+    // FAULT INJECTED against main.ts, one at a time, each failing this test:
+    // deleting the `did-navigate` line; commenting it out; registering it with
+    // `contents.once`; registering it on `did-navigate-in-page`; and keeping
+    // it while adding a second `closeReloadGap` on `did-finish-load`.
+    //
+    // A boolean rather than `toMatch`, so a failure names the missing wiring
+    // instead of printing the whole of main.ts as the received value.
+    const registered =
+      /contents\.on\(\s*'did-navigate',\s*\([^)]*\)\s*=>\s*\{?\s*localTurns\.closeReloadGap\(contents\.id\)/.test(code);
+    expect(registered, "contents.on('did-navigate', () => localTurns.closeReloadGap(contents.id))").toBe(true);
+    expect(code.match(/\.closeReloadGap\(/g), 'call sites of closeReloadGap in main.ts').toHaveLength(1);
+  });
+
+  it('#313: forgets the turns a window’s teardowns ended once it is destroyed, and at no other departure', () => {
+    // `destroyed` reaches `forgetWindow` over three links, and this pins the
+    // one nothing else did:
+    //  1. `contents.once('destroyed', () => teardown('destroyed'))`: [6] above.
+    //  2. `releaseRendererOn` calls `forget` for `destroyed` only: "[6] only a
+    //     destroyed renderer is forgotten" in `tests/desktop-bridge.test.ts`.
+    //  3. `forget` calls `localTurns.forgetWindow`: here.
+    // Without (3), every requestId a window's teardowns ended that no page
+    // ever sent `endTurn` for stays in main for as long as main runs, for
+    // every window ever closed, and nothing fails.
+    // And ONLY there. `forgetWindow` at a reload's teardown
+    // (`did-start-navigation`) would drop the very list that refuses the old
+    // document's later decode of a turn that teardown ended, and that decode
+    // would be admitted as a new turn no page is left to end.
+    //
+    // FAULT INJECTED against main.ts, one at a time, each failing this test:
+    // deleting the `localTurns.forgetWindow(id)` line; commenting it out; and
+    // keeping it while adding a second `forgetWindow` to the
+    // `did-start-navigation` handler.
+    const targets = /releaseRendererOn\(\s*event,\s*contents\.id,\s*\{/.exec(code);
+    expect(targets, 'the teardown hands `releaseRendererOn` its targets inline').not.toBeNull();
+    const forget = /\bforget:\s*\((\w+)\)\s*=>\s*\{([^}]*)\}/.exec(code.slice(targets?.index ?? 0));
+    expect(forget, 'the teardown targets have a `forget` with a block body').not.toBeNull();
+    const [, id, body] = forget ?? [];
+    expect(body, 'the body of the `forget` teardown target').toContain(`localTurns.forgetWindow(${id ?? ''})`);
+    expect(code.match(/\.forgetWindow\(/g), 'call sites of forgetWindow in main.ts').toHaveLength(1);
   });
 
   it('[14] routes BOTH openExternal call sites through the allowlist', () => {
