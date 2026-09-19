@@ -149,6 +149,23 @@ export type {
 } from './identity-store.js';
 
 /*
+ * THE PAIRED-DEVICE REGISTRY (#133): the digests, tombstones, names and pairing
+ * times a host verifies and revokes phones with, in one owner-only file beside
+ * the tunnel key, bound to that key. It binds nothing — see `device-registry.ts`
+ * — and nothing calls it yet: it lands tested but unreachable, as #133's ruling
+ * allows.
+ */
+export { DeviceRegistryError, openDeviceRegistry } from './device-registry.js';
+export type {
+  DeviceRecord,
+  DeviceRegistry,
+  DeviceRegistryErrorReason,
+  DeviceRegistryOptions,
+  DeviceRemoval,
+  RegistryFileSystem,
+} from './device-registry.js';
+
+/*
  * WHAT A CONNECTION THAT PRESENTED NOTHING MAY HOLD (#136, #169).
  *
  * A pairing tunnel is the one kind of connection nobody has authenticated, so
