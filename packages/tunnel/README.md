@@ -167,7 +167,8 @@ What a pairing tunnel can hold is bounded, one named constant per limit
   the delete fails, the rejection is rethrown and the device stays refused,
   including by a registry opened over the same store after a restart.
 - `CredentialStore` is an interface. `createMemoryCredentialStore` forgets
-  everything on exit.
+  everything on exit; `openDeviceRegistry` keeps the records in a file beside
+  the tunnel key (see "The paired-device registry" below).
 
 Rung 0's test credential is minted exactly that way.
 `createTunnelClient({ url, credential })` sends it in the header, and only over
@@ -236,6 +237,46 @@ re-issued from the same key serves the same one.
 - **Durable before it is reported.** The key is written under a private
   `O_EXCL` name, checked, synced, hard-linked into place, and the directory is
   synced before `created: true` is returned.
+
+## The paired-device registry (#133)
+
+`src/host/device-registry.ts` is the `CredentialStore` both apps would keep
+their phones in (#158: one implementation). The owner ruled on #133 that the
+desktop's list lives in an app-data file next to the certificate key,
+owner-only, sealed where sealing is available, holding what verification and
+revocation need and never the credential. It lands tested but unreachable:
+nothing calls `openDeviceRegistry` yet.
+
+- **What a record holds.** A device id, the 32-byte digest or the zero-byte
+  tombstone `revoke` writes, the phone's name (#129; `setName` renames it and
+  refuses a blank name, one past `MAX_NAME_BYTES`, or one with a control or
+  direction-changing character), and when it paired. `list()` shows each
+  device's id, name, pairing time and whether it is revoked, and never a
+  digest. Nothing says whether the tunnel is on (#158: off at every launch).
+- **Where.** `<data>/tunnel-identity/paired-devices`, 0600 beside the key.
+  Opening the registry runs `loadOrCreateTunnelKey` with the same options, so
+  the directories get the key store's own checks. The file gets the same rule as
+  the key: a wider mode, a symlink, another owner, a macOS allow entry, or a
+  Windows descriptor that lets anyone but this account, SYSTEM or Administrators
+  in is refused, never tightened.
+- **Bound to the key.** The file records a 32-byte `bindTo`: the desktop passes
+  the key's pin, and the server would pass a digest over the pin and its
+  operator token (#135). It is read before the protection: a file for another
+  binding is discarded and reported as `cleared: 'binding-changed'`, since a key
+  reset (#180) or a Linux downgrade's new key (#179) means every device pairs
+  again. With the binding matching, a plain file where the process can seal, or
+  a sealed one where it cannot, is refused and left as it is. An unknown version
+  or an unexpected field is refused too.
+- **Atomic and serialised.** Each change writes the whole file to a private
+  `O_EXCL` name, checks it before writing, syncs it, and renames it over the old
+  one (`RegistryFileSystem` is the key store's file system plus `rename`). A
+  failed write leaves the old file and the in-memory records as they were, so a
+  tombstone that reached the disk still refuses after a restart.
+- **Removal and reset for #170.** `watchRemovals` is told when a device's record
+  is deleted (the delete `revoke` makes) and when `reset()` forgets every device.
+  It is told only after the file has changed, and a watcher's failure makes that
+  delete or reset reject. The not-sent records a later change keeps per phone
+  beside this file hook in here.
 
 ## #7's vocabulary: waiting, prompts, refusals, and collecting a result
 
@@ -361,8 +402,10 @@ without bound.
   and `createTunnelListener` speak the real wire format through the credential
   gate. **No app starts a listener** (#158). A listener that carries turns
   waits on #7, per #169's ruling.
-- **Where the paired-device registry persists** (#133). `CredentialStore` is
-  the seam. The only implementation forgets every phone when the process ends.
+- **Opening the paired-device registry** (#133). `openDeviceRegistry` keeps
+  it beside the key, but neither app calls it, so a running app still forgets
+  every phone when it exits. Also not here: the #170 not-sent records it offers
+  `watchRemovals` to.
 - **Handing the identity to a listener.** `identity.ts` makes the key and its
   certificates, `identity-store.ts` keeps the key, and the TLS arm accepts what
   they make. Both apps have a key loader (`apps/*/src/tunnel-identity.ts`) and

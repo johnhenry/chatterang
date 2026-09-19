@@ -2488,6 +2488,12 @@ describe('a listening socket forces the privacy copy to change', () => {
     advertisedAddresses: 'binds nothing',
     advertisedAddressesForThisMachine: 'binds nothing',
     pairingAddressesOf: 'binds nothing',
+    // The paired-device registry (#133): an owner-only file of digests,
+    // tombstones, names and pairing times beside the tunnel key. `node:fs`,
+    // `node:crypto`, the key store it calls for its directories, and the same
+    // `ls`, `whoami` and Get-Acl reads for its own file; no socket.
+    DeviceRegistryError: 'binds nothing',
+    openDeviceRegistry: 'binds nothing',
   };
 
   const LISTENS: readonly (readonly [name: string, pattern: RegExp])[] = [
