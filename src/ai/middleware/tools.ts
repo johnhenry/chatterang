@@ -168,6 +168,9 @@ export function callNames(tools: readonly Pick<ChatterangTool, 'id' | 'name'>[])
  */
 const APP_CALL_OPENING = /\[tool\s+([^()[\]{}\n]+?)\s*\(\s*(?=\{)/gi;
 
+/** Where a tag call whose body is one JSON object may open: a `<tool_call>` with the object's `{` after it. */
+const TAGGED_OBJECT_OPENING = /<tool_call>\s*(?=\{)/gi;
+
 /**
  * The calls a request's history shows the model: every `tool_use` block in its
  * messages, as `messageText` in ai/prompt.ts writes each into a text template's
@@ -250,11 +253,27 @@ export function extractTextualToolCalls(
   };
 
   // <tool_call>{"name": "...", "arguments": {...}}</tool_call>  (Qwen, Hermes)
-  for (const match of text.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
-    const body = match[1];
-    if (!body) continue;
+  //
+  // READ BY ITS JSON, as `stripToolSyntax` reads it: from a `<tool_call>` the
+  // object opens right after, through that object's closing brace — past any
+  // brace or closing tag inside a string — to the `</tool_call>` after it. The
+  // lazy `<tool_call>([\s\S]*?)</tool_call>` this replaced began at the FIRST
+  // tag in the text: reasoning or prose that named `<tool_call>` began a body
+  // that never parsed and swallowed the real call after it, which the stripper
+  // then took out of the reply — the call neither ran nor showed. And a closing
+  // tag in a string argument ended the body there, so a call the stripper took
+  // out whole never ran.
+  let tagged = 0;
+  for (const match of text.matchAll(TAGGED_OBJECT_OPENING)) {
+    // Inside the arguments of a call already read.
+    if (match.index < tagged) continue;
+    const from = match.index + match[0].length;
+    const end = endOfJson(text, from);
+    const close = end === -1 ? null : /^\s*<\/tool_call>/i.exec(text.slice(end));
+    if (!close) continue;
+    tagged = end + close[0].length;
     try {
-      const parsed = JSON.parse(body) as { name?: string; arguments?: unknown; parameters?: unknown };
+      const parsed = JSON.parse(text.slice(from, end)) as { name?: string; arguments?: unknown; parameters?: unknown };
       if (typeof parsed.name === 'string') {
         const args = parsed.arguments ?? parsed.parameters ?? {};
         calls.push({

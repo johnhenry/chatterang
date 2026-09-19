@@ -3102,6 +3102,37 @@ describe('a JSON record whose "name" is an offered tool’s id, carrying no argu
   });
 });
 
+/* ── Round 6: a real call after words naming its tag ────────────────── */
+
+describe('a real <tool_call> after words that name the tag, in a chat with its tool on', () => {
+  // The extractor read a tag call as everything from the FIRST `<tool_call>` to
+  // the first `</tool_call>`: reasoning or prose naming the tag began a body
+  // that never parsed, and swallowed the real call after it. The stripper,
+  // which reads a call by its JSON, took it out of the reply: the call the
+  // model made neither ran nor showed.
+  const CALC = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>';
+
+  for (const [where, before] of [
+    ['reasoning', '<think>I will answer with a <tool_call> for this.</think>\n'],
+    ['prose', 'Qwen wraps each call in a <tool_call> tag, so here is mine.\n'],
+  ] as const) {
+    it(`runs when ${where} named the tag first`, async () => {
+      const id = `r6_tag_after_${where}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`${before}${CALC}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const ran = assistantRows(id).at(-1)!;
+      expect(ran.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+      expect(local.seen, 'the follow-up').toHaveLength(2);
+      expect(ran.content, 'the stored reply').toMatch(/It is 42\.$/);
+      expect(ran.content, 'the stored reply').not.toContain('6*7');
+    });
+  }
+});
+
 /* ── Round 6: a follow-up recounting the call its history shows ─────── */
 
 const { sanitiseMessages } = await import('@/ai/prompt');

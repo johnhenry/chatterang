@@ -173,6 +173,39 @@ describe('extractTextualToolCalls', () => {
     expect(extractTextualToolCalls('I think the answer is four.')).toEqual([]);
   });
 
+  it('reads a real <tool_call> when earlier words, in reasoning or prose, name the tag', () => {
+    const call = '<tool_call>{"name": "calculate", "arguments": {"expression": "2+2"}}</tool_call>';
+    for (const before of [
+      '<think>I should answer with a <tool_call> here.</think>\n',
+      'Qwen wraps each call in a <tool_call> tag, so here is mine.\n',
+      'It opens <tool_call> and closes </tool_call>. Now:\n',
+    ]) {
+      const text = before + call;
+      expect(extractTextualToolCalls(text).map((found) => [found.name, found.input]), text).toEqual([
+        ['calculate', { expression: '2+2' }],
+      ]);
+    }
+  });
+
+  it('reads a <tool_call> through its JSON, so a closing tag in a string argument does not end it', () => {
+    const text = '<tool_call>{"name":"calculate","arguments":{"expression":"1","note":"a </tool_call> b"}}</tool_call>';
+    expect(extractTextualToolCalls(text).map((found) => found.input)).toEqual([
+      { expression: '1', note: 'a </tool_call> b' },
+    ]);
+    // What the stripper takes out is what was read.
+    expect(stripToolSyntax(`Ok.${text}Done.`)).toBe('Ok.Done.');
+    // An object the tag's JSON goes on past is not the call: nothing runs from
+    // it, and nothing runs from a tag inside it either. The stripper takes the
+    // whole out as one malformed call.
+    for (const malformed of [
+      '<tool_call>{"name":"calculate","arguments":{}} {"name":"calculate","arguments":{}}</tool_call>',
+      '<tool_call>{"name":"calculate","arguments":{}, "then": <tool_call>{"name":"calculate","arguments":{}}</tool_call>}</tool_call>',
+    ]) {
+      expect(extractTextualToolCalls(malformed), malformed).toEqual([]);
+      expect(stripToolSyntax(`Ok.${malformed}Done.`), malformed).toBe('Ok.Done.');
+    }
+  });
+
   it('assigns each call a distinct id', () => {
     const calls = extractTextualToolCalls(
       '<tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>',
