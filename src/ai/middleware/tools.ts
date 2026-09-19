@@ -344,6 +344,15 @@ const LITERALS: ReadonlyMap<string, unknown> = new Map<string, unknown>([
  * and a call it drafted there is not one it made: read as a round the model
  * ended, a round cut off at its limit mid-reasoning ran the call it was only
  * weighing, and sent an MCP server its arguments. See `reasoningSpans`.
+ *
+ * UNLESS THE MODEL ENDED THE ROUND WITH NOTHING OUTSIDE ITS REASONING. A
+ * reasoning model can write its call inside its think block and close the
+ * block with nothing after it: that call is the one the round made. Read as a
+ * call only named there, it never ran, no follow-up was asked for, nothing said
+ * why, and the reply was stored with no words. A call named in reasoning and
+ * then answered, or drafted there and then made, has words or a call outside
+ * the reasoning. A round Stop or a limit cut there could still have gone on to
+ * either, so its reasoning stays reasoning.
  */
 export function extractTextualToolCalls(
   text: string,
@@ -351,7 +360,15 @@ export function extractTextualToolCalls(
   shown: readonly ToolUseContent[],
   { ended = 'model' }: { readonly ended?: TextEnding } = {},
 ): ToolUseContent[] {
-  const reasoning = reasoningSpans(text, { unclosed: ended !== 'model' });
+  const spans = reasoningSpans(text, { unclosed: ended !== 'model' });
+  let outside = '';
+  let from = 0;
+  for (const [start, stop] of spans) {
+    outside += text.slice(from, start);
+    from = stop;
+  }
+  outside += text.slice(from);
+  const reasoning = ended === 'model' && outside.trim() === '' ? [] : spans;
   const inReasoning = (at: number): boolean => reasoning.some(([start, end]) => at >= start && at < end);
 
   // READ AS THE STRIPPER READS THEM: every call is one `callMarkup` finds, the

@@ -4318,3 +4318,66 @@ describe('a round its token limit cut short while its reasoning was still open',
     expect(local.seen, 'no follow-up').toHaveLength(1);
   });
 });
+
+describe('a call the model made inside reasoning it closed, with nothing after it', () => {
+  // A reasoning model can write its call inside its think block and close the
+  // block with nothing after it. Read as a call only named in reasoning, it
+  // never ran: no follow-up was sent, nothing said why, and the reply was
+  // stored with no words while the person waited for an answer. A call named
+  // in reasoning and then answered, or drafted there and then made, has words
+  // or a call outside the reasoning; this has neither.
+  const MADE = '<think>I need their notes first.\n<tool_call>{"name":"leaky","arguments":{"path":"notes.md"}}</tool_call>\n</think>';
+  for (const finishReason of ['stop', 'tool_calls'] as const) {
+    it(`ended ${finishReason}: runs it once, and the follow-up’s answer is the reply`, async () => {
+      const id = `rv8_call_in_closed_reasoning_${finishReason}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([{ text: MADE, finishReason }, 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(
+        {
+          ran: stored.toolCalls?.map((call) => call.name) ?? [],
+          content: stored.content,
+          thinking: stored.thinking,
+          stopped: stored.stopped,
+          requests: local.seen.length,
+        },
+        'the stored reply',
+      ).toEqual({
+        ran: ['leaky'],
+        content: 'They mention a passphrase.',
+        thinking: 'I need their notes first.',
+        stopped: undefined,
+        requests: 2,
+      });
+    });
+  }
+
+  it('stopped just after it closed that reasoning: records nothing as not sent', async () => {
+    // Stop landed before the model said whether an answer followed.
+    const id = 'rv8_call_in_closed_reasoning_stopped';
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>I will file it.\n${MCP_CALL_CLEAN}\n</think>`, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file a note');
+      await until(() => (useChats.getState().messages.at(-1)?.thinking ?? '').includes('I will file it.'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+  });
+});

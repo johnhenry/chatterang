@@ -222,6 +222,18 @@ describe('extractTextualToolCalls', () => {
     expect(extractFrom(`<think>I will check.\n${call}`, OFFERED, [], { ended: 'model' })).toHaveLength(1);
   });
 
+  it('reads a call in reasoning the round closed when the model ended the round with nothing outside it', () => {
+    const call = '<tool_call>{"name": "calculate", "arguments": {"expression": "2+2"}}</tool_call>';
+    const made = `<think>I need to add them.\n${call}\n</think>\n`;
+    expect(extractTextualToolCalls(made).map((found) => found.input)).toEqual([{ expression: '2+2' }]);
+    // Cut short or stopped there, an answer could still have followed it.
+    expect(extractFrom(made, OFFERED, [], { ended: 'cut' })).toEqual([]);
+    expect(extractFrom(made, OFFERED, [], { ended: 'stopped' })).toEqual([]);
+    // Words, or a call, outside the reasoning: it only named the call.
+    expect(extractTextualToolCalls(`${made}It is 4.`)).toEqual([]);
+    expect(extractTextualToolCalls(`${made}${call}`)).toHaveLength(1);
+  });
+
   it('assigns each call a distinct id', () => {
     const calls = extractTextualToolCalls(
       '<tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>',
