@@ -30,6 +30,8 @@ import {
   validateScannedPayload,
 } from '@/lib/pairing';
 
+import { codeOf } from './support/source-scan';
+
 const text = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 
 function payload(over: Partial<PairingPayload> = {}): PairingPayload {
@@ -104,9 +106,12 @@ describe('the controller this build has', () => {
  * #256's remaining item is that "the binding is not wired to a real socket".
  * `channelIdentifierFor` has existed since #265 and the socket plugin's
  * contract since #326; nothing called one with the other. This is that call
- * site, driven over a fake plugin: the platform plugins do not exist yet, and a
- * test over a fake cannot see the real caller, so the first platform plugin to
- * land runs this path once before anyone calls it done.
+ * site, driven here over a fake plugin, which can stage what a real plugin
+ * should never do. The plugin landed in #332:
+ * `tests/pairing-desktop-socket.test.ts` runs this same function over its
+ * desktop leg (`apps/desktop/src/net/tunnel-socket.ts`) against a real TLS
+ * listener. Its iOS and Android legs (`native/plugin-tunnel-socket/`) have not
+ * been compiled or run, so on a phone this path has never run.
  *
  * The fake keeps the contract's rules that matter here: `negotiatedPeer`
  * throws for a handle that is not open, and events carry a `connectionId`.
@@ -129,7 +134,11 @@ describe('binding an open pairing connection to what it negotiated (#256)', () =
   type AnyListener = (event: never) => void;
 
   function fakeSocket(
-    peers: Readonly<Record<string, { readonly spkiSha256: unknown }>>,
+    /**
+     * What `negotiatedPeer` resolves with, by handle. Any value, not only a
+     * certificate: a bridge's answer is JSON nobody typed on the way over.
+     */
+    peers: Readonly<Record<string, unknown>>,
     options: { readonly ids?: readonly string[]; readonly openDuringConnect?: boolean; readonly rejectConnect?: Error } = {},
   ) {
     /** Every method called, in order, with the handle it named. */
@@ -168,9 +177,10 @@ describe('binding an open pairing connection to what it negotiated (#256)', () =
       },
       async negotiatedPeer({ connectionId }) {
         calls.push(`negotiatedPeer ${connectionId}`);
-        const peer = peers[connectionId];
-        if (!open.has(connectionId) || peer === undefined) throw new Error(`${connectionId} is not an open connection`);
-        return peer as NegotiatedPeerCertificate;
+        if (!open.has(connectionId) || !Object.hasOwn(peers, connectionId)) {
+          throw new Error(`${connectionId} is not an open connection`);
+        }
+        return peers[connectionId] as NegotiatedPeerCertificate;
       },
       async addListener(eventName: TunnelSocketEventName, listener: AnyListener): Promise<ListenerHandle> {
         calls.push(`addListener ${eventName}`);
@@ -386,6 +396,38 @@ describe('binding an open pairing connection to what it negotiated (#256)', () =
     }
   });
 
+  it('refuses a negotiatedPeer that resolves with no certificate at all, as bad-negotiated-spki, and closes the connection', async () => {
+    const pin = realPin();
+    const routes: readonly (readonly [string, PairingRoute])[] = [
+      ['typed', DESKTOP_TYPED],
+      ['scanned', { kind: 'scanned', payload: payload({ trust: pin.spki }) }],
+    ];
+    const answers: readonly (readonly [string, unknown])[] = [
+      // A bridge that answered with no data, or with null: reading a field of
+      // either is a TypeError, which is not the module's refusal.
+      ['undefined', undefined],
+      ['null', null],
+      // Controls: already refused before this test, and must stay refused.
+      ['an object without the field', {}],
+      ['the fingerprint itself, not in an object', pin.spkiSha256],
+    ];
+
+    for (const [routeLabel, route] of routes) {
+      for (const [answerLabel, answer] of answers) {
+        const label = `${routeLabel}, negotiatedPeer resolved ${answerLabel}`;
+        const fake = fakeSocket({ 'connection-1': answer });
+        const pending = openBoundPairingConnection(fake.socket, URL_DIALLED, route);
+        await until(() => fake.calls.includes('connect'), `connect (${label})`);
+        fake.emitOpen('connection-1');
+        const error = await within(pending.then(() => null, (e: unknown) => e));
+        expect(error, label).toBeInstanceOf(BindingError);
+        expect((error as BindingError).reason, label).toBe('bad-negotiated-spki');
+        expect(fake.acts(), label).toEqual(['connect', 'negotiatedPeer connection-1', 'close connection-1']);
+        expect(fake.listening(), label).toBe(0);
+      }
+    }
+  });
+
   it('does not dial at all for a scanned code whose trust mode this build cannot check', async () => {
     const fake = fakeSocket({});
     const error = await within(
@@ -426,13 +468,18 @@ describe('binding an open pairing connection to what it negotiated (#256)', () =
      * on every phone, including the old ones #223 is open about. The binding
      * half brings `pake/` and noble with it, which nothing on this build runs,
      * so its only door here is a dynamic `import()`. Type imports are erased.
+     *
+     * Every static form counts, not only the one with `from`: a side-effect
+     * `import '…'` loads the module just the same, and so does an import whose
+     * every name is marked `type` (under `verbatimModuleSyntax` it is emitted as
+     * `import {} from '…'`). Either quote. Only `import type` and `export type`
+     * are erased whole. Comments are stripped by the stripper
+     * `tests/layering.test.ts`'s import guards use, which leaves strings alone.
      */
-    const code = readFileSync(resolve(process.cwd(), 'src/lib/pairing.ts'), 'utf8')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/^\s*\/\/.*$/gm, '');
-    const staticValueImports = [...code.matchAll(/^\s*(?:import|export)\s+(?!type\b)[^;]*?\bfrom\s+'([^']+)'/gm)].map(
-      (match) => match[1],
-    );
+    const code = codeOf(readFileSync(resolve(process.cwd(), 'src/lib/pairing.ts'), 'utf8'));
+    const staticValueImports = [
+      ...code.matchAll(/^\s*(?:import|export)\b(?!\s*type\b)\s*(?:[^;'"]*?\bfrom\s*)?['"]([^'"]+)['"]/gm),
+    ].map((match) => match[1]);
     expect(staticValueImports).toEqual(['@chatterang/tunnel/pairing']);
   });
 });

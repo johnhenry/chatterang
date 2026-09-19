@@ -6,10 +6,15 @@
  * The controller is what connects, runs CPace and binds the channel, and it
  * cannot be written yet. Its binding step is here now:
  * `openBoundPairingConnection` takes the certificate fingerprint #181's native
- * socket plugin negotiated and puts it into CPace's `CI` (#256). The CPace
- * message exchange that would use that `CI` is not defined, and no platform
- * plugin exists, so nothing on this build calls it. A browser `WebSocket`
- * cannot report a peer certificate at all.
+ * socket plugin negotiated and puts it into CPace's `CI` (#256). That plugin
+ * exists now: `apps/desktop/src/net/tunnel-socket.ts` on the Electron desktop,
+ * and `native/plugin-tunnel-socket/` on iOS and Android, whose sources say they
+ * have not been compiled or run. `src/plugins/tunnel-socket/index.ts` registers
+ * it as `TunnelSocket`, though nothing in `src/` imports that module yet. The
+ * CPace message exchange that would use that `CI` is not defined, so nothing on
+ * this build calls this. A browser `WebSocket` cannot report a peer certificate
+ * at all, which is why `src/plugins/tunnel-socket/web.ts` refuses every
+ * `connect`.
  *
  * So this file ships the SHAPE and an honest refusal, modelled on how
  * `MountHostWeb` refuses rather than pretends. `pairingController()` returns a
@@ -155,8 +160,14 @@ export function validateScannedPayload(
 /**
  * The part of the socket plugin (#181, #295) a pairing connection uses.
  *
- * Handed in, never looked up: nothing in `src/` registers the plugin yet, and a
- * seam that found its own transport could not be driven over a fake.
+ * Handed in, never looked up. `TunnelSocket` from
+ * `src/plugins/tunnel-socket/index.ts` is one as it stands, and on the desktop
+ * its calls reach `apps/desktop/src/net/tunnel-socket.ts` through the bridge;
+ * the controller that will pass it is not written. A seam that found its own
+ * transport could not be driven over a fake (`tests/pairing-seam.test.ts`), or
+ * over the desktop leg against a real listener
+ * (`tests/pairing-desktop-socket.test.ts`, which also holds `TunnelSocket` to
+ * this type).
  */
 export type PairingSocket = Pick<TunnelSocketPlugin, 'connect' | 'close' | 'negotiatedPeer' | 'addListener'>;
 
@@ -192,8 +203,19 @@ export class PairingConnectionClosedError extends Error {
  */
 const SPKI_SHA256_BASE64 = /^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$/;
 
-/** The 32 bytes a plugin reported, decoded once, at the boundary; or null. */
-function spkiFromBridge(reported: unknown): Uint8Array | null {
+/**
+ * The 32 bytes a plugin reported, decoded once, at the boundary; or null.
+ *
+ * Takes the WHOLE answer `negotiatedPeer` resolved with, not its field: the
+ * answer crossed a bridge as JSON, so `undefined` or `null` where a certificate
+ * should be is possible, and reading a field of either is a `TypeError` rather
+ * than this module's refusal.
+ */
+function spkiFromBridge(answer: unknown): Uint8Array | null {
+  const reported =
+    typeof answer === 'object' && answer !== null
+      ? (answer as { readonly spkiSha256?: unknown }).spkiSha256
+      : undefined;
   if (typeof reported !== 'string' || !SPKI_SHA256_BASE64.test(reported)) return null;
   return Uint8Array.from(atob(reported), (char) => char.charCodeAt(0));
 }
@@ -223,7 +245,9 @@ const toBase64 = (bytes: Uint8Array): string => btoa(String.fromCharCode(...byte
  *
  * THROWS, after closing the connection when one was opened:
  * - `BindingError` (`pin-mismatch`, `unsupported-trust-mode`,
- *   `bad-negotiated-spki`), from the binding half;
+ *   `bad-negotiated-spki`), from the binding half. `bad-negotiated-spki` is
+ *   also what a `negotiatedPeer` that resolved with no certificate at all
+ *   (`undefined`, `null`, no `spkiSha256`) comes to;
  * - {@link PairingConnectionClosedError}, when the connection ended before it
  *   opened (nothing is closed: it is already over);
  * - whatever `connect` or `negotiatedPeer` rejected with, unchanged.
@@ -278,7 +302,7 @@ export async function openBoundPairingConnection(
 
     try {
       await opening;
-      const spki = spkiFromBridge((await socket.negotiatedPeer({ connectionId })).spkiSha256);
+      const spki = spkiFromBridge(await socket.negotiatedPeer({ connectionId }));
       if (spki === null) throw new BindingError('bad-negotiated-spki');
       return { connectionId, ci: channelIdentifierFor(route, { spki }) };
     } catch (error) {
