@@ -326,15 +326,25 @@ export function extractTextualToolCalls(
   // it: [tool notes.note({…})]" — copies it. Read as a call, it ran again: a
   // second note filed on the server, a second message sent. The copy is
   // stripped from the words as any call is, and runs nothing.
-  const recounts = new Set(shown.map((call) => asShown(call.name, call.input)));
+  //
+  // NOR ONE THIS REPLY MAKES AGAIN. Compared with the history alone, a call the
+  // reply announced in this form and then made in the model's own markup —
+  // "Next, [tool notes.note({…})]:" and the `<tool_call>` — ran twice, and so
+  // did one made and then recounted in the same reply, or written in this form
+  // twice. Only this form is read that way: two of a model's own calls are its
+  // calls. The model's calls are all read before this loop.
+  const copies = new Set([...shown, ...calls].map((call) => asShown(call.name, call.input)));
   for (const match of text.matchAll(APP_CALL_OPENING)) {
     const name = match[1]?.trim();
     const from = match.index + match[0].length;
     const end = endOfJson(text, from);
     if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end)) || inReasoning(match.index)) continue;
     const raw = text.slice(from, end);
-    const input = recounts.size > 0 ? parsedJson(raw) : undefined;
-    if (input !== undefined && recounts.has(asShown(name, input))) continue;
+    const input = parsedJson(raw);
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) continue;
+    const copy = asShown(name, input);
+    if (copies.has(copy)) continue;
+    copies.add(copy);
     push(name, raw);
   }
 

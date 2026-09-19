@@ -579,6 +579,17 @@ describe('a call written as this app writes one in a text prompt’s history: [t
     ).toHaveLength(1);
   });
 
+  it('is read once when the same reply makes the same call again, in its own markup or in this form', () => {
+    const app = '[tool calculate({"expression": "6*7"})]';
+    const tag = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>';
+    for (const text of [`Next, ${app}:\n${tag}`, `${tag}\nThat was ${app}.`, `Working: ${app}\n${app}`]) {
+      expect(extractTextualToolCalls(text).map((call) => call.input), text).toEqual([{ expression: '6*7' }]);
+    }
+    // Two different calls in this form are two calls, and two of a model's own are its calls.
+    expect(extractTextualToolCalls('[tool calculate({"expression": "1"})] [tool calculate({"expression": "2"})]')).toHaveLength(2);
+    expect(extractTextualToolCalls(`${tag}${tag}`)).toHaveLength(2);
+  });
+
   it('is cut where it starts when the text ends inside it, or on its opening', () => {
     expect(cut('Ok.\n[tool calculate({"expression": "one plus')).toBe('Ok.\n');
     expect(cut('Ok.\n[tool calculate({"expression": "2"})')).toBe('Ok.\n');

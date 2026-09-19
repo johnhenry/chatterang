@@ -3480,3 +3480,87 @@ describe('a call named in reasoning', () => {
     expect(stopped?.thinking, 'the reasoning').toContain('I will file it with');
   });
 });
+
+/* ── A call written twice in one reply, once in this app's history form ─ */
+
+describe('a call a reply writes twice, once as this app’s history writes a call', () => {
+  // A copy of a call in the `[tool NAME({…})]` form that the history shows the
+  // model is a recount, but it was compared with the history alone: announced
+  // in that form and then made in the model's own markup, or made and then
+  // recounted in the same reply, one call ran twice — a second note filed on
+  // the server — and Stop after it recorded two calls not sent for the one.
+  const CALC = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>';
+  const APP_CALC = '[tool calculate({"expression": "6*7"})]';
+
+  it('sends an MCP call once when a follow-up announces it in that form and then makes it', async () => {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const local = recordingBackend([
+        '<tool_call>{"name": "notes.note", "arguments": {"text": "first"}}</tool_call>',
+        'Filed the first. Next, [tool notes.note({"text": "second"})]:\n<tool_call>{"name": "notes.note", "arguments": {"text": "second"}}</tool_call>',
+        'Both filed.',
+      ]);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.replace(QWEN.engine, local.adapter as never);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file two notes' }],
+          target: ON_DEVICE,
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+
+      expect(probe.call.mock.calls.map((call) => call[2]), 'notes sent to the server').toEqual([
+        { text: 'first' },
+        { text: 'second' },
+      ]);
+      const done = events.find((event) => event.type === 'done');
+      expect(done?.type === 'done' && done.text, 'the finished words').toBe('Filed the first. Next, :\n\nBoth filed.');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+
+  for (const [how, text] of [
+    ['announced in that form, then made', `I will work it out with ${APP_CALC}:\n${CALC}`],
+    ['made, then recounted in that form', `${CALC}\nThat was ${APP_CALC}.`],
+    ['written in that form twice', `Working it out: ${APP_CALC}\n${APP_CALC}`],
+  ] as const) {
+    it(`runs once when ${how}`, async () => {
+      const id = `rv6_twice_${how.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').not.toMatch(/\[tool|tool_call/);
+    });
+  }
+
+  it('stopped after it: records the one call as not sent, once (refs #293)', async () => {
+    const id = 'rv6_twice_stopped';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Next, [tool notes.note({"text": "canary-7f3a"})]:\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>\nAnd`,
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', '\nAnd', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((call) => call.receipt), 'the calls recorded').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped' }),
+    ]);
+  });
+});
