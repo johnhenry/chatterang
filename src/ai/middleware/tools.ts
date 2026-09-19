@@ -989,8 +989,11 @@ export function unfinishedCallAt(
       continue;
     }
     if (form === CALL_END.paren && text.charAt(open) !== '{') {
-      // Python's keyword arguments: see `readKeywordArguments`.
-      const { end } = readKeywordArguments(text, open);
+      // Python's keyword arguments: see `readKeywordArguments`. Arguments
+      // written without their `)` end no call here, as `taggedCallsEnd` and
+      // `xmlCallEnd` read one: see `wordsAfterCall`.
+      const keywords = readKeywordArguments(text, open);
+      const end = keywords.loose === true ? -1 : keywords.end;
       if (typeof end === 'string') {
         if (beingWritten(end)) return cutFrom;
         continue;
@@ -1156,9 +1159,24 @@ export function closeReasoningOutsideCalls(text: string, offered: readonly strin
  * sent back in every later request. The lazy match main stripped with took
  * both out. Words between them are prose.
  *
- * `short` is the token that ends a tag or paren form, for a call with a closing
- * bracket too few: see {@link shortCallEnd}. A fenced block has none, because
- * any other is a code example.
+ * AND A CALL WRITTEN WITHOUT ITS CLOSE THAT THE REPLY GOES ON PAST ends where
+ * its arguments do. The two closers above — the close itself, and the next
+ * call's opening — left a call followed by one more sentence in no reading at
+ * all: it was not read, so the tool never ran, no follow-up was asked for and
+ * no #331 receipt said it had not gone; and it was not stripped, so the whole
+ * markup, name and arguments, stayed in the stored row's words and rode in
+ * every later request, while the reply said it had filed a note that never
+ * went. A model that goes on writing has ended the call it was writing, as one
+ * that ends its reply has ({@link callEndingInItsClose}), and the rule is the
+ * same one: the markup is read only when it calls tools the request offered
+ * (see {@link callsOnlyTo}), so a call-shaped example naming none is words, and
+ * only when what follows is words rather than a close still being written (see
+ * {@link wordsAfterCall}).
+ *
+ * `ends` is the token that closes a tag or paren form, as a sticky pattern for
+ * a call with a closing bracket too few ({@link shortCallEnd}) and as text for
+ * a call written without its close. A fenced block has none, because any other
+ * is a code example.
  *
  * `read` is the calls the markup holds, from its JSON and its opening's match,
  * whose group is the tool's name in the forms that write it before the JSON; or
@@ -1169,14 +1187,15 @@ export function closeReasoningOutsideCalls(text: string, offered: readonly strin
 const CALL_SHAPES: readonly {
   readonly open: RegExp;
   readonly close: RegExp;
-  readonly short?: RegExp;
+  readonly ends?: { readonly token: RegExp; readonly text: string };
+  readonly half?: RegExp;
   readonly read: (json: string, opening: RegExpExecArray, offered: readonly string[]) => WrittenCall[] | undefined;
   readonly copy?: boolean;
 }[] = [
   {
     open: /<tool_call>\s*(?=[{[])/gi,
     close: /^[\s}\]]*(?:<\/tool_call>|(?=<tool_call>|\[TOOL_CALLS?\]))/i,
-    short: CALL_END.tag.token,
+    ends: CALL_END.tag,
     read: (json) => callsInJson(looseJson(json)),
   },
   // The tag around a fenced block: markup whatever the JSON holds, as the tag
@@ -1184,13 +1203,14 @@ const CALL_SHAPES: readonly {
   {
     open: /<tool_call>\s*```(?:json|tool)?\s*(?=[{[])/gi,
     close: /^[\s}\]]*```\s*<\/tool_call>/i,
-    short: CALL_END.fencedTag.token,
+    ends: CALL_END.fencedTag,
+    half: /^\x60{3}/,
     read: (json) => callsInJson(looseJson(json)),
   },
   {
     open: /\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*(?=\{)/gi,
     close: /^[\s}\]]*(?:\)|(?=\[TOOL_CALLS?\]|<tool_call>))/i,
-    short: CALL_END.paren.token,
+    ends: CALL_END.paren,
     read: (json, opening) => callWithArguments(opening[1] ?? '', json),
   },
   // This app's own rendering of a call in a text prompt's history, which a model
@@ -1199,7 +1219,8 @@ const CALL_SHAPES: readonly {
   {
     open: APP_CALL_OPENING,
     close: /^[\s}\]]*\)\s*\]/,
-    short: CALL_END.bracket.token,
+    ends: CALL_END.bracket,
+    half: /^\)/,
     read: (json, opening) => callWithArguments(opening[1]?.trim() ?? '', json),
     copy: true,
   },
@@ -1214,6 +1235,43 @@ const CALL_SHAPES: readonly {
 ];
 
 /**
+ * A call's stray closing brackets, ON THE LINE IT WAS WRITTEN ON: the brace too
+ * many a small model's commonest malformed call has, as `CALL_SHAPES`'s closes
+ * read them, but never the line break after it. See {@link wordsAfterCall}.
+ */
+const STRAY_BRACKETS = /^[^\S\n]*(?:[}\]][^\S\n]*)*/;
+
+/** Whether the line a call ends at `at` holds nothing after it. See {@link wordsAfterCall}. */
+const ENDS_ITS_LINE = /^[^\S\n]*(?:\r?\n|$)/;
+
+/**
+ * Whether what stands after a call's arguments, at `at`, is the REPLY GOING ON
+ * — words the model wrote after a call it never closed — rather than what is
+ * left of the close it was still writing. `closing` is the form's close as text
+ * (see {@link CALL_END}).
+ *
+ * ON ITS OWN LINE. A call the model wrote and then left, and went on writing
+ * below, ends the line it stands on; a call's shape named INSIDE a sentence
+ * that goes on on the same line — "Write `<tool_call>{"name": "calculate", …}`
+ * and then another `<tool_call>` tag after it." — is that sentence's words,
+ * and stays in them whatever it names.
+ *
+ * AND NOT A CLOSE STILL BEING WRITTEN. The whole of the rest, its whitespace
+ * taken out, is compared: a remainder that is all of a close, or the start of
+ * one, or the start of a next call's opening, is a call ending in its close,
+ * and `callEndingInItsClose` reads it with how the text ended. Anything else —
+ * one more sentence, a reasoning tag the model closed, a paragraph, another
+ * call after prose — is words.
+ */
+function wordsAfterCall(text: string, at: number, closing: string): boolean {
+  if (!ENDS_ITS_LINE.test(text.slice(at))) return false;
+  const rest = text.slice(at).replace(/\s+/g, '').toLowerCase();
+  if (rest === '' || closing.toLowerCase().startsWith(rest)) return false;
+  return !OPENINGS.some((opening) => opening.startsWith(rest));
+}
+
+
+/**
  * Every finished call's markup in `text`, and the calls read from it: what
  * `stripToolSyntax` takes out of a reply's words, and what
  * `extractTextualToolCalls` reads as its calls. One reading, so that a call the
@@ -1225,12 +1283,22 @@ const CALL_SHAPES: readonly {
  */
 function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
   const found: CallMarkup[] = [];
-  for (const { open, close, short, read, copy = false } of CALL_SHAPES) {
+  /**
+   * A call the model wrote without its close, and then went on writing past:
+   * markup, and the call it names, only when what follows is words
+   * ({@link wordsAfterCall}) and it calls tools the request offered
+   * ({@link callsOnlyTo}). Anything else is a call ending in its close, which
+   * `callEndingInItsClose` reads with how the text ended, or an example.
+   */
+  const unclosed = (markup: CallMarkup, closing: string): void => {
+    if (wordsAfterCall(text, markup.end, closing) && callsOnlyTo(markup, offered)) found.push(markup);
+  };
+  for (const { open, close, ends, half, read, copy = false } of CALL_SHAPES) {
     for (const match of text.matchAll(open)) {
       const from = match.index + match[0].length;
       // A closing bracket too few, ended by its tag or paren: read before the
       // JSON's end, which a later brace in the text can supply. See `shortCallEnd`.
-      const shortened = short ? shortCall(text, from, short) : undefined;
+      const shortened = ends ? shortCall(text, from, ends.token) : undefined;
       let json: string;
       let end: number;
       if (shortened) {
@@ -1239,8 +1307,27 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
         const closed = endOfJson(text, from);
         if (closed === -1) continue;
         const closing = close.exec(text.slice(closed));
-        if (!closing) continue;
         json = text.slice(from, closed);
+        if (!closing) {
+          // WRITTEN WITHOUT ITS CLOSE, WITH WORDS AFTER IT. The stray closing
+          // brackets of a brace too many are the call's, as they are before a
+          // close that is written, and so is `half`: the part of the close some
+          // forms can have without the rest — this app's history form loses
+          // only its `]`, and a fenced tag only its `</tool_call>` — which left
+          // in the words is markup the person reads and the model is sent back.
+          if (!ends) continue;
+          const calls = read(json, match, offered);
+          if (!calls) continue;
+          let at = closed + (STRAY_BRACKETS.exec(text.slice(closed))?.[0].length ?? 0);
+          if (half) {
+            // A fenced tag writes its fence on the line below its JSON.
+            const gap = /^\s*/.exec(text.slice(at))?.[0].length ?? 0;
+            const part = half.exec(text.slice(at + gap))?.[0].length ?? 0;
+            if (part > 0) at += gap + part;
+          }
+          unclosed({ start: match.index, end: at, calls, copy }, ends.text);
+          continue;
+        }
         end = closed + closing[0].length;
       }
       const calls = read(json, match, offered);
@@ -1257,18 +1344,28 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
     });
   }
   for (const match of text.matchAll(KEYWORD_CALL_OPENING)) {
-    const { end, input } = readKeywordArguments(text, match.index + match[0].length);
+    const { end, input, loose } = readKeywordArguments(text, match.index + match[0].length);
     if (typeof end === 'number' && end !== -1) {
-      found.push({ start: match.index, end, calls: [{ name: match[1] ?? '', input }], copy: false });
+      const markup = { start: match.index, end, calls: [{ name: match[1] ?? '', input }], copy: false };
+      if (loose) unclosed(markup, CALL_END.paren.text);
+      else found.push(markup);
     }
   }
   for (const match of text.matchAll(XML_CALL_OPENING)) {
-    const { end, calls } = readXmlCall(text, match.index);
-    if (typeof end === 'number' && end !== -1) found.push({ start: match.index, end, calls, copy: false });
+    const { end, calls, loose } = readXmlCall(text, match.index);
+    if (typeof end === 'number' && end !== -1) {
+      const markup = { start: match.index, end, calls, copy: false };
+      if (loose) unclosed(markup, CALL_END.tag.text);
+      else found.push(markup);
+    }
   }
   for (const match of text.matchAll(TAG_OPENING)) {
-    const { end, calls } = readTaggedCalls(text, match.index, offered);
-    if (typeof end === 'number' && end !== -1) found.push({ start: match.index, end, calls, copy: false });
+    const { end, calls, loose } = readTaggedCalls(text, match.index, offered);
+    if (typeof end === 'number' && end !== -1) {
+      const markup = { start: match.index, end, calls, copy: false };
+      if (loose) unclosed(markup, CALL_END.tag.text);
+      else found.push(markup);
+    }
   }
   return found;
 }
@@ -1476,11 +1573,20 @@ export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
  * the structure as soon as it goes on.
  */
 export function xmlCallEnd(text: string, at: number): number | Unended {
-  return readXmlCall(text, at).end;
+  // A call written without its close is not one this reading ends: the cut asks
+  // where a call still being written starts, and `callMarkup` asks whether what
+  // follows is words. See `wordsAfterCall`.
+  const read = readXmlCall(text, at);
+  return read.loose === true ? -1 : read.end;
 }
 
-/** {@link xmlCallEnd}'s reading, with the call it read when it is whole. */
-function readXmlCall(text: string, at: number): { end: number | Unended; calls: WrittenCall[] } {
+/**
+ * {@link xmlCallEnd}'s reading, with the call it read when it is whole.
+ *
+ * `loose` says the call ended with its `</tool_call>` unwritten, just past the
+ * `</function>` that closed it: see {@link wordsAfterCall}.
+ */
+function readXmlCall(text: string, at: number): { end: number | Unended; calls: WrittenCall[]; loose?: boolean } {
   let pos = at;
   /** Read `word` here, in any case: true; `'open'` when the text ends partway through it; or false. */
   const read = (word: string): boolean | 'open' => {
@@ -1548,8 +1654,12 @@ function readXmlCall(text: string, at: number): { end: number | Unended; calls: 
     }
     step = read('</function>');
     if (step !== true) return notACall(step);
+    const closed = pos;
     skipSpace();
     step = read('</tool_call>');
+    // WRITTEN WITHOUT ITS `</tool_call>`, the reply going on after it: the call
+    // ends where its function did. See `wordsAfterCall`.
+    if (step === false) return { end: closed, calls: [{ name, input }], loose: true };
     if (step !== true) return notACall(step);
     return { end: pos, calls: [{ name, input }] };
   }
@@ -1598,23 +1708,36 @@ const TAG_END = '</tool_call>';
  * call across the words after it.
  */
 export function taggedCallsEnd(text: string, at: number, offered: readonly string[]): number | Unended {
-  return readTaggedCalls(text, at, offered).end;
+  // As `xmlCallEnd`: a tag whose close is never written is not one this reading
+  // ends. See `wordsAfterCall`.
+  const read = readTaggedCalls(text, at, offered);
+  return read.loose === true ? -1 : read.end;
 }
 
 /**
  * {@link taggedCallsEnd}'s reading, with the calls it read: a name before its
  * JSON calls that tool with the JSON as its arguments; bare JSON is a call
  * object, or an array of them, as a tag's single object is read.
+ *
+ * `loose` says the tag ended with its `</tool_call>` unwritten, at the last
+ * call it held: what follows is neither another call nor the closing tag, so
+ * it is one more word — or, at the end of the text, a close still being
+ * written. Which is `callMarkup`'s question: see {@link wordsAfterCall}.
  */
 function readTaggedCalls(
   text: string,
   at: number,
   offered: readonly string[],
-): { end: number | Unended; calls: WrittenCall[] } {
+): { end: number | Unended; calls: WrittenCall[]; loose?: boolean } {
   let pos = at + '<tool_call>'.length;
   let written = 0;
+  /** Where the last call read ended, for a tag whose close is never written. */
+  let lastEnd = -1;
   const calls: WrittenCall[] = [];
   const reading = (end: number | Unended): { end: number | Unended; calls: WrittenCall[] } => ({ end, calls });
+  /** The tag ends at the last call in it, its `</tool_call>` unwritten. */
+  const noClose = (): { end: number | Unended; calls: WrittenCall[]; loose?: boolean } =>
+    written > 0 && lastEnd !== -1 ? { end: lastEnd, calls, loose: true } : reading(-1);
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
@@ -1637,7 +1760,7 @@ function readTaggedCalls(
         skipSpace();
       }
       // A name the text ends on is as likely a word; with its paren, a call begun.
-      if (pos === text.length) return reading(paren ? 'open' : -1);
+      if (pos === text.length) return paren ? reading('open') : noClose();
     }
     // Python's keyword arguments in its parens: see `readKeywordArguments`.
     if (name !== undefined && paren && text.charAt(pos) !== '{') {
@@ -1645,11 +1768,14 @@ function readTaggedCalls(
       if (typeof keywords.end === 'string' || keywords.end === -1) return reading(keywords.end);
       calls.push({ name, input: keywords.input });
       written += 1;
+      lastEnd = keywords.end;
+      // Its own `)` unwritten: the tag's close cannot follow, so the tag ends here.
+      if (keywords.loose === true) return { end: keywords.end, calls, loose: true };
       pos = keywords.end;
       continue;
     }
     const opener = text.charAt(pos);
-    if (opener !== '{' && !(name === undefined && opener === '[')) return reading(-1);
+    if (opener !== '{' && !(name === undefined && opener === '[')) return noClose();
     const read = (json: string): WrittenCall[] =>
       name === undefined ? callsInJson(looseJson(json)) : callWithArguments(name, json);
 
@@ -1659,25 +1785,31 @@ function readTaggedCalls(
       written += 1;
       if (!paren) return reading(shortened.end);
       pos = shortened.end;
+      lastEnd = pos;
       continue;
     }
     const end = endOfJson(text, pos);
     if (end === -1) {
       const writing = writesJson(text, pos, { tagged: name === undefined, offered });
-      return reading(writing === 'in-value' ? writing : writing ? 'open' : -1);
+      if (writing === 'in-value') return reading(writing);
+      return writing ? reading('open') : noClose();
     }
-    if (!writesJson(text, pos, { tagged: false, offered, until: end })) return reading(-1);
+    if (!writesJson(text, pos, { tagged: false, offered, until: end })) return noClose();
     const json = text.slice(pos, end);
     pos = end;
-    // Stray closing brackets are the call's, as the single-object form reads them.
+    // Stray closing brackets are the call's, as the single-object form reads
+    // them; only those on the call's own line end it when its tag never comes.
+    let endsAt = end + (STRAY_BRACKETS.exec(text.slice(end))?.[0].length ?? 0);
     while (pos < text.length && /[\s}\]]/.test(text.charAt(pos))) pos += 1;
     if (paren) {
       if (pos === text.length) return reading('open');
-      if (text.charAt(pos) !== ')') return reading(-1);
+      if (text.charAt(pos) !== ')') return noClose();
       pos += 1;
+      endsAt = pos;
     }
     calls.push(...read(json));
     written += 1;
+    lastEnd = endsAt;
   }
 }
 
@@ -1709,17 +1841,28 @@ const KEYWORD = /([A-Za-z_]\w*)\s*=(?!=)\s*/y;
  * parameter its value is for: nothing can run it, and it is left as words.
  * Neither is a word that is no value, so "[TOOL_CALLS] before (not after)" is
  * prose.
+ *
+ * `loose` says the arguments ended with their `)` unwritten, at the last value
+ * the call gave: what follows is one more word, not one more argument. Whether
+ * that word is the reply going on or a close still being written is
+ * `callMarkup`'s question (see {@link wordsAfterCall}).
  */
 function readKeywordArguments(
   text: string,
   start: number,
-): { end: number | Unended; input: Record<string, unknown> } {
+): { end: number | Unended; input: Record<string, unknown>; loose?: boolean } {
   const input: Record<string, unknown> = {};
   let pos = start;
+  let written = 0;
+  /** Where the last value given ends, for arguments whose `)` is never written. */
+  let lastValue = -1;
   const reading = (end: number | Unended): { end: number | Unended; input: Record<string, unknown> } => ({
     end,
     input,
   });
+  /** The arguments end at the last value given, their `)` unwritten. */
+  const noClose = (): { end: number | Unended; input: Record<string, unknown>; loose?: boolean } =>
+    written > 0 && lastValue !== -1 ? { end: lastValue, input, loose: true } : reading(-1);
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
@@ -1730,7 +1873,7 @@ function readKeywordArguments(
     KEYWORD.lastIndex = pos;
     const keyword = KEYWORD.exec(text);
     // A name the text ends inside or on is a keyword being written.
-    if (!keyword) return reading(/^[A-Za-z_]\w*\s*$/.test(text.slice(pos)) ? 'open' : -1);
+    if (!keyword) return /^[A-Za-z_]\w*\s*$/.test(text.slice(pos)) ? reading('open') : noClose();
     pos += keyword[0].length;
     const end = valueEnd(text, pos);
     if (typeof end === 'string' || end === -1) return reading(end);
@@ -1738,10 +1881,12 @@ function readKeywordArguments(
     if (value === undefined) return reading(-1);
     Object.defineProperty(input, keyword[1] ?? '', { value, enumerable: true, writable: true, configurable: true });
     pos = end;
+    written += 1;
+    lastValue = end;
     skipSpace();
     if (pos === text.length) return reading('open');
     if (text.charAt(pos) === ',') pos += 1;
-    else if (text.charAt(pos) !== ')') return reading(-1);
+    else if (text.charAt(pos) !== ')') return noClose();
   }
 }
 
