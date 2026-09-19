@@ -4453,6 +4453,30 @@ describe('two calls, the first written without its closing tag or paren', () => 
     ]);
     expect(stopped?.content, 'the stored reply').toBe('Filing both.');
   });
+
+  it('tags, stopped partway into the second’s opening: records nothing, and stores none of the first', async () => {
+    // The first has no close yet: nothing has ended it, so it is a call still
+    // being written, cut and not recorded, as one Stop caught before its
+    // closing tag is.
+    const id = 'rv8_first_unclosed_stopped_in_opening';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing both.\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-1"}}\n<tool_c',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', '<tool_c', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(stopped?.content, 'the stored reply').toBe('Filing both.');
+  });
 });
 
 describe('a call whose string argument names a reasoning tag', () => {

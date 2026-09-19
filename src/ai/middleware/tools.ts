@@ -617,6 +617,13 @@ const CALL_END = {
 } as const;
 
 /**
+ * The opening of a next call, `<tool_call>` or `[TOOL_CALLS]`, at the start of
+ * what follows a tag or `[TOOL_CALLS]` call's JSON: it ends a call written
+ * without its own close. See `CALL_SHAPES`.
+ */
+const NEXT_CALL = /^(?:<tool_call>|\[TOOL_CALLS?\])/i;
+
+/**
  * A tool call's opening marker with nothing after it, in a STOPPED turn:
  * `<tool_call>` followed by the end of the text or a lone `{`; `[TOOL_CALL]`
  * or `[TOOL_CALLS]` followed by the end, by a tool name the text ends in, or
@@ -958,6 +965,12 @@ export function unfinishedCallAt(
     const after = text.slice(close + stray);
     const rest = after.replace(/\s+/g, '').toLowerCase();
     if (form.text.startsWith(rest)) return cutFrom;
+    // Or partway into the opening of a next call, the one that would end this
+    // call written without its close (see `NEXT_CALL`).
+    const unclosable = form === CALL_END.tag || form === CALL_END.paren;
+    if (unclosable && ['<tool_call>', '[tool_calls]', '[tool_call]'].some((opening) => opening.startsWith(rest))) {
+      return cutFrom;
+    }
     // More calls after it inside the same tag: see `taggedCallsEnd`.
     if (form === CALL_END.tag) {
       const end = taggedCallsEnd(text, match.index, offered);
@@ -971,10 +984,7 @@ export function unfinishedCallAt(
       }
     }
     // Written without its close, the next call's opening right after it.
-    if (
-      (form === CALL_END.tag && /^<tool_call>/i.test(after)) ||
-      (form === CALL_END.paren && /^\[TOOL_CALLS?\]/i.test(after))
-    ) {
+    if (unclosable && NEXT_CALL.test(after)) {
       chain = cutFrom;
       next = close + stray;
     } else {
@@ -1070,11 +1080,12 @@ export function closeReasoningOutsideCalls(text: string, offered: readonly strin
  * THE NEXT CALL'S OPENING ENDS A CALL WRITTEN WITHOUT ITS CLOSE, in the tag and
  * `[TOOL_CALLS]` forms: `<tool_call>{…}` then `<tool_call>{…}</tool_call>`, or
  * `[TOOL_CALLS] a({…}` then `[TOOL_CALLS] b({…})`, with only whitespace and
- * stray brackets between. A small model writing two calls leaves out the
- * first's close, and read by a close that had to follow its JSON the first
- * was neither read, stripped nor cut: only the second ran, and the first,
- * arguments and all, was stored and sent back in every later request. The
- * lazy match main stripped with took both out. Words between them are prose.
+ * stray brackets between (`NEXT_CALL`, either opening after either form). A
+ * small model writing two calls leaves out the first's close, and read by a
+ * close that had to follow its JSON the first was neither read, stripped nor
+ * cut: only the second ran, and the first, arguments and all, was stored and
+ * sent back in every later request. The lazy match main stripped with took
+ * both out. Words between them are prose.
  *
  * `short` is the token that ends a tag or paren form, for a call with a closing
  * bracket too few: see {@link shortCallEnd}. A fenced block has none, because
@@ -1095,7 +1106,7 @@ const CALL_SHAPES: readonly {
 }[] = [
   {
     open: /<tool_call>\s*(?=[{[])/gi,
-    close: /^[\s}\]]*(?:<\/tool_call>|(?=<tool_call>))/i,
+    close: /^[\s}\]]*(?:<\/tool_call>|(?=<tool_call>|\[TOOL_CALLS?\]))/i,
     short: CALL_END.tag.token,
     read: (json) => callsInJson(looseJson(json)),
   },
@@ -1109,7 +1120,7 @@ const CALL_SHAPES: readonly {
   },
   {
     open: /\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*(?=\{)/gi,
-    close: /^[\s}\]]*(?:\)|(?=\[TOOL_CALLS?\]))/i,
+    close: /^[\s}\]]*(?:\)|(?=\[TOOL_CALLS?\]|<tool_call>))/i,
     short: CALL_END.paren.token,
     read: (json, opening) => callWithArguments(opening[1] ?? '', json),
   },

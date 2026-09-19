@@ -942,6 +942,33 @@ describe('two calls, the first written without its closing tag or paren', () => 
     expect(words(mistral, 'stopped')).toBe('Both.');
   });
 
+  it('cuts the first, unread, when the text ends partway into the opening after it', () => {
+    for (const [first, opening] of [
+      [`<tool_call>${calc('6*7')}`, '<tool_c'],
+      [`<tool_call>${calc('6*7')}`, '[TOOL_CA'],
+      ['[TOOL_CALLS] calculate({"expression": "6*7"}', '[TOOL_CALLS'],
+      ['[TOOL_CALLS] calculate({"expression": "6*7"}', '<tool'],
+    ] as const) {
+      const text = `Both.\n${first}\n${opening}`;
+      for (const ended of ['stopped', 'cut', 'model'] as const) {
+        expect(words(text, ended), `${text}, ${ended}`).toBe('Both.');
+      }
+      expect(extractFrom(text, OFFERED, [], { ended: 'stopped' }), text).toEqual([]);
+    }
+  });
+
+  it('is ended by the other form’s opening too', () => {
+    for (const text of [
+      `Both.\n<tool_call>${calc('6*7')}\n[TOOL_CALLS] calculate({"expression": "6*8"})`,
+      `Both.\n[TOOL_CALLS] calculate({"expression": "6*7"}\n<tool_call>${calc('6*8')}</tool_call>`,
+    ]) {
+      expect(extractTextualToolCalls(text).map((found) => found.input['expression']), text).toEqual(['6*7', '6*8']);
+      for (const ended of ['stopped', 'cut', 'model'] as const) {
+        expect(words(`${text}\nDone.`, ended), `${text}, ${ended}`).toBe('Both.\n\nDone.');
+      }
+    }
+  });
+
   it('keeps prose between a call’s JSON and a later opening', () => {
     const prose = `Write <tool_call>${calc('6*7')} and then another <tool_call> tag after it.`;
     expect(stripToolSyntax(prose)).toBe(prose);
