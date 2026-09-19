@@ -758,17 +758,41 @@ const REASONING_CLOSE = /<\/(think|thinking|reasoning)>/i;
  */
 export function maskReasoning(raw: string): string {
   let masked = '';
-  let rest = raw;
+  let at = 0;
+  for (const [start, end] of reasoningSpans(raw)) {
+    masked += raw.slice(at, start) + ' '.repeat(end - start);
+    at = end;
+  }
+  return masked + raw.slice(at);
+}
+
+/**
+ * Where each reasoning block in a generation's text starts and ends, its tags
+ * included, as {@link splitThinking} reads them: `[start, end)`.
+ *
+ * A block still open at the end runs to the end, unless `unclosed` is false,
+ * when it is left out. A finished round whose reasoning was never closed can
+ * have written its call inside it, and did — a model that calls before it
+ * closes its reasoning — while a round Stop cut there was still reasoning.
+ */
+export function reasoningSpans(
+  raw: string,
+  { unclosed = true }: { readonly unclosed?: boolean } = {},
+): [number, number][] {
+  const spans: [number, number][] = [];
+  let at = 0;
   for (;;) {
-    const open = REASONING_OPEN.exec(rest);
-    if (!open) return masked + rest;
-    masked += rest.slice(0, open.index);
-    const inside = open.index + open[0].length;
-    const close = REASONING_CLOSE.exec(rest.slice(inside));
-    if (!close) return masked + ' '.repeat(rest.length - open.index);
-    const end = inside + close.index + close[0].length;
-    masked += ' '.repeat(end - open.index);
-    rest = rest.slice(end);
+    const open = REASONING_OPEN.exec(raw.slice(at));
+    if (!open) return spans;
+    const start = at + open.index;
+    const inside = start + open[0].length;
+    const close = REASONING_CLOSE.exec(raw.slice(inside));
+    if (!close) {
+      if (unclosed) spans.push([start, raw.length]);
+      return spans;
+    }
+    at = inside + close.index + close[0].length;
+    spans.push([start, at]);
   }
 }
 

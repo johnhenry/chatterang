@@ -30,7 +30,7 @@ import {
   type ToolDestination,
   type WithheldWhy,
 } from '@/domain/mcp';
-import { maskReasoning } from '@/domain/chat';
+import { maskReasoning, reasoningSpans } from '@/domain/chat';
 import { encodeUntrusted } from '@/ai/taint';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
@@ -227,14 +227,27 @@ function parsedJson(raw: string): unknown {
  * {@link shownCalls} gives them. A call in this app's own history form that
  * repeats one of them, name and arguments, is the model recounting what it
  * did, not a call: see `APP_CALL_OPENING`.
+ *
+ * NOTHING IN REASONING IS A CALL. Reasoning is the model thinking: its words
+ * are never the reply's, and a call it names — "I could call <tool_call>{…}
+ * </tool_call>, but I know this" — is not one the round made. Read with its
+ * reasoning in it, a round ran a call only mentioned there and sent a
+ * follow-up, and ran a call drafted there and then made twice. A block the
+ * round closed is reasoning. One still open at the end is reasoning when
+ * `stopped`, since Stop cut the model's thinking short; in a round that
+ * finished, the model wrote its call before it closed its reasoning, and it
+ * runs. See `reasoningSpans`.
  */
 export function extractTextualToolCalls(
   text: string,
   offered: readonly string[],
   shown: readonly ToolUseContent[],
+  { stopped = false }: { readonly stopped?: boolean } = {},
 ): ToolUseContent[] {
   const calls: ToolUseContent[] = [];
   let index = 0;
+  const reasoning = reasoningSpans(text, { unclosed: stopped });
+  const inReasoning = (at: number): boolean => reasoning.some(([start, end]) => at >= start && at < end);
 
   const push = (name: string, raw: string): void => {
     try {
@@ -272,6 +285,7 @@ export function extractTextualToolCalls(
     const close = end === -1 ? null : /^\s*<\/tool_call>/i.exec(text.slice(end));
     if (!close) continue;
     tagged = end + close[0].length;
+    if (inReasoning(match.index)) continue;
     try {
       const parsed = JSON.parse(text.slice(from, end)) as { name?: string; arguments?: unknown; parameters?: unknown };
       if (typeof parsed.name === 'string') {
@@ -291,7 +305,7 @@ export function extractTextualToolCalls(
   // ```json { "tool": "name", "arguments": {...} } ```   (generic fenced form)
   for (const match of text.matchAll(/```(?:json|tool)?\s*(\{[\s\S]*?\})\s*```/gi)) {
     const body = match[1];
-    if (!body) continue;
+    if (!body || inReasoning(match.index)) continue;
     const call = fencedCall(body, offered);
     if (call) calls.push({ type: 'tool_use', id: `text_call_${index++}`, ...call });
   }
@@ -300,7 +314,7 @@ export function extractTextualToolCalls(
   for (const match of text.matchAll(/\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(\{[\s\S]*?\})\s*\)/gi)) {
     const name = match[1];
     const body = match[2];
-    if (name && body) push(name, body);
+    if (name && body && !inReasoning(match.index)) push(name, body);
   }
 
   // [tool name({...})]                                   (this app's own history)
@@ -317,7 +331,7 @@ export function extractTextualToolCalls(
     const name = match[1]?.trim();
     const from = match.index + match[0].length;
     const end = endOfJson(text, from);
-    if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end))) continue;
+    if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end)) || inReasoning(match.index)) continue;
     const raw = text.slice(from, end);
     const input = recounts.size > 0 ? parsedJson(raw) : undefined;
     if (input !== undefined && recounts.has(asShown(name, input))) continue;
@@ -1074,14 +1088,20 @@ export function stripToolSyntax(
  * `offered` and `shown` are REQUIRED, as `enabledIds` is on `runToolCalls`: a
  * reading that left out `offered` took a data record for a call, and one that
  * left out `shown` ran a call again when the model recounted it. `shown` is
- * {@link shownCalls} of the messages the reply answers.
+ * {@link shownCalls} of the messages the reply answers. `stopped` is whether
+ * Stop cut the message short, which decides whether reasoning it left open is
+ * still reasoning: see {@link extractTextualToolCalls}.
  */
 export function findToolCalls(
   message: IRMessage,
   offered: readonly string[],
   shown: readonly ToolUseContent[],
+  reading: { readonly stopped?: boolean } = {},
 ): ToolUseContent[] {
-  return [...structuredToolCalls(message), ...extractTextualToolCalls(messageToText(message), offered, shown)];
+  return [
+    ...structuredToolCalls(message),
+    ...extractTextualToolCalls(messageToText(message), offered, shown, reading),
+  ];
 }
 
 /** Run a batch of tool calls, returning both IR results and UI records. */

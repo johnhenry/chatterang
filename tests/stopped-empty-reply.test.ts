@@ -3413,3 +3413,70 @@ describe('a local turn whose stream died after some words, finished by the cloud
     expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
+
+/* ── A call named in reasoning is not a call ────────────────────────── */
+
+describe('a call named in reasoning', () => {
+  // Reasoning is the model thinking, not calling: its words are never the
+  // reply's, and a call it names is not one the round made. The extractor read
+  // the round with its reasoning in it, so a call only mentioned there ran and
+  // sent a follow-up, a call drafted there and then made ran twice, and Stop
+  // landing mid-reasoning recorded a call the model never made as not sent.
+  const calc = (expression: string): string =>
+    `<tool_call>{"name": "calculate", "arguments": {"expression": "${expression}"}}</tool_call>`;
+
+  it('is not run when the answer makes no call', async () => {
+    const id = 'rv6_reasoning_names_call';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`<think>I could call ${calc('6*7')} but I know it.</think>\nIt is 42.`, 'Second answer.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(
+      { tools: stored.toolCalls?.length ?? 0, requests: local.seen.length, content: stored.content },
+      'the finished reply',
+    ).toEqual({ tools: 0, requests: 1, content: 'It is 42.' });
+  });
+
+  for (const [form, call] of [
+    ['a <tool_call>', calc('6*7')],
+    ['a fenced block', '```json\n{"name": "calculate", "arguments": {"expression": "6*7"}}\n```'],
+    ['this app’s history form', '[tool calculate({"expression": "6*7"})]'],
+  ] as const) {
+    it(`runs once when the reasoning drafts it as ${form} and the answer makes it`, async () => {
+      const id = `rv6_reasoning_drafts_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`<think>First ${call}, then the answer.</think>\n${call}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42']);
+      expect(local.seen, 'one follow-up').toHaveLength(2);
+      expect(stored.content, 'the stored reply').toBe('It is 42.');
+    });
+  }
+
+  it('stopped mid-reasoning after drafting a call to an MCP tool: records nothing as not sent', async () => {
+    const id = 'rv6_reasoning_stopped';
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>I will file it with ${MCP_CALL_CLEAN}, and then`, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file a note');
+      await until(() => (useChats.getState().messages.at(-1)?.thinking ?? '').includes('and then'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(stopped?.thinking, 'the reasoning').toContain('I will file it with');
+  });
+});

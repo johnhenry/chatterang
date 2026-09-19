@@ -1136,12 +1136,20 @@ export class ChatterangEngine {
            * recorded here nor kept in the words as an example — the stripper
            * took it out as a call — so the reply lost it and no record said
            * it had not gone.
+           *
+           * Read as STOPPED: reasoning the round had not closed when Stop
+           * landed is still reasoning, and a call it drafted is not one the
+           * model made. Read as a finished round, it was recorded as a call
+           * not sent. The stored words, read from the reply's answer alone,
+           * never held it.
            */
           // Only in a round whose request offered a tool, as a finished round
           // is read below.
           const strandedCalls =
             offered.length > 0
-              ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
+              ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages), {
+                  stopped: true,
+                })
               : [];
           if (strandedCalls.length > 0) {
             const batch = await runToolCalls(toolRegistry, strandedCalls, {
