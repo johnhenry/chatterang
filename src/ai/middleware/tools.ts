@@ -559,9 +559,17 @@ const CALL_END = {
  * by `name(`. A stopped turn's text ends wherever Stop landed, so a bare marker
  * there may be a call begun; that it may also be a marker named in prose is
  * the accepted limit.
+ *
+ * A NAME AFTER `[TOOL_CALLS]`, HERE AND IN EVERY FORM THAT WRITES ONE BEFORE
+ * ITS ARGUMENTS, is a tool's name or id as `CALL_NAME` reads one: word
+ * characters, dots, colons and hyphens. Every MCP tool is named `server.tool`,
+ * with the id `mcp:server.tool`, and these forms read a word alone: a call to
+ * one was neither read, run, stripped nor cut, so its arguments were stored
+ * and sent back, finished or stopped, and Stop catching it complete wrote no
+ * record that it had not gone.
  */
 const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*\w+\s*\(\s*|[ \t]*\w*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply NOBODY STOPPED:
@@ -572,7 +580,7 @@ const CALL_MARKER_AT_END =
  * special token [TOOL_CALLS]" to "... the special token".
  */
 const CALL_OPENED_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{`
@@ -598,7 +606,7 @@ const CALL_OPENED_AT_END =
  * tests/support/source-scan.ts read a bare one in a regex literal as the start
  * of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -898,7 +906,7 @@ const CALL_SHAPES: readonly {
     read: (json) => callsInJson(looseJson(json)),
   },
   {
-    open: /\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(?=\{)/gi,
+    open: /\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*(?=\{)/gi,
     close: /^[\s}\]]*\)/,
     short: CALL_END.paren.token,
     read: (json, opening) => callWithArguments(opening[1] ?? '', json),
@@ -1048,7 +1056,7 @@ function shortCall(text: string, start: number, short: RegExp): { end: number; j
  * no tool, or `[TOOL_CALLS] name()`, a call to a tool that takes no arguments.
  * The group is that name.
  */
-const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*\)/gi;
+const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*\)/gi;
 
 /** Where a Qwen3-Coder call may start: a `<tool_call>` with `<function=` after it. See {@link xmlCallEnd}. */
 export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
@@ -1271,7 +1279,7 @@ function readTaggedCalls(
  * its name and `(`, with a word after it. The group is the name. See
  * {@link readKeywordArguments}.
  */
-const KEYWORD_CALL_OPENING = /\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(?=[A-Za-z_])/gi;
+const KEYWORD_CALL_OPENING = /\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*(?=[A-Za-z_])/gi;
 /** A keyword argument's name and its `=`, as Python writes one. */
 const KEYWORD = /([A-Za-z_]\w*)\s*=(?!=)\s*/y;
 

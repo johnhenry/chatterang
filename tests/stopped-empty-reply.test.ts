@@ -3818,3 +3818,88 @@ describe('a call written as Python writes one, name(key=value, …), in a tag or
     expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
   });
 });
+
+/* ── Review round 7: an MCP tool's name in the [TOOL_CALLS] forms ───── */
+
+describe('a [TOOL_CALLS] call to an MCP tool, whose name and id hold a dot and a colon', () => {
+  // Every MCP tool is named `server.tool`, with the id `mcp:server.tool`, and
+  // each `[TOOL_CALLS]` form read a call's name as a word alone. So a call to
+  // one was never read: finished, the server was never called, and the call,
+  // arguments and all, was stored and sent back in every later request;
+  // stopped inside it, nothing was cut; and Stop catching it complete wrote no
+  // record that it had not gone.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, call] of [
+    ['by its name, with JSON', '[TOOL_CALLS] notes.note({"text": "canary-7f3a"})'],
+    ['by its id, with JSON', '[TOOL_CALLS] mcp:notes.note({"text": "canary-7f3a"})'],
+    ['by its name, with Python’s keyword arguments', '[TOOL_CALLS] notes.note(text="canary-7f3a")'],
+  ] as const) {
+    it(`${form}, finished: is sent once, and none of it is stored or sent back`, async () => {
+      const id = `rv7_mcp_name_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Filing it.\n${call}`, 'Filed.', 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-7f3a' });
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing it.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  for (const [form, partial, marker] of [
+    ['inside its JSON', 'Filing it.\n[TOOL_CALLS] notes.note({"text": "canary-7f3a', 'canary-7f3a'],
+    ['inside its keyword arguments', 'Filing it.\n[TOOL_CALLS] mcp:notes.note(text="canary-7f3a', 'canary-7f3a'],
+    ['on its name', 'Filing it.\n[TOOL_CALLS] notes.no', 'notes.no'],
+  ] as const) {
+    it(`stopped ${form}: keeps the words before it, and sends none of it back`, async () => {
+      const id = `rv7_mcp_name_stopped_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', marker, gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('notes.no');
+    });
+  }
+
+  it('Stop caught complete: is recorded as not sent, and none of it is stored (refs #293)', async () => {
+    const id = 'rv7_mcp_name_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it.\n[TOOL_CALLS] notes.note({"text": "canary-7f3a"})\nWaiting', stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it\.\s+Waiting$/);
+  });
+});

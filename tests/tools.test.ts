@@ -691,3 +691,46 @@ describe('a call written as this app writes one in a text prompt’s history: [t
     expect(cut('See the [tool', true), 'a bare opening word').toBe('See the [tool');
   });
 });
+
+describe('a [TOOL_CALLS] call to a tool whose name or id holds a dot, a colon or a hyphen, as every MCP tool’s does', () => {
+  // An MCP tool is named `server.tool`, with the id `mcp:server.tool`. Each
+  // `[TOOL_CALLS]` form read its name as a word alone, so a call to one was
+  // neither read, run, stripped nor cut: finished, the server was never called
+  // and the call's arguments were stored and sent back; stopped, the same.
+  const MCP = ['mcp:notes.note', 'notes.note', 'mcp:my-notes.add-note', 'my-notes.add-note'];
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: MCP });
+
+  it('is read, and stripped, by name and by id, with JSON or Python’s keyword arguments, or none', () => {
+    for (const [text, name, input] of [
+      ['[TOOL_CALLS] notes.note({"text": "x"})', 'notes.note', { text: 'x' }],
+      ['[TOOL_CALLS] mcp:notes.note({"text": "x"})', 'mcp:notes.note', { text: 'x' }],
+      ['[TOOL_CALLS] my-notes.add-note(text="x")', 'my-notes.add-note', { text: 'x' }],
+      ["[TOOL_CALLS]\nnotes.note(text='x', pinned=True)", 'notes.note', { text: 'x', pinned: true }],
+      ['[TOOL_CALLS] notes.note()', 'notes.note', {}],
+    ] as const) {
+      expect(extractFrom(text, MCP, []).map((call) => [call.name, call.input]), text).toEqual([[name, input]]);
+      expect(stripFrom(`Ok.\n${text}\nDone.`, { offered: MCP, ran: false }), text).toBe('Ok.\n\nDone.');
+    }
+  });
+
+  it('is cut where it starts when the text ends inside it, or, stopped, on its name', () => {
+    for (const call of [
+      '[TOOL_CALLS] notes.note({"text": "one plus',
+      '[TOOL_CALLS] mcp:notes.note(text="one plus',
+      '[TOOL_CALLS] notes.note(',
+    ]) {
+      expect(cut(`Ok.\n${call}`), call).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`, true), `${call} (stopped)`).toBe('Ok.\n');
+    }
+    expect(cut('Ok.\n[TOOL_CALLS] mcp:notes.no', true)).toBe('Ok.\n');
+  });
+
+  it('keeps prose that names the marker before a dotted word', () => {
+    for (const prose of ['See [TOOL_CALLS] notes.md (the file) for more.', 'Mistral emits [TOOL_CALLS] v1.2 (and later) first.']) {
+      expect(stripFrom(prose, { offered: MCP, ran: false }), prose).toBe(prose);
+      expect(extractFrom(prose, MCP, []), prose).toEqual([]);
+      expect(cut(prose), prose).toBe(prose);
+      expect(cut(prose, true), `${prose} (stopped)`).toBe(prose);
+    }
+  });
+});
