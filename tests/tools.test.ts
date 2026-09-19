@@ -734,3 +734,62 @@ describe('a [TOOL_CALLS] call to a tool whose name or id holds a dot, a colon or
     }
   });
 });
+
+describe('a call whose single-quoted strings hold a bracket or a double quote', () => {
+  // A call's end was found by scanners that knew only JSON's double quote,
+  // while its body is read as a small model writes it, single quotes and all.
+  // A `}` or `]` inside a single-quoted string closed the call's JSON early:
+  // the stripper took the call out and the reader read nothing from the cut
+  // body, so it never ran, and stopped, no record said it had not gone. A `"`
+  // inside one opened a string that never closed: the call was neither read
+  // nor stripped, and its arguments were stored and sent back.
+  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const calc = (note: string): string => `{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': '${note}'}}`;
+
+  it('is read, and stripped whole, in each form', () => {
+    for (const [text, notes] of [
+      [`<tool_call>${calc('smile :-}')}</tool_call>`, ['smile :-}']],
+      [`<tool_call>${calc('item 3]')}</tool_call>`, ['item 3]']],
+      [`<tool_call>${calc('a 5" board')}</tool_call>`, ['a 5" board']],
+      [`<tool_call>${calc('a { brace')}</tool_call>`, ['a { brace']],
+      [`<tool_call>[${calc('x]')}]</tool_call>`, ['x]']],
+      [`<tool_call>\n${calc('a "b')}\n${calc('c}')}\n</tool_call>`, ['a "b', 'c}']],
+      [`<tool_call>calculate({'expression': '6*7', 'note': 'a 5" board'})</tool_call>`, ['a 5" board']],
+      [`[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'a 5" board'})`, ['a 5" board']],
+      [`[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'x})'})`, ['x})']],
+      [`[tool calculate({'expression': '6*7', 'note': 'x}'})]`, ['x}']],
+      // A closing brace too few, ended by its tag or paren, read as a call's JSON is.
+      [`<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': 'a 5" board'}</tool_call>`, ['a 5" board']],
+      [`[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'b}', 'more': {'a': 1})`, ['b}']],
+    ] as const) {
+      expect(stripToolSyntax(`Ok.\n${text}\nDone.`), text).toBe('Ok.\n\nDone.');
+      const calls = extractTextualToolCalls(text);
+      expect(calls.map((call) => [call.name, call.input['note']]), text).toEqual(notes.map((note) => ['calculate', note]));
+    }
+  });
+
+  it('is cut where it starts when the text ends inside it or in its end, and not once it has ended', () => {
+    for (const unfinished of [
+      `<tool_call>${calc('a 5" board')}</tool_`,
+      `<tool_call>${calc('smile :-}')}</tool_`,
+      `<tool_call>${calc('smile :-}')}`,
+      `[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'x}'}`,
+    ]) {
+      expect(cut(`Ok.\n${unfinished}`), unfinished).toBe('Ok.\n');
+      expect(cut(`Ok.\n${unfinished}`, true), `${unfinished} (stopped)`).toBe('Ok.\n');
+    }
+    const whole = `Ok.\n<tool_call>${calc('a 5" board')}</tool_call>\nDone.`;
+    expect(cut(whole), whole).toBe(whole);
+  });
+
+  it('keeps prose with an apostrophe after a call’s opening', () => {
+    for (const prose of [
+      "Qwen's <tool_call>{ isn't JSON, and </tool_call> ends it.",
+      "It opens <tool_call>{'a': 1} and that's the call's body.",
+    ]) {
+      expect(stripToolSyntax(prose), prose).toBe(prose);
+      expect(extractTextualToolCalls(prose), prose).toEqual([]);
+      expect(cut(prose), prose).toBe(prose);
+    }
+  });
+});

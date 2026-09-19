@@ -516,19 +516,46 @@ function fencedCall(
 }
 
 /**
+ * Where the string whose quote is at `at` ends, just past its closing quote; -1
+ * if the text ends first. Either quote opens one, as a small model writes a
+ * call's JSON (see {@link looseJson}).
+ *
+ * EVERY SCANNER THAT FINDS WHERE A CALL'S JSON ENDS READS ITS STRINGS HERE.
+ * They knew only JSON's double quote while the body was read with both, so a
+ * `}` or `]` inside a single-quoted string closed the JSON early — the stripper
+ * took the call out, and nothing could be read from what was left, so it never
+ * ran, and stopped, no record said it had not gone — and a `"` inside one
+ * opened a string that never closed, so the call was neither read nor
+ * stripped, its arguments stored and sent back.
+ */
+function stringEnd(text: string, at: number): number {
+  const quote = text.charAt(at);
+  for (let end = at + 1; end < text.length; end += 1) {
+    const char = text.charAt(end);
+    if (char === '\\') end += 1;
+    else if (char === quote) return end + 1;
+  }
+  return -1;
+}
+
+/** Whether `char` opens a string in a call's JSON: either quote. See {@link stringEnd}. */
+function opensString(char: string | undefined): boolean {
+  return char === '"' || char === "'";
+}
+
+/**
  * Where the JSON object or array opening at `start` ends, just past its closing
- * bracket; -1 if the text ends first. A bracket inside a string is not counted.
+ * bracket; -1 if the text ends first. A bracket inside a string, in either
+ * quote, is not counted: see {@link stringEnd}.
  */
 export function endOfJson(text: string, start: number): number {
   let depth = 0;
-  let inString = false;
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (inString) {
-      if (char === '\\') at += 1;
-      else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
+    if (opensString(char)) {
+      const end = stringEnd(text, at);
+      if (end === -1) return -1;
+      at = end - 1;
     } else if (char === '{' || char === '[') {
       depth += 1;
     } else if (char === '}' || char === ']') {
@@ -610,18 +637,17 @@ const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
- * -1 if the text ends first. A brace inside a string is not counted.
+ * -1 if the text ends first. A brace inside a string, in either quote, is not
+ * counted: see {@link stringEnd}.
  */
 function endOfObject(text: string, start: number): number {
   let depth = 0;
-  let inString = false;
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (inString) {
-      if (char === '\\') at += 1;
-      else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
+    if (opensString(char)) {
+      const end = stringEnd(text, at);
+      if (end === -1) return -1;
+      at = end - 1;
     } else if (char === '{') {
       depth += 1;
     } else if (char === '}') {
@@ -1010,6 +1036,10 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
  * and a closing tag it names — "write `<tool_call>{"name": "x"` and end it with
  * `</tool_call>`" — does not parse, and keeps every word. The call read this
  * way runs, from the JSON with its missing brackets: see {@link shortCall}.
+ *
+ * Its strings are read in either quote, and its JSON as a call's is (see
+ * {@link looseJson}): a single-quoted call with a brace too few was read as
+ * neither, and was kept, its arguments stored and sent back.
  */
 export function shortCallEnd(text: string, start: number, short: RegExp): number {
   return shortCall(text, start, short)?.end ?? -1;
@@ -1021,14 +1051,12 @@ export function shortCallEnd(text: string, start: number, short: RegExp): number
  */
 function shortCall(text: string, start: number, short: RegExp): { end: number; json: string } | undefined {
   const open: string[] = [];
-  let inString = false;
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (inString) {
-      if (char === '\\') at += 1;
-      else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
+    if (opensString(char)) {
+      const end = stringEnd(text, at);
+      if (end === -1) return undefined;
+      at = end - 1;
     } else if (char === '{' || char === '[') {
       open.push(char);
     } else if (char === '}' || char === ']') {
@@ -1040,12 +1068,7 @@ function shortCall(text: string, start: number, short: RegExp): { end: number; j
       if (!token) continue;
       const closers = open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('');
       const json = text.slice(start, at) + closers;
-      try {
-        const parsed: unknown = JSON.parse(json);
-        return isRecord(parsed) ? { end: at + token[0].length, json } : undefined;
-      } catch {
-        return undefined;
-      }
+      return isRecord(looseJson(json)) ? { end: at + token[0].length, json } : undefined;
     }
   }
   return undefined;

@@ -3903,3 +3903,97 @@ describe('a [TOOL_CALLS] call to an MCP tool, whose name and id hold a dot and a
     expect(stopped?.content, 'the stored reply').toMatch(/^Filing it\.\s+Waiting$/);
   });
 });
+
+/* ── Review round 7: a single-quoted call's strings ─────────────────── */
+
+describe('a single-quoted call whose strings hold a bracket or a double quote', () => {
+  // A call's end was found by scanners that knew only JSON's double quote, and
+  // its body read by one that knows both. A `}` or `]` in a single-quoted
+  // string closed the call's JSON early: the stripper took the call out and
+  // the reader read nothing from what was left, so it never ran, and stopped,
+  // no record said it had not gone. A `"` in one opened a string that never
+  // closed: the call was neither read nor stripped, and its arguments were
+  // stored and sent back, where main's lazy strip had removed them.
+  const calc = (note: string): string =>
+    `{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': '${note}'}}`;
+
+  for (const [shape, call] of [
+    ['a closing brace in a string', `<tool_call>${calc('canary-7f3a :-}')}</tool_call>`],
+    ['a closing bracket in a string', `<tool_call>${calc('canary-7f3a, item 3]')}</tool_call>`],
+    ['a double quote in a string', `<tool_call>${calc('canary-7f3a, a 5" board')}</tool_call>`],
+    ['an opening brace in a string', `<tool_call>${calc('canary-7f3a, a { brace')}</tool_call>`],
+    ['a double quote in a [TOOL_CALLS] call', `[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'canary-7f3a, a 5" board'})`],
+    [
+      'a double quote in a call with a closing brace too few',
+      `<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': 'canary-7f3a, a 5" board'}</tool_call>`,
+    ],
+  ] as const) {
+    it(`${shape}, finished: runs, and none of it is stored or sent back`, async () => {
+      const id = `rv7_quoted_${shape.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}\nOne moment.`, 'It is 42.', 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nOne moment.\n\nIt is 42.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  const note = (text: string): string => `<tool_call>{'name': 'notes.note', 'arguments': {'text': '${text}'}}</tool_call>`;
+  for (const [shape, call] of [
+    ['a closing brace in a string', note('canary-7f3a :-}')],
+    ['a closing bracket in a string', note('canary-7f3a, item 3]')],
+    ['a double quote in a string', note('canary-7f3a, a 5" board')],
+  ] as const) {
+    it(`${shape}, Stop caught complete: is recorded as not sent, and none of it is stored or sent back (refs #293)`, async () => {
+      const id = `rv7_quoted_stranded_${shape.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n${call}\nWaiting`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'Waiting', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+        expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+      ]);
+      expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a closing brace in a string, stopped before the paren that ends it: keeps the words before it, and sends none of it back', async () => {
+    const id = 'rv7_quoted_before_paren';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: "Filing it now.\n[TOOL_CALLS] notes.note({'text': 'canary-7f3a :-}'}", stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', ":-}'}", gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Filing it now.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
