@@ -168,9 +168,6 @@ export function callNames(tools: readonly Pick<ChatterangTool, 'id' | 'name'>[])
  */
 const APP_CALL_OPENING = /\[tool\s+([^()[\]{}\n]+?)\s*\(\s*(?=\{)/gi;
 
-/** Where a tag call whose body is one JSON object may open: a `<tool_call>` with the object's `{` after it. */
-const TAGGED_OBJECT_OPENING = /<tool_call>\s*(?=\{)/gi;
-
 /**
  * The calls a request's history shows the model: every `tool_use` block in its
  * messages, as `messageText` in ai/prompt.ts writes each into a text template's
@@ -206,14 +203,121 @@ function asShown(name: string, input: unknown): string {
   return JSON.stringify([encodeUntrusted(name), encode(input)]);
 }
 
-/** `raw` parsed as JSON, or undefined when it is not JSON. */
-function parsedJson(raw: string): unknown {
+/**
+ * `raw` read as a call's JSON: JSON, or JSON as a small model writes a call —
+ * strings in single quotes, keys left unquoted, a comma before a closing
+ * bracket, and Python's `True`, `False` and `None` — or undefined when it is
+ * neither. The order of its tokens is checked, as JSON's is: this reads a
+ * call's arguments, where {@link writesJson} only asks whether a call is being
+ * written.
+ */
+export function looseJson(raw: string): unknown {
   try {
     return JSON.parse(raw) as unknown;
+  } catch {
+    // Not JSON itself; read on as a small model writes it.
+  }
+  const notJson = new Error('not a call’s JSON');
+  let at = 0;
+  const skipSpace = (): void => {
+    while (at < raw.length && /\s/.test(raw.charAt(at))) at += 1;
+  };
+  const quoted = (): string | undefined => {
+    const quote = raw.charAt(at);
+    if (quote !== '"' && quote !== "'") return undefined;
+    let end = at + 1;
+    while (end < raw.length && raw.charAt(end) !== quote) end += raw.charAt(end) === '\\' ? 2 : 1;
+    if (end >= raw.length) throw notJson;
+    const body = raw.slice(at + 1, end);
+    at = end + 1;
+    // Its escapes read as JSON's, and a single-quoted string's own quotes too.
+    let asJson = '';
+    for (let index = 0; index < body.length; index += 1) {
+      const char = body.charAt(index);
+      if (char === '\\') {
+        const next = body.charAt(index + 1);
+        asJson += next === "'" ? "'" : `\\${next}`;
+        index += 1;
+      } else if (char === '"') {
+        asJson += '\\"';
+      } else if (char < ' ') {
+        asJson += `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`;
+      } else {
+        asJson += char;
+      }
+    }
+    try {
+      return JSON.parse(`"${asJson}"`) as string;
+    } catch {
+      return body;
+    }
+  };
+  const bare = (pattern: RegExp): string | undefined => {
+    pattern.lastIndex = at;
+    const word = pattern.exec(raw)?.[0];
+    if (word !== undefined) at += word.length;
+    return word;
+  };
+  const value = (): unknown => {
+    skipSpace();
+    const char = raw.charAt(at);
+    if (char === '{' || char === '[') {
+      const object = char === '{';
+      const closer = object ? '}' : ']';
+      const out: Record<string, unknown> = {};
+      const items: unknown[] = [];
+      at += 1;
+      skipSpace();
+      while (raw.charAt(at) !== closer) {
+        if (object) {
+          const key = quoted() ?? bare(LOOSE_KEY);
+          if (key === undefined) throw notJson;
+          skipSpace();
+          if (raw.charAt(at) !== ':') throw notJson;
+          at += 1;
+          // Defined, not assigned: a key `__proto__` is a key, as JSON.parse reads it.
+          Object.defineProperty(out, key, { value: value(), enumerable: true, writable: true, configurable: true });
+        } else {
+          items.push(value());
+        }
+        skipSpace();
+        if (raw.charAt(at) === ',') {
+          at += 1;
+          skipSpace();
+        } else if (raw.charAt(at) !== closer) {
+          throw notJson;
+        }
+      }
+      at += 1;
+      return object ? out : items;
+    }
+    const string = quoted();
+    if (string !== undefined) return string;
+    const word = bare(BARE_WORD);
+    if (word === undefined || !JSON_WORD.test(word)) throw notJson;
+    const literal = LITERALS.get(word);
+    return literal === undefined && !LITERALS.has(word) ? Number(word) : literal;
+  };
+  try {
+    const parsed = value();
+    skipSpace();
+    return at === raw.length ? parsed : undefined;
   } catch {
     return undefined;
   }
 }
+
+/** A key a small model leaves unquoted. */
+const LOOSE_KEY = /[A-Za-z_$][\w$.-]*/y;
+/** What each bare word that is not a number stands for, JSON's and Python's. */
+const LITERALS: ReadonlyMap<string, unknown> = new Map<string, unknown>([
+  ['true', true],
+  ['false', false],
+  ['null', null],
+  ['True', true],
+  ['False', false],
+  ['None', null],
+]);
 
 /**
  * Recognise a textual tool call. Local models produce these in a handful of
@@ -244,82 +348,30 @@ export function extractTextualToolCalls(
   shown: readonly ToolUseContent[],
   { stopped = false }: { readonly stopped?: boolean } = {},
 ): ToolUseContent[] {
-  const calls: ToolUseContent[] = [];
-  let index = 0;
   const reasoning = reasoningSpans(text, { unclosed: stopped });
   const inReasoning = (at: number): boolean => reasoning.some(([start, end]) => at >= start && at < end);
 
-  const push = (name: string, raw: string): void => {
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        calls.push({
-          type: 'tool_use',
-          id: `text_call_${index++}`,
-          name,
-          input: parsed as Record<string, unknown>,
-        });
-      }
-    } catch {
-      // Malformed JSON is not a tool call; leave the text alone.
-    }
-  };
-
-  // <tool_call>{"name": "...", "arguments": {...}}</tool_call>  (Qwen, Hermes)
+  // READ AS THE STRIPPER READS THEM: every call is one `callMarkup` finds, the
+  // markup `stripToolSyntax` takes out of the words. The reader read a tag's
+  // body only as one strict JSON object followed by its closing tag, and the
+  // stripper took out more — several calls in one tag, an array of them,
+  // Qwen3-Coder's XML, a name before its JSON, a trailing comma, a closing
+  // brace too many or too few. Such a call, finished, was stripped and never
+  // ran; stopped, it vanished from the words with no record that it had not
+  // gone, which is the record #331 writes for a call it reads.
   //
-  // READ BY ITS JSON, as `stripToolSyntax` reads it: from a `<tool_call>` the
-  // object opens right after, through that object's closing brace — past any
-  // brace or closing tag inside a string — to the `</tool_call>` after it. The
-  // lazy `<tool_call>([\s\S]*?)</tool_call>` this replaced began at the FIRST
-  // tag in the text: reasoning or prose that named `<tool_call>` began a body
-  // that never parsed and swallowed the real call after it, which the stripper
-  // then took out of the reply — the call neither ran nor showed. And a closing
-  // tag in a string argument ended the body there, so a call the stripper took
-  // out whole never ran.
-  let tagged = 0;
-  for (const match of text.matchAll(TAGGED_OBJECT_OPENING)) {
-    // Inside the arguments of a call already read.
-    if (match.index < tagged) continue;
-    const from = match.index + match[0].length;
-    const end = endOfJson(text, from);
-    const close = end === -1 ? null : /^\s*<\/tool_call>/i.exec(text.slice(end));
-    if (!close) continue;
-    tagged = end + close[0].length;
-    if (inReasoning(match.index)) continue;
-    try {
-      const parsed = JSON.parse(text.slice(from, end)) as { name?: string; arguments?: unknown; parameters?: unknown };
-      if (typeof parsed.name === 'string') {
-        const args = parsed.arguments ?? parsed.parameters ?? {};
-        calls.push({
-          type: 'tool_use',
-          id: `text_call_${index++}`,
-          name: parsed.name,
-          input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown>,
-        });
-      }
-    } catch {
-      // ignore
-    }
+  // THE OUTERMOST MARKUP ONLY: a call inside another's string, or the fenced
+  // block inside a tag, is part of that call, not one of its own.
+  const markup: CallMarkup[] = [];
+  let end = 0;
+  for (const found of callMarkup(text, offered).sort((a, b) => a.start - b.start || b.end - a.end)) {
+    if (found.start < end) continue;
+    end = found.end;
+    if (!inReasoning(found.start)) markup.push(found);
   }
 
-  // ```json { "tool": "name", "arguments": {...} } ```   (generic fenced form)
-  for (const match of text.matchAll(/```(?:json|tool)?\s*(\{[\s\S]*?\})\s*```/gi)) {
-    const body = match[1];
-    if (!body || inReasoning(match.index)) continue;
-    const call = fencedCall(body, offered);
-    if (call) calls.push({ type: 'tool_use', id: `text_call_${index++}`, ...call });
-  }
-
-  // [TOOL_CALL] name({...})                              (Mistral-style)
-  for (const match of text.matchAll(/\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(\{[\s\S]*?\})\s*\)/gi)) {
-    const name = match[1];
-    const body = match[2];
-    if (name && body && !inReasoning(match.index)) push(name, body);
-  }
-
-  // [tool name({...})]                                   (this app's own history)
-  // Read through its arguments' JSON, as `stripToolSyntax` reads a call, so a
-  // string holding `)]` does not end it. See `APP_CALL_OPENING`.
+  // A COPY — a call in this app's own history form, `[tool NAME({…})]` — IS
+  // READ ONLY WHEN NOTHING ELSE IS THE SAME CALL.
   //
   // NOT ONE THE HISTORY SHOWED. This is the form the follow-up's history shows
   // the model its own call in, and a model recounting what it did — "I filed
@@ -332,23 +384,72 @@ export function extractTextualToolCalls(
   // "Next, [tool notes.note({…})]:" and the `<tool_call>` — ran twice, and so
   // did one made and then recounted in the same reply, or written in this form
   // twice. Only this form is read that way: two of a model's own calls are its
-  // calls. The model's calls are all read before this loop.
-  const copies = new Set([...shown, ...calls].map((call) => asShown(call.name, call.input)));
-  for (const match of text.matchAll(APP_CALL_OPENING)) {
-    const name = match[1]?.trim();
-    const from = match.index + match[0].length;
-    const end = endOfJson(text, from);
-    if (!name || end === -1 || !/^\s*\)\s*\]/.test(text.slice(end)) || inReasoning(match.index)) continue;
-    const raw = text.slice(from, end);
-    const input = parsedJson(raw);
-    if (input === null || typeof input !== 'object' || Array.isArray(input)) continue;
-    const copy = asShown(name, input);
-    if (copies.has(copy)) continue;
-    copies.add(copy);
-    push(name, raw);
+  // calls.
+  const copies = new Set(
+    [...shown, ...markup.flatMap((found) => (found.copy ? [] : found.calls))].map((call) =>
+      asShown(call.name, call.input),
+    ),
+  );
+  const calls: ToolUseContent[] = [];
+  for (const found of markup) {
+    for (const call of found.calls) {
+      if (found.copy) {
+        const copy = asShown(call.name, call.input);
+        if (copies.has(copy)) continue;
+        copies.add(copy);
+      }
+      calls.push({ type: 'tool_use', id: `text_call_${calls.length}`, name: call.name, input: call.input });
+    }
   }
-
   return calls;
+}
+
+/** A call a reply writes: the tool it names, and the arguments it gives it. */
+interface WrittenCall {
+  readonly name: string;
+  readonly input: Record<string, unknown>;
+}
+
+/**
+ * A call's markup in a reply's text, from `start` to just before `end`, and the
+ * calls read from it.
+ *
+ * `calls` is empty for markup no call can be read from — a tag with nothing in
+ * it, or a body that names no tool — which is still the model's markup, and is
+ * stripped. `copy` is this app's own history form: see `APP_CALL_OPENING`.
+ */
+interface CallMarkup {
+  readonly start: number;
+  readonly end: number;
+  readonly calls: readonly WrittenCall[];
+  readonly copy: boolean;
+}
+
+/** A plain object, as a call's arguments are. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * The calls a tag's JSON holds: an object naming its tool by `name`, `tool` or
+ * `function` with its arguments in `arguments`, `parameters` or `input`, or an
+ * array of such objects. None from anything else.
+ */
+function callsInJson(parsed: unknown): WrittenCall[] {
+  if (Array.isArray(parsed)) return parsed.flatMap((item) => (isRecord(item) ? callsInJson(item) : []));
+  if (!isRecord(parsed)) return [];
+  const name = [parsed['name'], parsed['tool'], parsed['function']].find(
+    (value): value is string => typeof value === 'string',
+  );
+  if (name === undefined) return [];
+  const args = parsed['arguments'] ?? parsed['parameters'] ?? parsed['input'] ?? {};
+  return [{ name, input: isRecord(args) ? args : {} }];
+}
+
+/** A call to `name` with `raw`'s JSON as its arguments, when that JSON is an object. */
+function callWithArguments(name: string, raw: string): WrittenCall[] {
+  const input = looseJson(raw);
+  return isRecord(input) ? [{ name, input }] : [];
 }
 
 /**
@@ -745,10 +846,11 @@ export function cutUnfinishedCall(
  * Each textual call's shape: where its JSON may open, what must follow the JSON
  * once it closes, and whether a body in that shape is a call.
  *
- * `<tool_call>` and `[TOOL_CALLS] name(` are markup whatever their JSON holds:
- * a body that does not parse is a malformed call, which runs nothing and is
- * still the model's plumbing. A fenced block is markup only when it reads as a
- * call, because any other is a code example.
+ * `<tool_call>` and `[TOOL_CALLS] name(` are markup whatever their JSON holds.
+ * A malformed body is read as a small model writes JSON (see {@link looseJson})
+ * and runs as the call it names; one that names no tool even then runs nothing,
+ * and is still the model's plumbing. A fenced block is markup only when it reads
+ * as a call, because any other is a code example.
  *
  * A tag or paren's close may come after stray closing brackets: a small model's
  * commonest malformed call has one brace too many, `{"name": …, "arguments":
@@ -758,34 +860,113 @@ export function cutUnfinishedCall(
  * `short` is the token that ends a tag or paren form, for a call with a closing
  * bracket too few: see {@link shortCallEnd}. A fenced block has none, because
  * any other is a code example.
+ *
+ * `read` is the calls the markup holds, from its JSON and its opening's match,
+ * whose group is the tool's name in the forms that write it before the JSON; or
+ * undefined when a fenced block is not a call, and so not markup at all. It is
+ * `extractTextualToolCalls`'s reading, so what is stripped as a call is read as
+ * that call. `copy` is this app's own history form: see `APP_CALL_OPENING`.
  */
 const CALL_SHAPES: readonly {
   readonly open: RegExp;
   readonly close: RegExp;
   readonly short?: RegExp;
-  readonly fenced: boolean;
+  readonly read: (json: string, opening: RegExpExecArray, offered: readonly string[]) => WrittenCall[] | undefined;
+  readonly copy?: boolean;
 }[] = [
-  { open: /<tool_call>\s*(?=[{[])/gi, close: /^[\s}\]]*<\/tool_call>/i, short: CALL_END.tag.token, fenced: false },
+  {
+    open: /<tool_call>\s*(?=[{[])/gi,
+    close: /^[\s}\]]*<\/tool_call>/i,
+    short: CALL_END.tag.token,
+    read: (json) => callsInJson(looseJson(json)),
+  },
   // The tag around a fenced block: markup whatever the JSON holds, as the tag
   // form is. Stripping only the fenced call inside left `<tool_call>\n\n</tool_call>`.
   {
     open: /<tool_call>\s*```(?:json|tool)?\s*(?=[{[])/gi,
     close: /^[\s}\]]*```\s*<\/tool_call>/i,
     short: CALL_END.fencedTag.token,
-    fenced: false,
+    read: (json) => callsInJson(looseJson(json)),
   },
-  { open: /\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)/gi, close: /^[\s}\]]*\)/, short: CALL_END.paren.token, fenced: false },
+  {
+    open: /\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*(?=\{)/gi,
+    close: /^[\s}\]]*\)/,
+    short: CALL_END.paren.token,
+    read: (json, opening) => callWithArguments(opening[1] ?? '', json),
+  },
   // This app's own rendering of a call in a text prompt's history, which a model
   // copies: see `APP_CALL_OPENING`. Markup whatever its JSON holds, as the
   // Mistral form is.
   {
-    open: /\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi,
+    open: APP_CALL_OPENING,
     close: /^[\s}\]]*\)\s*\]/,
     short: CALL_END.bracket.token,
-    fenced: false,
+    read: (json, opening) => callWithArguments(opening[1]?.trim() ?? '', json),
+    copy: true,
   },
-  { open: /```(?:json|tool)?\s*(?=\{)/gi, close: /^\s*```/, fenced: true },
+  {
+    open: /```(?:json|tool)?\s*(?=\{)/gi,
+    close: /^\s*```/,
+    read: (json, _opening, offered) => {
+      const call = fencedCall(json, offered);
+      return call ? [call] : undefined;
+    },
+  },
 ];
+
+/**
+ * Every finished call's markup in `text`, and the calls read from it: what
+ * `stripToolSyntax` takes out of a reply's words, and what
+ * `extractTextualToolCalls` reads as its calls. One reading, so that a call the
+ * words lose is a call that runs, or is recorded as not sent.
+ *
+ * Markup can nest — a call inside another's string, the fenced block inside a
+ * tag — and one call can be found by two readers: the stripper takes out the
+ * union, and the reader reads the outermost.
+ */
+function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
+  const found: CallMarkup[] = [];
+  for (const { open, close, short, read, copy = false } of CALL_SHAPES) {
+    for (const match of text.matchAll(open)) {
+      const from = match.index + match[0].length;
+      // A closing bracket too few, ended by its tag or paren: read before the
+      // JSON's end, which a later brace in the text can supply. See `shortCallEnd`.
+      const shortened = short ? shortCall(text, from, short) : undefined;
+      let json: string;
+      let end: number;
+      if (shortened) {
+        ({ json, end } = shortened);
+      } else {
+        const closed = endOfJson(text, from);
+        if (closed === -1) continue;
+        const closing = close.exec(text.slice(closed));
+        if (!closing) continue;
+        json = text.slice(from, closed);
+        end = closed + closing[0].length;
+      }
+      const calls = read(json, match, offered);
+      if (calls) found.push({ start: match.index, end, calls, copy });
+    }
+  }
+  for (const match of text.matchAll(EMPTY_CALL)) {
+    const name = match[1];
+    found.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      calls: name ? [{ name, input: {} }] : [],
+      copy: false,
+    });
+  }
+  for (const match of text.matchAll(XML_CALL_OPENING)) {
+    const { end, calls } = readXmlCall(text, match.index);
+    if (typeof end === 'number' && end !== -1) found.push({ start: match.index, end, calls, copy: false });
+  }
+  for (const match of text.matchAll(TAG_OPENING)) {
+    const { end, calls } = readTaggedCalls(text, match.index, offered);
+    if (typeof end === 'number' && end !== -1) found.push({ start: match.index, end, calls, copy: false });
+  }
+  return found;
+}
 
 /**
  * Where a call whose JSON opens at `start` and has a closing bracket too few
@@ -802,12 +983,20 @@ const CALL_SHAPES: readonly {
  * whole answer. The reply was stored with none of them, or with no words at all
  * and shown as "Stopped before its first word".
  *
- * THE FIRST SUCH TOKEN, AND ONLY JSON BEFORE IT. The extractor reads a tag's
- * body up to the first `</tool_call>` too. Prose between an opening shape and a
- * closing tag it names — "write `<tool_call>{"name": "x"` and end it with
- * `</tool_call>`" — does not parse, and keeps every word.
+ * THE FIRST SUCH TOKEN, AND ONLY JSON BEFORE IT. Prose between an opening shape
+ * and a closing tag it names — "write `<tool_call>{"name": "x"` and end it with
+ * `</tool_call>`" — does not parse, and keeps every word. The call read this
+ * way runs, from the JSON with its missing brackets: see {@link shortCall}.
  */
 export function shortCallEnd(text: string, start: number, short: RegExp): number {
+  return shortCall(text, start, short)?.end ?? -1;
+}
+
+/**
+ * {@link shortCallEnd}'s reading, with the call's JSON as it parsed: the text
+ * from `start` to the token, and the brackets that were missing.
+ */
+function shortCall(text: string, start: number, short: RegExp): { end: number; json: string } | undefined {
   const open: string[] = [];
   let inString = false;
   for (let at = start; at < text.length; at += 1) {
@@ -821,25 +1010,30 @@ export function shortCallEnd(text: string, start: number, short: RegExp): number
       open.push(char);
     } else if (char === '}' || char === ']') {
       open.pop();
-      if (open.length === 0) return -1;
+      if (open.length === 0) return undefined;
     } else if (open.length > 0) {
       short.lastIndex = at;
       const token = short.exec(text);
       if (!token) continue;
       const closers = open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('');
+      const json = text.slice(start, at) + closers;
       try {
-        const parsed: unknown = JSON.parse(text.slice(start, at) + closers);
-        return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? at + token[0].length : -1;
+        const parsed: unknown = JSON.parse(json);
+        return isRecord(parsed) ? { end: at + token[0].length, json } : undefined;
       } catch {
-        return -1;
+        return undefined;
       }
     }
   }
-  return -1;
+  return undefined;
 }
 
-/** A call with nothing inside it at all: `<tool_call></tool_call>`, or `[TOOL_CALLS] name()`. */
-const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*\w+\s*\(\s*\)/gi;
+/**
+ * A call with nothing inside it at all: `<tool_call></tool_call>`, which names
+ * no tool, or `[TOOL_CALLS] name()`, a call to a tool that takes no arguments.
+ * The group is that name.
+ */
+const EMPTY_CALL = /<tool_call>\s*<\/tool_call>|\[TOOL_CALLS?\]\s*(\w+)\s*\(\s*\)/gi;
 
 /** Where a Qwen3-Coder call may start: a `<tool_call>` with `<function=` after it. See {@link xmlCallEnd}. */
 export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
@@ -856,10 +1050,11 @@ export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
  *     </function>
  *     </tool_call>
  *
- * Nothing runs from this form: its body is not JSON. It is still the model's
- * call, and the lazy pattern `stripToolSyntax` replaced took it out; after that
- * the call, parameter values included, was kept as the reply's words and sent
- * back to the model.
+ * The call runs: the function is the tool, and each parameter an argument
+ * whose value is the text between its tags, one line break either side taken
+ * off, as Qwen3-Coder writes it. Its values are strings: nothing in the call
+ * says which is a number. It was only stripped, and a call the words lost
+ * never ran, and a stopped one had no record that it had not gone.
  *
  * READ BY ITS STRUCTURE, as a JSON call is by its brackets: these tags in this
  * order, with nothing but whitespace between them outside a parameter's value.
@@ -868,6 +1063,11 @@ export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
  * the structure as soon as it goes on.
  */
 export function xmlCallEnd(text: string, at: number): number | 'open' {
+  return readXmlCall(text, at).end;
+}
+
+/** {@link xmlCallEnd}'s reading, with the call it read when it is whole. */
+function readXmlCall(text: string, at: number): { end: number | 'open'; calls: WrittenCall[] } {
   let pos = at;
   /** Read `word` here, in any case: true; `'open'` when the text ends partway through it; or false. */
   const read = (word: string): boolean | 'open' => {
@@ -879,37 +1079,43 @@ export function xmlCallEnd(text: string, at: number): number | 'open' {
     return pos + piece.length === text.length && word.startsWith(piece) ? 'open' : false;
   };
   /** Read `NAME>`: a name with no space or angle bracket in it, and the `>` after it. */
-  const readName = (): boolean | 'open' => {
+  const readName = (): string | 'open' | false => {
     const name = /^[^\s<>]*/.exec(text.slice(pos))?.[0] ?? '';
     pos += name.length;
     if (pos === text.length) return 'open';
     if (name === '' || text.charAt(pos) !== '>') return false;
     pos += 1;
-    return true;
+    return name;
   };
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
-  const notACall = (step: boolean | 'open'): number | 'open' => (step === 'open' ? 'open' : -1);
+  const notACall = (step: boolean | 'open'): { end: number | 'open'; calls: WrittenCall[] } => ({
+    end: step === 'open' ? 'open' : -1,
+    calls: [],
+  });
 
   let step = read('<tool_call>');
   if (step !== true) return notACall(step);
   skipSpace();
   step = read('<function=');
   if (step !== true) return notACall(step);
-  step = readName();
-  if (step !== true) return notACall(step);
+  const name = readName();
+  if (typeof name !== 'string') return notACall(name);
+  const input: Record<string, unknown> = {};
   for (;;) {
     skipSpace();
-    if (pos === text.length) return 'open';
+    if (pos === text.length) return notACall('open');
     step = read('<parameter=');
-    if (step === 'open') return 'open';
+    if (step === 'open') return notACall('open');
     if (step === true) {
-      step = readName();
-      if (step !== true) return notACall(step);
+      const key = readName();
+      if (typeof key !== 'string') return notACall(key);
       const close = text.toLowerCase().indexOf('</parameter>', pos);
       // Its value runs to the end of the text: the call is still being written.
-      if (close === -1) return 'open';
+      if (close === -1) return notACall('open');
+      const value = text.slice(pos, close).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+      Object.defineProperty(input, key, { value, enumerable: true, writable: true, configurable: true });
       pos = close + '</parameter>'.length;
       continue;
     }
@@ -918,7 +1124,7 @@ export function xmlCallEnd(text: string, at: number): number | 'open' {
     skipSpace();
     step = read('</tool_call>');
     if (step !== true) return notACall(step);
-    return pos;
+    return { end: pos, calls: [{ name, input }] };
   }
 }
 
@@ -947,13 +1153,15 @@ const TAG_END = '</tool_call>';
  *     </tool_call>
  *
  * One or more calls, each a JSON object or array, or a name and its JSON object
- * in parens or not, with whitespace between them and nothing else. Nothing runs
- * from these: `extractTextualToolCalls` reads a tag's body as one JSON object.
- * They are still the model's calls, and a turn that offered a tool strips a tag
- * form whatever its body. The single-object form `stripToolSyntax` already
- * strips took out neither, so both calls, arguments included, were stored as
- * the reply's words and sent back to the model; the lazy
- * `<tool_call>[\s\S]*?</tool_call>` it replaced had removed them.
+ * in parens or not, with whitespace between them and nothing else. A turn that
+ * offered a tool strips a tag form whatever its body. The single-object form
+ * `stripToolSyntax` already strips took out neither, so both calls, arguments
+ * included, were stored as the reply's words and sent back to the model; the
+ * lazy `<tool_call>[\s\S]*?</tool_call>` it replaced had removed them.
+ *
+ * EACH CALL IN IT RUNS, as `extractTextualToolCalls` reads it from
+ * {@link readTaggedCalls}. They were only stripped: a call the words lost never
+ * ran, and a stopped one had no record that it had not gone.
  *
  * READ BY ITS STRUCTURE, as `xmlCallEnd` reads Qwen3-Coder's: prose naming both
  * tags has words between them that are neither a name followed by JSON nor
@@ -963,17 +1171,32 @@ const TAG_END = '</tool_call>';
  * call across the words after it.
  */
 export function taggedCallsEnd(text: string, at: number, offered: readonly string[]): number | 'open' {
+  return readTaggedCalls(text, at, offered).end;
+}
+
+/**
+ * {@link taggedCallsEnd}'s reading, with the calls it read: a name before its
+ * JSON calls that tool with the JSON as its arguments; bare JSON is a call
+ * object, or an array of them, as a tag's single object is read.
+ */
+function readTaggedCalls(
+  text: string,
+  at: number,
+  offered: readonly string[],
+): { end: number | 'open'; calls: WrittenCall[] } {
   let pos = at + '<tool_call>'.length;
-  let calls = 0;
+  let written = 0;
+  const calls: WrittenCall[] = [];
+  const reading = (end: number | 'open'): { end: number | 'open'; calls: WrittenCall[] } => ({ end, calls });
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
   for (;;) {
     skipSpace();
-    if (pos === text.length) return calls > 0 ? 'open' : -1;
+    if (pos === text.length) return reading(written > 0 ? 'open' : -1);
     const rest = text.slice(pos, pos + TAG_END.length).toLowerCase();
-    if (rest === TAG_END) return calls > 0 ? pos + TAG_END.length : -1;
-    if (pos + rest.length === text.length && TAG_END.startsWith(rest)) return calls > 0 ? 'open' : -1;
+    if (rest === TAG_END) return reading(written > 0 ? pos + TAG_END.length : -1);
+    if (pos + rest.length === text.length && TAG_END.startsWith(rest)) return reading(written > 0 ? 'open' : -1);
 
     CALL_NAME.lastIndex = pos;
     const name = CALL_NAME.exec(text)?.[0];
@@ -987,30 +1210,35 @@ export function taggedCallsEnd(text: string, at: number, offered: readonly strin
         skipSpace();
       }
       // A name the text ends on is as likely a word; with its paren, a call begun.
-      if (pos === text.length) return paren ? 'open' : -1;
+      if (pos === text.length) return reading(paren ? 'open' : -1);
     }
     const opener = text.charAt(pos);
-    if (opener !== '{' && !(name === undefined && opener === '[')) return -1;
+    if (opener !== '{' && !(name === undefined && opener === '[')) return reading(-1);
+    const read = (json: string): WrittenCall[] =>
+      name === undefined ? callsInJson(looseJson(json)) : callWithArguments(name, json);
 
-    const shortEnd = shortCallEnd(text, pos, paren ? CALL_END.paren.token : CALL_END.tag.token);
-    if (shortEnd !== -1) {
-      if (!paren) return shortEnd;
-      pos = shortEnd;
-      calls += 1;
+    const shortened = shortCall(text, pos, paren ? CALL_END.paren.token : CALL_END.tag.token);
+    if (shortened) {
+      calls.push(...read(shortened.json));
+      written += 1;
+      if (!paren) return reading(shortened.end);
+      pos = shortened.end;
       continue;
     }
     const end = endOfJson(text, pos);
-    if (end === -1) return writesJson(text, pos, { tagged: name === undefined, offered }) ? 'open' : -1;
-    if (!writesJson(text, pos, { tagged: false, offered, until: end })) return -1;
+    if (end === -1) return reading(writesJson(text, pos, { tagged: name === undefined, offered }) ? 'open' : -1);
+    if (!writesJson(text, pos, { tagged: false, offered, until: end })) return reading(-1);
+    const json = text.slice(pos, end);
     pos = end;
     // Stray closing brackets are the call's, as the single-object form reads them.
     while (pos < text.length && /[\s}\]]/.test(text.charAt(pos))) pos += 1;
     if (paren) {
-      if (pos === text.length) return 'open';
-      if (text.charAt(pos) !== ')') return -1;
+      if (pos === text.length) return reading('open');
+      if (text.charAt(pos) !== ')') return reading(-1);
       pos += 1;
     }
-    calls += 1;
+    calls.push(...read(json));
+    written += 1;
   }
 }
 
@@ -1034,6 +1262,11 @@ export function taggedCallsEnd(text: string, at: number, offered: readonly strin
  * whole, by its structure: see {@link xmlCallEnd}. An unfinished call has no
  * end, and is left for the caller: see `wordsWithoutCalls` in `state/chat.ts`.
  *
+ * WHAT IS STRIPPED IS WHAT `extractTextualToolCalls` READS: both take the
+ * markup `callMarkup` finds. A call the words lose runs in a finished turn, and
+ * is recorded as not sent in a stopped one or past the round limit — unless it
+ * names no tool, when there is nothing to run or record.
+ *
  * `offered` is what the turn's request offered, as {@link callNames} gives it.
  * A fenced block is stripped only when it names one of those — the call
  * `extractTextualToolCalls` would have read and run — and is an example
@@ -1052,39 +1285,11 @@ export function stripToolSyntax(
   { offered, ran }: { readonly offered: readonly string[]; readonly ran: boolean },
 ): string {
   if (offered.length === 0 && !ran) return text.trim();
-  const spans: [number, number][] = [];
-  for (const { open, close, short, fenced } of CALL_SHAPES) {
-    if (fenced && offered.length === 0) continue;
-    for (const match of text.matchAll(open)) {
-      const from = match.index + match[0].length;
-      // A closing bracket too few, ended by its tag or paren: read before the
-      // JSON's end, which a later brace in the text can supply. See `shortCallEnd`.
-      const shortEnd = short ? shortCallEnd(text, from, short) : -1;
-      if (shortEnd !== -1) {
-        spans.push([match.index, shortEnd]);
-        continue;
-      }
-      const end = endOfJson(text, from);
-      if (end === -1) continue;
-      const closing = close.exec(text.slice(end));
-      if (!closing || (fenced && fencedCall(text.slice(from, end), offered) === undefined)) continue;
-      spans.push([match.index, end + closing[0].length]);
-    }
-  }
-  for (const match of text.matchAll(EMPTY_CALL)) spans.push([match.index, match.index + match[0].length]);
-  for (const match of text.matchAll(XML_CALL_OPENING)) {
-    const end = xmlCallEnd(text, match.index);
-    if (end !== 'open' && end !== -1) spans.push([match.index, end]);
-  }
-  for (const match of text.matchAll(TAG_OPENING)) {
-    const end = taggedCallsEnd(text, match.index, offered);
-    if (end !== 'open' && end !== -1) spans.push([match.index, end]);
-  }
-
-  spans.sort((a, b) => a[0] - b[0]);
+  // The markup `extractTextualToolCalls` reads its calls from: see `callMarkup`.
+  const spans = callMarkup(text, offered).sort((a, b) => a.start - b.start);
   let out = '';
   let at = 0;
-  for (const [start, end] of spans) {
+  for (const { start, end } of spans) {
     if (start > at) out += text.slice(at, start);
     at = Math.max(at, end);
   }

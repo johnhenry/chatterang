@@ -1715,7 +1715,9 @@ describe('words a model writes before a tool call that runs, when the follow-up 
 });
 
 describe('a finished reply that is only a malformed <tool_call>', () => {
-  it('stores and sends back none of its markup or arguments', async () => {
+  // Read past its trailing comma, it is the call it names, and it runs: the
+  // stripper took it out of the words, and a call the words lose is a call.
+  it('runs it, and stores and sends back none of its markup or arguments', async () => {
     const id = 'r1_malformed_call';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const malformed = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a",}}</tool_call>';
@@ -1731,11 +1733,14 @@ describe('a finished reply that is only a malformed <tool_call>', () => {
     }
 
     const last = assistantRows(id)[1]!;
-    expect(last.toolCalls, 'no tool ran').toBeUndefined();
-    expect({ content: last.content, stopped: last.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(last.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect({ content: last.content, stopped: last.stopped }, 'the stored reply').toEqual({
+      content: 'Next.',
+      stopped: undefined,
+    });
     expect(refusals()).toEqual([]);
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
 
@@ -2152,8 +2157,10 @@ describe('a call written with one closing brace too many', () => {
     ['a [TOOL_CALLS] call', 'Let me look. [TOOL_CALLS] leaky({"path": "canary-7f3a"}})'],
   ] as const;
 
+  // Each is the call it names, and runs: see "a call in a shape the stripper
+  // took out and the reader did not read".
   for (const [form, text] of CASES) {
-    it(`in ${form} after words: a finished reply stores and sends back none of it`, async () => {
+    it(`in ${form} after words: a finished reply runs it, and stores and sends back none of it`, async () => {
       const id = `r2_extra_brace_${form.length}`;
       given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
       const local = recordingBackend([text, 'Next.']);
@@ -2168,13 +2175,13 @@ describe('a call written with one closing brace too many', () => {
       }
 
       const stored = assistantRows(id)[1]!;
-      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
-      expect(stored.content, 'the stored reply').toBe('Let me look.');
-      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+      expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+      expect(stored.content, 'the stored reply').toBe('Let me look.\n\nNext.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
     });
   }
 
-  it('that was all a finished reply wrote: stores and sends back none of it', async () => {
+  it('that was all a finished reply wrote: runs it, and stores and sends back none of it', async () => {
     const id = 'r2_extra_brace_only';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const local = recordingBackend(['<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}}}</tool_call>', 'Next.']);
@@ -2189,9 +2196,13 @@ describe('a call written with one closing brace too many', () => {
     }
 
     const stored = assistantRows(id)[1]!;
-    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    expect(stored.toolCalls?.map((call) => call.name), 'the call that ran').toEqual(['leaky']);
+    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: 'Next.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 
   it('stopped before its closing tag: keeps only the words before it', async () => {
@@ -2216,7 +2227,7 @@ describe('a call written with one closing brace too many', () => {
 describe('a Qwen3-Coder <tool_call> with an XML body', () => {
   const XML_CALL = '<tool_call>\n<function=leaky>\n<parameter=path>\ncanary-7f3a\n</parameter>\n</function>\n</tool_call>';
 
-  it('after words: a finished reply stores and sends back none of it', async () => {
+  it('after words: a finished reply runs it, and stores and sends back none of it', async () => {
     const id = 'r2_xml_finished';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const local = recordingBackend([`Let me check.\n${XML_CALL}`, 'Next.']);
@@ -2231,9 +2242,10 @@ describe('a Qwen3-Coder <tool_call> with an XML body', () => {
     }
 
     const stored = assistantRows(id)[1]!;
-    expect(stored.content, 'the stored reply').toBe('Let me check.');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect(stored.content, 'the stored reply').toBe('Let me check.\n\nNext.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 
   it('stopped inside a parameter: keeps only the words before it', async () => {
@@ -2414,14 +2426,14 @@ describe('a fenced call wrapped in <tool_call> tags, stopped on its closing fenc
 /* ── Round 3: a call with a closing brace too few ───────────────────── */
 
 /**
- * A call with one closing brace too few, ended by its closing tag. Its JSON does
- * not parse, so it runs nothing; its JSON never closes, so it was read as a call
- * still being written, and everything after it was cut.
+ * A call with one closing brace too few, ended by its closing tag. Its JSON never
+ * closes, so it was read as a call still being written, and everything after it
+ * was cut. Read with the missing brace, it is the call it names, and runs.
  */
 const SHORT_BRACE = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}</tool_call>';
 
 describe('a call written with a closing brace too few', () => {
-  it('between words: a finished reply keeps the words after it, and stores and sends none of the call', async () => {
+  it('between words: a finished reply runs it, keeps the words after it, and stores and sends none of the call', async () => {
     const id = 'r3_short_brace_finished';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const local = recordingBackend([`Let me look.\n${SHORT_BRACE}\nI have asked for your notes; one moment.`, 'Next.']);
@@ -2436,10 +2448,10 @@ describe('a call written with a closing brace too few', () => {
     }
 
     const stored = assistantRows(id)[1]!;
-    expect(stored.toolCalls, 'no tool ran').toBeUndefined();
-    expect(stored.content, 'the stored reply').toBe('Let me look.\n\nI have asked for your notes; one moment.');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
-    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect(stored.content, 'the stored reply').toBe('Let me look.\n\nI have asked for your notes; one moment.\n\nNext.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 
   for (const [before, expected] of [
@@ -2461,7 +2473,7 @@ describe('a call written with a closing brace too few', () => {
       }
 
       const ran = assistantRows(id)[1]!;
-      expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(ran.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
       expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
         content: expected,
         stopped: undefined,
@@ -2492,7 +2504,7 @@ describe('a call written with a closing brace too few', () => {
       toolRegistry.unregister(leakyTool.id);
     }
 
-    expect(stopped?.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(stopped?.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
     expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
       content: 'They mention a pass',
       stopped: undefined,
@@ -2564,7 +2576,7 @@ describe('a finished tool turn whose calling round ended inside a second call', 
     }
 
     const ran = assistantRows(id).at(-1)!;
-    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
     expect(ran.content, 'the stored reply').toBe(
       'Let me look.\n\nI have asked for your notes.\n\nThey mention a passphrase.',
     );
@@ -2892,15 +2904,16 @@ describe('a local turn whose stream died mid-reasoning, diverted to the cloud fa
 });
 
 describe('a <tool_call> whose body is calls, but not one JSON object', () => {
-  for (const [form, call] of [
+  for (const [form, call, inputs] of [
     [
       'two call objects',
       '<tool_call>\n{"name":"leaky","arguments":{"path":"a.md"}}\n{"name":"leaky","arguments":{"path":"canary-7f3a"}}\n</tool_call>',
+      [{ path: 'a.md' }, { path: 'canary-7f3a' }],
     ],
-    ['a name and its arguments in parens', '<tool_call>leaky({"path":"canary-7f3a"})</tool_call>'],
-    ['a name on its own line and its JSON', '<tool_call>\nleaky\n{"path": "canary-7f3a"}\n</tool_call>'],
+    ['a name and its arguments in parens', '<tool_call>leaky({"path":"canary-7f3a"})</tool_call>', [{ path: 'canary-7f3a' }]],
+    ['a name on its own line and its JSON', '<tool_call>\nleaky\n{"path": "canary-7f3a"}\n</tool_call>', [{ path: 'canary-7f3a' }]],
   ] as const) {
-    it(`${form}: a finished reply stores and sends back none of it`, async () => {
+    it(`${form}: a finished reply runs each call, and stores and sends back none of it`, async () => {
       const id = `r4_tag_body_${form.length}`;
       given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
       const local = recordingBackend([`Reading it.\n${call}`, 'Next.']);
@@ -2915,10 +2928,10 @@ describe('a <tool_call> whose body is calls, but not one JSON object', () => {
       }
 
       const stored = assistantRows(id)[1]!;
-      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
-      expect(stored.content, 'the stored reply').toBe('Reading it.');
-      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
-      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+      expect(stored.toolCalls?.map((ran) => ran.input), 'the calls that ran').toEqual(inputs);
+      expect(stored.content, 'the stored reply').toBe('Reading it.\n\nNext.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
     });
   }
 
@@ -3599,4 +3612,116 @@ describe('a turn stopped inside a single-quoted tag call that holds Python’s T
       expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
     });
   }
+});
+
+/* ── What the stripper takes out as a call is read as one ───────────── */
+
+describe('a call in a shape the stripper took out and the reader did not read', () => {
+  // The stripper takes a call out of the words in more shapes than the reader
+  // read: a <tool_call> holding several calls, an array of them, Qwen3-Coder's
+  // XML, a name before its JSON, and a body with a trailing comma or a closing
+  // brace too many or too few. The reader read a tag's body only as one strict
+  // JSON object followed by its closing tag. So such a call, stopped, vanished
+  // from the words with no record that it had not gone — #331 writes that
+  // record for the calls the reader reads — and finished, it was stripped and
+  // never ran: the call the model made neither ran, nor showed, nor was
+  // recorded.
+  const note = (text: string): string => `{"name": "notes.note", "arguments": {"text": "${text}"}}`;
+  const STRANDED = [
+    ['two calls in one tag', `<tool_call>\n${note('canary-1')}\n${note('canary-2')}\n</tool_call>`, 2],
+    ['an array body', `<tool_call>[${note('canary-7f3a')}]</tool_call>`, 1],
+    [
+      'an XML body',
+      '<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-7f3a\n</parameter>\n</function>\n</tool_call>',
+      1,
+    ],
+    ['a name before its JSON', '<tool_call>notes.note({"text": "canary-7f3a"})</tool_call>', 1],
+    ['a trailing comma', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"},}</tool_call>', 1],
+    ['a closing brace too many', `<tool_call>${note('canary-7f3a')}}</tool_call>`, 1],
+    ['a closing brace too few', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}</tool_call>', 1],
+  ] as const;
+
+  for (const [shape, call, count] of STRANDED) {
+    it(`${shape}, Stop caught complete: is recorded as not sent, and none of it is stored or sent back (refs #293)`, async () => {
+      const id = `rv6_stranded_${shape.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n${call}\nWaiting`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'Waiting', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual(
+        Array.from({ length: count }, () =>
+          expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+        ),
+      );
+      expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary');
+    });
+  }
+
+  const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+  for (const [shape, call, outputs] of [
+    ['two calls in one tag', `<tool_call>\n${calc('6*7')}\n${calc('6*8')}\n</tool_call>`, ['6*7 = 42', '6*8 = 48']],
+    ['an array body', `<tool_call>[${calc('6*7')}, ${calc('6*8')}]</tool_call>`, ['6*7 = 42', '6*8 = 48']],
+    [
+      'an XML body',
+      '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>\n</function>\n</tool_call>',
+      ['6*7 = 42'],
+    ],
+    ['a name before its JSON', '<tool_call>calculate({"expression": "6*7"})</tool_call>', ['6*7 = 42']],
+    ['a trailing comma', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"},}</tool_call>', ['6*7 = 42']],
+    ['single quotes', "<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7'}}</tool_call>", ['6*7 = 42']],
+    ['a closing brace too many', `<tool_call>${calc('6*7')}}</tool_call>`, ['6*7 = 42']],
+    ['a closing brace too few', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}</tool_call>', ['6*7 = 42']],
+    ['a [TOOL_CALLS] call with a closing brace too many', '[TOOL_CALLS] calculate({"expression": "6*7"}})', ['6*7 = 42']],
+  ] as const) {
+    it(`${shape}, finished: runs, and the reply keeps none of it`, async () => {
+      const id = `rv6_finished_${shape.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(outputs);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nIt is 42.');
+    });
+  }
+
+  it('two calls in one tag, past the round limit: each is recorded as not sent (refs #293)', async () => {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const local = recordingBackend([`<tool_call>\n${note('a')}\n${note('b')}\n</tool_call>`]);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.replace(QWEN.engine, local.adapter as never);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file notes until I say stop' }],
+          target: ON_DEVICE,
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+
+      const receipts = events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt] : []));
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(8);
+      expect(receipts.slice(8), 'the last round’s calls').toEqual([
+        expect.objectContaining({ outcome: 'withheld', why: 'round-limit' }),
+        expect.objectContaining({ outcome: 'withheld', why: 'round-limit' }),
+      ]);
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
 });

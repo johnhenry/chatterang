@@ -194,16 +194,16 @@ describe('extractTextualToolCalls', () => {
     ]);
     // What the stripper takes out is what was read.
     expect(stripToolSyntax(`Ok.${text}Done.`)).toBe('Ok.Done.');
-    // An object the tag's JSON goes on past is not the call: nothing runs from
-    // it, and nothing runs from a tag inside it either. The stripper takes the
-    // whole out as one malformed call.
-    for (const malformed of [
-      '<tool_call>{"name":"calculate","arguments":{}} {"name":"calculate","arguments":{}}</tool_call>',
-      '<tool_call>{"name":"calculate","arguments":{}, "then": <tool_call>{"name":"calculate","arguments":{}}</tool_call>}</tool_call>',
-    ]) {
-      expect(extractTextualToolCalls(malformed), malformed).toEqual([]);
-      expect(stripToolSyntax(`Ok.${malformed}Done.`), malformed).toBe('Ok.Done.');
-    }
+    // Two calls in one tag are two calls, read as the stripper takes them out.
+    const two = '<tool_call>{"name":"calculate","arguments":{}} {"name":"calculate","arguments":{}}</tool_call>';
+    expect(extractTextualToolCalls(two), two).toHaveLength(2);
+    expect(stripToolSyntax(`Ok.${two}Done.`), two).toBe('Ok.Done.');
+    // An object that is not JSON is not a call, and nothing runs from a tag
+    // inside it either. The stripper takes the whole out as one malformed call.
+    const malformed =
+      '<tool_call>{"name":"calculate","arguments":{}, "then": <tool_call>{"name":"calculate","arguments":{}}</tool_call>}</tool_call>';
+    expect(extractTextualToolCalls(malformed), malformed).toEqual([]);
+    expect(stripToolSyntax(`Ok.${malformed}Done.`), malformed).toBe('Ok.Done.');
   });
 
   it('reads no call in reasoning the round closed, nor, when stopped, in reasoning still open', () => {
@@ -257,10 +257,47 @@ describe('stripToolSyntax', () => {
     ).toBe('AB');
   });
 
-  it('strips a malformed call, which runs nothing and is still plumbing', () => {
+  it('strips a malformed call, which is still plumbing, and reads the call it names', () => {
     expect(stripToolSyntax('<tool_call>{"name": "leaky", "arguments": {"path": "x",}}</tool_call>')).toBe('');
     expect(stripToolSyntax('Ok [TOOL_CALLS] calculate({expression: 2}) end')).toBe('Ok  end');
     expect(stripToolSyntax('Ok <tool_call></tool_call> [TOOL_CALLS] now() end')).toBe('Ok   end');
+    expect(
+      extractTextualToolCalls(
+        'A <tool_call>{"name": "leaky", "arguments": {"path": "x",}}</tool_call> [TOOL_CALLS] calculate({expression: 2}) <tool_call></tool_call> [TOOL_CALLS] now()',
+      ).map((call) => [call.name, call.input]),
+    ).toEqual([
+      ['leaky', { path: 'x' }],
+      ['calculate', { expression: 2 }],
+      ['now', {}],
+    ]);
+  });
+
+  it('reads every call it strips, in every shape, so a call the words lose is a call', () => {
+    const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+    for (const [text, inputs] of [
+      [`<tool_call>${calc('1')}</tool_call>`, [{ expression: '1' }]],
+      [`<tool_call>\n${calc('1')}\n${calc('2')}\n</tool_call>`, [{ expression: '1' }, { expression: '2' }]],
+      [`<tool_call>[${calc('1')}, ${calc('2')}]</tool_call>`, [{ expression: '1' }, { expression: '2' }]],
+      [`<tool_call>${calc('1')}}</tool_call>`, [{ expression: '1' }]],
+      ['<tool_call>{"name": "calculate", "arguments": {"expression": "1"}</tool_call>', [{ expression: '1' }]],
+      ["<tool_call>{'name': 'calculate', 'arguments': {'expression': '1', 'exact': True}}</tool_call>", [{ expression: '1', exact: true }]],
+      ['<tool_call>{name: "calculate", arguments: {expression: "1", note: None,},}</tool_call>', [{ expression: '1', note: null }]],
+      ['<tool_call>calculate({"expression": "1"})</tool_call>', [{ expression: '1' }]],
+      ['<tool_call>\ncalculate\n{"expression": "1"}\n</tool_call>', [{ expression: '1' }]],
+      ['<tool_call>\n<function=calculate>\n<parameter=expression>\n1 + 2\n</parameter>\n</function>\n</tool_call>', [{ expression: '1 + 2' }]],
+      [`<tool_call>\n\`\`\`json\n${calc('1')}\n\`\`\`\n</tool_call>`, [{ expression: '1' }]],
+      ['[TOOL_CALLS] calculate({"expression": "1"}})', [{ expression: '1' }]],
+      ['[TOOL_CALLS] calculate({"expression": "a })"})', [{ expression: 'a })' }]],
+      ['[tool calculate({"expression": "1"}})]', [{ expression: '1' }]],
+    ] as const) {
+      expect(stripToolSyntax(`Ok.\n${text}\nDone.`), text).toBe('Ok.\n\nDone.');
+      expect(extractTextualToolCalls(text).map((call) => call.input), text).toEqual(inputs);
+    }
+    // Markup that names no tool is still stripped, and holds no call to read.
+    for (const text of ['<tool_call></tool_call>', '<tool_call>{not json}</tool_call>', '<tool_call>{"arguments": {}}</tool_call>']) {
+      expect(stripToolSyntax(`Ok.\n${text}\nDone.`), text).toBe('Ok.\n\nDone.');
+      expect(extractTextualToolCalls(text), text).toEqual([]);
+    }
   });
 
   it('strips a call written with a closing bracket too many, in each tag form', () => {
