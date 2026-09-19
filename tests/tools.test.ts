@@ -428,6 +428,33 @@ describe('cutUnfinishedCall', () => {
     expect(cut('Ok.\n<tool_call>{"name": "calculate", "arguments": {"expression": 1.5e')).toBe('Ok.\n');
   });
 
+  it('cuts a tag call the text ends inside whose body is single-quoted, has unquoted keys, or is an array', () => {
+    for (const call of [
+      "<tool_call>{'name': 'calculate', 'arguments': {'expression': 'one plus",
+      '<tool_call>{name: "calculate", arguments: {expression: "one plus',
+      '<tool_call>[{"name": "calculate", "arguments": {"expression": "one plus',
+      "<tool_call>[{'name': 'calculate', 'arguments': {'expression': 'one plus",
+      "<tool_call>\n```json\n{'name': 'calculate', 'arguments': {'expression': 'one plus",
+    ]) {
+      expect(cut(`Ok.\n${call}`, true), call).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`), `${call} (finished)`).toBe('Ok.\n');
+    }
+  });
+
+  it('keeps prose after a tag whose words are not such a body being written', () => {
+    for (const prose of [
+      "Qwen's <tool_call>{ isn't how it's done here.",
+      'Its body is <tool_call>{name} with the name filled in.',
+      "It can be <tool_call>['a', 'b'] or an object.",
+      "A call opens <tool_call>{' and then its name.",
+      'Some models start each call with <tool_call>{name: " and the tool name follows.',
+      'Some models start each call with <tool_call>[{"name": " and the tool name follows.',
+    ]) {
+      expect(cut(prose), prose).toBe(prose);
+      expect(cut(prose, true), `${prose} (stopped)`).toBe(prose);
+    }
+  });
+
   it('cuts a call cut off in a name with a space in it that a tool offered has', () => {
     const offered = ['mcp:My Notes.note', 'My Notes.note'];
     expect(cutUnfinishedCall('Ok.\n<tool_call>{"name": "My No', { stopped: true, offered })).toBe('Ok.\n');

@@ -450,21 +450,28 @@ const CALL_OPENED_AT_END =
   /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*\w+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
- * A call's opening shape with its arguments begun: `<tool_call>` and the `{"`
- * a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and a
- * `{`. The match ends where the arguments' `{` starts.
+ * A call's opening shape with its arguments begun: `<tool_call>` and the `{`
+ * or `[` a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and
+ * a `{`. The match ends where the arguments' `{` or `[` starts.
  *
- * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the same
- * `{"`. Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`.
- * One whose body is a name and its JSON opens `<tool_call>`, the name, and a
- * `(` or `{`: see `taggedCallsEnd`. This app's own rendering opens `[tool`,
- * the name, `(` and a `{`: see `APP_CALL_OPENING`.
+ * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and a `{`.
+ * Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`. One
+ * whose body is a name and its JSON opens `<tool_call>`, the name, and a `(` or
+ * `{`: see `taggedCallsEnd`, which reads an array of calls too. This app's own
+ * rendering opens `[tool`, the name, `(` and a `{`: see `APP_CALL_OPENING`.
  *
- * The quote is spelled `\x22`, and a fence's backtick `\x60`: the source scans
- * in tests/support/source-scan.ts read a bare one in a regex literal as the
- * start of a string.
+ * NOT ONLY `{"`. A small model's call is often single-quoted, leaves its keys
+ * unquoted, or is an array of calls, and the opening this read — the `{"` of
+ * strict JSON — let a turn stopped inside any of them keep the call, its
+ * arguments stored and sent back. Whether what follows is a call being written
+ * or prose naming the tag is {@link writesJson}'s question, which reads a
+ * single-quoted string and an unquoted key as a call's own.
+ *
+ * A fence's backtick is spelled `\x60`: the source scans in
+ * tests/support/source-scan.ts read a bare one in a regex literal as the start
+ * of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=\{\s*\x22)|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{\s*\x22)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*\w+\s*\(\s*(?=\{)|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -513,7 +520,13 @@ const ARGUMENT_KEYS: ReadonlySet<string> = new Set(['arguments', 'parameters', '
  *
  * `tagged` is a tag form's JSON, whose top-level keys are the call's own and
  * whose `name` names a tool. Neither holds a space, unless the name is the start
- * of an offered tool's that does (an MCP server's name can).
+ * of an offered tool's that does (an MCP server's name can). The call's own
+ * object is the top-level one, or one in a top-level array of calls.
+ *
+ * A STRING MAY BE SINGLE-QUOTED, AND A KEY UNQUOTED, as a small model writes
+ * them. Read as JSON's strings alone, a call written `{'name': 'notes.note',
+ * 'arguments': {'text': '…` was not a call being written, and a turn stopped
+ * inside one kept it, its arguments stored and sent back.
  *
  * THE BRACES AND QUOTES ALONE CANNOT TELL A CALL FROM PROSE. A finished reply
  * explaining how to parse a call — "look for the prefix `[TOOL_CALLS]
@@ -538,17 +551,20 @@ function writesJson(
 ): boolean {
   /** Each bracket still open: an object reading a key, or reading the value of `naming` one; or an array. */
   const containers: { readonly object: boolean; key: boolean; naming: boolean }[] = [];
+  /** Whether the object on top is the call's own: at the top level, or in a top-level array of calls. */
+  const callsOwn = (): boolean =>
+    containers.length === 1 || (containers.length === 2 && containers[0]?.object === false);
   let at = start;
   while (at < until) {
     const char = text.charAt(at);
     const top = containers.at(-1);
     if (/\s/.test(char)) {
       at += 1;
-    } else if (char === '"') {
+    } else if (char === '"' || char === "'") {
       let end = at + 1;
-      while (end < until && text.charAt(end) !== '"') end += text.charAt(end) === '\\' ? 2 : 1;
+      while (end < until && text.charAt(end) !== char) end += text.charAt(end) === '\\' ? 2 : 1;
       const body = text.slice(at + 1, end);
-      const ownWord = tagged && containers.length === 1 && top !== undefined && (top.key || top.naming);
+      const ownWord = tagged && callsOwn() && top !== undefined && top.object && (top.key || top.naming);
       if (ownWord && /\s/.test(body) && !offered.some((name) => name.startsWith(body))) return false;
       if (top?.object && top.key) top.naming = NAMING_KEYS.has(body);
       at = end + 1;
@@ -576,6 +592,8 @@ function writesJson(
       at += word.length;
       AFTER_KEY.lastIndex = at;
       if (!JSON_WORD.test(word) && at < until && !AFTER_KEY.test(text)) return false;
+      // An unquoted key names the tool as a quoted one does.
+      if (top?.object && top.key) top.naming = NAMING_KEYS.has(word);
     }
   }
   return true;

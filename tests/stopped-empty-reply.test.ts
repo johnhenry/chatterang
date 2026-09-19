@@ -3133,6 +3133,43 @@ describe('a real <tool_call> after words that name the tag, in a chat with its t
   }
 });
 
+/* ── Round 6: a stopped tag call whose body is not strict JSON ──────── */
+
+describe('a turn stopped inside a tag call whose body is not strict JSON', () => {
+  // A small model's call is often single-quoted, leaves its keys unquoted, or
+  // wraps its calls in an array. The cut read a tag call's body only when it
+  // opened `{"`, so a stopped turn kept every such call, its arguments stored
+  // and sent back to the model.
+  for (const [form, body] of [
+    ['single-quoted', "{'name': 'notes.note', 'arguments': {'text': 'canary-7f3a"],
+    ['unquoted keys', '{name: "notes.note", arguments: {text: "canary-7f3a'],
+    ['an array', '[{"name": "notes.note", "arguments": {"text": "canary-7f3a'],
+  ] as const) {
+    it(`${form}: keeps the words before it, and sends none of it back`, async () => {
+      const id = `r6_loose_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n<tool_call>${body}`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+});
+
 /* ── Round 6: a follow-up recounting the call its history shows ─────── */
 
 const { sanitiseMessages } = await import('@/ai/prompt');
