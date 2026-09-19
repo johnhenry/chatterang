@@ -450,6 +450,16 @@ describe('cutUnfinishedCall', () => {
     }
   });
 
+  it('cuts a single-quoted tag call the text ends inside that holds Python’s True, False or None', () => {
+    for (const literal of ['True', 'False', 'None']) {
+      const call = `<tool_call>{'name': 'calculate', 'arguments': {'exact': ${literal}, 'expression': 'one plus`;
+      expect(cut(`Ok.\n${call}`, true), call).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`), `${call} (finished)`).toBe('Ok.\n');
+    }
+    const prose = "Qwen's <tool_call>{ None of this is JSON, and the app reads on.";
+    expect(cut(prose, true), prose).toBe(prose);
+  });
+
   it('keeps prose after a tag whose words are not such a body being written', () => {
     for (const prose of [
       "Qwen's <tool_call>{ isn't how it's done here.",

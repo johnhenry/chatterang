@@ -521,8 +521,13 @@ function endOfObject(text: string, start: number): number {
   return -1;
 }
 
-/** A word JSON writes bare: a number, `true`, `false` or `null`. */
-const JSON_WORD = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/;
+/**
+ * A word a call's JSON writes bare: a number, `true`, `false` or `null`, or
+ * Python's `True`, `False` or `None`, which a model writing its call as a
+ * Python dict writes in their place. Read as JSON's alone, a single-quoted call
+ * holding `True` was read as prose, and a turn stopped inside it kept it.
+ */
+const JSON_WORD = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|True|False|None)$/;
 /** Any bare word, read where {@link writesJson} finds one. */
 const BARE_WORD = /[\w.+-]+/y;
 /** A colon after a bare word, which makes it a key a small model left unquoted. */
