@@ -3001,3 +3001,63 @@ describe('a follow-up that writes a call as the app writes the call that ran in 
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 });
+
+/* ── Round 6: a stopped turn's fenced call, #331's record and the words ─ */
+
+describe('a fenced call Stop caught complete, in a turn offering its tool (refs #293)', () => {
+  // #331 reads the text a stopped stream left for calls it can record as not
+  // sent. A fenced block is a call only when it names an offered tool, and the
+  // stripper reads it with the names the request offered, so the stranded-call
+  // reading must too: read with none, the call below was stripped from the
+  // words as a call and never recorded as one. A block naming no offered tool
+  // is neither.
+  const FENCED_CALL = '```json\n{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}\n```';
+  const FENCED_EXAMPLE = '```json\n{"name": "search", "arguments": {"query": "canary-7f3a"}}\n```';
+
+  it('is recorded as not sent, stopped, and none of it is stored or sent back', async () => {
+    const id = 'r6_stranded_fenced';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `Filing it.\n\n${FENCED_CALL}\n\nThen I will`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Then I will', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      stopped?.toolCalls?.map((call) => ({ name: call.name, receipt: call.receipt })),
+      'the call Stop caught, as #331 records it',
+    ).toEqual([
+      {
+        name: 'notes.note',
+        receipt: expect.objectContaining({ outcome: 'withheld', why: 'stopped', host: 'notes.example' }),
+      },
+    ]);
+    expect(stopped?.stopped, 'a reply with words carries no marker').toBeUndefined();
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it\.\s+Then I will$/);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('naming no offered tool, is neither recorded nor stripped', async () => {
+    const id = 'r6_stranded_example';
+    const partial = `Configure it like this:\n\n${FENCED_EXAMPLE}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('what goes in the config?', 'Then restart', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'nothing recorded').toBeUndefined();
+    expect(stopped?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});

@@ -1109,9 +1109,17 @@ export class ChatterangEngine {
            * turn's own (already aborted) signal — so `runToolCalls` records
            * each one as `stopped` and none of them run (owner ruling that
            * "not sent" covers every call that did not leave).
+           *
+           * Read with the names the request offered, as a finished turn's
+           * calls are and as `stripToolSyntax` reads a fenced block: a fenced
+           * JSON block is a call only when it names an offered tool. Read with
+           * none, a stopped turn's fenced call to an offered tool was neither
+           * recorded here nor kept in the words as an example — the stripper
+           * took it out as a call — so the reply lost it and no record said
+           * it had not gone.
            */
           const strandedCalls = request.toolIds?.length
-            ? findToolCalls({ role: 'assistant', content: turn.text })
+            ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered))
             : [];
           if (strandedCalls.length > 0) {
             const batch = await runToolCalls(toolRegistry, strandedCalls, {
