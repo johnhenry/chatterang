@@ -885,14 +885,23 @@ export function unfinishedCallAt(
   /** Whether a call the text ends inside, at `where` in it, is one being written. */
   const beingWritten = (where: Unended): boolean => where === 'open' || ended !== 'model';
   let from = 0;
+  // CALLS WRITTEN WITHOUT THEIR CLOSE, EACH ENDED BY THE NEXT ONE'S OPENING (see
+  // `CALL_SHAPES`), are cut together: `chain` is where the first starts, and
+  // `next` where the opening after the last stands. Cut from the call after
+  // them alone, the last had nothing after it to end it, and was neither
+  // stripped nor cut: its arguments were stored and sent back.
+  let chain: number | undefined;
+  let next = -1;
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
+    if (match.index !== next) chain = undefined;
+    const cutFrom = chain ?? match.index;
     const open = match.index + match[0].length;
     if (text.startsWith('<', open)) {
       // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
       const end = xmlCallEnd(text, match.index);
       if (typeof end === 'string') {
-        if (beingWritten(end)) return match.index;
+        if (beingWritten(end)) return cutFrom;
         continue;
       }
       if (end !== -1) from = end;
@@ -912,7 +921,7 @@ export function unfinishedCallAt(
       // A name and its JSON inside the tag, read by its structure: see `taggedCallsEnd`.
       const end = taggedCallsEnd(text, match.index, offered);
       if (typeof end === 'string') {
-        if (beingWritten(end)) return match.index;
+        if (beingWritten(end)) return cutFrom;
         continue;
       }
       if (end !== -1) from = end;
@@ -922,7 +931,7 @@ export function unfinishedCallAt(
       // Python's keyword arguments: see `readKeywordArguments`.
       const { end } = readKeywordArguments(text, open);
       if (typeof end === 'string') {
-        if (beingWritten(end)) return match.index;
+        if (beingWritten(end)) return cutFrom;
         continue;
       }
       if (end !== -1) from = end;
@@ -936,20 +945,22 @@ export function unfinishedCallAt(
     const close = endOfObject(text, open);
     if (close === -1) {
       const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
-      if (writing && beingWritten(writing === true ? 'open' : writing)) return match.index;
+      if (writing && beingWritten(writing === true ? 'open' : writing)) return cutFrom;
       continue;
     }
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
     // a call with a brace too many, stopped before its closing tag.
     // Compared with no whitespace: a fenced call's end is a fence, a line break
     // and `</tool_call>`, and none of a call's closing tokens holds a space.
-    const rest = text.slice(close).replace(/^[\s}\]]*/, '').replace(/\s+/g, '').toLowerCase();
-    if (form.text.startsWith(rest)) return match.index;
+    const stray = /^[\s}\]]*/.exec(text.slice(close))?.[0].length ?? 0;
+    const after = text.slice(close + stray);
+    const rest = after.replace(/\s+/g, '').toLowerCase();
+    if (form.text.startsWith(rest)) return cutFrom;
     // More calls after it inside the same tag: see `taggedCallsEnd`.
     if (form === CALL_END.tag) {
       const end = taggedCallsEnd(text, match.index, offered);
       if (typeof end === 'string') {
-        if (beingWritten(end)) return match.index;
+        if (beingWritten(end)) return cutFrom;
         continue;
       }
       if (end !== -1) {
@@ -957,9 +968,20 @@ export function unfinishedCallAt(
         continue;
       }
     }
+    // Written without its close, the next call's opening right after it.
+    if (
+      (form === CALL_END.tag && /^<tool_call>/i.test(after)) ||
+      (form === CALL_END.paren && /^\[TOOL_CALLS?\]/i.test(after))
+    ) {
+      chain = cutFrom;
+      next = close + stray;
+    } else {
+      chain = undefined;
+    }
     from = close;
   }
-  return text.search(ended === 'stopped' ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
+  const at = text.search(ended === 'stopped' ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
+  return chain !== undefined && at === next ? chain : at;
 }
 
 /**
@@ -994,6 +1016,15 @@ export function cutUnfinishedCall(
  * {…}}}`, and its JSON closed a brace early and was not followed by the tag, so
  * the call and its arguments were kept as the reply's words and sent back.
  *
+ * THE NEXT CALL'S OPENING ENDS A CALL WRITTEN WITHOUT ITS CLOSE, in the tag and
+ * `[TOOL_CALLS]` forms: `<tool_call>{…}` then `<tool_call>{…}</tool_call>`, or
+ * `[TOOL_CALLS] a({…}` then `[TOOL_CALLS] b({…})`, with only whitespace and
+ * stray brackets between. A small model writing two calls leaves out the
+ * first's close, and read by a close that had to follow its JSON the first
+ * was neither read, stripped nor cut: only the second ran, and the first,
+ * arguments and all, was stored and sent back in every later request. The
+ * lazy match main stripped with took both out. Words between them are prose.
+ *
  * `short` is the token that ends a tag or paren form, for a call with a closing
  * bracket too few: see {@link shortCallEnd}. A fenced block has none, because
  * any other is a code example.
@@ -1013,7 +1044,7 @@ const CALL_SHAPES: readonly {
 }[] = [
   {
     open: /<tool_call>\s*(?=[{[])/gi,
-    close: /^[\s}\]]*<\/tool_call>/i,
+    close: /^[\s}\]]*(?:<\/tool_call>|(?=<tool_call>))/i,
     short: CALL_END.tag.token,
     read: (json) => callsInJson(looseJson(json)),
   },
@@ -1027,7 +1058,7 @@ const CALL_SHAPES: readonly {
   },
   {
     open: /\[TOOL_CALLS?\]\s*([\w.:-]+)\s*\(\s*(?=\{)/gi,
-    close: /^[\s}\]]*\)/,
+    close: /^[\s}\]]*(?:\)|(?=\[TOOL_CALLS?\]))/i,
     short: CALL_END.paren.token,
     read: (json, opening) => callWithArguments(opening[1] ?? '', json),
   },

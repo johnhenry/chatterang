@@ -4381,3 +4381,76 @@ describe('a call the model made inside reasoning it closed, with nothing after i
     expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
   });
 });
+
+describe('two calls, the first written without its closing tag or paren', () => {
+  // A small Hermes/Qwen-format model can leave out the first call's closing
+  // tag. Only the second ran, and the first, arguments and all, was stored as
+  // the reply's words and sent back in every later request; main's lazy strip
+  // took both out. The next call's opening ends the first.
+  const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+  for (const [form, calls] of [
+    ['tags', `<tool_call>\n${calc('6*7')}\n<tool_call>\n${calc('6*8')}\n</tool_call>`],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] calculate({"expression": "6*7"}\n[TOOL_CALLS] calculate({"expression": "6*8"})'],
+  ] as const) {
+    it(`${form}, finished: both run, and none of either is stored or sent back`, async () => {
+      const id = `rv8_first_unclosed_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Let me work both out.\n${calls}`, 'Both are done.', 'Next.']);
+      engineWith(local);
+
+      await useChats.getState().send('six times seven and six times eight?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42', '6*8 = 48']);
+      expect(stored.content, 'the stored reply').toBe('Let me work both out.\n\nBoth are done.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('6*7');
+    });
+  }
+
+  it('tags, Stop caught both complete: each is recorded as not sent, and none of either is stored (refs #293)', async () => {
+    const id = 'rv8_first_unclosed_stopped';
+    const gate = held();
+    const note = (text: string): string => `{"name": "notes.note", "arguments": {"text": "${text}"}}`;
+    const local = scriptedBackend([
+      { partial: `Filing both.\n<tool_call>\n${note('canary-1')}\n<tool_call>\n${note('canary-2')}\n</tool_call>\nWaiting`, stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing both\.\s+Waiting$/);
+  });
+
+  it('tags, stopped inside the second: records the first as not sent, and stores neither (refs #293)', async () => {
+    const id = 'rv8_first_unclosed_stopped_in_second';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial:
+          'Filing both.\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-1"}}\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-2',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', 'canary-2', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toBe('Filing both.');
+  });
+});

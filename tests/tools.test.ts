@@ -894,3 +894,57 @@ describe('an unfinished call, by how the text ended', () => {
     }
   });
 });
+
+describe('two calls, the first written without its closing tag or paren', () => {
+  // A small model writing two calls can leave out the first one's close. Read
+  // by a close that must follow its JSON, the first was neither read nor
+  // stripped nor cut: only the second ran, and the first, arguments and all,
+  // was stored and sent back in every later request. The lazy match main
+  // stripped with took both out. The next call's opening ends the first.
+  const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+  const FORMS = [
+    ['tags', `Let me work both out.\n<tool_call>\n${calc('6*7')}\n<tool_call>\n${calc('6*8')}\n</tool_call>`],
+    [
+      '[TOOL_CALLS]',
+      'Let me work both out.\n[TOOL_CALLS] calculate({"expression": "6*7"}\n[TOOL_CALLS] calculate({"expression": "6*8"})',
+    ],
+  ] as const;
+
+  /** A round's words as the engine and the store read them: cut where it ended, then stripped. */
+  const words = (text: string, ended: 'model' | 'cut' | 'stopped'): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+
+  it('reads both, and leaves none of either in the words, however the text ended', () => {
+    for (const [form, text] of FORMS) {
+      expect(extractTextualToolCalls(text).map((found) => found.input), form).toEqual([
+        { expression: '6*7' },
+        { expression: '6*8' },
+      ]);
+      expect(stripToolSyntax(text), form).toBe('Let me work both out.');
+      for (const ended of ['model', 'cut', 'stopped'] as const) {
+        expect(words(`${text}\nBoth are done.`, ended), `${form}, ${ended}`).toBe(
+          'Let me work both out.\n\nBoth are done.',
+        );
+        expect(words(text, ended), `${form}, ${ended}, at the end`).toBe('Let me work both out.');
+      }
+    }
+  });
+
+  it('reads the first, and cuts the second, when the text ends inside the second or on its opening', () => {
+    for (const second of ['<tool_call>{"name": "calculate", "arguments": {"expression": "6*', '<tool_call>']) {
+      const text = `Both.\n<tool_call>${calc('6*7')}\n${second}`;
+      expect(extractFrom(text, OFFERED, [], { ended: 'stopped' }).map((found) => found.input), second).toEqual([
+        { expression: '6*7' },
+      ]);
+      expect(words(text, 'stopped'), second).toBe('Both.');
+    }
+    const mistral = 'Both.\n[TOOL_CALLS] calculate({"expression": "6*7"}\n[TOOL_CALLS] calculate({"expression": "6*';
+    expect(words(mistral, 'stopped')).toBe('Both.');
+  });
+
+  it('keeps prose between a call’s JSON and a later opening', () => {
+    const prose = `Write <tool_call>${calc('6*7')} and then another <tool_call> tag after it.`;
+    expect(stripToolSyntax(prose)).toBe(prose);
+    expect(extractTextualToolCalls(prose)).toEqual([]);
+  });
+});
