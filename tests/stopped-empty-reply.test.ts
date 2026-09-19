@@ -4041,6 +4041,10 @@ describe('a reply the model ended that names a call’s opening, its value runni
     ['a keyword opening in a tag', 'A Python-style call looks like <tool_call>search(query=" and then the words to look for, a closing quote and a paren.'],
     ['a keyword opening after [TOOL_CALLS]', "Mistral's would be [TOOL_CALLS] search(query=' and then the words, a closing quote and a paren."],
     ['a JSON opening', 'Qwen writes <tool_call>{"name": "search", "arguments": {"query": " and then the words to look for.'],
+    [
+      'a JSON opening before its first key',
+      'Its arguments are an object, <tool_call>{"name": "search", "arguments": {" and then each key, its value, and a closing brace.',
+    ],
   ] as const;
 
   for (const [form, words] of PROSE) {

@@ -755,8 +755,13 @@ function writesJson(
       const ownWord = tagged && callsOwn() && top !== undefined && top.object && (top.key || top.naming);
       if (ownWord && /\s/.test(body) && !offered.some((name) => name.startsWith(body))) return false;
       // The text ends inside it: in a key, or the tool's name, which are the
-      // call's structure; or in a value, whose words can be anything.
-      if (end >= until) return (top?.object === true && top.key) || ownWord ? true : 'in-value';
+      // call's structure; or in a value, whose words can be anything. So can a
+      // key's that holds a space, as no argument's name does: "its arguments
+      // are `{"` and then each key…" is a sentence.
+      if (end >= until) {
+        const structure = (top?.object === true && top.key && !/\s/.test(body)) || ownWord;
+        return structure ? true : 'in-value';
+      }
       if (top?.object && top.key) top.naming = NAMING_KEYS.has(body);
       at = end + 1;
     } else if (char === '{' || char === '[') {

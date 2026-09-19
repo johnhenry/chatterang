@@ -817,6 +817,8 @@ describe('an unfinished call, by how the text ended', () => {
       'Qwen writes <tool_call>{"name": "search", "arguments": {"query": " and then the words.',
       'An array: <tool_call>[{"name": "search", "arguments": {"query": " and so on.',
       'Its history writes [tool calculate({"expression": " and then the sum.',
+      'Its arguments are an object, <tool_call>{"name": "search", "arguments": {" and then each key.',
+      'Mistral writes [TOOL_CALLS] search({" and then each key.',
     ]) {
       expect(cut(words, 'model'), words).toBe(words);
       for (const ended of ['cut', 'stopped'] as const) {
