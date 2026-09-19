@@ -755,11 +755,15 @@ const REASONING_CLOSE = /<\/(think|thinking|reasoning)>/i;
  * Reasoning that names a call it never finishes — `<think>A call opens
  * [TOOL_CALLS] leaky({"path": "</think>` — was taken for that call, and the cut
  * took the round's answer with it.
+ *
+ * `spans` are the blocks to blank, when the caller read them some other way
+ * than {@link reasoningSpans} reads `raw` alone: see `reasoningOutsideCalls` in
+ * ai/middleware/tools.ts.
  */
-export function maskReasoning(raw: string): string {
+export function maskReasoning(raw: string, spans: readonly (readonly [number, number])[] = reasoningSpans(raw)): string {
   let masked = '';
   let at = 0;
-  for (const [start, end] of reasoningSpans(raw)) {
+  for (const [start, end] of spans) {
     masked += raw.slice(at, start) + ' '.repeat(end - start);
     at = end;
   }
@@ -835,7 +839,12 @@ export function splitThinking(raw: string): { content: string; thinking: string;
  * ends there. Joined to what the follow-up wrote, the open tag made
  * {@link splitThinking} file the follow-up's whole answer as reasoning: the
  * reply was stored with no words and left out of every later request.
+ *
+ * `readAs` is the text whose reasoning is read, when that is not `text` itself:
+ * `text` with its finished tool calls blanked, so a reasoning tag a call's
+ * string argument names is not reasoning left open. See
+ * `closeReasoningOutsideCalls` in ai/middleware/tools.ts.
  */
-export function closeReasoning(text: string): string {
-  return splitThinking(text).open ? `${text}</think>` : text;
+export function closeReasoning(text: string, readAs: string = text): string {
+  return splitThinking(readAs).open ? `${text}</think>` : text;
 }

@@ -948,3 +948,35 @@ describe('two calls, the first written without its closing tag or paren', () => 
     expect(extractTextualToolCalls(prose)).toEqual([]);
   });
 });
+
+describe('a call whose string argument names a reasoning tag', () => {
+  // A `<think>` inside a finished call's string is the argument's words. Read
+  // as reasoning opening there, it ran to the end of the round: a call after it
+  // was taken for one drafted in reasoning, and a round cut short was cut from
+  // the call's opening, every word after it with it.
+  const noted = (expression: string): string =>
+    `<tool_call>{"name": "calculate", "arguments": {"expression": "${expression}", "note": "<think> is where I reason"}}</tool_call>`;
+  const words = (text: string, ended: 'model' | 'cut' | 'stopped'): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+
+  it('is read as a call, and so is a call after it, however the round ended', () => {
+    const text = `${noted('6*7')}\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*8"}}</tool_call>`;
+    for (const ended of ['model', 'cut', 'stopped'] as const) {
+      expect(extractFrom(text, OFFERED, [], { ended }).map((found) => found.input['expression']), ended).toEqual([
+        '6*7',
+        '6*8',
+      ]);
+    }
+  });
+
+  it('takes none of the words after it with it, however the round ended', () => {
+    for (const ended of ['model', 'cut', 'stopped'] as const) {
+      expect(words(`Ok.\n${noted('6*7')}\nDone.`, ended), ended).toBe('Ok.\n\nDone.');
+    }
+  });
+
+  it('still cuts a call the round ended inside, whose string names one', () => {
+    const text = 'Ok.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where';
+    for (const ended of ['cut', 'stopped'] as const) expect(words(text, ended), ended).toBe('Ok.');
+  });
+});

@@ -4454,3 +4454,162 @@ describe('two calls, the first written without its closing tag or paren', () => 
     expect(stopped?.content, 'the stored reply').toBe('Filing both.');
   });
 });
+
+describe('a call whose string argument names a reasoning tag', () => {
+  // A `<thinking>` inside a finished call's string is the argument's words.
+  // Read as reasoning left open, the round that wrote the call had `</think>`
+  // appended where it ended, and every reading of the streamed text split the
+  // call in two there: half of it, arguments and all, in the stored words, where
+  // the stripper could not find it. The row written as an MCP receipt came in,
+  // a stopped or failed follow-up, and a finished turn with no words of its own
+  // all stored it and sent it back — past the round limit, beside a record that
+  // said the call was withheld.
+  const TIP = 'Prompt tip: reason inside <thinking> tags. canary-7f3a';
+  const NOTE_CALL = `<tool_call>{"name": "notes.note", "arguments": {"text": "${TIP}"}}</tool_call>`;
+
+  for (const [where, after, midTurnWords, stoppedWords] of [
+    ['ending its round', '', 'Filing it.', /^Filing it\.\s+Filed it$/],
+    ['with words after it in its round', '\nOne moment.', 'Filing it.\n\nOne moment.', /^Filing it\.\s+One moment\.\s*Filed it$/],
+  ] as const) {
+    it(`${where}, sent under a grant, the follow-up stopped: the row written mid-turn and the stopped reply keep none of it`, async () => {
+      const id = `rv8_reasoning_tag_in_argument_mcp_${where.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([
+        { reply: `Filing it.\n${NOTE_CALL}${after}` },
+        { partial: 'Filed it', stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      engineWith(local);
+
+      let midTurn: Message | undefined;
+      let stopped: Message | undefined;
+      try {
+        toolRegistry.register(probe.tool);
+        const sending = useChats.getState().send('save that prompt tip to my notes');
+        await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+        midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true));
+        await until(() => (useChats.getState().messages.at(-1)?.content ?? '').includes('Filed it'));
+        useChats.getState().stop();
+        gate.release();
+        await sending;
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect({ content: midTurn?.content, thinking: midTurn?.thinking }, 'the row written mid-turn').toEqual({
+        content: midTurnWords,
+        thinking: undefined,
+      });
+      expect(stopped?.content, 'the stopped reply').toMatch(stoppedWords);
+      expect(stopped?.thinking, 'the stopped reply’s reasoning').toBeUndefined();
+      const next = JSON.stringify(local.seen.at(-1)?.messages);
+      expect(next, 'the next request').not.toContain('tool_call');
+      expect(next, 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('Stop caught it complete with a call after it: records both as not sent, and stores neither (refs #293)', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Filing both.\n${NOTE_CALL}\n<tool_call>{"name": "notes.note", "arguments": {"text": "second, canary-2"}}</tool_call>\nWaiting`,
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file two notes');
+      // The thread shows the streaming text split as it arrives, the tag in the
+      // argument included: 'Waiting' may be on screen as reasoning.
+      await until(() => {
+        const live = useChats.getState().messages.at(-1);
+        return `${live?.content ?? ''}${live?.thinking ?? ''}`.includes('Waiting');
+      });
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.input['text']), 'recorded as not sent').toEqual([
+      TIP,
+      'second, canary-2',
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing both\.\s+Waiting$/);
+  });
+
+  it('a local tool that ran, its follow-up writing nothing: stores no words and sends none of the call', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_local';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where I reason, canary-7f3a"}}</tool_call>',
+      '',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect({ content: stored.content, thinking: stored.thinking, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: '',
+      thinking: undefined,
+      stopped: false,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('a call every round to the round limit: stores none of the calls beside the one recorded as withheld (refs #293)', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_round_limit';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([NOTE_CALL]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file notes until I say stop');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((call) => call.receipt?.outcome), 'the records').toEqual([
+      'sent',
+      'sent',
+      'sent',
+      'sent',
+      'withheld',
+    ]);
+    expect(stored.content, 'the stored reply').toBe('');
+    expect(stored.thinking, 'the stored reply’s reasoning').toBeUndefined();
+  });
+
+  it('in a round cut off at its limit after words that follow it: keeps those words', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_cut';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where I reason"}}</tool_call>\nThe sum is on its way and',
+      ),
+      'It is 42.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe('Working it out.\n\nThe sum is on its way and\n\nIt is 42.');
+  });
+});

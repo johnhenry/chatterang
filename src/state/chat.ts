@@ -62,7 +62,7 @@ import type {
   TextEnding,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
-import { callNames, cutUnfinishedCall, stripToolSyntax } from '@/ai/middleware/tools';
+import { callNames, closeReasoningOutsideCalls, cutUnfinishedCall, stripToolSyntax } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1750,20 +1750,40 @@ async function runGeneration(
      * A turn's words and reasoning from text whose rounds were each cut where
      * they ended, with its finished calls read out (`wordsWithoutCalls`).
      *
-     * Reasoning is split off before the calls are read: read over the deltas
-     * whole, a `<tool_call>` the model only mentioned while reasoning was taken
-     * for an unfinished call, the cut took the closing think tag and the whole
-     * answer with it, and the reply was stored as "Stopped before its first
-     * word". A round's cut reads it with its reasoning blanked (see
-     * `maskReasoning`), so a call named there takes none of the answer.
+     * No unfinished call is read over the deltas whole: read that way, a
+     * `<tool_call>` the model only mentioned while reasoning was taken for an
+     * unfinished call, the cut took the closing think tag and the whole answer
+     * with it, and the reply was stored as "Stopped before its first word". A
+     * round's cut reads it with its reasoning blanked (see `maskReasoning`), so
+     * a call named there takes none of the answer.
+     *
+     * Its FINISHED calls are read out before its reasoning is split off, as the
+     * engine reads a round's whole, and out of the words again after: a
+     * reasoning tag a call's string argument names — a note saying "reason
+     * inside <thinking> tags" — is the argument's words. Split first, the call
+     * was cut in two there, and the half left in the words, arguments and all,
+     * could not be found by the stripper: it was stored and sent back. A
+     * finished call named in reasoning is taken out of the stored reasoning
+     * too, as the engine's reading of a finished round takes it. See
+     * `closeRaw`.
      */
     const readRounds = (text: string): { content: string; thinking: string } => {
-      const split = splitThinking(text);
+      const reading = { offered, ran: toolCalls.length > 0 };
+      const split = splitThinking(readsCalls() ? wordsWithoutCalls(text, reading) : text);
       return {
-        content: wordsWithoutCalls(split.content, { offered, ran: toolCalls.length > 0 }),
+        content: wordsWithoutCalls(split.content, reading),
         thinking: split.thinking,
       };
     };
+    /**
+     * `raw` with any reasoning a round left open closed where it ended (see
+     * `closeReasoning`), read outside its finished calls: a reasoning tag a
+     * call's string argument names is not reasoning left open, and closing it
+     * put the call's closing half in the reasoning and left the rest in the
+     * words. See `closeReasoningOutsideCalls`.
+     */
+    const closeRaw = (text: string): string =>
+      readsCalls() ? closeReasoningOutsideCalls(text, offered) : closeReasoning(text);
     /** The turn's words and reasoning read from `raw`, the round being written ending `ended`. */
     const readRaw = (ended: TextEnding): { content: string; thinking: string } =>
       readRounds(raw.slice(0, roundStart) + cutRound(raw.slice(roundStart), ended));
@@ -1795,7 +1815,7 @@ async function runGeneration(
           // The round that called it has ended, and any reasoning it left open
           // with it: what the follow-up writes is its answer, on screen and in
           // a turn stopped or killed from here on. See `closeReasoning`.
-          raw = closeReasoning(raw);
+          raw = closeRaw(raw);
           shown = closeReasoning(shown);
           toolCalls = [
             ...toolCalls,
@@ -1864,7 +1884,7 @@ async function runGeneration(
           // as reasoning while it arrived, stored with no words and shown as
           // "Stopped before its first word" when stopped, and kept as no words
           // in a failed row. See `closeReasoning`.
-          raw = closeReasoning(raw);
+          raw = closeRaw(raw);
           shown = closeReasoning(shown);
           endRound('cut');
           app.setActivity('remote');

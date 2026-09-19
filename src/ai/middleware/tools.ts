@@ -30,7 +30,7 @@ import {
   type ToolDestination,
   type WithheldWhy,
 } from '@/domain/mcp';
-import { maskReasoning, reasoningSpans } from '@/domain/chat';
+import { closeReasoning, maskReasoning, reasoningSpans } from '@/domain/chat';
 import { encodeUntrusted } from '@/ai/taint';
 import type { ChatterangTool, ToolRegistry } from '@/ai/tools/registry';
 
@@ -360,7 +360,9 @@ export function extractTextualToolCalls(
   shown: readonly ToolUseContent[],
   { ended = 'model' }: { readonly ended?: TextEnding } = {},
 ): ToolUseContent[] {
-  const spans = reasoningSpans(text, { unclosed: ended !== 'model' });
+  // Read outside its finished calls: a `<think>` a call's string argument names
+  // is that argument's words. See `reasoningOutsideCalls`.
+  const spans = reasoningOutsideCalls(text, offered, { unclosed: ended !== 'model' });
   let outside = '';
   let from = 0;
   for (const [start, stop] of spans) {
@@ -991,14 +993,63 @@ export function unfinishedCallAt(
  * {@link callNames} gives them.
  *
  * Found in its WORDS: a round's text still holds its reasoning, and a call its
- * reasoning names is not one the round was writing. See `maskReasoning`.
+ * reasoning names is not one the round was writing. See `maskReasoning`. Its
+ * reasoning is read outside its finished calls: see
+ * {@link reasoningOutsideCalls}.
  */
 export function cutUnfinishedCall(
   text: string,
   reading: { readonly ended: TextEnding; readonly offered: readonly string[] },
 ): string {
-  const at = unfinishedCallAt(maskReasoning(text), reading);
+  const at = unfinishedCallAt(maskReasoning(text, reasoningOutsideCalls(text, reading.offered)), reading);
   return at === -1 ? text : text.slice(0, at);
+}
+
+/**
+ * `text` with each finished call's markup, as `callMarkup` finds it, blanked to
+ * spaces. Every other character stays where it was.
+ */
+function blankCalls(text: string, offered: readonly string[]): string {
+  let out = '';
+  let at = 0;
+  for (const { start, end } of callMarkup(text, offered).sort((a, b) => a.start - b.start)) {
+    if (end <= at) continue;
+    const from = Math.max(start, at);
+    out += text.slice(at, from) + ' '.repeat(end - from);
+    at = end;
+  }
+  return out + text.slice(at);
+}
+
+/**
+ * Where each reasoning block in a round's text stands, as `reasoningSpans` in
+ * domain/chat.ts reads them, with each finished call's markup read as the
+ * call's own. `unclosed` is as `reasoningSpans` takes it.
+ *
+ * A REASONING TAG IN A CALL'S STRING ARGUMENT IS THE ARGUMENT'S WORDS: a note
+ * saying "reason inside <thinking> tags". Read as reasoning opening there, it
+ * ran to the end of the round. A call after it was taken for one drafted in
+ * reasoning, and not recorded when Stop caught it; a round cut short was cut
+ * from the call's opening, every word after it with it; and the store closed
+ * the "reasoning" where the round ended, which split the call in two — half
+ * of it, arguments and all, stored as the reply's words and sent back, where
+ * the stripper could not find it. See {@link closeReasoningOutsideCalls}.
+ */
+export function reasoningOutsideCalls(
+  text: string,
+  offered: readonly string[],
+  { unclosed = true }: { readonly unclosed?: boolean } = {},
+): [number, number][] {
+  return reasoningSpans(blankCalls(text, offered), { unclosed });
+}
+
+/**
+ * `closeReasoning` from domain/chat.ts, reading the reasoning outside the
+ * text's finished calls (see {@link reasoningOutsideCalls}): a reasoning tag a
+ * call's string argument names leaves no reasoning open.
+ */
+export function closeReasoningOutsideCalls(text: string, offered: readonly string[]): string {
+  return closeReasoning(text, blankCalls(text, offered));
 }
 
 /**
