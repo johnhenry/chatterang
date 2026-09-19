@@ -256,12 +256,24 @@ export function extractTextualToolCalls(text: string, offered: readonly string[]
  * example `{"tool": "search", "arguments": …}` was run and stripped the same way.
  * Neither names an offered tool, so neither is a call.
  *
- * WHATEVER OTHER KEYS IT HOLDS (the owner's ruling). A model that writes a call
- * with an `id` or a `type` beside its name and arguments is still calling the
- * tool, and requiring nothing but a name and its arguments left such a call
- * unrun and in the reply. So a FLAT tool definition naming an offered tool,
- * `{"name": "calculate", "description": …, "parameters": {…}}`, IS a call: its
- * name is an offered tool, and its `parameters` are read as the arguments.
+ * WHATEVER OTHER KEYS IT HOLDS BESIDE ITS ARGUMENTS (the owner's ruling). A
+ * model that writes a call with an `id` or a `type` beside its name and
+ * arguments is still calling the tool, and requiring nothing but a name and its
+ * arguments left such a call unrun and in the reply. So a FLAT tool definition
+ * naming an offered tool, `{"name": "calculate", "description": …,
+ * "parameters": {…}}`, IS a call: its name is an offered tool, and its
+ * `parameters` are read as the arguments.
+ *
+ * BUT A CALL CARRIES ITS ARGUMENTS — an `arguments`, `parameters` or `input`
+ * key — OR IS NOTHING BUT ITS NAME, a call to a tool that takes none. A tool's
+ * id is as plain a word as its name, and a record whose `name` is one is not a
+ * call: `{"name": "calculator", "version": "1.0.0", …}`, a package.json for a
+ * project named after the calculator tool's id, was run as a call to it and
+ * stripped from the reply the person had asked for, and so was a column
+ * definition `{"name": "datetime", "type": "timestamp"}`. A call to a tool
+ * that takes no arguments written with more keys than its name and none for
+ * arguments, `{"id": "call_0", "name": "get_datetime"}`, is read as words: the
+ * accepted cost of not running a record.
  */
 function fencedCall(
   body: string,
@@ -279,6 +291,9 @@ function fencedCall(
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
     const name = parsed.tool ?? parsed.name ?? parsed.function;
     if (typeof name !== 'string' || !offered.includes(name)) return undefined;
+    const keys = Object.keys(parsed);
+    const carriesArguments = keys.some((key) => ARGUMENT_KEYS.has(key));
+    if (!carriesArguments && !keys.every((key) => NAMING_KEYS.has(key))) return undefined;
     const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
     return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
   } catch {
@@ -394,6 +409,8 @@ const BARE_WORD = /[\w.+-]+/y;
 const AFTER_KEY = /\s*:/y;
 /** The keys a tag form's JSON names its tool by, as `extractTextualToolCalls` and `fencedCall` read them. */
 const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'tool', 'function']);
+/** The keys a fenced call carries its arguments in, as `fencedCall` reads them. */
+const ARGUMENT_KEYS: ReadonlySet<string> = new Set(['arguments', 'parameters', 'input']);
 
 /**
  * Could the text from `start`, where a call's JSON opens, to the end of the text

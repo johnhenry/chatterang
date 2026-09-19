@@ -3061,3 +3061,43 @@ describe('a fenced call Stop caught complete, in a turn offering its tool (refs 
     expect(stopped?.content, 'the words the person watched arrive').toBe(partial);
   });
 });
+
+/* ── Round 6: a record named after an offered tool is not a call ────── */
+
+describe('a JSON record whose "name" is an offered tool’s id, carrying no arguments, in a chat with that tool on', () => {
+  // The calculator's id is "calculator": a package.json for a project of that
+  // name was run as a call to it and stripped from the reply. A call carries
+  // its arguments, or is nothing but its name; a record is neither.
+  const PACKAGE = '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```';
+
+  it('is not run, and stays in a finished reply and the next request', async () => {
+    const id = 'r6_record_named_by_id';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Here is a package.json:\n\n${PACKAGE}\n\nThen run npm install.`;
+    const local = recordingBackend([text, 'Anything else?', 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('a package.json for my calculator app, please');
+    await useChats.getState().send('thanks');
+
+    const last = assistantRows(id)[1]!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+  });
+
+  it('stays whole in a reply stopped after it', async () => {
+    const id = 'r6_record_named_by_id_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is a package.json:\n\n${PACKAGE}\n\nThen run`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('a package.json for my calculator app, please', 'Then run', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls, 'no tool ran').toBeUndefined();
+    expect(stopped.content, 'the words the person watched arrive').toBe(partial);
+  });
+});

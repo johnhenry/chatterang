@@ -296,6 +296,25 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(shaped)).toBe(shaped);
   });
 
+  it('keeps a JSON record whose "name" is an offered tool’s id or name when it carries no arguments, and reads no call from it', () => {
+    for (const record of [
+      // A package.json for a project named after the calculator tool's id.
+      '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```',
+      // A column definition named after the date tool's id, and one after a tool's name.
+      '```json\n{"name": "datetime", "type": "timestamp", "nullable": false}\n```',
+      '```json\n{"name": "calculate", "type": "string"}\n```',
+    ]) {
+      expect(extractTextualToolCalls(record, [...OFFERED, 'datetime', 'get_datetime']), record).toEqual([]);
+      expect(stripToolSyntax(record, { offered: [...OFFERED, 'datetime', 'get_datetime'] }), record).toBe(record);
+    }
+    // A call to a tool that takes no arguments may be written as its name alone.
+    const bare = 'Now.\n```json\n{"name": "get_datetime"}\n```';
+    expect(extractTextualToolCalls(bare, ['datetime', 'get_datetime']).map((call) => call.name)).toEqual([
+      'get_datetime',
+    ]);
+    expect(stripToolSyntax(bare, { offered: ['datetime', 'get_datetime'] })).toBe('Now.');
+  });
+
   it('reads a flat tool definition naming an offered tool as a call to it, and a nested one as words', () => {
     // A CALL. The extractor reads a string `name` as the tool and `parameters` as
     // its arguments, and a block is a call when that name is a tool the turn
