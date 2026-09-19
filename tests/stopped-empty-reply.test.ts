@@ -3964,6 +3964,25 @@ describe('a single-quoted call whose strings hold a bracket or a double quote', 
     });
   }
 
+  it('a malformed call holding an apostrophe in a word, finished: none of it is stored or sent back', async () => {
+    // A single quote inside a word is an apostrophe, not a string's opening:
+    // read as one, it opened a string that never closed, and the malformed
+    // call, arguments and all, was kept where it had been stripped.
+    const id = 'rv7_quoted_apostrophe';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      "Working it out.\n<tool_call>{name: calculate, arguments: {note: canary-7f3a it's}}</tool_call>\nOne moment.",
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Working it out.\n\nOne moment.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
   const note = (text: string): string => `<tool_call>{'name': 'notes.note', 'arguments': {'text': '${text}'}}</tool_call>`;
   for (const [shape, call] of [
     ['a closing brace in a string', note('canary-7f3a :-}')],

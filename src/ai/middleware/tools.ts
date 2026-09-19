@@ -538,9 +538,24 @@ function stringEnd(text: string, at: number): number {
   return -1;
 }
 
-/** Whether `char` opens a string in a call's JSON: either quote. See {@link stringEnd}. */
-function opensString(char: string | undefined): boolean {
-  return char === '"' || char === "'";
+/**
+ * Whether the character at `at` opens a string in a call's JSON (see
+ * {@link stringEnd}): a double quote; or a single quote where a token starts —
+ * the start of the JSON, or after a bracket, a comma, a colon, a paren or an
+ * `=`, with only whitespace between.
+ *
+ * A SINGLE QUOTE INSIDE A WORD IS AN APOSTROPHE. Read as a string's opening,
+ * the `it's` of a malformed body, `{name: calculate, arguments: {note: it's}}`,
+ * opened a string that never closed: the call was neither stripped nor cut, and
+ * its arguments were stored and sent back, where they had been stripped.
+ */
+function opensString(text: string, at: number): boolean {
+  const char = text.charAt(at);
+  if (char === '"') return true;
+  if (char !== "'") return false;
+  let before = at - 1;
+  while (before >= 0 && /\s/.test(text.charAt(before))) before -= 1;
+  return before < 0 || /[{[,:(=]/.test(text.charAt(before));
 }
 
 /**
@@ -552,7 +567,7 @@ export function endOfJson(text: string, start: number): number {
   let depth = 0;
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (opensString(char)) {
+    if (opensString(text, at)) {
       const end = stringEnd(text, at);
       if (end === -1) return -1;
       at = end - 1;
@@ -644,7 +659,7 @@ function endOfObject(text: string, start: number): number {
   let depth = 0;
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (opensString(char)) {
+    if (opensString(text, at)) {
       const end = stringEnd(text, at);
       if (end === -1) return -1;
       at = end - 1;
@@ -1112,7 +1127,7 @@ function shortCall(text: string, start: number, short: RegExp): { end: number; j
   const open: string[] = [];
   for (let at = start; at < text.length; at += 1) {
     const char = text[at];
-    if (opensString(char)) {
+    if (opensString(text, at)) {
       const end = stringEnd(text, at);
       if (end === -1) return undefined;
       at = end - 1;

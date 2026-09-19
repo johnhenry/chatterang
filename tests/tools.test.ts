@@ -788,6 +788,26 @@ describe('a call whose single-quoted strings hold a bracket or a double quote', 
     expect(cut(whole), whole).toBe(whole);
   });
 
+  it('reads an apostrophe inside a word as one, not as a string’s opening, so a malformed call holding one is still stripped whole', () => {
+    // A single quote opens a string where a token starts. Read as one inside
+    // a word too, `it's` in a malformed body opened a string that never
+    // closed: the call was neither stripped nor cut, and its arguments were
+    // stored and sent back, where they had been stripped.
+    for (const call of [
+      "<tool_call>{name: calculate, arguments: {note: it's}}</tool_call>",
+      '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}, don\'t}</tool_call>',
+      "[TOOL_CALLS] calculate({expression: 6*7, note: it's})",
+      "<tool_call>{'name': 'calculate', 'arguments': {'note': 'it's'}}</tool_call>",
+    ]) {
+      expect(stripToolSyntax(`Ok.\n${call}\nDone.`), call).toBe('Ok.\n\nDone.');
+    }
+    // A single-quoted string still opens after a bracket, a comma or a colon.
+    expect(extractTextualToolCalls(`<tool_call>${calc("it's :-}")}</tool_call>`)).toEqual([]);
+    expect(extractTextualToolCalls(`<tool_call>${calc('a :-}')}</tool_call>`).map((call) => call.input['note'])).toEqual([
+      'a :-}',
+    ]);
+  });
+
   it('keeps prose with an apostrophe after a call’s opening', () => {
     for (const prose of [
       "Qwen's <tool_call>{ isn't JSON, and </tool_call> ends it.",
