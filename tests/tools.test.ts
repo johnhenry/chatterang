@@ -837,6 +837,8 @@ describe('an unfinished call, by how the text ended', () => {
       '[TOOL_CALLS] calculate(tags=[1, 2',
       '<tool_call>\n<function=calculate>\n<parameter=expr',
       '<tool_call>\n<function=calcul',
+      '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</param',
+      '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>\n</func',
       '<tool_call>{',
       '[TOOL_CALLS] calculate(',
     ]) {

@@ -1220,9 +1220,16 @@ function readXmlCall(text: string, at: number): { end: number | Unended; calls: 
       const key = readName();
       if (typeof key !== 'object') return notACall(key);
       const close = text.toLowerCase().indexOf('</parameter>', pos);
-      // Its value runs to the end of the text: the call is still being written,
-      // or a sentence named its opening and went on. See `unfinishedCallAt`.
-      if (close === -1) return { end: 'in-value', calls: [] };
+      if (close === -1) {
+        // Its value runs to the end of the text: the call is still being
+        // written, or a sentence named its opening and went on (see
+        // `unfinishedCallAt`). Unless the text ends inside the tag that closes
+        // it, which is the call's structure, as a JSON call's closing tag is.
+        const tag = text.lastIndexOf('<');
+        const closing =
+          tag >= pos && text.length - tag >= 2 && '</parameter>'.startsWith(text.slice(tag).toLowerCase());
+        return { end: closing ? 'open' : 'in-value', calls: [] };
+      }
       const value = text.slice(pos, close).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
       Object.defineProperty(input, key.name, { value, enumerable: true, writable: true, configurable: true });
       pos = close + '</parameter>'.length;

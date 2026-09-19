@@ -4153,6 +4153,24 @@ describe('a reply the model ended that names a call’s opening, its value runni
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
   });
 
+  it('a reply the model ended inside the tag that closes a Qwen3-Coder parameter: stores and sends none of the call', async () => {
+    // Its value is written, and the text ends in the call's structure, as a
+    // JSON call's whose arguments closed with its tag half written.
+    const id = 'rv7_xml_closing_tag';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      'Checking.\n<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7, canary-7f3a\n</param',
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
   it('a reply the model ended that spent fewer tokens than its limit: keeps every word', async () => {
     const id = 'rv7_under_limit';
     given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
