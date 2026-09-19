@@ -2776,7 +2776,11 @@ describe('a listening socket forces the privacy copy to change', () => {
  * IT IS A LEXICAL SCAN, NOT A PARSE. A green run means the spellings below are
  * absent from `apps/server/src`, not that the server owns no user data. It
  * cannot see: a registry kept by another process; one reached through a
- * wrapper, an alias, a computed name, `import()` or `require()`; a place to
+ * wrapper, an alias, a computed name, `import()` or `require()`; a file
+ * system's `open`, `link` or `cp` called on a file system held under a name
+ * that is neither a static import from `fs` nor `fs` itself — one from
+ * `import()`, `require()` or `process.getBuiltinModule()`, or one a
+ * dependency returns — which (ii) takes for someone else's; a place to
  * write handed over under a name none of (iii)'s spellings match — a layout
  * renamed or destructured on the way, a directory passed as
  * `options.directory`, a path typed out in full; what a dependency does with
@@ -2802,14 +2806,18 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
   ] as const;
 
   /**
-   * Calls that create a file or a directory. A registry kept as files under
-   * `--root` (#124) is one more of these, whatever it is named.
+   * Calls that create a file or a directory, counted wherever they are called:
+   * each name says what it does. A registry kept as files under `--root`
+   * (#124) is one more of these, or one of {@link FILE_SYSTEM_CREATES},
+   * whatever the registry is named.
    */
   const CREATES = [
     'mkdirSync',
     'mkdir',
     'mkdtempSync',
     'mkdtemp',
+    'mkdtempDisposableSync',
+    'mkdtempDisposable',
     'writeFileSync',
     'writeFile',
     'appendFileSync',
@@ -2824,6 +2832,34 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
     'symlink',
     'linkSync',
     'openSync',
+  ] as const;
+
+  /**
+   * The file system's creating calls whose names are ordinary words: `open`,
+   * counted whatever its flags, as `openSync` is; `link`; `cp`. A session's
+   * `open(` is not the file system, so these count only where the file system
+   * makes the call: a binding imported from {@link FILE_SYSTEM_MODULE}, under
+   * any local name, or a member of one or of anything named `fs`
+   * (`fsPromises.open(`, `fs.promises.cp(`, `options.fs.link(`). A
+   * {@link CREATES} name imported under another name counts the same way.
+   */
+  const FILE_SYSTEM_CREATES = ['open', 'link', 'cp'] as const;
+
+  /**
+   * What a `FileHandle` writes with (`@types/node`, `fs/promises`), counted on
+   * the name a counted `open(` was assigned to: `const handle = await
+   * open(…)`, then `handle.write(`. The open already counts. This names the
+   * write beside it, so a failure shows what was written as well as what was
+   * opened.
+   */
+  const HANDLE_WRITES = [
+    'write',
+    'writev',
+    'writer',
+    'writeFile',
+    'appendFile',
+    'createWriteStream',
+    'truncate',
   ] as const;
 
   /**
@@ -2877,8 +2913,8 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
   const REGISTRY_CHECKLIST = [
     'a paired-device registry in apps/server falsifies index.ts:15-37 and README.md:85-89; correct both in the SAME commit (#249)',
     '',
-    'apps/server now names the tunnel host’s device-credential registry, creates a file or a',
-    'directory, or hands --root, its layout or a file system to code outside apps/server, and this',
+    'apps/server now names the tunnel host’s device-credential registry, creates or opens a file or',
+    'a directory, or hands --root, its layout or a file system to code outside apps/server, and this',
     'block has not accounted for it. In the same change:',
     '',
     '  - apps/server/src/index.ts, "WHAT IT OWNS": "THE SERVER IS STATELESS WITH RESPECT TO USER',
@@ -2904,11 +2940,78 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
     );
   }
 
-  /** Every call that creates a file or a directory in one file's code. */
+  /**
+   * Every call in one file's code that creates a file or a directory, and
+   * every write through a handle a counted `open(` returned, in source order.
+   *
+   * A {@link CREATES} name counts as `name(` wherever it is called. A call the
+   * file system makes (see {@link FILE_SYSTEM_CREATES}) counts as its callee,
+   * spelled out. A call two rules see is one site.
+   */
   function creationSites(source: string): string[] {
     const code = codeOf(source);
-    return CREATES.flatMap((name) =>
-      [...code.matchAll(new RegExp(String.raw`(?<![\w$])${name}\s*\(`, 'g'))].map(() => `${name}(`),
+    // Keyed by where each call's `(` is.
+    const sites = new Map<number, string>();
+    for (const name of CREATES) {
+      for (const match of code.matchAll(new RegExp(String.raw`(?<![\w$])${name}\s*\(`, 'g'))) {
+        sites.set((match.index ?? 0) + match[0].length - 1, `${name}(`);
+      }
+    }
+
+    const fileSystems = fileSystemBindings(code);
+    const creating = new Set<string>([...CREATES, ...FILE_SYSTEM_CREATES]);
+    const calls = [
+      ...code.matchAll(
+        new RegExp(
+          String.raw`${NAME_START}([\w$]+(?:\s*\??\.\s*[\w$]+)*)\s*(?:\?\.\s*)?(?:<[^<>()]*>\s*)?\(`,
+          'g',
+        ),
+      ),
+    ].map((match) => ({
+      chain: (match[1] ?? '').replace(/[\s?]/g, '').split('.'),
+      start: match.index ?? 0,
+      paren: (match.index ?? 0) + match[0].length - 1,
+    }));
+
+    // The file system's own calls, and the names what its `open(` returned is kept under.
+    const handles = new Set<string>();
+    for (const { chain, start, paren } of calls) {
+      const receiver = chain.slice(0, -1);
+      const name =
+        receiver.length === 0
+          ? fileSystems.get(chain[0] ?? '')
+          : fileSystems.has(receiver[0] ?? '') || receiver.includes('fs')
+            ? chain.at(-1)
+            : undefined;
+      if (name === undefined || !creating.has(name)) continue;
+      if (!sites.has(paren)) sites.set(paren, `${chain.join('.')}(`);
+      if (name !== 'open') continue;
+      const kept = /(?<![\w$.])([\w$]+(?:\s*\.\s*[\w$]+)*)\s*(?::\s*[\w$.<>|\s]*)?=\s*(?:await\s+)?$/.exec(
+        code.slice(Math.max(0, start - 200), start),
+      );
+      if (kept !== null) handles.add((kept[1] ?? '').replace(/\s/g, ''));
+    }
+
+    for (const { chain, paren } of calls) {
+      const method = chain.at(-1) ?? '';
+      if (!handles.has(chain.slice(0, -1).join('.'))) continue;
+      if (!(HANDLE_WRITES as readonly string[]).includes(method)) continue;
+      if (!sites.has(paren)) sites.set(paren, `${chain.join('.')}(`);
+    }
+
+    return [...sites].sort(([a], [b]) => a - b).map(([, site]) => site);
+  }
+
+  /**
+   * One file's bindings from Node's file system, each local name mapped to the
+   * name it imports: `open` for `{ open }` and for `{ open as openFile }`,
+   * `default` for a default import, `*` for a namespace.
+   */
+  function fileSystemBindings(code: string): Map<string, string> {
+    return new Map(
+      importsOf(code)
+        .filter(({ specifier }) => FILE_SYSTEM_MODULE.test(specifier))
+        .map(({ local, imported }) => [local, imported] as const),
     );
   }
 
@@ -3149,11 +3252,7 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
     return [...sources].flatMap(([file, source]) => {
       const code = codeOf(source);
       const outside = outsideNames(file, code, reExports);
-      const fileSystems = new Set(
-        importsOf(code)
-          .filter(({ specifier }) => FILE_SYSTEM_MODULE.test(specifier))
-          .map(({ local }) => local),
-      );
+      const fileSystems = new Set(fileSystemBindings(code).keys());
       const layouts = new Set(
         [...code.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*layout\s*\(/g)].map(
           (match) => match[1] ?? '',
@@ -3294,6 +3393,19 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
       expect(main, `main.ts -> ${name}`).not.toContain(name);
     }
     expect([...outOf('tunnel-identity.ts')].sort()).toEqual(['loadOrCreateTunnelKey']);
+
+    // (ii) and (iii) read the real file-system imports, each under its local name.
+    const fileSystemsOf = (name: string): string[] =>
+      [...fileSystemBindings(codeOf(sources.get(resolve(SERVER_APP, 'src', name)) ?? ''))]
+        .map(([local, imported]) => `${local} <- ${imported}`)
+        .sort();
+    expect(fileSystemsOf('main.ts')).toEqual([
+      'existsSync <- existsSync',
+      'mkdirSync <- mkdirSync',
+      'readFileSync <- readFileSync',
+      'realpathSync <- realpathSync',
+    ]);
+    expect(fileSystemsOf('tunnel-identity.ts')).toEqual(['fsPromises <- *']);
   });
 
   it('the matchers see a registry, a write and a layout, and not a comment', () => {
@@ -3352,6 +3464,88 @@ describe('the headless server’s claim that it owns no user data (#249)', () =>
     ].join('\n');
     expect(layoutDirectories(fixture)).toEqual(['devices', 'files/data', 'files/data/models']);
     expect(layoutDirectories('function other() {}\n')).toEqual(['<no function layout( in main.ts>']);
+  });
+
+  it('(ii) sees the file system’s open, link and cp and a write through an opened handle, and not a session’s open or a response’s write', () => {
+    // The paired-device store a later change could write in apps/server
+    // itself, with the FileHandle API packages/tunnel's key store uses. Before
+    // (ii) read the file system's own `open(`, this left both pins green.
+    expect(
+      creationSites(
+        [
+          "import { open } from 'node:fs/promises';",
+          "import { join } from 'node:path';",
+          'export async function recordPairedDevice(root: string, record: PairedDeviceRecord): Promise<void> {',
+          '  const handle = await open(join(root, `paired-device-${record.id}.json`), \'wx\', 0o600);',
+          '  try {',
+          '    await handle.write(JSON.stringify(record));',
+          '  } finally {',
+          '    await handle.close();',
+          '  }',
+          '}',
+        ].join('\n'),
+      ),
+    ).toEqual(['open(', 'handle.write(']);
+
+    for (const [form, expected] of [
+      [
+        "import * as fsPromises from 'node:fs/promises';\nawait using file = await fsPromises.open(path, 'a');\nawait file.writev([head, body]);",
+        ['fsPromises.open(', 'file.writev('],
+      ],
+      [
+        "import { link, cp } from 'node:fs/promises';\nawait link(temporary, path);\nawait cp(staged, devices, { recursive: true });",
+        ['link(', 'cp('],
+      ],
+      [
+        "import fs from 'node:fs';\nfs.open(path, 'w', done);\nfs.link(temporary, path, done);\nawait fs.promises.cp(staged, devices);",
+        ['fs.open(', 'fs.link(', 'fs.promises.cp('],
+      ],
+      [
+        "import { promises as fsp } from 'node:fs';\nconst out: FileHandle = await fsp.open(path, 'wx');\nawait out.truncate(0);",
+        ['fsp.open(', 'out.truncate('],
+      ],
+      [
+        "import { open as openFile, writeFile as put } from 'node:fs/promises';\nawait openFile(path, 'wx');\nawait put(path, body);",
+        ['openFile(', 'put('],
+      ],
+      [
+        "this.handle = await options.fs?.open(path, 'wx');\nawait this.handle.write(body);",
+        ['options.fs.open(', 'this.handle.write('],
+      ],
+      [
+        "await using dir = await fsPromises.mkdtempDisposable(join(root, 'devices-'));",
+        ['mkdtempDisposable('],
+      ],
+      [
+        "const dir = mkdtempDisposableSync(join(root, 'devices-'));",
+        ['mkdtempDisposableSync('],
+      ],
+      // A creating name is one site, however many rules see it.
+      [
+        "import { mkdirSync } from 'node:fs';\nmkdirSync(directory, { recursive: true });",
+        ['mkdirSync('],
+      ],
+    ] as const) {
+      expect(creationSites(form), form).toEqual(expected);
+    }
+
+    for (const createsNothing of [
+      // apps/server's own words: a session opened on an event stream, and what it writes to.
+      "const session = routes.sessions.open({ write: (chunk) => response.write(chunk) });",
+      'open(sink: SessionSink): Session {\n  sink.write(encodeFrame(frame));\n}',
+      "process.stdout.write(`${tag} ${chunk.toString()}`);",
+      "if (!response.writableEnded) response.write(': keep-alive');",
+      // Not the file system: a local `open`, `link` and `cp`, and what a local open returns.
+      "import { link, open } from './graph.js';\nconst session = await open(sink);\nsession.write(frame);\nlink(a, b);\ncp(a, b);",
+      // The file system, but nothing created or written.
+      "import { readFile } from 'node:fs/promises';\nconst body = await readFile(path, 'utf8');",
+      "import * as fsPromises from 'node:fs/promises';\nawait fsPromises.readFile(path);\nawait fsPromises.stat(path);",
+      // A handle's write is counted only on what a counted open returned.
+      "import { open } from './sessions.js';\nconst handle = await open(sink);\nawait handle.write(frame);",
+      '// await open(join(root, "devices.json"), "wx")',
+    ]) {
+      expect(creationSites(createsNothing), createsNothing).toEqual([]);
+    }
   });
 
   it('the hand-off reader sees a place to write handed out of apps/server, and not one kept in it', () => {
