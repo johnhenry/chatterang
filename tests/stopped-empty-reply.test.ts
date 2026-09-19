@@ -3329,3 +3329,87 @@ describe('a follow-up that recounts the call its history shows, as the history s
     }
   });
 });
+
+/* ── A local round that died, the turn finished by the cloud fallback ── */
+
+describe('a local turn whose stream died after some words, finished by the cloud fallback', () => {
+  // The engine dropped the dead round's text when it diverted, so the finished
+  // reply was the cloud's round alone: the words the person had watched the
+  // local model write were gone from it, while a turn stopped or failed on the
+  // same path kept them.
+  async function divertedAndFinished(onScreen: () => boolean, dies: () => void): Promise<void> {
+    const sending = useChats.getState().send('what do my notes say?');
+    await until(onScreen);
+    dies();
+    await sending;
+  }
+
+  it('keeps the local words beside the cloud’s, and sends both back', async () => {
+    const id = 'rv6_fallback_finished_words';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: 'Checking your notes first.', stall: dies.promise }]);
+    const cloud = recordingBackend(['From the cloud: they mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    await divertedAndFinished(
+      () => useChats.getState().messages.some((message) => message.content.includes('first.')),
+      dies.release,
+    );
+    const finished = assistantRows(id).at(-1)!;
+    await useChats.getState().send('thanks');
+
+    const words = 'Checking your notes first.\n\nFrom the cloud: they mention a passphrase.';
+    expect(
+      { error: finished.error, content: finished.content, stopped: finished.stopped },
+      'the finished reply',
+    ).toEqual({ error: undefined, content: words, stopped: undefined });
+    expect(spoken(cloud.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+  });
+
+  it('keeps the reasoning the local model wrote before it died', async () => {
+    const id = 'rv6_fallback_finished_reasoning';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: '<think>The user wants a summary of', stall: dies.promise }]);
+    const cloud = recordingBackend(['Your notes mention a passphrase.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    await divertedAndFinished(
+      () => useChats.getState().messages.some((message) => (message.thinking ?? '').includes('summary of')),
+      dies.release,
+    );
+
+    const finished = assistantRows(id).at(-1)!;
+    expect({ content: finished.content, thinking: finished.thinking }, 'the finished reply').toEqual({
+      content: 'Your notes mention a passphrase.',
+      thinking: 'The user wants a summary of',
+    });
+  });
+
+  it('in a chat with a tool on, keeps the words and none of a call the local round died inside', async () => {
+    const id = 'rv6_fallback_finished_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([
+      { partial: 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a', stall: dies.promise },
+    ]);
+    const cloud = recordingBackend(['From the cloud: your notes mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      await divertedAndFinished(
+        () => useChats.getState().messages.some((message) => message.content.includes('canary-7f3a')),
+        dies.release,
+      );
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const finished = assistantRows(id)[1]!;
+    expect(finished.content, 'the finished reply').toBe('Checking.\n\nFrom the cloud: your notes mention a passphrase.');
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});

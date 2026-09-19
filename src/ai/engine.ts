@@ -200,6 +200,24 @@ function declaredTools(toolIds: readonly string[] | undefined): ChatterangTool[]
   });
 }
 
+/**
+ * The words of a round another round follows — one that called a tool, or one
+ * whose stream died before the turn diverted to the fallback — as they join the
+ * finished reply.
+ *
+ * Any call the round ended inside is cut, when it could have written one: see
+ * `cutUnfinishedCall`. Its finished calls are stripped, as the last round's are.
+ * And any reasoning it left open is closed where it ended, so the next round's
+ * words are answer, not reasoning: see `closeReasoning`.
+ *
+ * `offered` is the names a call can give, as `callNames` gives them; `ran` is
+ * whether a tool has run in the turn.
+ */
+function endedRoundWords(text: string, offered: readonly string[], ran: boolean): string {
+  const cut = offered.length > 0 || ran ? cutUnfinishedCall(text, { stopped: false, offered }) : text;
+  return closeReasoning(stripToolSyntax(cut, { offered, ran }));
+}
+
 interface TurnResult {
   text: string;
   stats: GenerationStatsSnapshot;
@@ -1158,6 +1176,14 @@ export class ChatterangEngine {
           return;
         }
 
+        // THE DEAD ROUND'S WORDS STAY IN THE ANSWER, as a tool round's do, and
+        // the fallback's follow them. They were dropped here, so a turn the
+        // fallback finished was stored as the fallback's words alone: what the
+        // person had watched the local model write was gone, while a turn
+        // stopped or failed after the divert kept it.
+        const deadWords = endedRoundWords(turn.text, callNames(offered), tools.length > 0);
+        if (deadWords) said.push(deadWords);
+
         const { reason, detail } = classifyFailure(failure);
         const event: FallbackEvent = { reason, from: target.backendId, to: fallback.name, detail };
         this.#lastFallback = event;
@@ -1247,12 +1273,7 @@ export class ChatterangEngine {
       // match. Cut here, where the round ends: joined to the next round's words,
       // it was either cut with all of them or kept with its arguments. See
       // `cutUnfinishedCall`.
-      const words = closeReasoning(
-        stripToolSyntax(cutUnfinishedCall(text, { stopped: false, offered: callNames(offered) }), {
-          offered: callNames(offered),
-          ran: true,
-        }),
-      );
+      const words = endedRoundWords(text, callNames(offered), true);
       if (words) said.push(words);
       text = '';
     }
