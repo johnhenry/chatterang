@@ -59,6 +59,7 @@ import { markTainted } from '@/ai/taint';
 import type {
   DestinationRequest,
   ExecutedTool,
+  TextEnding,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
 import { callNames, cutUnfinishedCall, stripToolSyntax } from '@/ai/middleware/tools';
@@ -1416,21 +1417,14 @@ function carriesReceipt(variant: MessageVariant): boolean {
 }
 
 /**
- * A reply's words with its tool calls read out of them, in a chat with tools.
- *
- * Handed the reply's text AFTER its reasoning is split off. Read over the raw
- * deltas, a `<tool_call>` the model only mentioned while reasoning was taken
- * for an unfinished call: the cut took the closing think tag and the whole
- * answer with it, and the reply was stored as "Stopped before its first word"
- * and left out of every later request.
+ * A reply's words with its finished tool calls read out of them, in a chat with
+ * tools. Handed the reply's text AFTER its reasoning is split off, and after
+ * any call a round ended inside was cut where that round ended: see `readRaw`
+ * in `runGeneration`, and the engine's `roundWords`.
  *
  * A finished call is stripped as the engine strips a finished reply's: a turn
  * stopped at an MCP send sheet stored the model's call, arguments and all, as
- * the words of its reply, and sent it back to the model as history. So is one
- * still being written, which the engine's patterns cannot see because it has
- * no end to match: everything from its opening marker on goes. That call never
- * ran and was never shown on a send sheet, and its arguments were still sent
- * back.
+ * the words of its reply, and sent it back to the model as history.
  *
  * FINISHED CALLS ARE STRIPPED FROM THE WORDS OF EVERY TURN THAT OFFERED A TOOL
  * OR RAN ONE (`ran`), a malformed one included: a reply that was only
@@ -1438,36 +1432,16 @@ function carriesReceipt(variant: MessageVariant): boolean {
  * still stored and sent back. A turn that offered none and ran none wrote no
  * call, and one showing a model's call format keeps it.
  *
- * THE UNFINISHED ONE IS CUT only when `cutsUnfinished` says so — not in a turn
- * that offered no tool, and no tool ran. There is no call being written, and a
- * call's opening shape at the end of the text is as likely a marker named in
- * prose. A chat can name tools and offer none: an MCP tool's id
- * stays on it after its server is removed or disconnected.
- *
  * `offered` is the names a call could give in the request, as `callNames` gives
  * them, which decides whether a fenced JSON block naming a tool is one. Only a
  * block the engine would have run is stripped: a config file, a data record, or
  * an example naming a tool the turn did not offer, is words. See `fencedCall`.
- *
- * An unfinished call in a fenced block is not cut: nothing tells it from the
- * start of a JSON example.
  */
 function wordsWithoutCalls(
   content: string,
-  {
-    offered,
-    ran,
-    stopped,
-    cutsUnfinished,
-  }: {
-    readonly offered: readonly string[];
-    readonly ran: boolean;
-    readonly stopped: boolean;
-    readonly cutsUnfinished: boolean;
-  },
+  { offered, ran }: { readonly offered: readonly string[]; readonly ran: boolean },
 ): string {
-  const finished = stripToolSyntax(content, { offered, ran });
-  return cutsUnfinished ? cutUnfinishedCall(finished, { stopped, offered }) : finished;
+  return stripToolSyntax(content, { offered, ran });
 }
 
 /* ── Generation ─────────────────────────────────────────────────────── */
@@ -1733,27 +1707,66 @@ async function runGeneration(
     // shows it while the turn streams.
     //
     // `raw` is what the words of a turn that ends stopped, failed, or killed
-    // after a receipt are read from: the same deltas, except that each round
-    // that has ended is cut where a call it ended inside starts, as it ends —
-    // when a tool it called runs, or when its local stream dies and the turn
-    // diverts to the fallback. The cut used to run once over every round
-    // joined, anchored to the end of the last. A call a round ended inside was
-    // no longer at the end: one cut off in its arguments took every word after
-    // it, the follow-up's or the cloud's, because its string ran on into them;
-    // one whose JSON closed with no tag after it had those words after it and
-    // was kept, its arguments stored and sent back. See `cutUnfinishedCall`.
+    // after a receipt are read from, and a finished one's when the engine
+    // hands back none: the same deltas, except that each round that has ended
+    // is cut where a call it ended inside starts, as it ends — when a tool it
+    // called runs, or when its local stream dies and the turn diverts to the
+    // fallback — and the round being written when the turn ends is cut as it
+    // ends, by `readRaw`. The cut used to run once over every round joined,
+    // anchored to the end of the last. A call a round ended inside was no
+    // longer at the end: one cut off in its arguments took every word after it,
+    // the follow-up's or the cloud's, because its string ran on into them; one
+    // whose JSON closed with no tag after it had those words after it and was
+    // kept, its arguments stored and sent back. So was a round the model ended
+    // on a call's opening named in prose, its words kept where it ended: read
+    // on to the end of the turn, it was cut from there, every later round's
+    // words with it. See `cutUnfinishedCall`.
     let shown = '';
     /** Where in `raw` the round being written starts. */
     let roundStart = 0;
-    const endRound = (): void => {
-      // Only in a turn that could have written a call, as `wordsWithoutCalls`
-      // is told for a failed turn: a round that ran no tool and was offered
-      // none ends on an example, not a call.
-      if (offersTools || toolCalls.length > 0) {
-        raw = raw.slice(0, roundStart) + cutUnfinishedCall(raw.slice(roundStart), { stopped: false, offered });
-      }
+    /**
+     * Whether the turn could have written a call: its request offered a tool,
+     * or one ran. A turn that did neither ends on an example, not a call, and
+     * a call's opening shape at its end is as likely a marker named in prose.
+     * A chat can name tools and offer none: an MCP tool's id stays on it after
+     * its server is removed or disconnected.
+     */
+    const readsCalls = (): boolean => offersTools || toolCalls.length > 0;
+    /**
+     * `round` with any call it ended inside cut where it starts, read as the
+     * round ended (see `TextEnding`): stopped or cut short, a call's opening
+     * the text ends inside is cut, whatever the words in its values; ended by
+     * the model, words that run on from inside a value are a sentence that
+     * named a call's opening, and are kept. An unfinished call in a fenced
+     * block is never cut: nothing tells it from the start of a JSON example.
+     */
+    const cutRound = (round: string, ended: TextEnding): string =>
+      readsCalls() ? cutUnfinishedCall(round, { ended, offered }) : round;
+    const endRound = (ended: TextEnding): void => {
+      raw = raw.slice(0, roundStart) + cutRound(raw.slice(roundStart), ended);
       roundStart = raw.length;
     };
+    /**
+     * A turn's words and reasoning from text whose rounds were each cut where
+     * they ended, with its finished calls read out (`wordsWithoutCalls`).
+     *
+     * Reasoning is split off before the calls are read: read over the deltas
+     * whole, a `<tool_call>` the model only mentioned while reasoning was taken
+     * for an unfinished call, the cut took the closing think tag and the whole
+     * answer with it, and the reply was stored as "Stopped before its first
+     * word". A round's cut reads it with its reasoning blanked (see
+     * `maskReasoning`), so a call named there takes none of the answer.
+     */
+    const readRounds = (text: string): { content: string; thinking: string } => {
+      const split = splitThinking(text);
+      return {
+        content: wordsWithoutCalls(split.content, { offered, ran: toolCalls.length > 0 }),
+        thinking: split.thinking,
+      };
+    };
+    /** The turn's words and reasoning read from `raw`, the round being written ending `ended`. */
+    const readRaw = (ended: TextEnding): { content: string; thinking: string } =>
+      readRounds(raw.slice(0, roundStart) + cutRound(raw.slice(roundStart), ended));
 
     for await (const event of stream) {
       switch (event.type) {
@@ -1799,8 +1812,9 @@ async function runGeneration(
             },
           ];
           patch((message) => ({ ...message, toolCalls }));
-          // And so has any call it was writing beside the one that ran.
-          endRound();
+          // And so has any call it was writing beside the one that ran, read
+          // as the engine says the round ended.
+          endRound(event.ended ?? 'cut');
 
           // A receipt that says bytes may have left the device is written down
           // NOW. A withheld one waits for the turn to end like any other text.
@@ -1817,21 +1831,17 @@ async function runGeneration(
           // lookup found nothing and nothing was written. It is the row `patch`
           // keeps on screen, field for field.
           if (mayHaveLeft(event.tool.receipt)) {
-            const split = splitThinking(raw);
+            // With its calls read out as a finished reply's are. Every delta
+            // so far includes the call this receipt is for, and a turn killed
+            // from here on is recovered with these words: Try again kept them
+            // as a version, and flipping back to it sent the call, and the
+            // arguments that went to the server, to the model. Every round
+            // so far has ended, and was cut as it ended, just above.
+            const read = readRaw(event.ended ?? 'cut');
             await putMessage({
               ...placeholder,
-              // With its calls read out as a finished reply's are. Every delta
-              // so far includes the call this receipt is for, and a turn killed
-              // from here on is recovered with these words: Try again kept them
-              // as a version, and flipping back to it sent the call, and the
-              // arguments that went to the server, to the model.
-              content: wordsWithoutCalls(split.content, {
-                offered,
-                ran: toolCalls.length > 0,
-                stopped: false,
-                cutsUnfinished: true,
-              }),
-              thinking: split.thinking || undefined,
+              content: read.content,
+              thinking: read.thinking || undefined,
               toolCalls,
               streaming: true,
             });
@@ -1856,7 +1866,7 @@ async function runGeneration(
           // in a failed row. See `closeReasoning`.
           raw = closeReasoning(raw);
           shown = closeReasoning(shown);
-          endRound();
+          endRound('cut');
           app.setActivity('remote');
           break;
 
@@ -1875,47 +1885,32 @@ async function runGeneration(
             });
           }
 
-          // `event.text` has had its finished tool calls stripped by the engine,
-          // and holds every round's words. When it is empty the streamed deltas
-          // stand in for it, as they always have. A STOPPED turn is read from
-          // the deltas whatever it holds: the engine never finished reading the
-          // round Stop cut, so its text has the earlier rounds' words and none
-          // of that one's.
+          // `event.text` holds every round's words, each cut by the engine where
+          // a call it ended inside starts, as its stream said it ended, and its
+          // finished calls stripped. Its finished calls are read out of it
+          // again here, once its reasoning is split off.
           //
-          // The reply's words are read by `wordsWithoutCalls`, once its
-          // reasoning is split off, so a call named in the reasoning takes none
-          // of the answer with it. Read when:
-          //   - a tool ran in it: the engine resets its text after a tool round,
-          //     so a follow-up that wrote nothing left every round's deltas,
-          //     the call that ran included, as the words of the reply;
-          //   - the request offered a tool, and
-          //       - the engine handed back text: its patterns need a closing
-          //         tag, so a call cut off mid-arguments was still in it; or
-          //       - the turn was stopped: a call it was writing or waiting to
-          //         send.
-          // Otherwise a call was stored as the reply's words and sent back to
-          // the model as history. That is when an unfinished call is CUT;
-          // finished calls are stripped from every turn's words, as the engine
-          // strips them from its own text. A turn nobody stopped, in which no
-          // tool ran and the engine handed back no text, used to keep its
-          // deltas whole — for a fenced JSON example the engine then stripped,
-          // and no longer does — and so kept a malformed call, arguments and
-          // all, that the engine had stripped.
+          // When it is empty the streamed deltas stand in for it, as they
+          // always have: the engine hands back no words only when every
+          // round's were calls, which read the same however a round ended, so
+          // the last round is read as cut short. A STOPPED turn is read from
+          // the deltas whatever it holds, the round Stop cut read as stopped:
+          // the engine never finished reading that round, so its text has the
+          // earlier rounds' words and none of that one's.
           //
-          // OFFERED, NOT NAMED ON THE CHAT. A chat keeps an MCP tool's id after
-          // its server is gone, and its requests offer no tool: nothing such a
-          // turn writes is a call, and reading it for one cut a JSON example,
-          // or a call marker named in prose, the person had watched arrive.
+          // Calls are read out of every turn that offered a tool or ran one:
+          // otherwise a call was stored as the reply's words and sent back to
+          // the model as history. A tool that ran left every round's deltas,
+          // the call included; a call cut off mid-arguments has no end for the
+          // engine's stripper; a stopped turn holds a call it was writing or
+          // waiting to send. OFFERED, NOT NAMED ON THE CHAT: a chat keeps an
+          // MCP tool's id after its server is gone, and its requests offer no
+          // tool, so nothing such a turn writes is a call, and reading it for
+          // one cut a JSON example, or a call marker named in prose, the person
+          // had watched arrive. See `readsCalls`.
           const aborted = controller.signal.aborted;
-          const split = splitThinking(aborted ? raw : event.text || raw);
-          const readsCalls =
-            toolCalls.length > 0 || (offersTools && (event.text !== '' || aborted));
-          const content = wordsWithoutCalls(split.content, {
-            offered,
-            ran: toolCalls.length > 0,
-            stopped: aborted,
-            cutsUnfinished: readsCalls,
-          }).trim();
+          const read = aborted ? readRaw('stopped') : event.text === '' ? readRaw('cut') : readRounds(event.text);
+          const content = read.content.trim();
           // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
           //   true  — stopped before its first word (owner ruling): kept, shown
           //           as stopped, and left out of every later request.
@@ -1929,7 +1924,7 @@ async function runGeneration(
           // the row, so the row cannot end up holding half of it.
           const own: MessageVariant = {
             content,
-            thinking: split.thinking || undefined,
+            thinking: read.thinking || undefined,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             provenance: {
               backendId: event.provenance.backendId,
@@ -2006,19 +2001,15 @@ async function runGeneration(
            * The `catch` below already preserved the row; only this branch
            * wiped it. They agree now.
            */
-          const partial = splitThinking(raw);
+          // With its calls read out as a finished reply's are, the round whose
+          // stream failed read as cut short. A failed row is left out of
+          // history, but Try again keeps it as a version, a version carries no
+          // error, and flipping back to it sent a call that ran, arguments and
+          // all, to the model.
+          const partial = readRaw('cut');
           const failed: Message = {
             ...placeholder,
-            // With its calls read out as a finished reply's are. A failed row
-            // is left out of history, but Try again keeps it as a version, a
-            // version carries no error, and flipping back to it sent a call
-            // that ran, arguments and all, to the model.
-            content: wordsWithoutCalls(partial.content, {
-              offered,
-              ran: toolCalls.length > 0,
-              stopped: false,
-              cutsUnfinished: offersTools || toolCalls.length > 0,
-            }).trim(),
+            content: partial.content.trim(),
             thinking: partial.thinking || undefined,
             // The calls happened, and a receipt among them says something left.
             // The placeholder has none, so without this line a failed turn

@@ -453,7 +453,8 @@ describe('stripToolSyntax', () => {
 });
 
 describe('cutUnfinishedCall', () => {
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: OFFERED });
 
   it('keeps words that name a call’s opening and go on past it in prose', () => {
     for (const text of [
@@ -483,7 +484,7 @@ describe('cutUnfinishedCall', () => {
       "<tool_call>\n```json\n{'name': 'calculate', 'arguments': {'expression': 'one plus",
     ]) {
       expect(cut(`Ok.\n${call}`, true), call).toBe('Ok.\n');
-      expect(cut(`Ok.\n${call}`), `${call} (finished)`).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`), `${call} (cut short)`).toBe('Ok.\n');
     }
   });
 
@@ -491,7 +492,7 @@ describe('cutUnfinishedCall', () => {
     for (const literal of ['True', 'False', 'None']) {
       const call = `<tool_call>{'name': 'calculate', 'arguments': {'exact': ${literal}, 'expression': 'one plus`;
       expect(cut(`Ok.\n${call}`, true), call).toBe('Ok.\n');
-      expect(cut(`Ok.\n${call}`), `${call} (finished)`).toBe('Ok.\n');
+      expect(cut(`Ok.\n${call}`), `${call} (cut short)`).toBe('Ok.\n');
     }
     const prose = "Qwen's <tool_call>{ None of this is JSON, and the app reads on.";
     expect(cut(prose, true), prose).toBe(prose);
@@ -513,12 +514,13 @@ describe('cutUnfinishedCall', () => {
 
   it('cuts a call cut off in a name with a space in it that a tool offered has', () => {
     const offered = ['mcp:My Notes.note', 'My Notes.note'];
-    expect(cutUnfinishedCall('Ok.\n<tool_call>{"name": "My No', { stopped: true, offered })).toBe('Ok.\n');
+    expect(cutUnfinishedCall('Ok.\n<tool_call>{"name": "My No', { ended: 'stopped', offered })).toBe('Ok.\n');
   });
 });
 
 describe('a <tool_call> whose body is calls, but not one JSON object', () => {
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: OFFERED });
 
   it('is stripped whole: two call objects, a name and its arguments in parens, a name and its JSON', () => {
     for (const call of [
@@ -564,7 +566,8 @@ describe('a <tool_call> whose body is calls, but not one JSON object', () => {
 });
 
 describe('a call written as Python writes one: name(key=value, …)', () => {
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: OFFERED });
 
   it('is read and stripped in a tag and after [TOOL_CALLS], each value read as Python writes it', () => {
     for (const [text, input] of [
@@ -610,7 +613,8 @@ describe('a call written as Python writes one: name(key=value, …)', () => {
 });
 
 describe('a call written as this app writes one in a text prompt’s history: [tool name({…})]', () => {
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: OFFERED });
 
   it('is read and stripped, whatever its string arguments hold, as `messageText` writes it', () => {
     const text = 'Ok.\n[tool calculate({"expression": "(1+2)]"})]\nDone.';
@@ -698,7 +702,8 @@ describe('a [TOOL_CALLS] call to a tool whose name or id holds a dot, a colon or
   // neither read, run, stripped nor cut: finished, the server was never called
   // and the call's arguments were stored and sent back; stopped, the same.
   const MCP = ['mcp:notes.note', 'notes.note', 'mcp:my-notes.add-note', 'my-notes.add-note'];
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: MCP });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: MCP });
 
   it('is read, and stripped, by name and by id, with JSON or Python’s keyword arguments, or none', () => {
     for (const [text, name, input] of [
@@ -743,7 +748,8 @@ describe('a call whose single-quoted strings hold a bracket or a double quote', 
   // body, so it never ran, and stopped, no record said it had not gone. A `"`
   // inside one opened a string that never closed: the call was neither read
   // nor stripped, and its arguments were stored and sent back.
-  const cut = (text: string, stopped = false) => cutUnfinishedCall(text, { stopped, offered: OFFERED });
+  const cut = (text: string, stopped = false) =>
+    cutUnfinishedCall(text, { ended: stopped ? 'stopped' : 'cut', offered: OFFERED });
   const calc = (note: string): string => `{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': '${note}'}}`;
 
   it('is read, and stripped whole, in each form', () => {
@@ -790,6 +796,58 @@ describe('a call whose single-quoted strings hold a bracket or a double quote', 
       expect(stripToolSyntax(prose), prose).toBe(prose);
       expect(extractTextualToolCalls(prose), prose).toEqual([]);
       expect(cut(prose), prose).toBe(prose);
+    }
+  });
+});
+
+describe('an unfinished call, by how the text ended', () => {
+  // A value's words — a string, or a Qwen3-Coder parameter's value — can be
+  // anything, so an opening named in prose with no closing quote or tag after
+  // it reads as a call still being written to the end of the text. Only a text
+  // cut short can end inside a call: the model ends its reply outside one.
+  const cut = (text: string, ended: 'stopped' | 'cut' | 'model') => cutUnfinishedCall(text, { ended, offered: OFFERED });
+
+  it('keeps every word of a text the model ended that runs on from inside a value, and cuts one cut short there', () => {
+    for (const words of [
+      'Qwen3-Coder opens a call like this:\n\n```\n<tool_call>\n<function=get_weather>\n<parameter=city>\n```\n\nThe city goes next.',
+      '<tool_call>\n<function=search>\n<parameter=query>\nis how Qwen3-Coder begins a call; the value follows, then the closing tags.',
+      'A Python-style call looks like <tool_call>search(query=" and then the words.',
+      "Mistral's would be [TOOL_CALLS] search(query=' and then the words.",
+      "It can hold a list, [TOOL_CALLS] search(tags=['a', ' and so on.",
+      'Qwen writes <tool_call>{"name": "search", "arguments": {"query": " and then the words.',
+      'An array: <tool_call>[{"name": "search", "arguments": {"query": " and so on.',
+      'Its history writes [tool calculate({"expression": " and then the sum.',
+    ]) {
+      expect(cut(words, 'model'), words).toBe(words);
+      for (const ended of ['cut', 'stopped'] as const) {
+        expect(cut(words, ended), `${words} (${ended})`).not.toBe(words);
+      }
+    }
+  });
+
+  it('cuts a text the model ended inside a call’s structure, or on its opening', () => {
+    for (const call of [
+      '<tool_call>{"name": "calc',
+      '<tool_call>{"name": "calculate", "arguments": {"expr',
+      '<tool_call>{"name": "calculate", "arguments": {"expression": 1.5e',
+      '<tool_call>{"name": "calculate", "arguments": {}}',
+      '<tool_call>{"name": "calculate", "arguments": {}}</tool_',
+      '<tool_call>calculate(expr',
+      '[TOOL_CALLS] calculate(exact=Tr',
+      '[TOOL_CALLS] calculate(tags=[1, 2',
+      '<tool_call>\n<function=calculate>\n<parameter=expr',
+      '<tool_call>\n<function=calcul',
+      '<tool_call>{',
+      '[TOOL_CALLS] calculate(',
+    ]) {
+      expect(cut(`Ok.\n${call}`, 'model'), call).toBe('Ok.\n');
+    }
+  });
+
+  it('cuts only a stopped text on a bare marker', () => {
+    expect(cut('Ok.\n<tool_call>', 'stopped')).toBe('Ok.\n');
+    for (const ended of ['cut', 'model'] as const) {
+      expect(cut('Ok.\n<tool_call>', ended), ended).toBe('Ok.\n<tool_call>');
     }
   });
 });

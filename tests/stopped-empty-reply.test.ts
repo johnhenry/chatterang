@@ -103,7 +103,7 @@ const { ChatterangEngine } = await import('@/ai/engine');
 const { toolRegistry } = await import('@/ai/tools/registry');
 const { MessageView } = await import('@/features/chat/MessageView');
 const { renderTranscript } = await import('@/shell/commands');
-const { MCP_CALL, MCP_CALL_CLEAN, PROBE_SERVER, mcpProbe, probeResolver, recordingBackend } = await import(
+const { MCP_CALL, MCP_CALL_CLEAN, PROBE_SERVER, cutOff, mcpProbe, probeResolver, recordingBackend } = await import(
   './support/egress-probe'
 );
 
@@ -177,14 +177,17 @@ function given(entry: Chat, thread: Message[]): void {
 
 type Step =
   | { readonly reply: string }
+  | { readonly cutOff: string }
   | { readonly stall: Promise<void> }
   | { readonly partial: string; readonly stall: Promise<void> }
   | { readonly fail: string };
 
 /**
  * A backend that records every request it is handed, then follows its script:
- * reply, fail, or hold the stream open without a token until the test lets it
- * go — which the test does only after Stop, so the turn ends stopped.
+ * reply, as the model ending it (`finishReason: 'stop'`) or cut off at its limit
+ * on tokens (`'length'`); fail; or hold the stream open without a token until
+ * the test lets it go — which the test does only after Stop, so the turn ends
+ * stopped.
  */
 function scriptedBackend(steps: Step[]) {
   const seen: IRChatRequest[] = [];
@@ -207,6 +210,11 @@ function scriptedBackend(steps: Step[]) {
       if ('stall' in step) {
         await step.stall;
         throw new Error('the stream was cut when the turn stopped');
+      }
+      if ('cutOff' in step) {
+        yield { type: 'content', sequence: 1, delta: step.cutOff };
+        yield { type: 'done', sequence: 2, finishReason: 'length' };
+        return;
       }
       yield { type: 'content', sequence: 1, delta: step.reply };
       yield { type: 'done', sequence: 2, finishReason: 'stop' };
@@ -1133,8 +1141,10 @@ describe('a finished reply in a chat with tools', () => {
   it('cut off in the middle of a call stores and sends none of the call', async () => {
     const id = 'cut_off_call';
     given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    // Cut off at its limit on tokens: a reply the model ended ends outside
+    // any call, and one that runs on from inside a value is prose.
     const local = recordingBackend([
-      'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a',
+      cutOff('Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a'),
       'Next.',
     ]);
     engineWith(local);
@@ -2529,14 +2539,19 @@ const UNTAGGED_CALL = '<tool_call>{"name":"leaky","arguments":{"path":"canary-7f
 const roundEndingIn = (tail: string): string => `Reading both.\n${CALL}\n${tail}`;
 
 describe('a finished tool turn whose calling round ended inside a second call', () => {
-  for (const [form, tail] of [
-    ['half-written', HALF_CALL],
-    ['with no closing tag', UNTAGGED_CALL],
+  // A round ends inside a call's arguments only when it is cut off, at its
+  // limit on tokens: a round the model ended that runs on from inside a value
+  // is prose. One whose call's JSON closed with no tag after it is a call
+  // however the round ended.
+  for (const [form, tail, cutShort] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true],
+    ['with no closing tag', UNTAGGED_CALL, false],
   ] as const) {
     it(`${form}: keeps the follow-up’s answer, and stores and sends none of the call`, async () => {
       const id = `r3_round_${form.length}`;
       given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
-      const local = recordingBackend([roundEndingIn(tail), 'They mention a passphrase.', 'Next.']);
+      const round = roundEndingIn(tail);
+      const local = recordingBackend([cutShort ? cutOff(round) : round, 'They mention a passphrase.', 'Next.']);
       engineWith(local);
 
       try {
@@ -2608,16 +2623,18 @@ describe('a finished tool turn whose calling round ended inside a second call', 
 /* ── Round 3: a stopped or failed turn read round by round ──────────── */
 
 describe('a stopped follow-up after a calling round that ended inside a second call', () => {
-  for (const [form, tail] of [
-    ['half-written', HALF_CALL],
-    ['with no closing tag', UNTAGGED_CALL],
+  // As above: half-written, the calling round was cut off at its limit on tokens.
+  for (const [form, tail, cutShort] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true],
+    ['with no closing tag', UNTAGGED_CALL, false],
   ] as const) {
     it(`${form}: keeps both rounds’ words, and stores and sends none of the call`, async () => {
       const id = `r3_round_stopped_${form.length}`;
       given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
       const gate = held();
+      const round = roundEndingIn(tail);
       const local = scriptedBackend([
-        { reply: roundEndingIn(tail) },
+        cutShort ? { cutOff: round } : { reply: round },
         { partial: 'They mention a pass', stall: gate.promise },
         { reply: 'Fine.' },
       ]);
@@ -2810,6 +2827,8 @@ describe('a finished reply in a chat offering a tool, naming a call’s opening 
     expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(partial);
   });
 
+  // Cut off at its limit on tokens inside a call's arguments; or, however it
+  // ended, inside its structure — the tool's name.
   for (const [form, tail] of [
     ['a tag call', '<tool_call>{"name": "leaky", "arguments": {"path": "my notes canary-7f3a'],
     ['a Mistral call', '[TOOL_CALLS] leaky({"path": "my notes canary-7f3a'],
@@ -2818,7 +2837,8 @@ describe('a finished reply in a chat offering a tool, naming a call’s opening 
     it(`still stores none of ${form} it ended inside`, async () => {
       const id = `r4_ended_inside_${form.length}`;
       given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
-      const local = recordingBackend([`Checking.\n${tail}`]);
+      const inName = form.endsWith('its name');
+      const local = recordingBackend([inName ? `Checking.\n${tail}` : cutOff(`Checking.\n${tail}`)]);
       engineWith(local);
 
       try {
@@ -3995,5 +4015,147 @@ describe('a single-quoted call whose strings hold a bracket or a double quote', 
       stopped: undefined,
     });
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Review round 7: a call's opening named in a reply the model ended ─ */
+
+describe('a reply the model ended that names a call’s opening, its value running on as prose', () => {
+  // A value's words — a string, or a Qwen3-Coder parameter's value — can be
+  // anything, so a call's opening named in prose, with no closing quote or
+  // closing tag after it, reads as a call still being written to the end of
+  // the text. A finished reply was cut from that opening on: every word after
+  // it, which the person had watched arrive, was gone from the stored reply and
+  // every later request, and a reply that began with one was stored with no
+  // words at all. Only a reply cut short can end inside a call: the model
+  // ends its reply outside one.
+  const PROSE = [
+    [
+      'a Qwen3-Coder opening in a code block',
+      'Qwen3-Coder opens a call like this:\n\n```\n<tool_call>\n<function=get_weather>\n<parameter=city>\n```\n\nThe city goes on the next line, and each tag is closed in turn.',
+    ],
+    [
+      'a Qwen3-Coder opening it begins with',
+      '<tool_call>\n<function=search>\n<parameter=query>\nis how Qwen3-Coder begins a call; the value follows, then the closing tags.',
+    ],
+    ['a keyword opening in a tag', 'A Python-style call looks like <tool_call>search(query=" and then the words to look for, a closing quote and a paren.'],
+    ['a keyword opening after [TOOL_CALLS]', "Mistral's would be [TOOL_CALLS] search(query=' and then the words, a closing quote and a paren."],
+    ['a JSON opening', 'Qwen writes <tool_call>{"name": "search", "arguments": {"query": " and then the words to look for.'],
+  ] as const;
+
+  for (const [form, words] of PROSE) {
+    it(`${form}, finished: keeps every word, and sends them back`, async () => {
+      const id = `rv7_prose_opening_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([words, 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('how does a model write a call?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(
+        { content: stored.content, stopped: stored.stopped, toolCalls: stored.toolCalls },
+        'the stored reply',
+      ).toEqual({ content: words, stopped: undefined, toolCalls: undefined });
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+    });
+  }
+
+  const ROUND =
+    'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>\nA Python-style call would be <tool_call>calculate(expression=" and then the sum.';
+  const ROUND_WORDS = 'Working it out.\n\nA Python-style call would be <tool_call>calculate(expression=" and then the sum.';
+
+  for (const finishReason of ['stop', 'tool_calls'] as const) {
+    it(`at the end of a round whose call ran, ended as ${finishReason}: keeps the round’s words and the follow-up’s`, async () => {
+      const id = `rv7_prose_opening_tool_round_${finishReason}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([{ text: ROUND, finishReason }, 'It is 42.', 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe(`${ROUND_WORDS}\n\nIt is 42.`);
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', `${ROUND_WORDS}\n\nIt is 42.`]);
+    });
+  }
+
+  it('at the end of a round whose call ran, the follow-up stopped: keeps the round’s words and the follow-up’s', async () => {
+    const id = 'rv7_prose_opening_tool_round_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ reply: ROUND }, { partial: 'It is 42', stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('what is six times seven?', 'It is 42', gate.release);
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe(`${ROUND_WORDS}It is 42`);
+  });
+
+  for (const [form, tail] of [
+    ['inside a keyword argument', '<tool_call>calculate(expression="6*7, canary-7f3a'],
+    ['inside a Qwen3-Coder parameter', '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7 canary-7f3a'],
+    ['inside a JSON string', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7 canary-7f3a'],
+  ] as const) {
+    it(`cut off at its limit on tokens ${form}: stores and sends none of the call`, async () => {
+      const id = `rv7_cut_off_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(`Checking.\n${tail}`), 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a round Stop caught a complete call in, ending on a bare opening: records the call, and keeps none of the opening', async () => {
+    // The round's words are read as Stop left them, as every stopped round's
+    // are, though the call Stop caught complete in them has ended the round.
+    const id = 'rv7_stranded_then_marker';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing it now.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>\nAnd <tool_call>',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'And <tool_call>', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+And$/);
+  });
+
+  it('a round cut off at its limit inside a second call, its first call run: keeps its words and none of the second', async () => {
+    const id = 'rv7_cut_off_tool_round';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>\n<tool_call>calculate(expression="6*8, canary-7f3a',
+      ),
+      'It is 42.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe('Working it out.\n\nIt is 42.');
   });
 });

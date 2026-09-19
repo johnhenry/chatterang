@@ -675,8 +675,30 @@ const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'tool', 'function']);
 const ARGUMENT_KEYS: ReadonlySet<string> = new Set(['arguments', 'parameters', 'input']);
 
 /**
+ * How a text ended, which decides what at its end is a call still being
+ * written: see {@link unfinishedCallAt}.
+ *
+ * - `'stopped'`: Stop landed in it.
+ * - `'cut'`: its stream was cut short. It failed, or it finished for any reason
+ *   but the model's own, as at its limit on tokens.
+ * - `'model'`: the model ended it, and its stream said so: `stop`, or
+ *   `tool_calls`.
+ */
+export type TextEnding = 'stopped' | 'cut' | 'model';
+
+/**
+ * Where in a call a text that ends inside it ends: `'open'`, in its structure
+ * — its brackets, a key, the tool's name, a bare value, a tag — where nothing
+ * but the call can stand; `'in-value'`, in the words of one of its values — a
+ * string, or a Qwen3-Coder parameter's value — which can be anything, a
+ * sentence included.
+ */
+export type Unended = 'open' | 'in-value';
+
+/**
  * Could the text from `start`, where a call's JSON opens, to the end of the text
- * be that JSON still being written?
+ * be that JSON still being written? `'in-value'` when it could, and the text
+ * ends inside one of its values' strings: see {@link Unended}.
  *
  * Only JSON's own tokens stand outside its strings — brackets, colons, commas,
  * strings, numbers, `true`, `false`, `null`, and a key left unquoted — and a
@@ -714,7 +736,7 @@ function writesJson(
     offered,
     until = text.length,
   }: { readonly tagged: boolean; readonly offered: readonly string[]; readonly until?: number },
-): boolean {
+): boolean | 'in-value' {
   /** Each bracket still open: an object reading a key, or reading the value of `naming` one; or an array. */
   const containers: { readonly object: boolean; key: boolean; naming: boolean }[] = [];
   /** Whether the object on top is the call's own: at the top level, or in a top-level array of calls. */
@@ -732,6 +754,9 @@ function writesJson(
       const body = text.slice(at + 1, end);
       const ownWord = tagged && callsOwn() && top !== undefined && top.object && (top.key || top.naming);
       if (ownWord && /\s/.test(body) && !offered.some((name) => name.startsWith(body))) return false;
+      // The text ends inside it: in a key, or the tool's name, which are the
+      // call's structure; or in a value, whose words can be anything.
+      if (end >= until) return (top?.object === true && top.key) || ownWord ? true : 'in-value';
       if (top?.object && top.key) top.naming = NAMING_KEYS.has(body);
       at = end + 1;
     } else if (char === '{' || char === '[') {
@@ -796,11 +821,29 @@ function writesJson(
  * {@link writesJson} reads it. A brace that never closes, or a quote that
  * never does, is as often a sentence naming a call's opening and going on.
  * `offered` is the names a call can give, as {@link callNames} gives them.
+ *
+ * AND ONLY A TEXT CUT SHORT ENDS INSIDE A VALUE'S WORDS (`ended`: see
+ * {@link TextEnding}). A string, or a Qwen3-Coder parameter's value, can hold
+ * any words, so an opening named in prose with no closing quote or tag after
+ * it — Qwen3-Coder's `<tool_call>`, `<function=get_weather>` and
+ * `<parameter=city>` on lines of their own in a code block, and the sentences
+ * after it; "A Python-style call looks like <tool_call>search(query=" and
+ * then…" — reads as a call still being written to the end of the text, and a
+ * reply the model finished was cut from it: every word after it, which the
+ * person had watched arrive, was gone from the stored reply and every later
+ * request, and a reply that began with one was stored with no words at all. A
+ * model that ends its reply has ended any call it wrote, so in a text the model
+ * ended, words that run on from inside a value are a sentence. A text Stop
+ * landed in, or cut short — a stream that died, one at its limit on tokens —
+ * ended wherever it was, and is cut from the call. Where the text ends in a
+ * call's structure, it is a call being written however the text ended.
  */
 export function unfinishedCallAt(
   text: string,
-  { stopped, offered }: { readonly stopped: boolean; readonly offered: readonly string[] },
+  { ended, offered }: { readonly ended: TextEnding; readonly offered: readonly string[] },
 ): number {
+  /** Whether a call the text ends inside, at `where` in it, is one being written. */
+  const beingWritten = (where: Unended): boolean => where === 'open' || ended !== 'model';
   let from = 0;
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
@@ -808,7 +851,10 @@ export function unfinishedCallAt(
     if (text.startsWith('<', open)) {
       // Qwen3-Coder's XML body, read by its structure: see `xmlCallEnd`.
       const end = xmlCallEnd(text, match.index);
-      if (end === 'open') return match.index;
+      if (typeof end === 'string') {
+        if (beingWritten(end)) return match.index;
+        continue;
+      }
       if (end !== -1) from = end;
       continue;
     }
@@ -825,14 +871,20 @@ export function unfinishedCallAt(
     if (form === CALL_END.tag && text.charAt(open) !== '{') {
       // A name and its JSON inside the tag, read by its structure: see `taggedCallsEnd`.
       const end = taggedCallsEnd(text, match.index, offered);
-      if (end === 'open') return match.index;
+      if (typeof end === 'string') {
+        if (beingWritten(end)) return match.index;
+        continue;
+      }
       if (end !== -1) from = end;
       continue;
     }
     if (form === CALL_END.paren && text.charAt(open) !== '{') {
       // Python's keyword arguments: see `readKeywordArguments`.
       const { end } = readKeywordArguments(text, open);
-      if (end === 'open') return match.index;
+      if (typeof end === 'string') {
+        if (beingWritten(end)) return match.index;
+        continue;
+      }
       if (end !== -1) from = end;
       continue;
     }
@@ -843,9 +895,8 @@ export function unfinishedCallAt(
     }
     const close = endOfObject(text, open);
     if (close === -1) {
-      if (writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered })) {
-        return match.index;
-      }
+      const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
+      if (writing && beingWritten(writing === true ? 'open' : writing)) return match.index;
       continue;
     }
     // Stray closing brackets are the call's, as `stripToolSyntax` reads them:
@@ -857,7 +908,10 @@ export function unfinishedCallAt(
     // More calls after it inside the same tag: see `taggedCallsEnd`.
     if (form === CALL_END.tag) {
       const end = taggedCallsEnd(text, match.index, offered);
-      if (end === 'open') return match.index;
+      if (typeof end === 'string') {
+        if (beingWritten(end)) return match.index;
+        continue;
+      }
       if (end !== -1) {
         from = end;
         continue;
@@ -865,21 +919,21 @@ export function unfinishedCallAt(
     }
     from = close;
   }
-  return text.search(stopped ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
+  return text.search(ended === 'stopped' ? CALL_MARKER_AT_END : CALL_OPENED_AT_END);
 }
 
 /**
  * `text` up to where a tool call it ended inside starts — see
- * {@link unfinishedCallAt} — or all of it. `stopped` is whether Stop ended it
- * rather than the model or a failed stream; `offered` is the names a call can
- * give, as {@link callNames} gives them.
+ * {@link unfinishedCallAt} — or all of it. `ended` is how the text ended (see
+ * {@link TextEnding}); `offered` is the names a call can give, as
+ * {@link callNames} gives them.
  *
  * Found in its WORDS: a round's text still holds its reasoning, and a call its
  * reasoning names is not one the round was writing. See `maskReasoning`.
  */
 export function cutUnfinishedCall(
   text: string,
-  reading: { readonly stopped: boolean; readonly offered: readonly string[] },
+  reading: { readonly ended: TextEnding; readonly offered: readonly string[] },
 ): string {
   const at = unfinishedCallAt(maskReasoning(text), reading);
   return at === -1 ? text : text.slice(0, at);
@@ -1086,7 +1140,9 @@ export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
 
 /**
  * Where a Qwen3-Coder call starting at `at` ends, just past its `</tool_call>`;
- * `'open'` when the text ends inside one; -1 when what is there is not one.
+ * {@link Unended} when the text ends inside one — `'in-value'` inside a
+ * parameter's value, whose words can be anything; -1 when what is there is not
+ * one.
  *
  *     <tool_call>
  *     <function=NAME>
@@ -1108,12 +1164,12 @@ export const XML_CALL_OPENING = /<tool_call>\s*(?=<function=)/gi;
  * sentence that names both, and prose naming this form's tags stops matching
  * the structure as soon as it goes on.
  */
-export function xmlCallEnd(text: string, at: number): number | 'open' {
+export function xmlCallEnd(text: string, at: number): number | Unended {
   return readXmlCall(text, at).end;
 }
 
 /** {@link xmlCallEnd}'s reading, with the call it read when it is whole. */
-function readXmlCall(text: string, at: number): { end: number | 'open'; calls: WrittenCall[] } {
+function readXmlCall(text: string, at: number): { end: number | Unended; calls: WrittenCall[] } {
   let pos = at;
   /** Read `word` here, in any case: true; `'open'` when the text ends partway through it; or false. */
   const read = (word: string): boolean | 'open' => {
@@ -1124,19 +1180,24 @@ function readXmlCall(text: string, at: number): { end: number | 'open'; calls: W
     }
     return pos + piece.length === text.length && word.startsWith(piece) ? 'open' : false;
   };
-  /** Read `NAME>`: a name with no space or angle bracket in it, and the `>` after it. */
-  const readName = (): string | 'open' | false => {
+  /**
+   * Read `NAME>`: a name with no space or angle bracket in it, and the `>`
+   * after it; `'open'` when the text ends first. The name comes back in an
+   * object, so that a tool or parameter named `open` is not read as the text
+   * ending inside its name — or a text ending there as a parameter named `open`.
+   */
+  const readName = (): { readonly name: string } | 'open' | false => {
     const name = /^[^\s<>]*/.exec(text.slice(pos))?.[0] ?? '';
     pos += name.length;
     if (pos === text.length) return 'open';
     if (name === '' || text.charAt(pos) !== '>') return false;
     pos += 1;
-    return name;
+    return { name };
   };
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
-  const notACall = (step: boolean | 'open'): { end: number | 'open'; calls: WrittenCall[] } => ({
+  const notACall = (step: boolean | 'open'): { end: number | Unended; calls: WrittenCall[] } => ({
     end: step === 'open' ? 'open' : -1,
     calls: [],
   });
@@ -1146,8 +1207,9 @@ function readXmlCall(text: string, at: number): { end: number | 'open'; calls: W
   skipSpace();
   step = read('<function=');
   if (step !== true) return notACall(step);
-  const name = readName();
-  if (typeof name !== 'string') return notACall(name);
+  const tool = readName();
+  if (typeof tool !== 'object') return notACall(tool);
+  const { name } = tool;
   const input: Record<string, unknown> = {};
   for (;;) {
     skipSpace();
@@ -1156,12 +1218,13 @@ function readXmlCall(text: string, at: number): { end: number | 'open'; calls: W
     if (step === 'open') return notACall('open');
     if (step === true) {
       const key = readName();
-      if (typeof key !== 'string') return notACall(key);
+      if (typeof key !== 'object') return notACall(key);
       const close = text.toLowerCase().indexOf('</parameter>', pos);
-      // Its value runs to the end of the text: the call is still being written.
-      if (close === -1) return notACall('open');
+      // Its value runs to the end of the text: the call is still being written,
+      // or a sentence named its opening and went on. See `unfinishedCallAt`.
+      if (close === -1) return { end: 'in-value', calls: [] };
       const value = text.slice(pos, close).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-      Object.defineProperty(input, key, { value, enumerable: true, writable: true, configurable: true });
+      Object.defineProperty(input, key.name, { value, enumerable: true, writable: true, configurable: true });
       pos = close + '</parameter>'.length;
       continue;
     }
@@ -1183,8 +1246,8 @@ const TAG_END = '</tool_call>';
 
 /**
  * Where a `<tool_call>` starting at `at` whose body is calls ends, just past its
- * `</tool_call>`; `'open'` when the text ends inside one; -1 when what is there
- * is not one.
+ * `</tool_call>`; {@link Unended} when the text ends inside one; -1 when what is
+ * there is not one.
  *
  *     <tool_call>
  *     {"name": "a", "arguments": {…}}
@@ -1216,7 +1279,7 @@ const TAG_END = '</tool_call>';
  * paren (see {@link shortCallEnd}), so a later brace in the text cannot carry a
  * call across the words after it.
  */
-export function taggedCallsEnd(text: string, at: number, offered: readonly string[]): number | 'open' {
+export function taggedCallsEnd(text: string, at: number, offered: readonly string[]): number | Unended {
   return readTaggedCalls(text, at, offered).end;
 }
 
@@ -1229,11 +1292,11 @@ function readTaggedCalls(
   text: string,
   at: number,
   offered: readonly string[],
-): { end: number | 'open'; calls: WrittenCall[] } {
+): { end: number | Unended; calls: WrittenCall[] } {
   let pos = at + '<tool_call>'.length;
   let written = 0;
   const calls: WrittenCall[] = [];
-  const reading = (end: number | 'open'): { end: number | 'open'; calls: WrittenCall[] } => ({ end, calls });
+  const reading = (end: number | Unended): { end: number | Unended; calls: WrittenCall[] } => ({ end, calls });
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
@@ -1261,7 +1324,7 @@ function readTaggedCalls(
     // Python's keyword arguments in its parens: see `readKeywordArguments`.
     if (name !== undefined && paren && text.charAt(pos) !== '{') {
       const keywords = readKeywordArguments(text, pos);
-      if (keywords.end === 'open' || keywords.end === -1) return reading(keywords.end);
+      if (typeof keywords.end === 'string' || keywords.end === -1) return reading(keywords.end);
       calls.push({ name, input: keywords.input });
       written += 1;
       pos = keywords.end;
@@ -1281,7 +1344,10 @@ function readTaggedCalls(
       continue;
     }
     const end = endOfJson(text, pos);
-    if (end === -1) return reading(writesJson(text, pos, { tagged: name === undefined, offered }) ? 'open' : -1);
+    if (end === -1) {
+      const writing = writesJson(text, pos, { tagged: name === undefined, offered });
+      return reading(writing === 'in-value' ? writing : writing ? 'open' : -1);
+    }
     if (!writesJson(text, pos, { tagged: false, offered, until: end })) return reading(-1);
     const json = text.slice(pos, end);
     pos = end;
@@ -1308,8 +1374,9 @@ const KEYWORD = /([A-Za-z_]\w*)\s*=(?!=)\s*/y;
 
 /**
  * Where a call's arguments written as Python writes them, from `start` just
- * inside its `(`, end: just past the `)`; `'open'` when the text ends inside
- * them; -1 when what is there is not such arguments. `input` is what they give.
+ * inside its `(`, end: just past the `)`; {@link Unended} when the text ends
+ * inside them — `'in-value'` inside a string; -1 when what is there is not such
+ * arguments. `input` is what they give.
  *
  *     <tool_call>notes.note(text="Call Ana", pinned=True)</tool_call>
  *     [TOOL_CALLS] note(text='Call Ana', tags=['work'])
@@ -1328,10 +1395,10 @@ const KEYWORD = /([A-Za-z_]\w*)\s*=(?!=)\s*/y;
 function readKeywordArguments(
   text: string,
   start: number,
-): { end: number | 'open'; input: Record<string, unknown> } {
+): { end: number | Unended; input: Record<string, unknown> } {
   const input: Record<string, unknown> = {};
   let pos = start;
-  const reading = (end: number | 'open'): { end: number | 'open'; input: Record<string, unknown> } => ({
+  const reading = (end: number | Unended): { end: number | Unended; input: Record<string, unknown> } => ({
     end,
     input,
   });
@@ -1348,7 +1415,7 @@ function readKeywordArguments(
     if (!keyword) return reading(/^[A-Za-z_]\w*\s*$/.test(text.slice(pos)) ? 'open' : -1);
     pos += keyword[0].length;
     const end = valueEnd(text, pos);
-    if (end === 'open' || end === -1) return reading(end);
+    if (typeof end === 'string' || end === -1) return reading(end);
     const value = looseJson(text.slice(pos, end));
     if (value === undefined) return reading(-1);
     Object.defineProperty(input, keyword[1] ?? '', { value, enumerable: true, writable: true, configurable: true });
@@ -1363,9 +1430,10 @@ function readKeywordArguments(
 /**
  * Where the value a keyword argument gives, from `start`, ends: a string in
  * either quote, a list or dict read past the brackets in its strings, or a bare
- * word. `'open'` when the text ends inside it; -1 when it is none of these.
+ * word. {@link Unended} when the text ends inside it — `'in-value'` inside a
+ * string; -1 when it is none of these.
  */
-function valueEnd(text: string, start: number): number | 'open' {
+function valueEnd(text: string, start: number): number | Unended {
   let depth = 0;
   let quote = '';
   for (let at = start; at < text.length; at += 1) {
@@ -1392,7 +1460,8 @@ function valueEnd(text: string, start: number): number | 'open' {
       return at + word.length === text.length ? 'open' : at + word.length;
     }
   }
-  return 'open';
+  // The text ends inside a string's words, or in a list or dict's structure.
+  return quote === '' ? 'open' : 'in-value';
 }
 
 /**
