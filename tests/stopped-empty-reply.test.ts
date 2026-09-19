@@ -4249,3 +4249,72 @@ describe('a reply the model ended that names a call’s opening, its value runni
     expect(stored.content, 'the stored reply').toBe('Working it out.\n\nIt is 42.');
   });
 });
+
+/* ── Review round 8 ─────────────────────────────────────────────────── */
+
+const ROUND8_GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+describe('a round its token limit cut short while its reasoning was still open', () => {
+  // A round cut off at its limit is read at its end as a stopped one is: the
+  // model was still thinking, and a call it drafted there is not one it made.
+  // Read as a round the model ended, the drafted call ran, an MCP server was
+  // sent its arguments under a conversation's grant, and a follow-up was asked
+  // for, where Stop landing at the same character recorded nothing.
+  const DRAFT =
+    '<think>The notes might say. I could call <tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}</tool_call> but the question is only arithmetic, so I do not need';
+  for (const [how, ended] of [
+    ['cut off at its limit', cutOff(DRAFT)],
+    [
+      'said stop, having spent its whole limit',
+      { text: DRAFT, finishReason: 'stop' as const, completionTokens: DEFAULT_SAMPLER.maxTokens },
+    ],
+  ] as const) {
+    it(`${how}: does not run a call drafted there, nor ask for a follow-up`, async () => {
+      const id = `rv8_cut_open_reasoning_${how.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([ended, 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('what is six times seven?');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((call) => call.name) ?? [], 'tools that ran').toEqual([]);
+      expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+      expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+        content: '',
+        stopped: false,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('under a conversation’s grant: sends the MCP server nothing it only drafted', async () => {
+    const id = 'rv8_cut_open_reasoning_mcp';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        '<think>I could file it with <tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a"}}</tool_call> but the person only asked what the note would say, so I should not file anything. The note would',
+      ),
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('what would the note say?');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'sent to the MCP server').not.toHaveBeenCalled();
+    expect(assistantRows(id).at(-1)?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(local.seen, 'no follow-up').toHaveLength(1);
+  });
+});

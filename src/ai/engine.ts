@@ -1217,7 +1217,7 @@ export class ChatterangEngine {
           const strandedCalls =
             offered.length > 0
               ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages), {
-                  stopped: true,
+                  ended: 'stopped',
                 })
               : [];
           if (strandedCalls.length > 0) {
@@ -1303,9 +1303,18 @@ export class ChatterangEngine {
       // still named a tool id, a reply showing Qwen's call format had its example
       // dispatched, answered "No tool named", followed by a second request, and
       // stripped from the words the person had watched arrive.
+      //
+      // READ AS THE ROUND ENDED. A round its limit on tokens cut short
+      // mid-reasoning was still thinking, as one Stop cut there was, and a call
+      // it drafted there is not one it made. Read as a round the model ended,
+      // it ran the call the model was only weighing — under a conversation's
+      // grant, the MCP server was sent its arguments — and asked for a
+      // follow-up, where Stop at the same character recorded nothing.
       const calls =
         offered.length > 0
-          ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages))
+          ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages), {
+              ended: turn.ended,
+            })
           : [];
 
       if (calls.length === 0) break;

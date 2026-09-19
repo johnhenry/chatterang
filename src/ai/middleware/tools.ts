@@ -337,18 +337,21 @@ const LITERALS: ReadonlyMap<string, unknown> = new Map<string, unknown>([
  * </tool_call>, but I know this" — is not one the round made. Read with its
  * reasoning in it, a round ran a call only mentioned there and sent a
  * follow-up, and ran a call drafted there and then made twice. A block the
- * round closed is reasoning. One still open at the end is reasoning when
- * `stopped`, since Stop cut the model's thinking short; in a round that
- * finished, the model wrote its call before it closed its reasoning, and it
- * runs. See `reasoningSpans`.
+ * round closed is reasoning. One still open at the end is reasoning unless
+ * the model ended the round (`ended`, see {@link TextEnding}): a round the
+ * model ended with its reasoning open wrote its call before it closed it, and
+ * the call runs. Stop, or a limit on tokens, cut the model's thinking short,
+ * and a call it drafted there is not one it made: read as a round the model
+ * ended, a round cut off at its limit mid-reasoning ran the call it was only
+ * weighing, and sent an MCP server its arguments. See `reasoningSpans`.
  */
 export function extractTextualToolCalls(
   text: string,
   offered: readonly string[],
   shown: readonly ToolUseContent[],
-  { stopped = false }: { readonly stopped?: boolean } = {},
+  { ended = 'model' }: { readonly ended?: TextEnding } = {},
 ): ToolUseContent[] {
-  const reasoning = reasoningSpans(text, { unclosed: stopped });
+  const reasoning = reasoningSpans(text, { unclosed: ended !== 'model' });
   const inReasoning = (at: number): boolean => reasoning.some(([start, end]) => at >= start && at < end);
 
   // READ AS THE STRIPPER READS THEM: every call is one `callMarkup` finds, the
@@ -1557,15 +1560,15 @@ export function stripToolSyntax(
  * `offered` and `shown` are REQUIRED, as `enabledIds` is on `runToolCalls`: a
  * reading that left out `offered` took a data record for a call, and one that
  * left out `shown` ran a call again when the model recounted it. `shown` is
- * {@link shownCalls} of the messages the reply answers. `stopped` is whether
- * Stop cut the message short, which decides whether reasoning it left open is
- * still reasoning: see {@link extractTextualToolCalls}.
+ * {@link shownCalls} of the messages the reply answers. `ended` is how the
+ * message ended (see {@link TextEnding}), which decides whether reasoning it
+ * left open is still reasoning: see {@link extractTextualToolCalls}.
  */
 export function findToolCalls(
   message: IRMessage,
   offered: readonly string[],
   shown: readonly ToolUseContent[],
-  reading: { readonly stopped?: boolean } = {},
+  reading: { readonly ended?: TextEnding } = {},
 ): ToolUseContent[] {
   return [
     ...structuredToolCalls(message),

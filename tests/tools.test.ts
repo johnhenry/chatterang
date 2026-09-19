@@ -212,7 +212,14 @@ describe('extractTextualToolCalls', () => {
     expect(extractTextualToolCalls(`<think>First ${call}.</think>\n${call}`)).toHaveLength(1);
     // A round that finished with its reasoning open wrote its call there.
     expect(extractTextualToolCalls(`<think>I will check.\n${call}`)).toHaveLength(1);
-    expect(extractFrom(`<think>I will check.\n${call}`, OFFERED, [], { stopped: true })).toEqual([]);
+    expect(extractFrom(`<think>I will check.\n${call}`, OFFERED, [], { ended: 'stopped' })).toEqual([]);
+  });
+
+  it('reads no call in reasoning still open in a round cut short, as in one Stop cut', () => {
+    const call = '<tool_call>{"name": "calculate", "arguments": {"expression": "2+2"}}</tool_call>';
+    expect(extractFrom(`<think>I could check with ${call} but I do not need`, OFFERED, [], { ended: 'cut' })).toEqual([]);
+    // A round the model ended with its reasoning open wrote its call there.
+    expect(extractFrom(`<think>I will check.\n${call}`, OFFERED, [], { ended: 'model' })).toHaveLength(1);
   });
 
   it('assigns each call a distinct id', () => {
