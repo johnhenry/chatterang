@@ -931,7 +931,12 @@ describe('two calls, the first written without its closing tag or paren', () => 
   });
 
   it('reads the first, and cuts the second, when the text ends inside the second or on its opening', () => {
-    for (const second of ['<tool_call>{"name": "calculate", "arguments": {"expression": "6*', '<tool_call>']) {
+    for (const second of [
+      '<tool_call>{"name": "calculate", "arguments": {"expression": "6*',
+      '<tool_call>',
+      '[TOOL_CALLS] calculate(',
+      '[TOOL_CALLS] calculate',
+    ]) {
       const text = `Both.\n<tool_call>${calc('6*7')}\n${second}`;
       expect(extractFrom(text, OFFERED, [], { ended: 'stopped' }).map((found) => found.input), second).toEqual([
         { expression: '6*7' },
