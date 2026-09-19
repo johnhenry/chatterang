@@ -1082,6 +1082,8 @@ function receiptClause(receipt: McpCallReceipt): string {
           return `${receipt.toolName} was not sent to ${where} at ${when} — the reply was stopped before it went`;
         case 'round-limit':
           return `${receipt.toolName} was not sent to ${where} at ${when} — the turn had already used every tool round it was allowed`;
+        case 'reply-failed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the reply failed before it went`;
         default:
           return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
       }

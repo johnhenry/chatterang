@@ -175,13 +175,19 @@ export interface McpCallFields {
  *   that turn came after the turn's limit on tool rounds (`TOOL_ITERATIONS`),
  *   so it was never dispatched (#293). `stripToolSyntax` still removes it from
  *   the displayed text; this is the record that says why nothing happened.
+ * - `reply-failed`: the call was complete in the text of a model turn whose
+ *   stream then failed, with no fallback to finish the turn, so it was never
+ *   dispatched. The failed reply's stored words have their calls read out, as
+ *   a finished reply's are, and without this record nothing said the model
+ *   had written a call that did not go.
  *
  * A call here is one whose text was complete enough for {@link findToolCalls}
  * or its textual forms to read it as a call — whether that text came from a
- * turn that finished normally, one cut short by Stop, or one run past the
- * round limit. Text that never became a complete call — an argument still
- * streaming when Stop landed — was never read as a call at all: it was not
- * sent, and it has no record, because there is nothing named yet to record.
+ * turn that finished normally, one cut short by Stop, one run past the round
+ * limit, or one whose stream failed. Text that never became a complete call —
+ * an argument still streaming when Stop landed — was never read as a call at
+ * all: it was not sent, and it has no record, because there is nothing named
+ * yet to record.
  *
  * Each reads differently in the thread and the export, because each is a
  * different thing to have happened.
@@ -192,7 +198,8 @@ export type WithheldWhy =
   | 'declined'
   | 'server-changed'
   | 'stopped'
-  | 'round-limit';
+  | 'round-limit'
+  | 'reply-failed';
 
 /**
  * Could this call's arguments have reached the server?

@@ -1764,6 +1764,15 @@ export async function runToolCalls(
      * call that was never going to run regardless of the answer.
      */
     roundLimitReached?: boolean;
+    /*
+     * This batch was read from a turn whose stream failed, with nothing to
+     * finish it. As past the round limit, nothing in it runs and nobody is
+     * asked, and a call with a destination gets a `withheld` receipt, why
+     * `reply-failed`: the failed reply's words have their calls read out, and
+     * without the record nothing said the model had written a call that did
+     * not go.
+     */
+    replyFailed?: boolean;
   },
 ): Promise<{ results: MessageContent[]; executed: ExecutedTool[] }> {
   const results: MessageContent[] = [];
@@ -1809,9 +1818,11 @@ export async function runToolCalls(
     );
     // Asked BEFORE any call in the batch runs, so a sheet lists every call its
     // answer covers, and a destructive call's own confirm comes after it.
-    // Skipped entirely past the round limit: nothing in this batch runs
-    // whatever the answer, so nobody is asked (see `roundLimitReached`).
-    const { refused, onHeldGrant } = options.roundLimitReached
+    // Skipped entirely past the round limit, or after the reply failed:
+    // nothing in this batch runs whatever the answer, so nobody is asked (see
+    // `roundLimitReached` and `replyFailed`).
+    const neverRuns = options.roundLimitReached === true || options.replyFailed === true;
+    const { refused, onHeldGrant } = neverRuns
       ? { refused: new Map<number, Refusal>(), onHeldGrant: new Set<number>() }
       : await refusedDestinations(calls, tools, options.destinations, options.signal);
 
@@ -1889,17 +1900,36 @@ export async function runToolCalls(
       };
     };
 
+    /*
+     * AFTER THE REPLY FAILED, every call with a destination is withheld, and
+     * nothing runs, as past the round limit: the failure is the reason, and
+     * nobody was asked. See `replyFailed`.
+     */
+    const failedReply = (index: number): Refusal | undefined => {
+      const destination = tools[index]?.destination;
+      if (!destination || !options.replyFailed) return undefined;
+      return {
+        output: `This call’s arguments were not sent to ${destination.host}: the reply failed before it went.`,
+        why: 'reply-failed',
+      };
+    };
+
     for (const [index, call] of calls.entries()) {
       const refusal =
-        refused.get(index) ?? withdrawn(index) ?? changed(index) ?? stopped(index) ?? overLimit(index);
-      // Nothing runs once the turn is stopped or past the round limit. A
-      // refused call is still written down below, whatever refused it: a
-      // refusal sends nothing, and a call the person declined before Stop
-      // came is as much not sent as one Stop held back (owner ruling OD7).
-      // What is skipped here without a record is only a call with no
+        refused.get(index) ??
+        withdrawn(index) ??
+        changed(index) ??
+        stopped(index) ??
+        overLimit(index) ??
+        failedReply(index);
+      // Nothing runs once the turn is stopped, past the round limit, or
+      // failed. A refused call is still written down below, whatever refused
+      // it: a refusal sends nothing, and a call the person declined before
+      // Stop came is as much not sent as one Stop held back (owner ruling
+      // OD7). What is skipped here without a record is only a call with no
       // destination — a tool that runs on this device, or a name the request
       // did not declare — which has no server it was not sent to.
-      if ((options.signal?.aborted || options.roundLimitReached) && !refusal) continue;
+      if ((options.signal?.aborted || neverRuns) && !refusal) continue;
 
       const tool = tools[index];
       // What a record names: the live tool, or the one the request declared when

@@ -1240,6 +1240,30 @@ export class ChatterangEngine {
         // one request it acts on, `complete()`'s, can do neither.
         const fallback = runsOnThisDevice(target) ? this.#resolveFallback() : null;
         if (!fallback) {
+          // A CALL THE FAILED ROUND HAD WRITTEN IN FULL is recorded as not
+          // sent, as #331 records one Stop caught (#293). The failed row's words
+          // have their calls read out, as a finished reply's are — Try again
+          // keeps it as a version, and flipping back to it sent the call — and
+          // nothing else said the model had written a call to a server that
+          // never went. Its stream failed, so it ended wherever it was: read as
+          // `'cut'`, reasoning it left open is still reasoning. Nothing runs.
+          const unsent =
+            offered.length > 0
+              ? findToolCalls({ role: 'assistant', content: turn.text }, callNames(offered), shownCalls(messages), {
+                  ended: 'cut',
+                })
+              : [];
+          if (unsent.length > 0) {
+            const batch = await runToolCalls(toolRegistry, unsent, {
+              enabledIds: request.toolIds ?? [],
+              destinations: this.#mcpDestinations(request.mcpEgress),
+              declared: offered,
+              signal: request.signal,
+              replyFailed: true,
+            });
+            tools.push(...batch.executed);
+            for (const tool of batch.executed) yield { type: 'tool', tool, ended: 'cut' };
+          }
           const retryable = noBackendRetryable(failure);
           yield {
             type: 'error',

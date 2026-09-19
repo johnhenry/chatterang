@@ -738,6 +738,44 @@ describe('tool enablement is enforced', () => {
     expect(results).toHaveLength(1);
   });
 
+  it('records a call from a reply that failed as not sent, runs nothing, and asks nobody about it (refs #293)', async () => {
+    // The failed reply's words have their calls read out, as a finished
+    // reply's are, so this record is what says the model wrote a call that did
+    // not go. As past the round limit: nothing runs, nobody is asked, and only
+    // a call with a destination is recorded.
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const spy = spyTool('mcp:notes.note', 'notes.note');
+    const tool: ChatterangTool = { ...spy.tool, destination };
+    const local = spyTool('calculator');
+    const isGranted = vi.fn(() => true);
+    const request = vi.fn(async (): Promise<'calls'> => 'calls');
+
+    const { results, executed } = await runToolCalls(
+      new ToolRegistry([tool, local.tool]),
+      [
+        { type: 'tool_use' as const, id: 'c0', name: 'notes.note', input: { text: 'x' } },
+        { type: 'tool_use' as const, id: 'c1', name: 'calculator', input: {} },
+      ],
+      { enabledIds: [tool.id, local.tool.id], destinations: { isGranted, request }, replyFailed: true },
+    );
+
+    expect(spy.execute, 'nothing runs after the reply failed').not.toHaveBeenCalled();
+    expect(local.execute, 'not a local tool either').not.toHaveBeenCalled();
+    expect(isGranted, 'nobody is asked whether the destination is already granted').not.toHaveBeenCalled();
+    expect(request, 'nobody is asked').not.toHaveBeenCalled();
+    expect(executed.map((record) => record.receipt)).toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'reply-failed', host: 'notes.example', toolName: 'notes.note' }),
+    ]);
+    expect(executed[0]?.output).toBe('This call’s arguments were not sent to notes.example: the reply failed before it went.');
+    expect(results).toHaveLength(1);
+  });
+
   it('drops a round-limit call with no destination silently, as a local tool always has been', async () => {
     // Only a call with a destination gets a receipt: a local tool has no
     // server it was not sent to, and past the round limit it simply does not

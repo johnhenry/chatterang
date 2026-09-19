@@ -4613,3 +4613,101 @@ describe('a call whose string argument names a reasoning tag', () => {
     expect(stored.content, 'the stored reply').toBe('Working it out.\n\nThe sum is on its way and\n\nIt is 42.');
   });
 });
+
+describe('a complete call in a round whose stream then failed', () => {
+  // The failed row's words have their calls read out, as a finished reply's
+  // are: a failed row is kept as a version by Try again, and flipping back to
+  // it sent the call. But nothing recorded a call read out that way, so the
+  // failed row said nothing of a call the model wrote to a server that was
+  // never sent — where main kept its text on screen. It is recorded as not
+  // sent, as #331 records a call Stop caught or the round limit held back.
+  const FAILS_AFTER = `Filing it.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>`;
+  function streamsThenFails(text: string) {
+    const seen: IRChatRequest[] = [];
+    const adapter = new FunctionBackendAdapter({
+      execute: async () => {
+        throw new Error('this rig only streams');
+      },
+      executeStream: async function* (request: IRChatRequest): AsyncGenerator<IRStreamChunk> {
+        seen.push(structuredClone(request));
+        if (seen.length > 1) {
+          yield { type: 'start', sequence: 0, metadata: request.metadata };
+          yield { type: 'content', sequence: 1, delta: 'Fine.' };
+          yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          return;
+        }
+        yield { type: 'start', sequence: 0, metadata: request.metadata };
+        yield { type: 'content', sequence: 1, delta: text };
+        throw new Error('not enough memory');
+      },
+    });
+    return { adapter, seen };
+  }
+
+  it('is recorded as not sent, and none of it is stored or sent back (refs #293)', async () => {
+    const id = 'rv8_failed_round_call';
+    const local = streamsThenFails(FAILS_AFTER);
+    let failed: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await useChats.getState().send('file a note');
+      failed = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ content: failed?.content, error: failed?.error }, 'the failed row').toEqual({
+      content: 'Filing it.',
+      error: 'not enough memory',
+    });
+    expect(failed?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({
+        outcome: 'withheld',
+        why: 'reply-failed',
+        toolName: 'notes.note',
+        host: 'notes.example',
+      }),
+    ]);
+    await mounted(failed!, () => {
+      expect(receipts(), 'the thread').toEqual(['Not sent to notes.example (notes) — the reply failed before it went.']);
+    });
+    expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').toMatch(
+      /notes\.note was not sent to notes\.example \(notes\) at .+ — the reply failed before it went/,
+    );
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('canary-7f3a');
+    expect(next, 'the next request').not.toContain('the reply failed');
+  });
+
+  it('drafted in reasoning the stream failed inside: records nothing', async () => {
+    const id = 'rv8_failed_round_reasoning';
+    const local = streamsThenFails(`<think>I could file it with ${MCP_CALL_CLEAN} but the person only asked`);
+    let failed: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await useChats.getState().send('what would the note say?');
+      failed = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ error: failed?.error, toolCalls: failed?.toolCalls }, 'the failed row').toEqual({
+      error: 'not enough memory',
+      toolCalls: undefined,
+    });
+  });
+
+  it('with no destination, as a local tool’s: records nothing, and none of it is stored', async () => {
+    const id = 'rv8_failed_round_local_call';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = streamsThenFails('Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>');
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(
+      { content: failed.content, error: failed.error, toolCalls: failed.toolCalls },
+      'the failed row',
+    ).toEqual({ content: 'Working it out.', error: 'not enough memory', toolCalls: undefined });
+  });
+});

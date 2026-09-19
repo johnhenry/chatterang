@@ -446,6 +446,8 @@ function receiptSentence(receipt: McpCallReceipt): string {
           return `Not sent to ${where} — the reply was stopped before it went.`;
         case 'round-limit':
           return `Not sent to ${where} — the turn had already used every tool round it was allowed.`;
+        case 'reply-failed':
+          return `Not sent to ${where} — the reply failed before it went.`;
         default:
           return `Not sent to ${where} — ${unhandledWhy(receipt.why)}.`;
       }

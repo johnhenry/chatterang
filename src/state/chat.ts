@@ -2192,6 +2192,7 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
         case 'server-changed':
         case 'stopped':
         case 'round-limit':
+        case 'reply-failed':
           return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
         default:
           // Not sent; whose words came back is not this build's to say.
@@ -2218,6 +2219,7 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
         case 'server-changed':
         case 'stopped':
         case 'round-limit':
+        case 'reply-failed':
           return `${names}, which was not sent to ${receipt.host}`;
         default:
           return `${names}, which was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`;
