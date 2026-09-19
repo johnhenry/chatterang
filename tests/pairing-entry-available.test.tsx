@@ -38,6 +38,7 @@ import {
   typeInto,
   type Mounted,
 } from './support/pairing-dom';
+import { stage } from './support/stage';
 
 const mounted: Mounted[] = [];
 
@@ -50,14 +51,43 @@ afterEach(async () => {
 });
 
 /**
- * Settle until the lazy sheet has loaded, or fail naming it. It opens on Type,
+ * How long a press may take to become a sheet on screen: the sheet's chunk
+ * transformed and evaluated, then rendered. A BOUND ON A HANG, NEVER A WINDOW
+ * FOR A RACE (`tests/support/stage.ts`): a pressed entry must load its sheet,
+ * and a loaded runner only makes that later. It used to be 50 rounds of
+ * `settle()`, a count that a runner busy with other files spent before the
+ * chunk arrived. Generous, because under load the first press spends it
+ * transforming the chunk; free, because the wait returns the moment the sheet
+ * is there.
+ */
+const SHEET_MS = 15_000;
+/**
+ * Each test's timeout here: `SHEET_MS` and the rest of a test, under load. Over
+ * `SHEET_MS`, so a sheet that never loads fails naming the sheet rather than
+ * at `it(` (stage.ts: raise the bound with the test timeout, never past it).
+ */
+const TEST_MS = 25_000;
+
+/**
+ * Wait until the lazy sheet has loaded, or fail naming it. It opens on Type,
  * which every test here pairs by, although the real `web` row jsdom runs can
  * scan (#124): so Type here is the sheet's choice, not a missing camera.
+ *
+ * Two waits, each on the thing it means:
+ *   - The lazy import itself. The press rendered `lazy()`, which called
+ *     `import()` for the sheet; the module runner hands this `import()` the
+ *     same evaluation, so it resolves when the sheet's module has loaded.
+ *   - The render. React retries the suspended boundary once `lazy()`'s own
+ *     promise settles; each look lets that work run inside `act`. What bounds
+ *     the looks is what is left of `SHEET_MS`, not a count of them, so a sheet
+ *     that never renders still fails here, only later.
  */
 async function sheetLoaded(): Promise<HTMLElement> {
-  for (let i = 0; i < 50 && dialog() === null; i += 1) await settle();
+  const started = Date.now();
+  await stage("the lazy sheet's module to load", import('@/features/pairing/PairingSheet'), SHEET_MS);
+  while (dialog() === null && Date.now() - started < SHEET_MS) await settle();
   const found = dialog();
-  expect(found, 'the lazy sheet never loaded').not.toBeNull();
+  expect(found, `the lazy sheet never loaded (waited ${Date.now() - started}ms of ${SHEET_MS}ms)`).not.toBeNull();
   expect(capabilities().cameraScan, 'this row can scan').toBe(true);
   expect(mustButton('Type').getAttribute('aria-pressed'), 'the sheet opened on Type').toBe('true');
   return found!;
@@ -79,7 +109,7 @@ async function pairTyped(): Promise<void> {
 
 const toasts = () => useApp.getState().toasts.map(({ message, tone }) => ({ message, tone }));
 
-describe('the pairing entry when a controller is available', () => {
+describe('the pairing entry when a controller is available', { timeout: TEST_MS }, () => {
   it('shows the section and its button, and opens the sheet only when pressed', async () => {
     const mount = await render(<PairingEntry />);
     mounted.push(mount);
