@@ -235,12 +235,34 @@ function endedRoundWords(
 }
 
 /**
- * How a round's stream ended, from the reason its last chunk gave: the model
- * ending it, `stop` or `tool_calls`; or anything else — its limit on tokens, a
- * filter — which cut it short. See `TextEnding`.
+ * How a round's stream ended, from the reason its last chunk gave and what the
+ * request asked for: `'model'` when the model ended it; `'cut'` when anything
+ * else did, or may have. See `TextEnding`.
+ *
+ * The model ended it only when the stream says `stop` or `tool_calls` and
+ * nothing says otherwise. A limit on tokens, a filter or an error cut it short.
+ * So did a limit on tokens the stream spent to the last token, whatever reason
+ * it gave: an adapter can say `stop` for every reply — aimatey's Ollama
+ * adapter does — and a reply cut off inside a call's arguments, read as one
+ * the model ended, kept them, stored and sent back. And a `stop` in a request
+ * with stop sequences of its own may be one of them, anywhere in a call.
  */
-function endingOf(reason: FinishReason): TextEnding {
-  return reason === 'stop' || reason === 'tool_calls' ? 'model' : 'cut';
+function endingOf(
+  reason: FinishReason,
+  {
+    completionTokens,
+    maxTokens,
+    stopSequences,
+  }: {
+    readonly completionTokens: number | undefined;
+    readonly maxTokens: number | undefined;
+    readonly stopSequences: readonly string[] | undefined;
+  },
+): TextEnding {
+  if (reason !== 'stop' && reason !== 'tool_calls') return 'cut';
+  if (completionTokens !== undefined && maxTokens !== undefined && completionTokens >= maxTokens) return 'cut';
+  if (reason === 'stop' && (stopSequences?.length ?? 0) > 0) return 'cut';
+  return 'model';
 }
 
 interface TurnResult {
@@ -248,8 +270,8 @@ interface TurnResult {
   stats: GenerationStatsSnapshot;
   /**
    * How the round's stream ended: `'model'` when its last chunk said the model
-   * ended it, `'cut'` for anything else — its limit on tokens, a filter, an
-   * error, or no last chunk at all. See `endingOf`.
+   * ended it and nothing said otherwise, `'cut'` for anything else — its limit
+   * on tokens, a filter, an error, or no last chunk at all. See `endingOf`.
    */
   ended: TextEnding;
   error?: string;
@@ -1464,7 +1486,11 @@ export class ChatterangEngine {
           }
           // Whether the model ended it, or its limit on tokens or a filter cut
           // it short: a text the model ended ends outside any call it wrote.
-          ended = endingOf(chunk.finishReason);
+          ended = endingOf(chunk.finishReason, {
+            completionTokens: stats.completionTokens,
+            maxTokens: irRequest.parameters?.maxTokens,
+            stopSequences: irRequest.parameters?.stopSequences,
+          });
           sawTerminal = true;
           break;
         }

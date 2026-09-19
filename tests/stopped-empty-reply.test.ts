@@ -4116,6 +4116,55 @@ describe('a reply the model ended that names a call’s opening, its value runni
     });
   }
 
+  // A stream can say `stop` without the model having ended it: aimatey's Ollama
+  // adapter says it for every reply, a reply cut off at its limit included, and
+  // a stop sequence of the request's own ends a reply wherever it matches.
+  const CUT_CALL = 'Checking.\n<tool_call>calculate(expression="6*7, canary-7f3a';
+
+  it('a reply whose stream says stop but spent its request’s whole limit on tokens: stores and sends none of the call', async () => {
+    const id = 'rv7_spent_limit';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const limit = DEFAULT_SAMPLER.maxTokens;
+    const local = recordingBackend([{ text: CUT_CALL, finishReason: 'stop', completionTokens: limit }, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(local.seen[0]?.parameters?.maxTokens, 'the request’s limit on tokens').toBe(limit);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('a reply whose stream says stop, in a request with stop sequences of its own: stores and sends none of the call', async () => {
+    const id = 'rv7_stop_sequences';
+    given(chat(id, { tools: ['calculator'], sampler: { stopSequences: ['###'] } }), [
+      user(id, 1, 'hello'),
+      reply(id, 2, 'Hi.'),
+    ]);
+    const local = recordingBackend([CUT_CALL, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(local.seen[0]?.parameters?.stopSequences, 'the request’s stop sequences').toEqual(['###']);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('a reply the model ended that spent fewer tokens than its limit: keeps every word', async () => {
+    const id = 'rv7_under_limit';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = PROSE[2][1];
+    const local = recordingBackend([{ text: words, finishReason: 'stop', completionTokens: 40 }, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('how does a model write a call?');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe(words);
+  });
+
   it('a round Stop caught a complete call in, ending on a bare opening: records the call, and keeps none of the opening', async () => {
     // The round's words are read as Stop left them, as every stopped round's
     // are, though the call Stop caught complete in them has ended the round.

@@ -115,12 +115,14 @@ export const cloudTarget = {
 
 /**
  * A reply as a script for {@link recordingBackend} writes one when its stream
- * ends for a reason of its own: a plain string ends as the model ending it,
- * `finishReason: 'stop'`.
+ * ends for a reason of its own, or says how many tokens it spent: a plain
+ * string ends as the model ending it, `finishReason: 'stop'`, and says nothing
+ * of its tokens.
  */
 export interface EndedReply {
   readonly text: string;
   readonly finishReason: FinishReason;
+  readonly completionTokens?: number;
 }
 
 /** `text` as a reply the backend cut off at its limit on tokens, `finishReason: 'length'`. */
@@ -153,10 +155,17 @@ export function recordingBackend(turns: readonly (string | EndedReply)[]): {
         };
       },
       executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
-        const { text, finishReason } = next(request);
+        const { text, finishReason, completionTokens } = next(request);
         yield { type: 'start', sequence: 0, metadata: request.metadata };
         yield { type: 'content', sequence: 1, delta: text };
-        yield { type: 'done', sequence: 2, finishReason };
+        yield {
+          type: 'done',
+          sequence: 2,
+          finishReason,
+          ...(completionTokens === undefined
+            ? {}
+            : { usage: { promptTokens: 1, completionTokens, totalTokens: completionTokens + 1 } }),
+        };
       },
     }),
   };
