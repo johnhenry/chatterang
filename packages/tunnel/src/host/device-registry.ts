@@ -89,6 +89,17 @@
  * directory sync that fails after it rejects the change with the new file
  * already in place and held, since that is what a restart would read.
  *
+ * NO COPY OUTLIVES THE WRITE THAT MADE IT (#131: a revocation leaves nothing
+ * behind). A process killed between filling its private name and renaming it,
+ * or a write whose own removal of that name failed, leaves a whole copy of the
+ * records as they were — every id, digest and name, in the clear where nothing
+ * seals. Every open removes each `paired-devices.<16 hex>.tmp` before it reads
+ * the file, and every change removes any after its rename, syncing the
+ * directory after on Linux and macOS. A removal that fails refuses the open, or
+ * rejects the change with the new file in place and held. So once a revoke's
+ * delete or a reset resolves, no file here names the phone. The key store's own
+ * private names are its to remove, and are left alone.
+ *
  * ON WINDOWS the directory is not synced, for the key store's reason (Node
  * offers nothing that flushes a directory entry there), and Node documents the
  * overwrite and nothing about whether it is atomic there. Nobody here has
@@ -97,7 +108,8 @@
  * ONE PROCESS. What was read at open, then each change this process made, is
  * the answer to every `get`. The desktop is one instance and the server one
  * per `--root`; a second process writing the same file is not something this
- * coordinates.
+ * coordinates. (One that opens it while this one is mid-write removes that
+ * write's private name, so its rename fails and this process keeps what it had.)
  */
 
 import { Buffer } from 'node:buffer';
@@ -118,13 +130,16 @@ import {
 } from './identity-store.js';
 
 /**
- * The key store's file system, and `rename`: the registry replaces its file on
- * every change, where the key store only ever creates one. Declared here, so
- * the key store's own interface — and every caller that hands it one — is
- * unchanged. `node:fs/promises` is one.
+ * The key store's file system, with `rename` and `readdir`: the registry
+ * replaces its file on every change, where the key store only ever creates
+ * one, and it lists its directory to find a copy an unfinished write left
+ * behind. Declared here, so the key store's own interface — and every caller
+ * that hands it one — is unchanged. `node:fs/promises` is one.
  */
 export interface RegistryFileSystem extends KeyFileSystem {
   rename(oldPath: string, newPath: string): Promise<void>;
+  /** The names in a directory. */
+  readdir(path: string): Promise<string[]>;
 }
 
 export interface DeviceRegistryOptions extends Omit<TunnelKeyStoreOptions, 'fs'> {
@@ -199,8 +214,8 @@ export interface DeviceRegistry {
    * phone's on `device` and all of them on `reset`, and when it opens it deletes
    * any phone's that `list()` no longer has — which covers `cleared`, and a
    * removal whose watchers were never told: the process ended first, or the
-   * directory sync after the rename failed, which rejects the change after the
-   * file has already lost the device.
+   * directory sync or the removal of a leftover copy after the rename failed,
+   * which rejects the change after the file has already lost the device.
    */
   watchRemovals(onRemoved: (removal: DeviceRemoval) => Promise<void>): () => void;
 }
@@ -236,6 +251,8 @@ export class DeviceRegistryError extends Error {
 }
 
 const REGISTRY_FILE = 'paired-devices';
+/** The private name a write fills before its rename, and no other name. */
+const TEMPORARY_FILE = new RegExp(`^${REGISTRY_FILE}\\.[0-9a-f]{16}\\.tmp$`);
 const FORMAT = 'chatterang-paired-devices';
 const VERSION = 1;
 const ENVELOPE_FIELDS = ['bindTo', 'contents', 'format', 'protection', 'version'].join(',');
@@ -683,11 +700,33 @@ async function syncDirectory(fs: KeyFileSystem, directory: string): Promise<void
 }
 
 /**
+ * Remove every private name a write left behind, and resolve to whether there
+ * was one. Each holds a whole copy of the records as they were when it was
+ * written, so one left in place would outlive the revoke or reset that forgot
+ * a phone (#131). A name already gone counts as removed; any other failure
+ * rejects. The key store's own private names are not this file's to remove.
+ */
+async function removeLeftovers(fs: RegistryFileSystem, directory: string): Promise<boolean> {
+  let removed = false;
+  for (const name of await fs.readdir(directory)) {
+    if (!TEMPORARY_FILE.test(name)) continue;
+    try {
+      await fs.unlink(join(directory, name));
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error;
+    }
+    removed = true;
+  }
+  return removed;
+}
+
+/**
  * Open the paired-device registry for this data directory.
  *
- * The key store's checks run first, on every open, then the file's own. A
- * refusal from either leaves every file as it was, except that a file bound to
- * another `bindTo` is replaced by an empty one and reported as `cleared`.
+ * The key store's checks run first, on every open, then any copy an unfinished
+ * write left is removed, then the file's own checks. A refusal from the file's
+ * checks leaves the file as it was, except that a file bound to another
+ * `bindTo` is replaced by an empty one and reported as `cleared`.
  */
 export async function openDeviceRegistry(options: DeviceRegistryOptions): Promise<DeviceRegistry> {
   if (!(options.bindTo instanceof Uint8Array) || options.bindTo.byteLength !== BIND_BYTES) {
@@ -704,6 +743,13 @@ export async function openDeviceRegistry(options: DeviceRegistryOptions): Promis
     windows: options.platform === 'win32' ? await windowsAccessFor(options) : null,
   };
 
+  /** Remove what an unfinished write left, and make that durable where the key store syncs. */
+  const sweep = async (): Promise<void> => {
+    if ((await removeLeftovers(options.fs, directory)) && context.windows === null) {
+      await syncDirectory(options.fs, directory);
+    }
+  };
+
   /** The whole next file, parsed back before it is written, then written. */
   const write = async (next: Devices): Promise<void> => {
     const text = registryText(next, bindTo, options.sealer);
@@ -713,6 +759,10 @@ export async function openDeviceRegistry(options: DeviceRegistryOptions): Promis
     }
     await replaceRegistryFile(context, directory, path, text);
   };
+
+  // A process killed between a write and its rename left its copy: before
+  // anything is read or written.
+  await sweep();
 
   let devices: Devices = new Map();
   let cleared: null | 'binding-changed' = null;
@@ -735,11 +785,16 @@ export async function openDeviceRegistry(options: DeviceRegistryOptions): Promis
     tail = result.catch(() => undefined);
     return result;
   };
-  /** Write `next`, and hold it once the file does. */
+  /**
+   * Write `next`, and hold it once the file does; then remove a copy an
+   * earlier write of this process could not, so that once a change resolves no
+   * copy holds what it replaced.
+   */
   const commit = async (next: Devices): Promise<void> => {
     await write(next);
     devices = next;
     if (context.windows === null) await syncDirectory(options.fs, directory);
+    await sweep();
   };
 
   const watchers = new Set<(removal: DeviceRemoval) => Promise<void>>();

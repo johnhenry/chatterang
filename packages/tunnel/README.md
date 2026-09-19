@@ -269,9 +269,14 @@ nothing calls `openDeviceRegistry` yet.
   or an unexpected field is refused too.
 - **Atomic and serialised.** Each change writes the whole file to a private
   `O_EXCL` name, checks it before writing, syncs it, and renames it over the old
-  one (`RegistryFileSystem` is the key store's file system plus `rename`). A
-  failed write leaves the old file and the in-memory records as they were, so a
-  tombstone that reached the disk still refuses after a restart.
+  one (`RegistryFileSystem` is the key store's file system plus `rename` and
+  `readdir`). A failed write leaves the old file and the in-memory records as
+  they were, so a tombstone that reached the disk still refuses after a restart.
+- **No copy left behind (#131).** A private name that was never renamed, because
+  the process was killed or its own removal failed, holds a whole copy of the
+  records. Every open removes each one before it reads the file, and every change
+  removes any after its rename. A removal that fails refuses the open or rejects
+  the change, so a revoke or reset that resolves leaves no file naming the phone.
 - **Removal and reset for #170.** `watchRemovals` is told when a device's record
   is deleted (the delete `revoke` makes) and when `reset()` forgets every device.
   It is told only after the file has changed, and a watcher's failure makes that

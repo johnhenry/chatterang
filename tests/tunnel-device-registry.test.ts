@@ -210,13 +210,16 @@ interface Faults {
   failRename(nth: number): void;
   /** The next handle `writeFile` writes half of what it was given, then throws. */
   failWriteHalfway(): void;
+  /** The next `unlink` throws, and removes nothing. */
+  failNextUnlink(): void;
   readonly renames: string[];
 }
 
-/** `node:fs/promises`, with a rename or a write that fails on request. */
+/** `node:fs/promises`, with a rename, a write or an unlink that fails on request. */
 function faulty(): Faults {
   let renameCountdown = 0;
   let halfway = false;
+  let unlinkFails = false;
   const renames: string[] = [];
   const fs: RegistryFileSystem = {
     ...realFs,
@@ -227,6 +230,13 @@ function faulty(): Faults {
         if (renameCountdown === 0) throw Object.assign(new Error('EIO: rename failed'), { code: 'EIO' });
       }
       return fsPromises.rename(from, to);
+    },
+    unlink: async (path) => {
+      if (unlinkFails) {
+        unlinkFails = false;
+        throw Object.assign(new Error('EIO: unlink failed'), { code: 'EIO' });
+      }
+      return fsPromises.unlink(path);
     },
     open: async (path, flags, mode) => {
       const handle = await fsPromises.open(path, flags, mode);
@@ -255,6 +265,9 @@ function faulty(): Faults {
     },
     failWriteHalfway: () => {
       halfway = true;
+    },
+    failNextUnlink: () => {
+      unlinkFails = true;
     },
   };
 }
@@ -364,6 +377,123 @@ describe('the paired-device registry (#133): verification data only, in one owne
       const restarted = await open();
       expect(await verifyOn(restarted, kept.credential)).toBe(kept.deviceId);
       expect(restarted.list()).toHaveLength(1);
+    });
+  });
+
+  /*
+   * #131: a revocation leaves nothing behind. A write's private name holds a
+   * whole copy of the records — every id, digest and name, in the clear where
+   * nothing seals — so one that is never renamed or removed would outlive the
+   * revoke and the reset that were meant to forget the phone.
+   */
+  describe('a copy an unfinished write left behind is removed', () => {
+    const stalePath = (): string => join(keyDirectory(), 'paired-devices.0011223344556677.tmp');
+
+    it('a copy a killed process left is removed at the next open, so a revoke and a reset then leave nothing that names the phone', async () => {
+      const registry = await open({ sealer: null });
+      const { deviceId } = await mint(registry.store);
+      await registry.setName(deviceId, 'Alice’s phone');
+
+      // Killed after its private name was written and synced, before the rename:
+      // on disk, that is a write whose rename and whose clean-up both failed.
+      const dying = faulty();
+      const killed = await open({ sealer: null, fs: dying.fs });
+      dying.failRename(1);
+      dying.failNextUnlink();
+      await expect(killed.setName(deviceId, 'Alice’s old phone')).rejects.toThrow(/rename failed/);
+      expect(temporaries()).toHaveLength(1);
+      expect(readFileSync(join(keyDirectory(), temporaries()[0]!), 'utf8')).toContain(deviceId);
+
+      // Removed on open, before anything is written.
+      const restarted = await open({ sealer: null });
+      expect(temporaries()).toEqual([]);
+
+      expect(await createDeviceCredentials(restarted.store).revoke(deviceId)).toBe(true);
+      await restarted.reset();
+      expect(readdirSync(keyDirectory()).sort()).toEqual(['key', 'paired-devices']);
+      const left = readFileSync(registryFile(), 'utf8');
+      expect(left).not.toContain(deviceId);
+      expect(left).not.toContain('Alice');
+    });
+
+    it('a copy this process could not remove is removed by its next change, so the revoke after it leaves nothing that names the phone', async () => {
+      const faults = faulty();
+      const registry = await open({ sealer: null, fs: faults.fs });
+      const credentials = createDeviceCredentials(registry.store);
+      const gone = await credentials.mint(claimedWindow(), 0);
+      const kept = await credentials.mint(claimedWindow(), 0);
+      await registry.setName(gone.deviceId, 'Alice’s phone');
+
+      faults.failRename(1);
+      faults.failNextUnlink();
+      await expect(registry.setName(gone.deviceId, 'Alice’s old phone')).rejects.toThrow(/rename failed/);
+      expect(temporaries()).toHaveLength(1);
+
+      expect(await credentials.revoke(gone.deviceId)).toBe(true);
+      expect(readdirSync(keyDirectory()).sort()).toEqual(['key', 'paired-devices']);
+      const left = readFileSync(registryFile(), 'utf8');
+      expect(left).not.toContain(gone.deviceId);
+      expect(left).not.toContain('Alice');
+      expect(left).toContain(kept.deviceId);
+    });
+
+    it.runIf(onPosix)('removes only its own private names, takes one already gone as removed, and syncs the directory after', async () => {
+      const registry = await open();
+      const kept = await mint(registry.store);
+      writeFileSync(stalePath(), readFileSync(registryFile()), { mode: 0o600 });
+      // The key store's private name, and names this build does not write.
+      const others = ['key.0011223344556677.tmp', 'paired-devices.backup', 'paired-devices.00112233445566AA.tmp'];
+      for (const name of others) writeFileSync(join(keyDirectory(), name), 'not the registry’s\n', { mode: 0o600 });
+
+      const steps: string[] = [];
+      const recording: RegistryFileSystem = {
+        ...realFs,
+        // One more, gone by the time it is removed.
+        readdir: async (path) => [...(await fsPromises.readdir(path)), 'paired-devices.ffffffffffffffff.tmp'],
+        unlink: async (path) => {
+          steps.push(`unlink ${path}`);
+          await fsPromises.unlink(path);
+        },
+        open: async (path, flags, mode) => {
+          const handle = await fsPromises.open(path, flags, mode);
+          return {
+            stat: () => handle.stat(),
+            readFile: () => handle.readFile(),
+            writeFile: (data) => handle.writeFile(data),
+            sync: async () => {
+              steps.push(`sync ${path}`);
+              await handle.sync();
+            },
+            close: () => handle.close(),
+          };
+        },
+      };
+
+      const restarted = await open({ fs: recording });
+      expect(existsSync(stalePath())).toBe(false);
+      expect(readdirSync(keyDirectory()).sort()).toEqual(['key', 'paired-devices', ...others].sort());
+      const removedAt = steps.indexOf(`unlink ${stalePath()}`);
+      expect(removedAt).toBeGreaterThanOrEqual(0);
+      expect(steps.lastIndexOf(`sync ${keyDirectory()}`)).toBeGreaterThan(removedAt);
+      expect(await verifyOn(restarted, kept.credential)).toBe(kept.deviceId);
+    });
+
+    it('a copy that cannot be removed refuses the open, and the registry file is left as it was', async () => {
+      const registry = await open();
+      await mint(registry.store);
+      writeFileSync(stalePath(), readFileSync(registryFile()), { mode: 0o600 });
+      const before = readFileSync(registryFile());
+      const stuck: RegistryFileSystem = {
+        ...realFs,
+        unlink: async (path) => {
+          if (path === stalePath()) throw Object.assign(new Error(`EACCES: permission denied, unlink '${path}'`), { code: 'EACCES' });
+          await fsPromises.unlink(path);
+        },
+      };
+
+      await expect(open({ fs: stuck })).rejects.toMatchObject({ code: 'EACCES' });
+      expect(existsSync(stalePath())).toBe(true);
+      expect(readFileSync(registryFile())).toEqual(before);
     });
   });
 
