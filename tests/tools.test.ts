@@ -940,6 +940,39 @@ describe('an unfinished call, by how the text ended', () => {
     }
   });
 
+  it('cuts a stopped or cut-short text partway through the tool’s name after a tag or [tool', () => {
+    // `CALL_OPENING` needs the `(` or `{` that has not arrived, and the bare
+    // marker above does not cover a name after these two: a round that ended
+    // while the name was streaming — several tokens, for a server-qualified
+    // MCP name — stored the marker and the name as the reply's words and sent
+    // them back in every later request. The name written so far must begin one
+    // the request offered, because these two are a tag and a bracket a
+    // sentence can name where `[TOOL_CALLS]` is a special token.
+    for (const marker of [
+      '<tool_call>calc',
+      '<tool_call>\ncalculate',
+      '<tool_call>```js',
+      '<tool_call>```',
+      '[tool calc',
+      '[tool calculate',
+    ]) {
+      for (const ended of ['stopped', 'cut'] as const) {
+        expect(cut(`Ok.\n${marker}`, ended), `${JSON.stringify(marker)} (${ended})`).toBe('Ok.\n');
+      }
+      expect(cut(`Ok.\n${marker}`, 'model'), `${JSON.stringify(marker)} (model)`).toBe(`Ok.\n${marker}`);
+    }
+  });
+
+  it('keeps a word no offered tool’s name begins, after a tag or [tool, stopped or cut short', () => {
+    for (const words of [
+      'Ok.\n<tool_call>weather',
+      'Ok.\nSee the [tool chest',
+      'Qwen wraps each call in a <tool_call> tag and the name follows: calculate',
+    ]) {
+      for (const ended of ['stopped', 'cut'] as const) expect(cut(words, ended), `${words} (${ended})`).toBe(words);
+    }
+  });
+
   it('cuts a stopped or cut-short text ending partway into the close of a call with a closing bracket too few', () => {
     // Its JSON never closes, so it is not JSON being written once the close
     // begins, and the close is not whole, so it is not a finished call either:

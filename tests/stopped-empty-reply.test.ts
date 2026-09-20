@@ -6052,3 +6052,80 @@ describe('a call whose list or dict argument is a closing bracket short', () => 
     );
   });
 });
+
+/* ── Round 12: a round that ended inside the tool's name ────────────── */
+
+describe('a round cut short or stopped while the tool’s name was streaming', () => {
+  // `CALL_OPENING` needs the `(` or `{` that has not arrived, and the bare
+  // marker the cut already reads does not cover a name after `<tool_call>` or
+  // after this app's own `[tool `. So the marker and the name were stored as
+  // the reply's words and rode in every later request. The window is the
+  // several tokens of a server-qualified MCP name — `notes.note` here.
+  for (const [form, opening, kept] of [
+    ['a tag', 'Filing it now.\n<tool_call>notes.note', 'Filing it now.'],
+    ['a tag, the name on its own line', 'Filing it now.\n<tool_call>\nnotes.note', 'Filing it now.'],
+    ['a tag around a fence, its language half written', 'Filing it now.\n<tool_call>\x60\x60\x60js', 'Filing it now.'],
+    ['this app’s history form', 'I filed it: [tool notes.note', 'I filed it:'],
+  ] as const) {
+    it(`${form}: cut off at its limit on tokens, stores and sends none of it`, async () => {
+      const id = `r12_naming_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(opening), 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe(kept);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('notes.note');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('[tool');
+    });
+  }
+
+  it('stopped while the name was streaming: stores and sends none of it', async () => {
+    const id = 'r12_naming_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n<tool_call>notes.note', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'Filing it now.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('keeps a word no offered tool’s name begins, after the same tag', async () => {
+    const id = 'r12_naming_word';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'The tag is <tool_call>weather';
+    const local = recordingBackend([cutOff(words), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('how does a call open?');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(words);
+  });
+});

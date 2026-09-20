@@ -689,9 +689,47 @@ const NEXT_CALL = /^(?:<tool_call>|\[TOOL_CALLS?\])/i;
  * one was neither read, run, stripped nor cut, so its arguments were stored
  * and sent back, finished or stopped, and Stop catching it complete wrote no
  * record that it had not gone.
+ *
+ * A NAME AFTER `<tool_call>` OR `[tool ` is {@link nameBeingWritten}'s, which
+ * asks that it begin a name the request offered: those two forms take the name
+ * of any tag or any bracket in prose, where `[TOOL_CALLS]` takes only its own
+ * special token's.
+ *
+ * A FENCE'S LANGUAGE MAY BE HALF WRITTEN — ` ```js ` for the ` ```json ` that
+ * was coming — as every other token at the end of a cut text may be.
  */
 const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:[{[]|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}[\w.:-]*\s*)?(?:[{[]|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+
+/**
+ * Where a call's opening stands at the end of a text STOPPED OR CUT SHORT with
+ * THE TOOL'S NAME half written after it — `<tool_call>notes.note`, or this
+ * app's own `[tool notes.note` — or -1. The name written so far must begin one
+ * the request offered, by name or by id (`offered`, as {@link callNames} gives
+ * it).
+ *
+ * `CALL_OPENING` needs the `(` or `{` that has not arrived, and
+ * {@link CALL_MARKER_AT_END} covers a bare marker but not a name after these
+ * two, so a round that ended while the name was streaming — Stop, or its limit
+ * on tokens — stored the marker and the name as the reply's words and sent
+ * them back in every later request. The window is the several tokens of a
+ * server-qualified MCP name.
+ *
+ * ASKED OF THE OFFERED NAMES, where `[TOOL_CALLS]` asks of nothing: that
+ * marker is a special token no sentence holds, and these two are a tag and a
+ * bracket a sentence can name — "the name follows the `<tool_call>` tag", "see
+ * the [tool section". A word that begins no offered tool's name is such a
+ * word, and stays in the reply.
+ */
+function nameBeingWritten(text: string, offered: readonly string[]): number {
+  const match = NAME_AT_END.exec(text);
+  if (!match) return -1;
+  const written = (match[1] ?? '').toLowerCase();
+  return offered.some((name) => name.toLowerCase().startsWith(written)) ? match.index : -1;
+}
+
+/** A call's opening and the start of a tool's name at the end of a text: see {@link nameBeingWritten}. */
+const NAME_AT_END = /(?:<tool_call>\s*|\[tool\s+)([\w.:-]*)$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply THE MODEL ENDED:
@@ -1095,8 +1133,13 @@ export function unfinishedCallAt(
     }
     from = close;
   }
-  // A text stopped or cut short ends wherever it was, on a bare marker too.
-  const at = text.search(ended === 'model' ? CALL_OPENED_AT_END : CALL_MARKER_AT_END);
+  // A text stopped or cut short ends wherever it was, on a bare marker too —
+  // or partway through the tool's NAME in the forms that write it before the
+  // arguments and are a tag or a bracket a sentence can name: see
+  // {@link nameBeingWritten}.
+  const marker = text.search(ended === 'model' ? CALL_OPENED_AT_END : CALL_MARKER_AT_END);
+  const naming = ended === 'model' ? -1 : nameBeingWritten(text, offered);
+  const at = marker === -1 || (naming !== -1 && naming < marker) ? naming : marker;
   return chain !== undefined && at === next ? chain : at;
 }
 
