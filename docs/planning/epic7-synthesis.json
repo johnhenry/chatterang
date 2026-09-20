@@ -1,0 +1,358 @@
+{
+ "decisionDraft": "# #7: where work that outlives a window runs, and what the phone does instead (DRAFT)\n\n> **Draft for the owner.** Read at `476c5cd` (branch `complete-path-no-cloud-divert`, clean, includes `2af1bbb`). Nothing in the repo or on GitHub was changed. This is a recommendation, not a ruling. Q1\u2013Q8 at the end are the choices it cannot make for you. Where a sentence depends on a question's answer, it names the question.\n\n## The short answer\n\n- **#49.** The Supervisor's guarantees carry over to non-inference work; the class itself does not have to change. What it lacks goes into a platform-free sibling in `apps/desktop/src/bridge/` (call it `WorkBroker`):\n  - admitting work into one slot, with a wait list;\n  - owners that are not windows;\n  - relayed prompts that expire;\n  - awareness of the app's lifecycle and of system sleep.\n\n  A turn from a paired phone runs in a renderer, because only a renderer has the engine, the tools, the model list and the grants. The recommended renderer is a separate, on-demand worker window that is supervised like a host (Q1), not the user's own window. The tunnel listener and the broker's bookkeeping live in main. Native code stays in utility processes.\n- **#50.** In v1 the phone hosts none of #3, #4 or #5, and has no background mode, service or notification. The UI says where each of those runs. As a tunnel client, the phone streams while it is visible. Whether a turn survives the phone leaving is Q4. Whatever is decided, a relayed prompt the phone cannot answer is refused, as #170 already ruled.\n- **#51.** `apps/server` is the headless host profile: a peer of the desktop, never something the desktop needs running. It pairs in v1, as ruled. Whether it also carries phone turns in v1 is Q8. The shared substrate stays in `apps/desktop/src/bridge`, which the server already imports. No new `packages/runtime` for now, for the reason given in the #51 section.\n- **The first paired turn** needs:\n  - the broker;\n  - the worker;\n  - a turn runner that needs no chat row, with relayed prompts that expire;\n  - four new wire frames (waiting, prompt, answer, and attach/ack if Q4 chooses to hold results);\n  - corrected quit, window-close and sleep handling;\n  - four measurements.\n\n  That comes to M\u2013L, not S\u2013M.\n\n## Rulings this draft is bound by\n\n- A turn-carrying listener waits for #7: https://github.com/johnhenry/chatterang/issues/169#issuecomment-5668856400. #7 is on the critical path: https://github.com/johnhenry/chatterang/issues/7#issuecomment-5668856928\n- One turn at a time. A second turn waits in a queue and its peer is told. \"Pretending otherwise produces a queue that loses work\": https://github.com/johnhenry/chatterang/issues/169#issuecomment-5627063224\n- The listener lives in `packages/tunnel/host` and both apps start it. It is off by default. It stops on quit and on the explicit toggle; on macOS, closing the window does not stop it: https://github.com/johnhenry/chatterang/issues/158#issuecomment-5652315171 and correction #issuecomment-5653627401. The desktop must not require a second process: #issuecomment-5618992412\n- The listener takes a separate `TunnelBinding` and a per-device credential that the desktop mints. The desktop keeps only what it needs to verify that credential, and revoking a device closes its live sockets: https://github.com/johnhenry/chatterang/issues/135#issuecomment-5668855837. Revoking the operator token invalidates every device under it: #issuecomment-5629798231\n- The tunnel exposes turns, not plugins, and that is enforced by not registering them: https://github.com/johnhenry/chatterang/issues/153#issuecomment-5532476241\n- A tunnelled turn may use the tools the desktop has enabled: https://github.com/johnhenry/chatterang/issues/170#issuecomment-5668856693. Its prompts are relayed to the phone: #issuecomment-5668899287. A prompt that is not answered in time, whose tunnel drops, or whose turn is cancelled is refused and recorded as not sent on both sides. Holding the turn open was rejected. The timeout is a named constant: #issuecomment-5668943134\n- The server pairs in v1, fully, and its registry is kept in files: https://github.com/johnhenry/chatterang/issues/124#issuecomment-5643636983\n- The phone's queue stores a snapshot and re-checks it at dequeue: pairing revoked, chat gone, model absent on the far side: https://github.com/johnhenry/chatterang/issues/196#issuecomment-5629624189\n- A CLI source is inference now, with a process spawned per turn; the agent loop is a later feature: https://github.com/johnhenry/chatterang/issues/5#issuecomment-5639214599\n- The privacy claim stays an enumerated list and gains a paired-device item: https://github.com/johnhenry/chatterang/issues/221#issuecomment-5653788037\n- The tunnel adapter classifies a desktop that is asleep as \"unreachable\", and retries cheaply: https://github.com/johnhenry/chatterang/issues/186#issuecomment-5628299600\n\n## What the code says\n\n1. **A turn needs a renderer and a desktop chat row.**\n   - `runGeneration` (`src/state/chat.ts:949`) returns early when there is no chat (`:961-964`).\n   - The store has one `generating` flag and one `controller` (`:374`, `:378`, `:995`). A send while generating returns silently (`:728`).\n   - Egress grants are read per chat (`egressPolicy`, `:1435`). Approval prompts go through `requestApproval` (`:1463`, `:1584`; `src/state/mcp.ts:179`; `src/shell/register.ts:23`).\n   - `requestApproval` resolves only on an answer or an abort (`src/state/app.ts:405-428`). The bash confirm passes **no signal at all** (`src/shell/register.ts:23`), so today it cannot be ended except by an answer.\n2. **The host side already has an IR adapter, but no model list and no tools.**\n   - `DesktopLlamaBackend` (`apps/desktop/src/host/llama-backend.ts:73`) is registered on a Router inside the llama host (`llama-engine.ts:58-59`).\n   - Its header says it \"resolves a model id as an absolute GGUF path. The renderer owns the model catalogue\" (`:19-24`).\n   - It calls `LlamaCppNode` in-process, so a turn it runs is outside the Supervisor's in-flight table.\n3. **The Supervisor's terminal guarantee rests on invokes, never on events.**\n   - Its header says \"an invoke settles once by construction \u2026 an event can be\" lost (`supervisor.ts:60-66`).\n   - A turn belongs to one window (`:40-45`), and a duplicate live requestId is refused (`:734`).\n   - Timers are injectable (`SupervisorTimers`, `:313-319`; `HostFleetOptions.timers`, `host-fleet.ts:79`), but `main.ts:463-487` passes none, so `now` is `Date.now` (`supervisor.ts:437`).\n   - The ping state is private (`:487-489`).\n4. **Delivery is keyed by real renderer ids.**\n   - main's only push to a renderer is `send`, \"FIRE AND FORGET\" (`main.ts:372-376`).\n   - PluginHost delivers through a map keyed by `webContents.id` (`main.ts:429-434`, `:583`, `:628`), filtered on `senderId !== ownerId` (`plugin-host.ts:315-322`).\n   - The server hands out sender ids starting at 1 (`apps/server/src/sessions.ts:60-71`). A made-up id for something that is not a window can therefore collide with a real one.\n5. **Lifecycle today.**\n   - `will-quit` disposes the fleet (`main.ts:591`).\n   - `activate` makes a window only when `getAllWindows()` is empty (`:600-602`).\n   - `window-all-closed` quits everywhere except macOS (`:688-690`).\n   - A window's teardown cancels that window's turns (`:640-660`; `renderer-lifecycle.ts:84-116`).\n   - Nothing in `apps/*/src`, `packages/*/src` or `src` uses `powerMonitor` or `powerSaveBlocker` (grep, empty).\n6. **Electron, per ctx7 `/electron/electron` (Electron 44.0.0, `apps/desktop/package.json:23`).**\n   - `Browser::Quit` emits `before-quit`. Then, if no windows exist, it shuts down; otherwise it calls `CloseAllWindows()`. `OnWindowCloseCancelled` resets `is_quitting_` (`shell/browser/browser.cc`).\n   - Each `BrowserWindow` gets its own renderer process, and destroying the window ends that process (`docs/tutorial/process-model.md`).\n   - With `backgroundThrottling` off, a hidden window's page stays \"visible\" (`docs/api/browser-window.md`). The repo's own layout probe already does this for a `show: false` window (`tests/support/layout-probe.mjs:646`).\n   - `powerMonitor` emits `suspend` and `resume` (`electron_api_power_monitor.cc`).\n   - `prevent-app-suspension` keeps the system awake but lets the screen turn off (`docs/api/power-save-blocker.md`).\n7. **Placement.**\n   - `dsh.ts:9-21`: native code in main takes down \"the entire app \u2014 every window, no error\".\n   - #7's constraint: \"A crashed background job must not be a crashed app.\"\n   - The listener has already had one uncaught socket `error` that \"took down every tunnel in the process\" (`packages/tunnel/src/host/index.ts:274-289`). It is now handled per tunnel.\n   - A frame can be up to 8 MiB of inline images (`wire/index.ts:87`).\n8. **One sequence per loaded model.** `load` creates one context sequence per handle (`packages/inference-node/src/llama-cpp.ts:357`). `generate` uses that sequence with no lock that I could find (`:563-614`). The loaded model is shared between windows (`supervisor.ts:160-172`). **What two concurrent generates on one handle do has not been measured.**\n9. **Tunnel today.**\n   - `maxTunnels` is required. Replacing a device's stale socket is not built (`host/index.ts:178-199`).\n   - `close()` waits a turn of the event loop so `bye` flushes (`:340-360`, `:482-511`).\n   - The wire has exactly turn, chunk, cancel, hello, ping, pong, bye and error frames (`wire/index.ts:102-143`). There is no frame for waiting, prompt, answer, attach or ack.\n   - The client latches `PEER_GONE` on a close with no `bye` (`client/index.ts:174-197`).\n   - `openChat` rewrites any stored row still marked streaming, with no live generation behind it, as `INTERRUPTED` (`src/state/chat.ts:353`, `:469-470`).\n10. **Server.**\n    - Its scope is \"Two things, and they are the whole list\" (`apps/server/src/index.ts:5-11`).\n    - Its statelessness claim supports three conclusions (`:13-37`).\n    - It serves four plugins (`surface.ts:66-71`) and declares nine surfaces off (`:160-180`).\n    - The HTTP bridge owns `DEFAULT_PORT = 8973` (`binding.ts:255`). The tunnel listener opens its own HTTP server (`host/index.ts:36`), so **the server's tunnel port cannot be 8973 and is undecided.**\n    - The server imports `@chatterang/desktop/fs/filesystem` (`apps/server/src/main.ts:47`), which is not in the desktop package's exports (`apps/desktop/package.json:8-10`).\n    - The privacy-copy listen inventory already scans `apps/*/src` for start paths (`tests/privacy-copy.test.ts:2418`, `:2500-2502`). The statelessness sentence is not pinned.\n11. **Mobile.**\n    - `Info.plist` has no `UIBackgroundModes`. `AndroidManifest.xml:42` declares only INTERNET. There is no `@capacitor/app` (`package.json:34-42`). No socket plugin exists yet (`native/README.md` status table).\n    - Capacitor docs via ctx7 (https://capacitorjs.com/docs/apis/background-runner):\n      - On iOS a Background Runner task gets about 30 s, at times the OS chooses.\n      - On Android it gets at most 10 min, no more often than every 15 min.\n      - The runner is not a webview, and its fetch accepts only method, headers and body.\n    - `appStateChange` is iOS `willResignActive`/`didBecomeActive` and Android `onResume`/`onStop` (https://capacitorjs.com/docs/apis/app).\n    - ctx7 found no Apple BackgroundTasks library, so anything about `BGContinuedProcessingTask` is **UNVERIFIED**.\n12. **Layering.**\n    - `DESKTOP_LAYER_BAN` (`tests/layering.test.ts:56-57`).\n    - The tunnel package may not import `@/` (`:635-652`).\n    - `src/` may not branch on platform identity (`:1024-1032`).\n    - The bridge may import neither Electron nor Node builtins (`:1095-1115`).\n    - `apps/desktop` may import `src` (`llama-backend.ts:12-18`).\n\n## #49: does the supervisor generalise?\n\n**Answer: the guarantees generalise; the class does not have to.** HostFleet has already argued this: two engines need \"two instances\" of an unchanged class (`host-fleet.ts:4-9`). #5's CLI source has the same *shape*, a streamed plugin behind a utility host. That is a claim about shape only. Whether #5 ships on the desktop, on the server, or as a paired turn's target is still #5's open question.\n\nWhat the class does not have, and should not grow, goes into the sibling:\n- admitting work into one slot, with a wait list;\n- owners that are not windows;\n- a state for a unit that is waiting on a relayed prompt;\n- awareness of the app's lifecycle and of sleep.\n\nAdding these to a 1343-line class guarded by `tests/desktop-host-process.test.ts`, `desktop-host-split.test.ts` and `desktop-bridge.test.ts` would put \"every generation ends exactly once\" at risk for no benefit.\n\n### The guarantees, restated without \"generation\"\n\n- **G1. Every unit settles exactly once.** A unit is a phone turn, a drained turn, later a scheduled run or a CLI turn. It settles by exactly one of four paths, all through one idempotent settle:\n  1. the worker's terminal report;\n  2. the worker's loss;\n  3. the owner's loss;\n  4. the unit's deadline.\n\n  **The terminal report arrives on a call, never on a pushed event.** Either the worker pulls work and reports by invoke, or it speaks the existing host envelope over a `MessagePort` (`protocol.ts:474-504`), where every call is answered by a `ret`, by loss, or by the deadline. Which of the two depends on a layering check (build slice 1). \"Ended\" is marked only once delivery succeeds (defect [13], `main.ts:466-471`).\n- **G2. The worker comes back.** It starts from a factory. Loss is detected by exit, `render-process-gone`, or an unanswered probe. The remains are killed before a replacement starts. Respawns are capped per time window. For work that spawns a fresh process per unit (#5), the cap becomes \"refuse after N consecutive spawn failures\". A host that spawns children must kill them when it is retired, because `kill()` sends SIGTERM to the host alone (`main.ts:349-352`).\n- **G3. A unit belongs to one owner.** Owners live in the broker's own table, keyed by kind and id:\n  - a window: its `webContents.id`;\n  - a paired device: its #135 credential id plus the turn id;\n  - later, a schedule id.\n\n  They are **never** a made-up senderId, which fact 4 shows can collide. Only the owner receives the unit's progress and terminal. Only the owner can cancel it; a cancel from anyone else looks the same as \"not running\" (`supervisor.ts:790-800`). Revocation (#135) is always owner loss. **Whether a dropped socket is owner loss is Q4, not assumed.**\n- **G4. Isolation by kind.** Each kind has its own in-flight table. One kind's ids can never settle another kind's units (`supervisor.ts:47-58`).\n- **G5. An idle deadline, not a total cap.** Proof of progress resets the deadline; events about the machine do not. A unit waiting on a relayed prompt is in a separate state with its own named constant (`PROMPT_ANSWER_TIMEOUT_MS`). When that runs out, the call is refused and recorded as not sent, and never sent later (#170, #issuecomment-5668943134).\n- **G6. One slot per GPU-holding host.** `MAX_CONCURRENT_TURNS = 1`, enforced, with a test (#169). **Whether the desktop user's own turns take that slot is Q3.**\n\n### What does not carry over\n\n- \"Exactly once\" holds only for the life of one main process. After a quit, a crash or sleep, any durable copy belongs to the owner: the phone's #195 row, or #4's schedule record. Re-running is then at-least-once, and is safe only if nothing ran. #292's not-sent record is how we know.\n- Ping liveness needs our envelope. A foreign binary (#5) is supervised through a utility host that wraps it.\n- **Sleep is not a wedge.** Across a suspend, `Date.now` jumps. Reading `#tick` and `#pingTick`, a turn deadline or an outstanding ping would fire on the first tick after wake, and a healthy host could be condemned. Two steps, neither of which edits `supervisor.ts`:\n  1. confirm the misfire with injected timers;\n  2. inject a clock that does not count suspended time, through `HostFleetOptions.timers`.\n\n  Whether Node's monotonic clock excludes suspend time on macOS, Windows and Linux has to be measured first.\n\n### Where work runs\n\n- **Main**: app lifecycle and the toggle, the pairing window (#136), the listener (#158), and the broker's bookkeeping. All of it is pure JS. The listener already contains per-tunnel faults (`host/index.ts:274-289`), and the untrusted *execution* never happens in main. The broker is written against `MessageLink`, so it can move behind a utility host later.\n- **Worker renderer (recommended in Q1)**: a phone's turn. It is a separate `BrowserWindow`, `show: false`, with the security `webPreferences` of `main.ts:617-624` and `backgroundThrottling: false`. main creates it when the first unit is admitted, not at boot, and destroys it after `WORKER_IDLE_MS`.\n  - It has its own renderer process (fact 6). A phone's 8 MiB image turn that crashes or runs out of memory costs the worker, not the user's window or the user's own turn (`renderer-lifecycle.ts:13-19`).\n  - It runs a **turn runner that needs no chat row**: the phone's #196 snapshot in, the clearing gate run again (#296.2), `metadata.custom` ignored (#296.3), a tunnel policy object (Q2), chunks out. It writes nothing to the desktop's chats beyond what Q2 allows.\n  - Its entry is chosen by main. It is not a platform-identity branch in `src/` (`tests/layering.test.ts:1024-1032`).\n  - It handles one unit at a time. Module-scoped caches that could carry one phone's state into the next phone's turn (for example MCP client sessions) must be audited.\n  - Its liveness budget has to be measured under a tool call, the way ONNX's was (`main.ts:436-461`), because the probe is answered on the same thread that runs the tool loop.\n- **Utility processes**: native addons (llama, onnx) and later #5's CLI host. This follows `dsh.ts`.\n\n### Lifecycle on the desktop (under the recommended answers)\n\n- **Boot.** The broker is built idle next to the fleet. The listener does not start; it is off by default (#158).\n- **Toggle on.** The listener starts. No worker exists until a unit is admitted.\n- **Closing the user's window.** The user's renderer is torn down as it is today, and its own turns are cancelled with the existing reason. The worker and the listener are untouched.\n  - **No window close is ever cancelled.** A cancelled close resets `is_quitting_` (fact 6), which is how hiding the window would have broken Cmd+Q.\n  - `activate` must count only user windows. Today it counts all of them (`main.ts:600-602`), so a hidden worker would stop the Dock click from opening a window.\n  - **Inference, to be tested:** a hidden worker is an open window, so `window-all-closed` would not fire while it exists. main must therefore decide explicitly what closing the last *visible* window means on Windows and Linux (Q6), rather than inheriting \"the app keeps running invisibly\".\n  - A visible \"serving your phone\" indicator is needed while the tunnel is on.\n- **Quit.** On `before-quit`:\n  1. stop admitting;\n  2. settle every unit with a `DESKTOP_QUITTING` terminal;\n  3. `listener.close()` is async (`host/index.ts:482-511`), so call `preventDefault` once, await the close with a named bound, set a quitting flag and call `app.quit()` again;\n  4. destroy the worker;\n  5. `will-quit` disposes the fleet as it does today.\n\n  Because turns live in the worker and not in the user's window, a quit from `window-all-closed` still finds its units unsettled and settles them with the right reason. `app.exit()` skips both events. The phone already reads a close with no `bye` as a cut (`client/index.ts:196-197`).\n- **Toggle off.** The same as quit, except the fleet and the user's windows stay.\n- **Revocation.** Close that device's live sockets (#135). Settle its units as owner lost. Purge any results held for it (#196, #135).\n- **Sleep.** Q7.\n\n### What \"while you are not looking\" means on the desktop\n\n| State | Phone turns | Source |\n|---|---|---|\n| A user window is open | run in the worker | Q1 |\n| Last window closed, macOS | keep running | `main.ts:688-690`, #158, Q6 |\n| Last window closed, Windows/Linux | app quits, phone told with `bye` | `main.ts:688-690`, Q6 |\n| Tunnel toggled off / app quit | end, every unit settles, `bye` | #158 |\n| System asleep | end; the phone reads it as unreachable | #186, Q7 |\n| Desktop relaunched | nothing held for the phone | Q5 |\n\n## #50: the written mobile story\n\n**The phone hosts none of the long-running work, in v1, on either platform.**\n\nThe Background Runner budgets rule it out: about 30 s at the OS's choosing, or 10 min at most 15 min apart, with no webview and so no Dexie (fact 11). The turn, its grants and the database all live in the webview (fact 1).\n\nPer consumer:\n- **Daemon (#3).** Not on mobile. The UI says it runs on a desktop.\n- **Scheduler (#4, #33).** Not on mobile as the thing that runs a schedule. The per-platform cells belong to #101's table and should be written there, once, not also here. This draft proposes \"no\" for iOS and Android.\n- **CLI sources (#5).** Cannot run on a phone. Whether a phone may *target* a desktop's CLI source is #5's open question. It would also be a new egress route under #221, because a CLI calls a cloud API. This draft does not decide it.\n- **The queue (#195/#200).** Foreground drain, as written. The trigger is `@capacitor/app`'s `appStateChange` plus `visibilitychange`, as #200 names it, not pause/resume.\n- **Tunnel client.**\n  - Streams while the app is visible.\n  - Does **not** send a voluntary `bye` on backgrounding. The socket stays until the OS actually kills it, so a share sheet or a permission dialog does not end a stream.\n  - Refuses relayed prompts while it is away (#170). The copy must say that tools needing an answer are refused while the app is closed. It must not say \"your desktop finishes it\" unless Q4 and Q7 make that true.\n  - **If Q4 chooses to hold results**, the phone keeps a small durable record of each in-flight tunnelled turn (turn id, device, message id). The `INTERRUPTED` sweep (`src/state/chat.ts:469-470`) checks that record before failing a row, and attaching runs on cold boot as well as on resume. iOS routinely kills suspended apps, and a resume hook alone would find nothing to ask about.\n- **Capability table.** Add no field for the first paired turn. A `holdsConnectionInBackground` field would read false on every row that has a tunnel client (#181's plugin exists only on iOS and Android). The server row describes a browser tab, not a process (`src/lib/platform.ts:290-320`). That is the constant, documenting-only field #173 and #118 warn against. `runsUnattendedWork` and `spawnsProcesses` each land with the feature that reads them. A false value always renders a sentence saying where the feature does run (`src/App.tsx:66-78`).\n\nRejected for v1, with the reasons written down so they are not proposed again without new evidence:\n- **A Background Runner poll plus a local notification.** The runner's fetch cannot carry #181's certificate pin, it cannot reach Dexie, iOS timing is not guaranteed, and a notification permission is a product change.\n- **Silent push.** It needs APNs/FCM credentials and a relay, which is close to the rendezvous #181 rejected. The #50 proposal read that the Capacitor push plugin does not support iOS silent push; not re-verified here.\n- **An Android foreground service and `BGContinuedProcessingTask`.** Platforms diverge (#181), the review and notification surface is new (#102), and the iOS API is UNVERIFIED.\n- **A short grace window on backgrounding** to flush and detach. Plausible, but it waits for the socket plugin to exist and for an on-device measurement.\n- **A read-only phone view of desktop work** (#50's third answer). It is the named later layer. It is gated on #3 or #4 existing and on a ruling that widens \"turns, not plugins\" to jobs. It is the \"sync project wearing a small hat\" #50 warns about.\n\n## #51: what `apps/server` is for\n\n**The headless host profile.** It serves the web bundle and the plugin bridge in front of the same inference hosts. It pairs, and it starts the listener (#124, #158). It is a **peer** of the desktop and never something the desktop needs running (#158, #issuecomment-5618992412). It runs *instead of* the desktop on a machine nobody sits at.\n\nIf both run on one machine, they are independent hosts with separate roots, registries and ports. #169's slot is then per host, and GPU contention between the two is unmanaged; that should be said out loud. The sentence belongs in `docs/ARCHITECTURE.md`, which mentions the server nowhere.\n\n- **Long-running work is not in the server for the first paired turn.** The first turn is the desktop's (#153). The server has no renderer, so it can run neither the worker nor today's turn loop. Whether it carries phone turns in v1 is Q8.\n- **Where the shared code lives.** Keep the broker and the worker's host adapter in `apps/desktop/src/bridge`, which is platform-free (`tests/layering.test.ts:1095-1115`) and already imported by the server (`apps/server/src/main.ts:37-45`). **Not a new `packages/runtime` yet:**\n  - a package built on the tunnel's model may not import `@/` (`:635-652`), but the turn runner needs `@/ai/taint` and `@/ai/prompt`;\n  - `apps/desktop` may import `src` (`llama-backend.ts:12-18`).\n\n  This departs from #51's \"anything shared wants to be a package\", on purpose. Revisit when a second app actually runs the substrate.\n- **Surface.** A tunnel peer reaches the turn runner and whatever Q2 allows, and nothing is registered for it beyond that (#153, #170). There is no name-list filter against `OFF_SURFACES`, whose names \"are not plugin names that exist anywhere\" (`surface.ts:136-141`).\n- **Privacy consequences**, landing in the same change as any start path (`host/index.ts:28-33`; the inventory at `tests/privacy-copy.test.ts:2418` already fails a new start path):\n  - The registry keeps only what verifies a credential (#135). It cascades when the operator token is revoked. It lives outside any root the served bundle can address (#249, #issuecomment-5643644446).\n  - `index.ts:13-37` and `README.md:85` are re-derived rather than patched.\n  - The README list gains the paired-device item (#221).\n  - The rule against logging prompts (`main.ts:41-45`) applies to the broker and the worker.\n- **Desktop-side cloud fallback for a phone's turn** is #296's open decision and is not settled here. The worker runs the renderer engine, which drives fallback itself. #296 must rule before the worker carries a turn (build slice 4).\n\n## How the epics relate\n\n#183's reconciliation proposed folding #7 into #78 (https://github.com/johnhenry/chatterang/issues/183#issuecomment-5532481601). **This draft proposes keeping both, and does not ask about it:**\n- #7 owns the substrate and placement (#49, #50, #51);\n- #78 owns the scheduling product and unattended consent (#33, #101\u2013#105) and depends on #7.\n\nThe first consumers of the substrate are Track B's tunnel and queue. Merging would put #103's unattended-consent question onto the paired-turn path, even though a tunnelled turn has a person answering on the phone (#170). For phone turns, this draft's worker window is #105's option (a); #105 still owns the scheduler's version of that choice.\n\n## The critiques: what this draft applies and what it rejects\n\n**Applied from the #49 critique:**\n- Work reaches the worker by a call, not by fire-and-forget `send`.\n- The desktop user's own turns and the one slot are raised as Q3.\n- A phone's turn does not run in the user's only renderer, which is the crash-isolation point, and owners are not collapsed onto one senderId.\n- Hiding the window on close is dropped, because it cancels quit.\n- Units are settled on `before-quit` with the right reason, and the listener's async close is awaited.\n- Which chat and tools a phone turn runs under is raised as Q2.\n- Durability and #195's order are raised as Q5.\n- Reconnecting is no longer assumed to lose the turn; it is Q4, for #162.\n- Clock injection is preferred over editing the Supervisor.\n- `backgroundThrottling` is treated as a known setting, with app suspension and system sleep kept separate.\n- #5's CLI host must reap its children.\n- No made-up senderIds, and the #124 execution comment is not treated as a ruling.\n- The relay's prompt and answer frames come from #170's ruling, with no #103 dependency.\n- The size is re-rated to M\u2013L.\n\n**Applied from the #50 critique:**\n- #170's ruling on unanswered prompts is not asked again.\n- The `PEER_GONE` latch and the `INTERRUPTED` sweep mean a durable in-flight record on the phone if results are held (Q4).\n- Holding results needs an ack frame.\n- The copy may not overpromise (#200).\n- `holdsConnectionInBackground` is dropped.\n- The desktop's retention slice is not smuggled into #50.\n- No voluntary `bye`.\n- The CLI-target question is left with #5.\n- The Background Runner's real reasons are recorded.\n- Keeping the desktop awake is treated as an inbound posture question (Q7).\n- The stale `chat.ts` line numbers are corrected.\n- `BGContinuedProcessingTask` is marked UNVERIFIED.\n\n**Applied from the #51 critique:**\n- The IR adapter in the host already exists; the real gaps are the model list, reaching it through the Supervisor, and the clearing gate.\n- #197's divert happens on the phone, and #296's fallback question stays open.\n- Tool-less turns are not assumed (Q2).\n- An in-memory queue is not claimed to satisfy #169 (Q5).\n- No new package that cannot import the clearing gate.\n- The server's tunnel port is not 8973.\n- Stop admitting on suspend rather than closing and re-listening, which would change an ephemeral port while #252 is open.\n- The listen inventory already exists.\n- The registry keeps verification data plus the operator-token cascade.\n- The tunnel surface is enforced by not registering.\n- main's three lifecycle listeners are acknowledged.\n\n**Rejected, with reasons:**\n- **Moving the listener out of main into a supervised utility process before the first turn** (#49 missing option 6; #51 option E, for the turn service). `dsh.ts`'s rule is about native code, where there is \"no error\". The listener is pure JS with per-tunnel fault containment (`host/index.ts:274-289`). The part that is really untrusted, running the turn, leaves main under this draft. A utility process also has no engine, tools or model list for a turn. Recorded as a follow-up, triggered by the first uncaught exception path found in the listener. The broker is written against `MessageLink`, so the move stays cheap.\n- **Folding #49/#51 into #101/#105, or #7 into #78** (#51 missing option I). The reason is given in the previous section.\n- **\"The desktop runs phone turns only while a window exists\" as the recommendation** (#50 missing option). #169's ruling refused a foreground-only first turn (#issuecomment-5668856400). It remains available as Q6's \"Close stops\" option.\n- **Rating #49's Option C as XL.** Partly accepted: a phone's turn does not need the desktop's chat tables (#196, #296). But tools, grants, MCP and the model list are renderer-only, so a turn runner with no window is still large. Re-rated L, and recorded as the path for server turns (Q8).\n- **A new wire frame for \"waiting\" treated as optional.** Kept as required, because #169 made telling the waiting peer the load-bearing half.\n\n## Measurements this draft relies on and has not made\n\n1. The Supervisor clock across a simulated sleep, with a turn and a ping outstanding (injected timers), and how each OS's monotonic clock behaves across suspend.\n2. What two concurrent `generate` calls on one loaded llama handle do (fact 8). Q3 leans on this.\n3. Stream pacing and memory for a hidden worker window with `backgroundThrottling: false`, and the worker's probe budget under a blocking tool call.\n4. Whether the worker's call path (invoke-pull, or the host envelope over a `MessagePort` through the preload) passes `DESKTOP_LAYER_BAN` and the bridge guard, and whether an unchanged `Supervisor` instance can serve it. If it cannot, the broker carries its own tested settle discipline rather than the class being edited.\n5. Whether `window-all-closed` fires while a hidden window exists.",
+ "minimumSubstrateForFirstPairedTurn": "This comes on top of #158's existing gate (`packages/tunnel/src/host/index.ts:28-33`): the #135 device credential, #179 certificate material, the #170 surface declaration, the #221 inbound copy, and #296's handler. It assumes the recommended answers to Q1\u2013Q8, and each item names the question that would change it.\n\n**1. WorkBroker** in `apps/desktop/src/bridge/`. It is platform-free and takes injected timers.\n- **Named, enforced constants:** `MAX_CONCURRENT_TURNS = 1`, `MAX_WAITING_PER_DEVICE`, `MAX_WAITING_TOTAL`, `PROMPT_ANSWER_TIMEOUT_MS`, `WORKER_IDLE_MS`, `QUIT_CLOSE_BOUND_MS`. Add `RETAIN_RESULT_MS` and `RETAIN_RESULT_COUNT` only if Q4 is \"Finish and hold\".\n- **An owner table** keyed by (kind, id): device credential id plus turn id, or a window's `webContents.id`. It never uses a made-up senderId.\n- **A FIFO wait list** that tells each waiting peer its position.\n- **One idempotent settle** over four paths: terminal report, worker loss, owner loss, deadline. The terminal always arrives on a call.\n- **Revocation** closes the device's sockets, settles its units and purges anything held for it.\n- **Tests** in the shape of `tests/desktop-bridge.test.ts`:\n  - exactly one terminal per unit on each path;\n  - every limit is enforced, not merely documented (#169);\n  - a prompt that times out becomes a refusal plus a not-sent record (#170).\n- If Q3 is \"One slot\" or \"Local first\", main also wraps the LLAMA facade (`main.ts:492`), so the desktop's own `generate` takes the same slot, and the renderer shows a waiting state.\n\n**2. Wire vocabulary** in `packages/tunnel/src/wire`.\n- `waiting {position}`.\n- `prompt` and `answer`, bound to a turn (#170).\n- Defined refusal codes, including busy/full, `DESKTOP_QUITTING`, and a \"does not run turns\" code for the server (Q8).\n- Client-side classification tests.\n- If Q4 is \"Finish and hold\": `attach` and `ack` frames, plus last-writer-wins replacement of a device's stale socket (`host/index.ts:190-196`).\n\n**3. A turn runner that needs no chat row**, in `src/`. It takes the phone's #196 snapshot as IR and streams chunks back.\n- Runs the clearing gate again (#296.2) and ignores `metadata.custom` (#296.3).\n- Uses a tunnel policy object for tools and grants, as Q2 decides.\n- **Relay hook:** for a unit answered remotely, `requestApproval` sends a `prompt` frame. It resolves false on timeout, on tunnel drop, or on cancel, and writes #292's not-sent record on both sides.\n- The bash confirm gains the signal it lacks today (`src/shell/register.ts:23`).\n- Writes nothing to the desktop's chats beyond what Q2 allows.\n- Blocked on #296's desktop-side fallback ruling before it carries a real turn.\n\n**4. The worker host.**\n- An on-demand `BrowserWindow` with `show: false`, `backgroundThrottling: false`, and the security `webPreferences` from `main.ts:617-624`.\n- Wrapped as a `HostHandle`: kill = destroy; loss = `render-process-gone` or `destroyed`.\n- Supervised with a respawn cap.\n- Handles one unit at a time and is destroyed after `WORKER_IDLE_MS`.\n- Its entry is chosen by main, not by a platform branch in `src/`.\n\n**5. Lifecycle wiring in `main.ts`.**\n- The listener starts on the toggle, never at boot.\n- `activate` and window counting consider only user windows.\n- A visible \"serving your phone\" indicator.\n- No window close is ever cancelled.\n- **On `before-quit`:**\n  1. stop admitting;\n  2. settle units with `DESKTOP_QUITTING`;\n  3. call `preventDefault` once and await `listener.close()` within its bound;\n  4. set a quitting flag and quit again;\n  5. destroy the worker.\n- `will-quit` disposes the fleet as it does today.\n- **Toggle off** does the same, but keeps the fleet running.\n- **Windows and Linux:** closing the last visible window quits, as today (Q6).\n- **`powerMonitor`:** on `suspend`, stop admitting while the listening socket stays bound. Units in flight settle on the loss paths. On `resume`, admit again (Q7).\n- **Clock:** a clock that does not count suspended time, injected through `HostFleetOptions.timers` once measurement 1 confirms the misfire. `supervisor.ts` is not edited.\n\n**6. Phone** (only if Q4 is \"Finish and hold\").\n- A durable record of each in-flight tunnelled turn (turn id, device, message id).\n- Attach runs on cold boot and on `appStateChange`.\n- The `INTERRUPTED` sweep (`src/state/chat.ts:469-470`) checks that record before failing a row.\n- The phone sends no voluntary `bye` when it goes to the background.\n- In every case, the copy says that tool calls needing an answer are refused while the app is closed.\n\n**7. Copy, in the same change as the start path.**\n- The README gains the paired-device item and the inbound sentences (#221).\n- The server's statelessness sentence is pinned (#249).\n- `docs/ARCHITECTURE.md` gains one sentence on what `apps/server` is.\n\n**8. Four measurements:**\n- the Supervisor clock across sleep, and each OS's monotonic clock;\n- two concurrent `generate` calls on one llama handle;\n- a stream through the hidden worker, and its ping budget under a tool call;\n- the layering and Supervisor-reuse check for the worker's call path, plus whether `window-all-closed` fires while a hidden window exists.\n\n**Not needed for the first paired turn:**\n- any desktop durability across quit (Q5);\n- tray mode;\n- the phone's #195 queue (Q5);\n- chunk replay from lastSequence;\n- keeping the machine awake (Q7);\n- the server carrying turns (Q8);\n- a Node-side turn runner;\n- `packages/runtime`;\n- a listener in a utility process;\n- #4's clock or schedule store;\n- #5's CLI host;\n- the #3 daemon;\n- mobile background modes or notifications;\n- new `platform.ts` fields.",
+ "buildSlices": [
+  {
+   "title": "S1. Measurements and layering check",
+   "scope": "Measurements only. Changes no shipped behaviour.\n- Supervisor clock: an injected-timer test that jumps the wall clock across a simulated sleep with a turn and a ping outstanding.\n- Monotonic clocks: how each OS's monotonic clock behaves across a suspend (macOS, Windows, Linux).\n- Two concurrent `generate` calls on one loaded llama handle (`packages/inference-node/src/llama-cpp.ts:357`, `:563-614`).\n- Hidden worker window with `backgroundThrottling: false`: stream pacing, memory use, and ping latency under a blocking tool call.\n- Worker call path (invoke-pull, or the host envelope over a `MessagePort` through the preload): does it pass `DESKTOP_LAYER_BAN` (`tests/layering.test.ts:56-57`) and the bridge guard (`:1095-1115`)? Can an unchanged `Supervisor` instance serve it?\n- Does `window-all-closed` fire while a hidden window exists?",
+   "dependsOn": [],
+   "size": "S",
+   "blockedOnDecisions": []
+  },
+  {
+   "title": "S2. WorkBroker core",
+   "scope": "A new platform-free `apps/desktop/src/bridge/work-broker.ts`, with its own test file.\n- Named, enforced constants.\n- An owner table keyed by (kind, id), never a made-up senderId.\n- A FIFO wait list that reports each peer's position.\n- One idempotent settle over four paths: terminal report on a call, worker loss, owner loss, deadline.\n- A separate waiting-on-prompt state with `PROMPT_ANSWER_TIMEOUT_MS`, which refuses on expiry.\n- Revocation settles the device's units and purges anything held for it.\n- Tests: exactly one terminal per unit on each path, and every limit is enforced.",
+   "dependsOn": [
+    "S1. Measurements and layering check"
+   ],
+   "size": "M",
+   "blockedOnDecisions": [
+    "Q3 Shared slot (who takes the one slot)",
+    "Q4 Socket drop (whether a dropped socket is owner loss)"
+   ]
+  },
+  {
+   "title": "S3. Wire vocabulary for waiting, prompts and refusals",
+   "scope": "In `packages/tunnel/src/wire`, plus classification on the client and host sides.\n- A `waiting {position}` frame.\n- `prompt` and `answer` frames bound to a turn, as #170 ruled.\n- Defined refusal codes: busy/full, `DESKTOP_QUITTING`, and \"host does not run turns\".\n- If Q4 is \"Finish and hold\": `attach` and `ack` frames.\n- Rung-0 tests for each frame.",
+   "dependsOn": [],
+   "size": "S-M",
+   "blockedOnDecisions": [
+    "Q4 Socket drop (attach/ack frames)"
+   ]
+  },
+  {
+   "title": "S4. A turn runner that needs no chat row, with the relay hook",
+   "scope": "In `src/`: the phone's #196 snapshot comes in as IR, and chunks go back out.\n- Runs the clearing gate again (#296.2).\n- Ignores `metadata.custom` (#296.3).\n- Uses a tunnel policy object for tools and grants.\n- For a unit answered remotely, `requestApproval` sends a prompt frame. It resolves false on timeout, tunnel drop or cancel, and writes #292's not-sent record.\n- Gives the bash confirm the abort signal it lacks (`src/shell/register.ts:23`).\n- Audits module-scoped caches that could carry one phone's state into the next.\n- Writes to the desktop's chats only what Q2 allows.",
+   "dependsOn": [
+    "S3. Wire vocabulary for waiting, prompts and refusals"
+   ],
+   "size": "L",
+   "blockedOnDecisions": [
+    "Q2 Tool policy",
+    "#296 desktop-side fallback (may a phone's turn divert to the desktop's cloud provider)",
+    "#152 tool loop negotiation, if tools are in scope"
+   ]
+  },
+  {
+   "title": "S5. On-demand worker host",
+   "scope": "A hidden `BrowserWindow` created by main when the first unit is admitted.\n- `show: false`, `backgroundThrottling: false`, and the security `webPreferences` from `main.ts:617-624`.\n- Wrapped as a `HostHandle`: kill = destroy; loss = `render-process-gone` or `destroyed`.\n- Supervised, with a respawn cap.\n- Handles one unit at a time and is destroyed after `WORKER_IDLE_MS`.\n- Its entry is selected by main, not by a platform branch in `src/`.\n- Liveness budget taken from S1.\n- `activate` and window counting consider only user windows (`main.ts:600-602`).",
+   "dependsOn": [
+    "S1. Measurements and layering check",
+    "S2. WorkBroker core",
+    "S4. A turn runner that needs no chat row, with the relay hook"
+   ],
+   "size": "M",
+   "blockedOnDecisions": [
+    "Q1 Turn runner",
+    "Q6 Window close"
+   ]
+  },
+  {
+   "title": "S6. Shared admission for the desktop's own turns",
+   "scope": "Wrap the LLAMA plugin facade in main (`main.ts:492`), so a local `generate` takes the broker's slot. The renderer shows a waiting state instead of the silent early return (`src/state/chat.ts:728`). Tests cover a local turn and a phone turn contending for the slot.",
+   "dependsOn": [
+    "S2. WorkBroker core"
+   ],
+   "size": "S-M",
+   "blockedOnDecisions": [
+    "Q3 Shared slot"
+   ]
+  },
+  {
+   "title": "S7. Desktop lifecycle and listener wiring",
+   "scope": "In `main.ts`:\n- The listener starts on the toggle, never at boot, behind #158's gate (#135 credential, #179, #170 surface assertion before bind).\n- A \"serving your phone\" indicator.\n- **`before-quit`:**\n  1. stop admitting;\n  2. settle units with `DESKTOP_QUITTING`;\n  3. call `preventDefault` once and await `listener.close()` within `QUIT_CLOSE_BOUND_MS`;\n  4. set a quitting flag and quit again;\n  5. destroy the worker.\n- **Toggle off:** the same, but keeps the fleet running.\n- **Revocation:** closes the device's live sockets.\n- **Windows/Linux:** last-window behaviour as Q6 decides.\n- **`powerMonitor`:** `suspend` stops admitting with the socket still bound; `resume` admits again.\n- **Clock:** a clock that does not count suspended time, injected through `HostFleetOptions.timers` if S1 confirms the misfire.\n- **Tests:** extend the `tests/desktop-security.test.ts` text checks for the new lifecycle handlers.",
+   "dependsOn": [
+    "S2. WorkBroker core",
+    "S5. On-demand worker host"
+   ],
+   "size": "M",
+   "blockedOnDecisions": [
+    "Q6 Window close",
+    "Q7 Sleep"
+   ]
+  },
+  {
+   "title": "S8. Reconnect and held results",
+   "scope": "Only if Q4 is \"Finish and hold\".\n- **Desktop:** bounded in-memory holding per device, freed on ack, expiry, revocation or quit. Last-writer-wins replacement of a device's stale socket (`host/index.ts:190-196`).\n- **Phone:** `@capacitor/app` `appStateChange` and `visibilitychange` hooks beside `initialize()` (#200). A durable record of each in-flight tunnelled turn. Attach on cold boot and on resume. The `INTERRUPTED` sweep (`src/state/chat.ts:469-470`) checks the record first. The phone de-duplicates terminals by turn id.\n- **Test:** cut the socket at chunk N, reconnect, attach, and assert exactly one terminal. A revoked device's attach is refused and purged.",
+   "dependsOn": [
+    "S2. WorkBroker core",
+    "S3. Wire vocabulary for waiting, prompts and refusals"
+   ],
+   "size": "M-L",
+   "blockedOnDecisions": [
+    "Q4 Socket drop",
+    "Q5 Durability"
+   ]
+  },
+  {
+   "title": "S9. Inbound privacy copy and what the server is",
+   "scope": "Lands in the same change as S7's start path.\n- **README privacy list:** gains the paired-device item, drops \"and only these\", and rescopes the headline (#221).\n- **`ChatScreen` copy:** rewritten for inbound turns, with #158's correction applied.\n- **Relayed prompts:** a sentence saying they are refused while the phone app is closed.\n- **`docs/ARCHITECTURE.md`:** one sentence on `apps/server` as the headless peer.\n- **`apps/server/src/index.ts:13-37` and `README.md:85`:** re-derived, with the statelessness sentence pinned (#249).\n- **Tests:** `tests/privacy-copy.test.ts` pins every changed sentence.",
+   "dependsOn": [],
+   "size": "S",
+   "blockedOnDecisions": [
+    "Q8 Server turns (what the server sentence says)"
+   ]
+  },
+  {
+   "title": "S10. First paired turn end to end",
+   "scope": "A rung test from a phone client to the desktop: pair, connect, turn, chunks, terminal, then each of the following.\n- A second peer is told it is waiting.\n- Cancel mid-stream.\n- A relayed prompt that is answered, and one that times out and is recorded as not sent.\n- Revocation mid-turn.\n- Quit mid-turn.\n- Toggle off mid-turn.\n- The worker crashes mid-turn and the user's window is unaffected.\n- A phone turn is never diverted, as #296's ruling decides.",
+   "dependsOn": [
+    "S3. Wire vocabulary for waiting, prompts and refusals",
+    "S4. A turn runner that needs no chat row, with the relay hook",
+    "S5. On-demand worker host",
+    "S6. Shared admission for the desktop's own turns",
+    "S7. Desktop lifecycle and listener wiring",
+    "S9. Inbound privacy copy and what the server is"
+   ],
+   "size": "S-M",
+   "blockedOnDecisions": [
+    "#296 desktop-side fallback",
+    "B4 tunnel adapter (#153) landed"
+   ]
+  },
+  {
+   "title": "S11. Server answers turn frames",
+   "scope": "Two paths, depending on Q8:\n- **\"Pair, refuse\":** the server's listener answers every turn frame with the defined refusal code, and the app renders it.\n- **\"Engine only\":** a Node-side runner in the llama host, reached through a Supervisor stream spec rather than in-process. It needs a model list on the Node side for #196's \"model absent\" check, and the clearing gate imported from `src`.",
+   "dependsOn": [
+    "S3. Wire vocabulary for waiting, prompts and refusals"
+   ],
+   "size": "S for refuse; L for engine-only",
+   "blockedOnDecisions": [
+    "Q8 Server turns",
+    "#252 server advertise address",
+    "#249 registry correction"
+   ]
+  },
+  {
+   "title": "S12. Later consumers of the substrate (not on the critical path)",
+   "scope": "- **#5 CLI host:** a FleetEntry utility host that spawns one process per turn and reaps its children when retired.\n- **#4 scheduler:** a schedule store in main plus a clock, using S2's owners with kind 'schedule'.\n- **#3 daemon:** survival across reboot.\n- **Mobile read-only view of desktop work:** needs its own ruling that widens \"turns, not plugins\".\n- **Move the listener into a supervised utility process:** if an uncaught exception path is found in main.",
+   "dependsOn": [
+    "S2. WorkBroker core",
+    "S7. Desktop lifecycle and listener wiring"
+   ],
+   "size": "L to XL, per consumer",
+   "blockedOnDecisions": [
+    "#5 open questions (desktop or server, paired target)",
+    "#101 per-platform table",
+    "#103 unattended consent",
+    "a ruling widening #153's 'turns, not plugins' for the mobile view"
+   ]
+  }
+ ],
+ "ownerQuestions": [
+  {
+   "question": "Where does a turn from a paired phone run on the desktop?",
+   "header": "Turn runner",
+   "options": [
+    {
+     "label": "Worker window",
+     "description": "A hidden window, separate from yours, runs the app's own engine, tools and model list. Main starts it when a phone turn arrives and supervises it. If a phone's turn crashes it, your window and your own turn are unaffected."
+    },
+    {
+     "label": "Your window",
+     "description": "The app window you already have runs it. Smallest build, but a phone turn that crashes that window takes your own turn with it. On macOS the window would have to hide instead of close while serving, which blocks Cmd+Q unless quit is special-cased."
+    },
+    {
+     "label": "Utility host",
+     "description": "The llama host's existing IR router runs it with no window, and the server could reuse it. It has no tools, grants or model list, so #170's tool use and relayed prompts wait for a separate design."
+    }
+   ],
+   "recommendedLabel": "Worker window",
+   "issues": [
+    7,
+    49,
+    51,
+    105,
+    170,
+    296
+   ]
+  },
+  {
+   "question": "A phone's turn has no chat on the desktop, and tool enablement and grants are stored per chat today. Which tools and grants does it run under, and what does the desktop record?",
+   "header": "Tool policy",
+   "options": [
+    {
+     "label": "Per-turn policy",
+     "description": "A desktop-wide set of tools the desktop owner allows for paired phones (new setting). Every call that needs a prompt is relayed to the phone. Nothing goes into the desktop's chats except the not-sent record #170 requires."
+    },
+    {
+     "label": "Per-device chat",
+     "description": "Each paired phone gets a chat on the desktop holding its tool choices and grants, and its turns are stored there. Reuses today's per-chat rules, but puts that phone's conversation in the desktop's database."
+    },
+    {
+     "label": "Tool-less first",
+     "description": "The first paired turn runs with no tools. Tool reach is designed with #296's tool loop and ships after. Earliest turn, but it delays what #170 ruled a phone turn may use."
+    }
+   ],
+   "recommendedLabel": "Per-turn policy",
+   "issues": [
+    170,
+    296,
+    199,
+    103,
+    221
+   ]
+  },
+  {
+   "question": "#169 allows one turn at a time. Does the desktop user's own turn take that same slot?",
+   "header": "Shared slot",
+   "options": [
+    {
+     "label": "One slot",
+     "description": "Local and phone turns share one slot and one wait list, first come first served. Whoever waits is told, including the person at the desktop. Fits one GPU; running two generations on one loaded model has not been measured."
+    },
+    {
+     "label": "Local first",
+     "description": "One slot, but a local send goes ahead of any phone turns still waiting. A phone turn already running is not interrupted."
+    },
+    {
+     "label": "Phones only",
+     "description": "The slot counts only phone turns. A local turn and a phone turn may run at the same time on one model, with nothing managing the contention."
+    }
+   ],
+   "recommendedLabel": "One slot",
+   "issues": [
+    169,
+    49,
+    183
+   ]
+  },
+  {
+   "question": "A phone's socket drops mid-turn (screen lock, Wi-Fi to cellular, app killed). What happens to the turn? #162 is still open.",
+   "header": "Socket drop",
+   "options": [
+    {
+     "label": "Stop, keep part",
+     "description": "The desktop stops the turn. The phone keeps the text so far, marked unfinished, with a retry. No holding on the desktop and no new privacy sentence, but a phone that locks loses the rest of the reply."
+    },
+    {
+     "label": "Finish and hold",
+     "description": "The desktop finishes the turn and holds the final result in memory for a bounded time. The phone asks for it on return and acknowledges it. Needs attach and ack frames and a durable record of in-flight turns on the phone. Relayed prompts are still refused on a drop."
+    },
+    {
+     "label": "Replay chunks",
+     "description": "As 'Finish and hold', but the phone resumes from its last chunk (#162 option 2). The most faithful and needs the most buffering; can follow 'Finish and hold' without a redesign."
+    }
+   ],
+   "recommendedLabel": "Finish and hold",
+   "issues": [
+    162,
+    169,
+    163,
+    50,
+    49
+   ]
+  },
+  {
+   "question": "What does #169's 'a queue that does not lose work' require of the first paired turn?",
+   "header": "Durability",
+   "options": [
+    {
+     "label": "Memory, #195 later",
+     "description": "The desktop's wait list and any results it holds live in memory and end on desktop quit or sleep. The phone's durable queue (#195) stays last in Track B, so until it ships, a turn sent to an absent desktop fails visibly."
+    },
+    {
+     "label": "#195 first",
+     "description": "Same desktop substrate, but the phone's durable queue ships with the first paired turn. That pulls #197, #199 and #103's grant-lifetime question onto the critical path."
+    },
+    {
+     "label": "Durable desktop",
+     "description": "The desktop writes its wait list and held results under userData so they survive a restart. That puts another device's conversation on the desktop's disk, and #196 then needs a purge on revocation."
+    }
+   ],
+   "recommendedLabel": "Memory, #195 later",
+   "issues": [
+    169,
+    183,
+    195,
+    153,
+    199
+   ]
+  },
+  {
+   "question": "While the tunnel is on, what does closing the last visible window do?",
+   "header": "Window close",
+   "options": [
+    {
+     "label": "macOS serves",
+     "description": "macOS: the app keeps serving from the worker, with a menu-bar or Dock indicator. Windows and Linux: closing quits as today, and the phone is told with bye. Only your windows count, never the worker."
+    },
+    {
+     "label": "Tray on all",
+     "description": "Windows and Linux gain a tray icon and keep serving too, the same as macOS. New product surface on two operating systems."
+    },
+    {
+     "label": "Close stops",
+     "description": "On every OS, closing the last visible window stops phone turns. The listener stays up but refuses turn frames until a window opens. Close to the foreground-only shape #169's ruling refused."
+    }
+   ],
+   "recommendedLabel": "macOS serves",
+   "issues": [
+    158,
+    49,
+    169
+   ]
+  },
+  {
+   "question": "Does the desktop keep itself awake for a paired phone?",
+   "header": "Sleep",
+   "options": [
+    {
+     "label": "No keep-awake",
+     "description": "Sleep ends what is running. Admission stops on suspend, and the listening socket stays bound, because re-listening would change an ephemeral port (#158, #252). The phone classifies the desktop as unreachable (#186)."
+    },
+    {
+     "label": "During a turn",
+     "description": "Use powerSaveBlocker 'prevent-app-suspension' only while a phone's turn is running or waiting, and show it in the desktop UI. Whether closing a laptop lid overrides it is unmeasured."
+    },
+    {
+     "label": "While tunnel on",
+     "description": "Keep the machine awake for as long as the tunnel is on. A device on the network keeps this machine awake, which is an inbound posture change."
+    }
+   ],
+   "recommendedLabel": "No keep-awake",
+   "issues": [
+    186,
+    162,
+    49,
+    221
+   ]
+  },
+  {
+   "question": "The headless server pairs fully in v1 (#124). Does it also carry turns from paired phones in v1?",
+   "header": "Server turns",
+   "options": [
+    {
+     "label": "Pair, refuse",
+     "description": "It pairs and answers every turn frame with a defined refusal until a turn runner with no window exists. The app says the server does not run phone turns yet. Pairing is unchanged; the capability is reduced."
+    },
+    {
+     "label": "Engine only",
+     "description": "After the desktop's first paired turn, it runs tool-less turns in its llama host. That needs a model list and the clearing gate on the Node side, reached through the Supervisor."
+    },
+    {
+     "label": "Full parity",
+     "description": "Same tools as the desktop, through a Node-side runner. Reopens Bash and MCP on a machine that may be someone else's (surface.ts OFF_SURFACES)."
+    }
+   ],
+   "recommendedLabel": "Pair, refuse",
+   "issues": [
+    51,
+    124,
+    170,
+    249,
+    296
+   ]
+  }
+ ]
+}
