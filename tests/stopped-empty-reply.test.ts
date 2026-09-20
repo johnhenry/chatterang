@@ -6389,3 +6389,76 @@ describe('a call in the paren forms with a comma after its last argument and no 
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13c');
   });
 });
+
+/* ── Round 13: the closing marker a reply shows, in two more shapes ─── */
+
+describe('a reply that shows the closing marker after a tag that held two calls, or in a code block', () => {
+  // 22b5210 narrowed the orphan-close pass to an opening LEFT UNCLOSED, asking
+  // the reading it found first. One opening can be read twice: a tag holding
+  // two calls is read loosely at its first call and whole, past its closing
+  // tag, by `readTaggedCalls`, and the loose reading wrote no `</tool_call>` —
+  // so the marker the reply showed as content was deleted again, and the code
+  // block the person asked for was stored empty. And a marker standing inside a
+  // code BLOCK is the block's content whatever the call above it did: a model
+  // closing the tag it left open does not fence the close.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const BLOCK = '\x60\x60\x60\n</tool_call>\n\x60\x60\x60';
+
+  it('after a tag holding two calls: both go, and the marker the person asked for stays', async () => {
+    const id = 'r13_shown_after_pair';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const pair =
+      '<tool_call>\n{"name":"notes.note","arguments":{"text":"canary-r13d"}}\n{"name":"notes.note","arguments":{"text":"canary-r13e"}}\n</tool_call>';
+    const local = scriptedBackend([
+      { reply: `Filing both.\n${pair}\nA call ends with:\n${BLOCK}\nThat is all.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes, then show me the format');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r13d' },
+      { text: 'canary-r13e' },
+    ]);
+    expect(stored.content, 'the block the person asked for').toContain(BLOCK);
+    expect(stored.content, 'and none of the calls').not.toContain('canary-r13');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13d');
+  });
+
+  it('in a code block below a call written without its close: the block stays', async () => {
+    const id = 'r13_shown_in_block';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const unclosed = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13f"}}';
+    const local = scriptedBackend([
+      { reply: `Working.\n${unclosed}\nEvery call ends with this marker:\n${BLOCK}\nThat is all.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note, then show me the end marker');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([{ text: 'canary-r13f' }]);
+    expect(stored.content, 'the block the person asked for').toContain(BLOCK);
+    expect(stored.content, 'and none of the call').not.toContain('canary-r13f');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13f');
+  });
+});

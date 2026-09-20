@@ -1531,6 +1531,42 @@ describe('the calls in one tag, separated as an array’s elements are', () => {
       expect(stripToolSyntax(text), shape).toBe(`Filed.\n\n${after}`);
     }
   });
+
+  it('keeps a closing tag the reply wrote below a TAG HOLDING TWO CALLS', () => {
+    // One opening, two readings: `CALL_SHAPES` reads the tag loosely at its
+    // first call, and `readTaggedCalls` whole, past the closing tag. Asked only
+    // for the first reading — the loose one, which wrote no `</tool_call>` —
+    // the pass took the marker the reply showed as content, and the code block
+    // the person asked for was stored empty. Every reading of the opening is
+    // asked now.
+    const both = `<tool_call>\n${one}\n${two}\n</tool_call>`;
+    for (const [shape, after] of [
+      ['in a code block', '\x60\x60\x60\n</tool_call>\n\x60\x60\x60'],
+      ['in a sentence', 'You close it like this:\n\n</tool_call>\n\nand that is the whole format.'],
+    ] as const) {
+      const text = `Filed both.\n${both}\nA call ends with:\n${after}`;
+      expect(read(text), shape).toEqual(['6*7', '6*8']);
+      expect(stripToolSyntax(text), shape).toContain(after);
+    }
+  });
+
+  it('keeps a closing tag the reply shows IN A CODE BLOCK below a call left unclosed', () => {
+    // A model closing the tag it left open does not fence the close. The person
+    // asked what a call's end marker looks like, watched the block arrive, and
+    // the stored row held an empty fence.
+    const text = `Working.\n<tool_call>${one}\nEvery call ends with this marker:\n\x60\x60\x60\n</tool_call>\n\x60\x60\x60\nThat is all.`;
+    expect(read(text)).toEqual(['6*7']);
+    expect(stripToolSyntax(text)).toContain('\x60\x60\x60\n</tool_call>\n\x60\x60\x60');
+  });
+
+  it('still takes out the close a call left behind when the reply writes it in prose', () => {
+    // The other half of the same family, unchanged: nothing but the fence tells
+    // the marker the model wrote as markup from the one it wrote as a word, so
+    // in a line of prose it is still the close the call left behind.
+    const text = `Ok.\n<tool_call>${one}\nFiled it.\n</tool_call>\nAnything else?`;
+    expect(read(text)).toEqual(['6*7']);
+    expect(stripToolSyntax(text)).toBe('Ok.\n\nFiled it.\n\nAnything else?');
+  });
 });
 
 describe('a call a bracket short whose brackets a later closer balances', () => {

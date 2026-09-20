@@ -1403,6 +1403,30 @@ const STARTS_ITS_LINE = /(?:^|\n)[^\S\n]*$/;
  */
 const CLOSED_ITS_TAG = /<\/tool_call>\s*$/i;
 
+/** A fence opening or closing a code block: three backticks starting a line. */
+const FENCE_LINE = /^[^\S\n]*\x60{3}/gm;
+
+/**
+ * Whether `at` stands inside a code block the reply opened above it — an odd
+ * number of fences before it — so that a `</tool_call>` there is the block's
+ * content, not the close a call left behind: see `callMarkup`.
+ *
+ * A model that goes on writing past a call it never closed and then closes the
+ * tag anyway writes the marker as markup; one asked what a call's end marker is
+ * writes it in the block the person asked for, and that block was stored empty.
+ * Nothing but the fence tells them apart, and only the fenced half is told: a
+ * marker the reply writes in a line of PROSE below a call left unclosed is the
+ * close that call left behind, which is what this pass exists to take out.
+ */
+function insideCodeBlock(text: string, at: number): boolean {
+  let fences = 0;
+  for (const fence of text.slice(0, at).matchAll(FENCE_LINE)) {
+    void fence;
+    fences += 1;
+  }
+  return fences % 2 === 1;
+}
+
 /**
  * Whether what stands after a call's arguments, at `at`, is the REPLY GOING ON
  * — words the model wrote after a call it never closed — rather than what is
@@ -1584,21 +1608,29 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
   // `<tool_call>` tag and ends it with `</tool_call>`" — has an opening no
   // reading took, and keeps every word.
   //
-  // AND ONLY AN OPENING LEFT UNCLOSED. A call whose own `</tool_call>` was
-  // written closes nothing here: a reply that made a call and then answered a
-  // question about the format, showing the closing marker on a line of its own
-  // in a code block — or in a sentence below it — had that line taken out, and
-  // the code block the person asked for was stored empty.
+  // AND ONLY AN OPENING LEFT UNCLOSED — BY EVERY READING THAT TOOK IT. A call
+  // whose own `</tool_call>` was written closes nothing here: a reply that made
+  // a call and then answered a question about the format, showing the closing
+  // marker on a line of its own in a code block — or in a sentence below it —
+  // had that line taken out, and the code block the person asked for was stored
+  // empty. One opening can be read twice, and asking only the first reading
+  // brought that back: a tag holding TWO calls is read loosely at its first
+  // call by `CALL_SHAPES` and whole, past its closing tag, by
+  // `readTaggedCalls`, and the loose one wrote no `</tool_call>`.
+  //
+  // AND NOT ONE STANDING INSIDE A CODE BLOCK. A model closing the tag it left
+  // open does not fence the close; a reply asked what a call's end marker looks
+  // like shows it in a block, and that block is the answer.
   for (const match of text.matchAll(/<\/tool_call>/gi)) {
     const start = match.index;
     const end = start + match[0].length;
     if (found.some((markup) => start < markup.end && end > markup.start)) continue;
     if (!STARTS_ITS_LINE.test(text.slice(0, start)) || !ENDS_ITS_LINE.test(text.slice(end))) continue;
+    if (insideCodeBlock(text, start)) continue;
     const opened = text.slice(0, start).toLowerCase().lastIndexOf('<tool_call>');
-    const call = opened === -1 ? undefined : found.find((markup) => markup.start === opened);
-    if (call && !CLOSED_ITS_TAG.test(text.slice(call.start, call.end))) {
-      found.push({ start, end, calls: [], copy: false });
-    }
+    const readings = opened === -1 ? [] : found.filter((markup) => markup.start === opened);
+    const closed = readings.some((markup) => CLOSED_ITS_TAG.test(text.slice(markup.start, markup.end)));
+    if (readings.length > 0 && !closed) found.push({ start, end, calls: [], copy: false });
   }
   return found;
 }
