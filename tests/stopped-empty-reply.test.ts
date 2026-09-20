@@ -6462,3 +6462,111 @@ describe('a reply that shows the closing marker after a tag that held two calls,
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13f');
   });
 });
+
+/* ── Round 13: Mistral’s own [TOOL_CALLS] and its JSON ──────────────── */
+
+describe('a local Mistral writing its canonical call: the marker and then its JSON', () => {
+  // This file's own docs call `[TOOL_CALLS]` Mistral-style, and Mistral's real
+  // output is the special token followed DIRECTLY by a JSON list of calls. Every
+  // reader of the marker wanted a name and a `(` after it, so the canonical form
+  // was markup to none of them: the tool never ran, no follow-up round was asked
+  // for, `runToolCalls` was never handed the call so no #331 receipt said it had
+  // not gone, and the whole markup with the model's arguments was stored as the
+  // reply's words and rode in every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, body] of [
+    ['a list of calls', '[{"name": "notes.note", "arguments": {"text": "canary-r13g"}}]'],
+    ['one object', ' {"name": "notes.note", "arguments": {"text": "canary-r13g"}}'],
+    ['single-quoted', "[{'name': 'notes.note', 'arguments': {'text': 'canary-r13g'}}]"],
+  ] as const) {
+    it(`${form}: goes once, is recorded, and is stored nowhere`, async () => {
+      const id = `r13_mistral_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n[TOOL_CALLS]${body}` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+        { text: 'canary-r13g' },
+      ]);
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13g');
+    });
+  }
+
+  it('stopped inside its arguments: none of it is stored, and none is sent back', async () => {
+    const id = 'r13_mistral_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n[TOOL_CALLS][{"name": "notes.note", "arguments": {"text": "canary-r13g', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'canary-r13g', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.content, 'the stored reply').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13g');
+  });
+
+  it('cut short at its limit on tokens with the call whole: the tag form’s turn, exactly', async () => {
+    // Whatever a round cut off at its limit does with a whole call, the two
+    // forms must do the same: one reading, whichever marker the model wrote.
+    const outcomes: { words: string; sent: unknown[]; records: (string | undefined)[]; leaked: boolean }[] = [];
+    for (const [form, call] of [
+      ['Mistral’s marker and its JSON', '[TOOL_CALLS][{"name": "notes.note", "arguments": {"text": "canary-r13h"}}]'],
+      ['a tag', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-r13h"}}</tool_call>'],
+    ] as const) {
+      const id = `r13_mistral_cut_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(`Filing it now.\n${call}`), 'Filed.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      outcomes.push({
+        words: stored.content,
+        sent: probe.call.mock.calls.map((went) => went[2]),
+        records: stored.toolCalls?.map((recorded) => recorded.receipt?.outcome) ?? [],
+        leaked: JSON.stringify(local.seen.at(-1)?.messages).includes('canary-r13h'),
+      });
+    }
+
+    expect(outcomes[0], 'Mistral’s form and the tag form').toEqual(outcomes[1]);
+    expect(outcomes[0]?.words, 'the stored reply holds none of the markup').not.toContain('TOOL_CALLS');
+    expect(outcomes[0]?.leaked, 'the call’s arguments, sent back').toBe(false);
+  });
+});

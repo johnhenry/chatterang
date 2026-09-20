@@ -1708,3 +1708,71 @@ describe('a call a bracket short and unclosed: one reading for the cut and the s
     }
   });
 });
+
+describe('Mistral’s own output: the [TOOL_CALLS] marker and then its JSON', () => {
+  // The canonical form of the marker this file calls Mistral-style: the special
+  // token followed DIRECTLY by a JSON list of calls, or one object — no name,
+  // no paren. Every reader of the marker wanted a `name` and a `(` after it, so
+  // a marker followed straight by `[` or `{` was markup to none of them: no
+  // tool ran, no follow-up round was asked for, no receipt said the call had
+  // not gone, and the whole thing with the model's arguments was stored as the
+  // reply's words and rode in every later request.
+  const ENDINGS = ['model', 'stopped', 'cut'] as const;
+  const cutThenStrip = (text: string, ended: (typeof ENDINGS)[number]): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+  const sums = (text: string, ended: (typeof ENDINGS)[number]) =>
+    extractFrom(text, OFFERED, [], { ended }).map((call) => call.input['expression']);
+
+  it('is read, runs and is stripped, in a list or as one object', () => {
+    for (const [form, call] of [
+      ['a list of calls', '[TOOL_CALLS][{"name": "calculate", "arguments": {"expression": "6*7"}}]'],
+      ['one object', '[TOOL_CALLS] {"name": "calculate", "arguments": {"expression": "6*7"}}'],
+      ['single-quoted', "[TOOL_CALLS][{'name': 'calculate', 'arguments': {'expression': '6*7'}}]"],
+      ['[TOOL_CALL], singular', '[TOOL_CALL][{"name": "calculate", "arguments": {"expression": "6*7"}}]'],
+    ] as const) {
+      const text = `Let me work that out.\n${call}`;
+      for (const ended of ENDINGS) {
+        expect(sums(text, ended), `${form} (${ended})`).toEqual(['6*7']);
+        expect(cutThenStrip(text, ended), `${form} (${ended})`).toBe('Let me work that out.');
+      }
+    }
+  });
+
+  it('runs every call in the list, and keeps the words the reply wrote below it', () => {
+    const text =
+      'Both, then.\n[TOOL_CALLS][{"name": "calculate", "arguments": {"expression": "6*7"}}, {"name": "calculate", "arguments": {"expression": "6*8"}}]\nThat should do it.';
+    expect(sums(text, 'model')).toEqual(['6*7', '6*8']);
+    expect(cutThenStrip(text, 'model')).toBe('Both, then.\n\nThat should do it.');
+  });
+
+  it('is cut from a turn stopped or cut short inside its arguments', () => {
+    const text = 'Let me work that out.\n[TOOL_CALLS][{"name": "calculate", "arguments": {"expression": "6*';
+    for (const ended of ['stopped', 'cut'] as const) {
+      expect(cutThenStrip(text, ended), ended).toBe('Let me work that out.');
+    }
+  });
+
+  it('is cut from a turn that ended on the marker and its opening bracket', () => {
+    for (const opened of ['[TOOL_CALLS][', '[TOOL_CALLS] {', '[TOOL_CALLS]']) {
+      const text = `Let me work that out.\n${opened}`;
+      for (const ended of ['stopped', 'cut'] as const) {
+        expect(cutThenStrip(text, ended), `${opened} (${ended})`).toBe('Let me work that out.');
+      }
+    }
+  });
+
+  it('is the model’s markup whatever it names, as the other marker and tag forms are', () => {
+    // Read and refused by `runToolCalls` as a name nothing stands behind, and
+    // stripped either way: the marker is a special token no sentence holds.
+    const text = 'Checking.\n[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Paris"}}]';
+    expect(extractFrom(text, OFFERED, [], { ended: 'model' }).map((made) => made.name)).toEqual(['get_weather']);
+    expect(cutThenStrip(text, 'model')).toBe('Checking.');
+  });
+
+  it('a turn that offered no tool and ran none keeps every word of it', () => {
+    // `stripToolSyntax`'s own gate, unchanged: a reply explaining how Mistral
+    // formats a call keeps its example.
+    const text = 'Mistral writes\n[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Paris"}}]\nand nothing else.';
+    expect(stripToolSyntax(text, { offered: [] })).toBe(text);
+  });
+});

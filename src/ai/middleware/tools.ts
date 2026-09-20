@@ -664,6 +664,14 @@ const CALL_END = {
   fencedTag: { token: /\x60{3}\s*<\/tool_call>/iy, text: '\x60\x60\x60</tool_call>' },
   paren: { token: /\)/y, text: ')' },
   bracket: { token: /\)\s*\]/y, text: ')]' },
+  /**
+   * Mistral's own output — the `[TOOL_CALLS]` special token and then the JSON,
+   * with no name, no paren and NOTHING AFTER THE JSON: its closing bracket is
+   * the whole of its end. `(?!)` never matches, so no scanner looks for a token
+   * this form does not have, and the empty text says there is none left to
+   * write wherever such a call stops. See `CALL_SHAPES`.
+   */
+  json: { token: /(?!)/y, text: '' },
 } as const;
 
 /**
@@ -705,7 +713,7 @@ const NEXT_CALL = /^(?:<tool_call>|\[TOOL_CALLS?\])/i;
  * was coming — as every other token at the end of a cut text may be.
  */
 const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}[\w.:-]*\s*)?(?:[{[]|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}[\w.:-]*\s*)?(?:[{[]|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|\s*[{[]\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * Where a call's opening stands at the end of a text STOPPED OR CUT SHORT with
@@ -746,7 +754,7 @@ const NAME_AT_END = /(?:<tool_call>\s*|\[tool\s+)([\w.:-]*)$/i;
  * special token [TOOL_CALLS]" to "... the special token".
  */
 const CALL_OPENED_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?[{[]\s*$|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?[{[]\s*$|\[TOOL_CALLS?\]\s*(?:[\w.:-]+\s*\(|[{[])\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{`
@@ -778,7 +786,8 @@ const CALL_OPENED_AT_END =
  * tests/support/source-scan.ts read a bare one in a regex literal as the start
  * of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=[{[])|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
+const CALL_OPENING =
+  /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(?=[{A-Za-z_])|\[TOOL_CALLS?\]\s*(?=[{[])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=[{[])|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -1089,11 +1098,16 @@ export function unfinishedCallAt(
       CALL_END[
         /^\[tool\s/i.test(match[0])
           ? 'bracket'
-          : !match[0].startsWith('<')
-            ? 'paren'
-            : match[0].includes('\x60')
-              ? 'fencedTag'
-              : 'tag'
+          : // Mistral's own output: the marker and then the JSON, with no name
+            // and no paren between them, so nothing closes it but its own
+            // bracket. See `CALL_SHAPES`.
+            /^\[TOOL_CALLS?\]\s*$/i.test(match[0])
+            ? 'json'
+            : !match[0].startsWith('<')
+              ? 'paren'
+              : match[0].includes('\x60')
+                ? 'fencedTag'
+                : 'tag'
       ];
     if (form === CALL_END.tag && text.charAt(open) !== '{') {
       // A name and its JSON inside the tag, read by its structure: see `taggedCallsEnd`.
@@ -1143,7 +1157,12 @@ export function unfinishedCallAt(
         from = finished;
         continue;
       }
-      const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
+      const writing = writesJson(text, open, {
+        // The forms whose JSON's top-level keys are the call's own: the tag,
+        // the fenced tag, and Mistral's marker and JSON.
+        tagged: form === CALL_END.tag || form === CALL_END.fencedTag || form === CALL_END.json,
+        offered,
+      });
       if (writing && beingWritten(writing === true ? 'open' : writing)) return cutFrom;
       continue;
     }
@@ -1357,6 +1376,24 @@ const CALL_SHAPES: readonly {
     close: /^[\s}\]]*(?:\)|(?=\[TOOL_CALLS?\]|<tool_call>))/i,
     ends: CALL_END.paren,
     read: (json, opening) => callWithArguments(opening[1] ?? '', json),
+  },
+  // MISTRAL'S OWN OUTPUT: the `[TOOL_CALLS]` special token and then a JSON LIST
+  // of calls, or one object — no name before the JSON, and no paren round it.
+  // It is the canonical form of the marker this file's own docs call
+  // Mistral-style, and every reader of that marker wanted a `name` and a `(`
+  // after it, so a marker followed straight by `[` or `{` matched nothing at
+  // all: the call never ran, no follow-up round was asked for, no #331 receipt
+  // said it had not gone, and the whole markup with the model's arguments was
+  // stored as the reply's words and rode in every later request.
+  //
+  // Its JSON's closing bracket is the whole of its end, so its close matches
+  // nothing and consumes nothing. Markup whatever it names, as the other
+  // marker and tag forms are.
+  {
+    open: /\[TOOL_CALLS?\]\s*(?=[{[])/gi,
+    close: /^/,
+    ends: CALL_END.json,
+    read: (json) => callsInJson(looseJson(json)),
   },
   // This app's own rendering of a call in a text prompt's history, which a model
   // copies: see `APP_CALL_OPENING`. Markup whatever its JSON holds, as the
