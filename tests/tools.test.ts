@@ -629,6 +629,40 @@ describe('a call written as Python writes one: name(key=value, …)', () => {
       expect(cut(`Ok.\n${call}`, true), `${call} (stopped)`).toBe('Ok.\n');
     }
   });
+
+  it('runs when a list or dict argument is a closing bracket short, and keeps the words below it', () => {
+    // `valueEnd` opened depth on the `[`, never saw a `]`, and ran off the end
+    // of the text, which is the call's structure — where nothing but the call
+    // can stand — so the call was one still being written however the reply
+    // ended: the round was cut at its opening and every word after it went,
+    // while nothing was read as a call, so no tool ran and no receipt said one
+    // had not gone. The call's own `)` ends it, the missing bracket supplied,
+    // as `shortCall` reads a JSON body a bracket short.
+    for (const [form, call] of [
+      ['[TOOL_CALLS]', '[TOOL_CALLS] calculate(expression="6*7", tags=["sums")'],
+      ['a tag', '<tool_call>calculate(expression="6*7", tags=["sums")</tool_call>'],
+      ['a dict', '[TOOL_CALLS] calculate(expression="6*7", meta={"kind": "sum")'],
+    ] as const) {
+      const text = `Working it out.\n${call}\nAll done — the sum is filed.`;
+      expect(extractTextualToolCalls(text).map((found) => found.name), form).toEqual(['calculate']);
+      expect(stripToolSyntax(cutUnfinishedCall(text, { ended: 'model', offered: OFFERED })), form).toBe(
+        'Working it out.\n\nAll done — the sum is filed.',
+      );
+    }
+    expect(
+      extractTextualToolCalls('[TOOL_CALLS] calculate(expression="6*7", tags=["sums")').map((call) => call.input),
+      'the arguments the model wrote, the missing bracket supplied',
+    ).toEqual([{ expression: '6*7', tags: ['sums'] }]);
+  });
+
+  it('keeps every word when a list’s bracket never closes and no paren ends it either', () => {
+    // Nothing but the value's own tokens stands in it, as `writesJson` asks of
+    // a tag or JSON form's body: a sentence below an unclosed bracket is the
+    // reply going on, not the value's words.
+    const text = 'Working it out.\n[TOOL_CALLS] calculate(tags=["sums"\nAll done.';
+    expect(extractTextualToolCalls(text)).toEqual([]);
+    expect(stripToolSyntax(cutUnfinishedCall(text, { ended: 'model', offered: OFFERED }))).toBe(text);
+  });
 });
 
 describe('a call written as this app writes one in a text prompt’s history: [tool name({…})]', () => {

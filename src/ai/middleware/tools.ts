@@ -2097,9 +2097,12 @@ function readKeywordArguments(
     // A name the text ends inside or on is a keyword being written.
     if (!keyword) return /^[A-Za-z_]\w*\s*$/.test(text.slice(pos)) ? reading('open') : noClose();
     pos += keyword[0].length;
-    const end = valueEnd(text, pos);
+    // A LIST OR DICT A CLOSING BRACKET SHORT, ended by the call's own `)`, as
+    // `shortCall` reads a JSON body one bracket short: see {@link shortValue}.
+    const short = shortValue(text, pos);
+    const end = short ? short.end : valueEnd(text, pos);
     if (typeof end === 'string' || end === -1) return reading(end);
-    const value = looseJson(text.slice(pos, end));
+    const value = looseJson(short ? short.raw : text.slice(pos, end));
     if (value === undefined) return reading(-1);
     Object.defineProperty(input, keyword[1] ?? '', { value, enumerable: true, writable: true, configurable: true });
     pos = end;
@@ -2113,10 +2116,56 @@ function readKeywordArguments(
 }
 
 /**
+ * A value A CLOSING BRACKET SHORT, ended by the call's own `)`: the value's
+ * text with the brackets still open supplied, and where that `)` stands.
+ * Undefined for a value whose brackets balance, or that no `)` ends, or whose
+ * text with the brackets supplied is not a value at all.
+ *
+ * `shortCall` reads a JSON body a bracket short this way, and a list or dict a
+ * small model leaves open — `notes.note(text="Buy milk", tags=["errand")` — is
+ * the same malformation in the form that writes its arguments as Python does.
+ * Read by {@link valueEnd} alone, the value ran to the end of the text, so the
+ * call was one still being written: the round was cut at its opening and every
+ * word the reply wrote below it was lost — the whole visible answer, stored as
+ * `content: ''`, when the call stood at the start of the reply — while nothing
+ * was read as a call, so no tool ran and no receipt said one had not gone.
+ */
+function shortValue(text: string, start: number): { end: number; raw: string } | undefined {
+  const open: string[] = [];
+  for (let at = start; at < text.length; at += 1) {
+    const char = text.charAt(at);
+    if (opensString(text, at)) {
+      const end = stringEnd(text, at);
+      if (end === -1) return undefined;
+      at = end - 1;
+    } else if (char === '{' || char === '[') {
+      open.push(char);
+    } else if (char === '}' || char === ']') {
+      open.pop();
+      // Its brackets balance: `valueEnd` ends it, and this reading is not its.
+      if (open.length === 0) return undefined;
+    } else if (char === ')' && open.length > 0) {
+      const raw = text.slice(start, at) + open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('');
+      return looseJson(raw) === undefined ? undefined : { end: at, raw };
+    }
+  }
+  return undefined;
+}
+
+/**
  * Where the value a keyword argument gives, from `start`, ends: a string in
  * either quote, a list or dict read past the brackets in its strings, or a bare
  * word. {@link Unended} when the text ends inside it — `'in-value'` inside a
  * string; -1 when it is none of these.
+ *
+ * A LIST OR DICT WHOSE BRACKET NEVER CLOSES IS AS OFTEN THE REPLY GOING ON, so
+ * the words after it are read as {@link writesJson} reads a tag or JSON form's:
+ * only the value's own tokens stand in it. Read as the value's structure to
+ * the end of the text — where the doc says nothing but the call can stand —
+ * a call missing one `]` that the reply then went on past was a call still
+ * being written however the text ended, so the round was cut at its opening
+ * and every word below it was lost. A value {@link shortValue} reads, ended by
+ * the call's own `)`, never reaches here.
  */
 function valueEnd(text: string, start: number): number | Unended {
   let depth = 0;
@@ -2145,8 +2194,10 @@ function valueEnd(text: string, start: number): number | Unended {
       return at + word.length === text.length ? 'open' : at + word.length;
     }
   }
-  // The text ends inside a string's words, or in a list or dict's structure.
-  return quote === '' ? 'open' : 'in-value';
+  // The text ends inside a string's words, or in a list or dict's structure —
+  // which is the value's own only where nothing but its tokens stand in it.
+  if (quote !== '') return 'in-value';
+  return depth > 0 && !writesJson(text, start, { tagged: false, offered: [] }) ? -1 : 'open';
 }
 
 /**

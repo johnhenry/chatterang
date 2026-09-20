@@ -5978,3 +5978,77 @@ describe('a reply that makes a call and then shows the closing marker in its ans
     });
   }
 });
+
+/* ── Round 12: a keyword argument's bracket left open ───────────────── */
+
+describe('a call whose list or dict argument is a closing bracket short', () => {
+  // `valueEnd` opened depth on the `[`, never saw a `]` and ran off the end of
+  // the text, which the doc calls the call's structure — where nothing but the
+  // call can stand — so the call was one still being written whatever the
+  // reply's ending, the round was cut at its opening, and every word below it
+  // was lost. At the start of a reply that took the whole visible answer with
+  // it: the row was stored with `content: ''` and left out of every later
+  // request. Nothing was read as a call either, so no tool ran and no receipt
+  // said one had not gone.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '[TOOL_CALLS] notes.note(text="canary-r12d", tags=["errand")';
+
+  it('sends it once, records it, and keeps the sentence the reply wrote below it', async () => {
+    const id = 'r12_short_value';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `I’ll file that.\n${SHORT}\nDone — filed under errand.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(probe.call.mock.calls[0]?.[2], 'its arguments, the missing bracket supplied').toEqual({
+      text: 'canary-r12d',
+      tags: ['errand'],
+    });
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person watched arrive, and the follow-up’s').toBe(
+      'I’ll file that.\n\nDone — filed under errand.\n\nFiled.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12d');
+  });
+
+  it('at the start of a reply: the answer the person read is kept, and not called stopped', async () => {
+    const id = 'r12_short_value_first';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const answer = 'I could not file that — the tool refused the tag list.';
+    const local = scriptedBackend([{ reply: `${SHORT}\n${answer}` }, { reply: 'Filed.' }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await drainSheets(useChats.getState().send('file a note'));
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(
+      { starts: stored.content.startsWith(answer), stopped: stored.stopped, markup: stored.content.includes('[TOOL') },
+      'the reply the person watched arrive, kept and not called stopped',
+    ).toEqual({ starts: true, stopped: undefined, markup: false });
+    expect(stored.content, 'and none of the call’s arguments').not.toContain('canary-r12d');
+    expect(spoken(local.seen.at(-1)).some(([, said]) => said.includes(answer)), 'sent back in the next request').toBe(
+      true,
+    );
+  });
+});
