@@ -5848,3 +5848,91 @@ describe('a call a round writes after every tool has left the registry', () => {
     expect(stored.content, 'the words the person watched arrive').toBe(`Qwen writes:\n${example}`);
   });
 });
+
+/* ── Round 12: a call a bracket short that swallowed the next one ───── */
+
+describe('a call a bracket short and unclosed, with a second call below it', () => {
+  // The two malformations this file's own reader calls a small model's
+  // commonest: a closing brace too few with no closing tag, and a brace too
+  // many with its tag. `endOfJson` ran past the sentence between them and
+  // closed on the second call's spare brace, and the second call's own tag
+  // closed the span: one markup covered both calls and the words between
+  // them, read no call at all, and was stripped whole. So neither call was
+  // sent, neither was recorded, no follow-up round ran, and the sentence the
+  // person watched arrive was gone from the stored reply — which said it had
+  // filed two notes that never went.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12a"}';
+  const LONG = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12b"}}}</tool_call>';
+
+  it('sends both, records both, and keeps the sentence the reply wrote between them', async () => {
+    const id = 'r12_swallow';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both.\n${SHORT}\nAnd the second:\n${LONG}\nBoth queued.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r12a' },
+      { text: 'canary-r12b' },
+    ]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'their records').toEqual(['sent', 'sent']);
+    expect(stored.content, 'every word the person watched arrive, and none of the markup').toBe(
+      'Filing both.\n\nAnd the second:\n\nBoth queued.\n\nFiled.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12');
+  });
+
+  it('stopped after the pair: keeps the sentence between them, and is not called stopped', async () => {
+    const id = 'r12_swallow_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `${SHORT}\nHere is what I found.\n${LONG}`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'Here is what I found.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      { words: stopped.content, stopped: stopped.stopped },
+      'the sentence stays, and the reply is not called stopped before its first word',
+    ).toEqual({ words: 'Here is what I found.', stopped: undefined });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'shown as stopped before its first word').toBeNull();
+      expect(bodyText(), 'what the person reads').toBe('Here is what I found.');
+    });
+    expect(
+      renderTranscript(chat(id), [stopped]),
+      'and the export says the same',
+    ).not.toContain(STOPPED_NOTE);
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'both calls recorded as not sent',
+    ).toEqual(['withheld', 'withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r12');
+  });
+});

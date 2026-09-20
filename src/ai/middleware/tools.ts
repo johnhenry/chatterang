@@ -617,6 +617,37 @@ export function endOfJson(text: string, start: number): number {
 }
 
 /**
+ * Where the opening of a NEXT call stands at or after `from`, outside any
+ * string (see {@link stringEnd}): `<tool_call>`, `[TOOL_CALL]` or
+ * `[TOOL_CALLS]`, as {@link OPENINGS} spells them. The text's length when
+ * there is none.
+ *
+ * A CALL'S JSON ENDS BEFORE IT, as the call itself does: the next call's
+ * opening ends one written without its close (see `CALL_SHAPES`), so no
+ * bracket past it can be this call's. Scanned to the end of the text, a call
+ * with a closing bracket too few ran past the words below it and closed on the
+ * NEXT call's spare brace: one span, whose body parsed as nothing and read no
+ * call, covered both calls and the sentence between them. Neither call was
+ * read, so neither ran and nothing recorded that they had not gone, and
+ * `stripToolSyntax` took the sentence the person had watched arrive out of the
+ * stored reply and out of every later request.
+ */
+function nextCallOpening(text: string, from: number): number {
+  const lower = text.toLowerCase();
+  for (let at = from; at < text.length; at += 1) {
+    if (opensString(text, at)) {
+      const end = stringEnd(text, at);
+      // Its string never ends: no opening after it stands outside one.
+      if (end === -1) return text.length;
+      at = end - 1;
+    } else if (OPENINGS.some((opening) => lower.startsWith(opening, at))) {
+      return at;
+    }
+  }
+  return text.length;
+}
+
+/**
  * What ends each tag or paren form of a call, once its JSON is written: the
  * token as a sticky pattern, for {@link shortCallEnd}, and as text with no
  * whitespace, for {@link unfinishedCallAt}'s reading of a call stopped partway
@@ -1007,7 +1038,15 @@ export function unfinishedCallAt(
       if (end !== -1) from = end;
       continue;
     }
-    const short = shortCallEnd(text, open, form.token);
+    // READ NO FURTHER THAN THE NEXT CALL'S OPENING, as `callMarkup` reads the
+    // same call: no bracket past it is this call's. Scanned to the end of the
+    // text, a call a bracket short closed on the NEXT call's spare brace, and
+    // the closing tag that call's own end wrote was read as this one's: a
+    // stopped round was cut from the first call's opening, and every word
+    // between them — which the person had watched arrive — went with it, into
+    // a reply shown as stopped before its first word.
+    const reading = text.slice(0, nextCallOpening(text, open));
+    const short = shortCallEnd(reading, open, form.token);
     if (short !== -1) {
       from = short;
       continue;
@@ -1015,7 +1054,7 @@ export function unfinishedCallAt(
     // An array of calls, whose brackets `endOfObject` does not count: the
     // fenced tag's body can be one, as the plain tag's can — and the plain
     // tag's is read by `taggedCallsEnd` above, where a fenced one arrives here.
-    const close = text.charAt(open) === '[' ? endOfJson(text, open) : endOfObject(text, open);
+    const close = text.charAt(open) === '[' ? endOfJson(reading, open) : endOfObject(reading, open);
     if (close === -1) {
       const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
       if (writing && beingWritten(writing === true ? 'open' : writing)) return cutFrom;
@@ -1321,20 +1360,35 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
         ({ json, end } = shortened);
       } else {
         const closed = endOfJson(text, from);
-        if (closed === -1) {
-          // A CLOSING BRACKET TOO FEW AND NO CLOSE EITHER, the reply going on
-          // below it: neither `shortCall` above, which needs the form's close
-          // token, nor `endOfJson`, whose brackets never balance, ends it. It
-          // ends where its JSON's tokens do: see `shortCallWithoutClose`. Read
-          // by nothing, it never ran, nothing recorded that it had not gone,
-          // and its whole markup was stored and sent back.
-          if (!ends) continue;
+        // A CLOSING BRACKET TOO FEW AND NO CLOSE EITHER, the reply going on
+        // below it: neither `shortCall` above, which needs the form's close
+        // token, nor `endOfJson`, whose brackets never balance, ends it. It
+        // ends where its JSON's tokens do: see `shortCallWithoutClose`. Read
+        // by nothing, it never ran, nothing recorded that it had not gone,
+        // and its whole markup was stored and sent back.
+        //
+        // OR THE SAME CALL WITH A LATER STRAY CLOSER BALANCING ITS BRACKETS:
+        // a `}` the reply wrote in the sentence below it, or a whole second
+        // call's. `endOfJson` ends the call on that bracket, and the span it
+        // covers reads as no call at all — it is the reply's words, not the
+        // call's JSON — so the call was found by no reading either way, while
+        // what the stripper took out reached down into those words and took
+        // the sentence between the two calls with it.
+        //
+        // ONLY WHERE THE PREFIX READING FINDS A CALL, so a malformed body that
+        // reads as none — a tag nested in another's JSON, all on one line —
+        // is the one markup it has always been: the prefix reading ends at a
+        // line break, and `wordsAfterCall` asks that the call end its line.
+        const spanned = closed === -1 ? undefined : read(text.slice(from, closed), match, offered);
+        if (ends && (spanned === undefined || spanned.length === 0)) {
           const short = shortCallWithoutClose(text, from);
-          if (!short) continue;
-          const calls = read(short.json, match, offered);
-          if (calls) unclosed({ start: match.index, end: short.end, calls, copy }, ends.text);
-          continue;
+          const calls = short ? read(short.json, match, offered) : undefined;
+          if (short && calls && calls.length > 0) {
+            unclosed({ start: match.index, end: short.end, calls, copy }, ends.text);
+            continue;
+          }
         }
+        if (closed === -1) continue;
         const closing = close.exec(text.slice(closed));
         json = text.slice(from, closed);
         if (!closing) {
@@ -1591,6 +1645,12 @@ function shortCall(text: string, start: number, short: RegExp): { end: number; j
  * CLOSE, that the reply then goes on past: the text from `start` to the end of
  * the last line its JSON's tokens reach, and the brackets that were missing.
  *
+ * ITS BRACKETS MAY BALANCE ON A BRACKET THAT IS NOT ITS OWN — a `}` the reply
+ * wrote in the sentence below it, or a whole second call's. `endOfJson` ends
+ * the call there, and the span it covers reads as no call at all; this reading
+ * stops at that bracket, because the call's own JSON ended before it, and the
+ * candidates it collected up to there are the call's.
+ *
  * `shortCall` ends such a call at the token that closes its form, and
  * `endOfJson` at the bracket that closes its JSON. A call with neither —
  * `Filing it now.\n<tool_call>{"name": "notes.note", "arguments": {"text": "…"}`
@@ -1624,8 +1684,11 @@ function shortCallWithoutClose(text: string, start: number): { end: number; json
       open.push(char);
     } else if (char === '}' || char === ']') {
       open.pop();
-      // Its brackets balance: `endOfJson` ends it, and this reading is not its.
-      if (open.length === 0) return undefined;
+      // Its brackets balance HERE, and its own JSON ends at or before this
+      // bracket whichever it is: the call's own closing bracket, which
+      // `endOfJson` ends it at, or a stray one the reply wrote below it, whose
+      // span `endOfJson` reads no call from. Nothing past it is the call's.
+      if (open.length === 0) break;
     } else if (char === '\n' && open.length > 0) {
       breaks.push({ at, closers: open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('') });
     }

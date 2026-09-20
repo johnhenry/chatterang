@@ -1381,3 +1381,58 @@ describe('the calls in one tag, separated as an array’s elements are', () => {
     expect(stripToolSyntax(text)).toBe('Ok.\n\n\nFiled it.\n\n\nAnything else?');
   });
 });
+
+describe('a call a bracket short whose brackets a later closer balances', () => {
+  // `shortCall` needs the form's close token and finds none; `endOfJson` runs
+  // past the words below the call and closes on the first spare bracket it
+  // meets — a second call's, or a `}` the reply wrote in a sentence. The span
+  // it covers parses as nothing and reads no call, and was markup all the
+  // same: both calls were lost inside it, so neither ran and nothing recorded
+  // that they had not gone, while `stripToolSyntax` took the sentence between
+  // them out of the words the person had watched arrive.
+  //
+  // The call ends where its own JSON's tokens end, as one with no closer after
+  // it already does (`shortCallWithoutClose`), which is a line break: a call
+  // the reply goes on past ends the line it stands on.
+  const SHORT = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}';
+  const words = (text: string): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended: 'model', offered: OFFERED }));
+  const read = (text: string) => extractTextualToolCalls(text).map((call) => call.input['expression']);
+
+  it('reads both calls, and keeps the sentence the reply wrote between them', () => {
+    const text = `Filing both.\n${SHORT}\nAnd the second:\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*8"}}}</tool_call>\nBoth queued.`;
+    expect(read(text)).toEqual(['6*7', '6*8']);
+    expect(words(text)).toBe('Filing both.\n\nAnd the second:\n\nBoth queued.');
+  });
+
+  it('reads the call a stray closer in a later sentence balanced, and keeps that sentence', () => {
+    const text = `Filing it.\n${SHORT}\nThe set is {1, 2, 3}, which ends in }.\nAll done.`;
+    expect(read(text)).toEqual(['6*7']);
+    expect(words(text)).toBe('Filing it.\n\nThe set is {1, 2, 3}, which ends in }.\nAll done.');
+  });
+
+  it('keeps a call-shaped example naming no offered tool, and the stray closer below it', () => {
+    // `callsOnlyTo`, as for every other call written without its close.
+    const example =
+      'Qwen’s format, a brace short:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}\nand a spare } ends the object.';
+    expect(read(example)).toEqual([]);
+    expect(words(example)).toBe(example);
+  });
+
+  it('keeps a call’s shape named inside a sentence that goes on on the same line', () => {
+    // `wordsAfterCall`'s line rule: only a call that ends the line it stands on
+    // is one the reply went on past.
+    const sentence = `Write ${SHORT} and then a spare } after it.\nOk?`;
+    expect(read(sentence)).toEqual([]);
+    expect(words(sentence)).toBe(sentence);
+  });
+
+  it('leaves a tag nested in another’s JSON the one malformed markup it is', () => {
+    // All on one line, so no line break ends a JSON prefix: the outer tag is
+    // the markup it has always been, and nothing runs from the tag inside it.
+    const malformed =
+      '<tool_call>{"name":"calculate","arguments":{}, "then": <tool_call>{"name":"calculate","arguments":{}}</tool_call>}</tool_call>';
+    expect(extractTextualToolCalls(malformed), malformed).toEqual([]);
+    expect(stripToolSyntax(`Ok.${malformed}Done.`), malformed).toBe('Ok.Done.');
+  });
+});
