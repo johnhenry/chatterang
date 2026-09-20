@@ -6314,3 +6314,78 @@ describe('a call a bracket short, written without its close, with one line below
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13');
   });
 });
+
+/* ── Round 13: a paren form with a trailing separator ───────────────── */
+
+describe('a call in the paren forms with a comma after its last argument and no closing paren', () => {
+  // b6c345c took the separator a call leaves on its own line into the TAG
+  // form's markup, so `wordsAfterCall` would not read the comma as the start of
+  // a close. The forms that write their arguments in parens still ended at
+  // their last value, before the comma: the call to an offered tool never ran,
+  // no #331 receipt said it had not gone, and its whole markup with the model's
+  // arguments was stored as the reply's words and rode in every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, call] of [
+    ['[TOOL_CALLS], keyword arguments', '[TOOL_CALLS] notes.note(text="canary-r13c",'],
+    ['a tag, keyword arguments', '<tool_call>notes.note(text="canary-r13c",'],
+    ['[TOOL_CALLS], a name and its JSON', '[TOOL_CALLS] notes.note({"text": "canary-r13c"},'],
+  ] as const) {
+    it(`${form}: goes once, is recorded, and is stored nowhere`, async () => {
+      const id = `r13_sep_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n${call}\nAll set.` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+        { text: 'canary-r13c' },
+      ]);
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'every word the person watched arrive').toBe('Filing it now.\n\nAll set.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13c');
+    });
+  }
+
+  it('stopped with the comma written and nothing after it: the call is recorded as not sent', async () => {
+    const id = 'r13_sep_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n[TOOL_CALLS] notes.note(text="canary-r13c",\nAll set.', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'All set.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nAll set.');
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13c');
+  });
+});

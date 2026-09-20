@@ -1470,6 +1470,33 @@ describe('the calls in one tag, separated as an array’s elements are', () => {
     expect(stripToolSyntax(sentence)).toBe(sentence);
   });
 
+  it('runs the call a trailing comma follows in the paren forms too, and keeps the words below it', () => {
+    // `readTaggedCalls` takes in the separator a call left on its own line;
+    // the forms that write their arguments in PARENS ended before it, so
+    // `wordsAfterCall` read the comma as the start of a close still being
+    // written and the markup was dropped by every reader — the call never ran,
+    // no receipt said it had not gone, and the model's arguments were stored
+    // and sent back. The same three without the comma were always read.
+    for (const [form, call] of [
+      ['[TOOL_CALLS], keyword arguments', '[TOOL_CALLS] calculate(expression="6*7",'],
+      ['a tag, keyword arguments', '<tool_call>calculate(expression="6*7",'],
+      ['[TOOL_CALLS], a name and its JSON', '[TOOL_CALLS] calculate({"expression": "6*7"},'],
+      ['a semicolon instead', '[TOOL_CALLS] calculate(expression="6*7";'],
+    ] as const) {
+      const text = `Working it out.\n${call}\nAll done.`;
+      expect(extractTextualToolCalls(text).map((made) => made.input), form).toEqual([{ expression: '6*7' }]);
+      expect(stripToolSyntax(text), form).toBe('Working it out.\n\nAll done.');
+    }
+  });
+
+  it('keeps a paren form’s shape named inside a sentence that goes on past its comma', () => {
+    // `wordsAfterCall`'s line rule again: taking the separator in does not make
+    // a sentence a call.
+    const sentence = 'Write [TOOL_CALLS] calculate(expression="6*7", and then the closing paren after it.';
+    expect(extractTextualToolCalls(sentence)).toEqual([]);
+    expect(stripToolSyntax(sentence)).toBe(sentence);
+  });
+
   it('keeps a sentence that names both tags, on one line or on lines of their own', () => {
     for (const prose of [
       'Qwen wraps each call in a <tool_call> tag and ends it with </tool_call> after the JSON.',

@@ -1506,6 +1506,14 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
           const calls = read(json, match, offered);
           if (!calls) continue;
           let at = closed + (STRAY_BRACKETS.exec(text.slice(closed))?.[0].length ?? 0);
+          // AND THE SEPARATOR IT LEFT ON ITS OWN LINE, as `readTaggedCalls`
+          // takes one in (see {@link TRAILING_SEPARATORS}): ended before it,
+          // `wordsAfterCall` read the comma as the start of a close still
+          // being written, so `[TOOL_CALLS] note({…},` with the reply going on
+          // below it was markup to no reader at all — it never ran, nothing
+          // recorded that it had not gone, and the model's arguments were
+          // stored and sent back.
+          at += TRAILING_SEPARATORS.exec(text.slice(at))?.[0].length ?? 0;
           // WHAT IS LEFT OF THE CLOSE ONCE `half` IS TAKEN IN. A fenced tag
           // whose fence is written and whose `</tool_call>` is still arriving
           // was asked whether `</tool_` is the whole close being written, and
@@ -2189,9 +2197,22 @@ function readKeywordArguments(
     end,
     input,
   });
-  /** The arguments end at the last value given, their `)` unwritten. */
+  /**
+   * The arguments end at the last value given, their `)` unwritten — the
+   * separator the call left on its own line with it, as `readTaggedCalls`'s
+   * own `noClose` takes it in (see {@link TRAILING_SEPARATORS}).
+   *
+   * Ended before that comma, `wordsAfterCall` read the comma as the start of a
+   * close still being written: `[TOOL_CALLS] note(text="…",` with the reply
+   * going on below it was markup to no reader at all, so the call never ran,
+   * no #331 receipt said it had not gone, and the whole thing with the model's
+   * arguments was stored as the reply's words and sent back in every later
+   * request — the malformation b6c345c fixed for the tag form.
+   */
   const noClose = (): { end: number | Unended; input: Record<string, unknown>; loose?: boolean } =>
-    written > 0 && lastValue !== -1 ? { end: lastValue, input, loose: true } : reading(-1);
+    written > 0 && lastValue !== -1
+      ? { end: lastValue + (TRAILING_SEPARATORS.exec(text.slice(lastValue))?.[0].length ?? 0), input, loose: true }
+      : reading(-1);
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
