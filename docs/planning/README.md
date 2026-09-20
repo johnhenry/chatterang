@@ -30,8 +30,10 @@ documented exception to the precedence rule is at the end of this file.
 | [`track-maps.json`](track-maps.json) | 2026-09-15 | [`88d7c78`](https://github.com/johnhenry/chatterang/commit/88d7c78) (#312) |
 | [`RULINGS.md`](RULINGS.md) | 2026-09-14 → 2026-09-19 | n/a — decisions, not a code survey |
 
-`88d7c78` is 22 commits behind the `main` this directory was added to. Read every
-"today", "currently" and "does not exist yet" in these files against that commit.
+`88d7c78` is 22 commits behind the `main` this directory was added to, and
+`476c5cd` is 13 commits behind `88d7c78`. Read every "today", "currently" and
+"does not exist yet" against the commit its own file's row names, not against
+`main` and not against `88d7c78` for all three.
 
 ### `epic7-synthesis.json`
 
