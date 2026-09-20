@@ -513,6 +513,16 @@ function callWithArguments(name: string, raw: string): WrittenCall[] {
  * "parameters": {…}}`, IS a call: its name is an offered tool, and its
  * `parameters` are read as the arguments.
  *
+ * READ AS A SMALL MODEL WRITES JSON ({@link looseJson}), as every tag form's
+ * body is. Read with `JSON.parse` alone, a block that unmistakably named an
+ * offered tool and carried its arguments — with the commonest small-model
+ * malformations, a comma before a closing bracket, strings in single quotes,
+ * keys left unquoted, Python's `True` — was a call to neither the reader nor
+ * the stripper: the tool never ran, no #331 receipt said it had not gone, and
+ * the model's own arguments were stored in the reply's words and sent back in
+ * every later request, while the same body inside `<tool_call>` ran and was
+ * stripped. What counts as a call cannot depend on the wrapper alone.
+ *
  * BUT A CALL CARRIES ITS ARGUMENTS — an `arguments`, `parameters` or `input`
  * key — OR IS NOTHING BUT ITS NAME, a call to a tool that takes none. A tool's
  * id is as plain a word as its name, and a record whose `name` is one is not a
@@ -528,26 +538,22 @@ function fencedCall(
   body: string,
   offered: readonly string[],
 ): { name: string; input: Record<string, unknown> } | undefined {
-  try {
-    const parsed = JSON.parse(body) as {
-      tool?: unknown;
-      name?: unknown;
-      function?: unknown;
-      arguments?: unknown;
-      parameters?: unknown;
-      input?: unknown;
-    } | null;
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
-    const name = parsed.tool ?? parsed.name ?? parsed.function;
-    if (typeof name !== 'string' || !offered.includes(name)) return undefined;
-    const keys = Object.keys(parsed);
-    const carriesArguments = keys.some((key) => ARGUMENT_KEYS.has(key));
-    if (!carriesArguments && !keys.every((key) => NAMING_KEYS.has(key))) return undefined;
-    const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
-    return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
-  } catch {
-    return undefined;
-  }
+  const parsed = looseJson(body) as {
+    tool?: unknown;
+    name?: unknown;
+    function?: unknown;
+    arguments?: unknown;
+    parameters?: unknown;
+    input?: unknown;
+  } | null;
+  if (!isRecord(parsed)) return undefined;
+  const name = parsed.tool ?? parsed.name ?? parsed.function;
+  if (typeof name !== 'string' || !offered.includes(name)) return undefined;
+  const keys = Object.keys(parsed);
+  const carriesArguments = keys.some((key) => ARGUMENT_KEYS.has(key));
+  if (!carriesArguments && !keys.every((key) => NAMING_KEYS.has(key))) return undefined;
+  const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
+  return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
 }
 
 /**

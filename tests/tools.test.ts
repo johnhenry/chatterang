@@ -384,6 +384,47 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(byIdWithType)).toBe('');
   });
 
+  it('reads a fenced call to an offered tool written as a small model writes JSON, and strips it', () => {
+    // Every tag form's body is read by `looseJson`; this one was read by
+    // `JSON.parse` alone, so a block that unmistakably named an offered tool
+    // and carried its arguments was a call to neither the reader nor the
+    // stripper as soon as it held the commonest small-model malformation: the
+    // tool never ran, nothing recorded that it had not gone, and the model's
+    // own arguments were stored in the reply's words and sent back in every
+    // later request — where the same body inside `<tool_call>` ran and was
+    // stripped. What a call is cannot depend on the wrapper alone.
+    for (const [malformation, body] of [
+      ['a trailing comma', '{"name": "calculate", "arguments": {"expression": "2+2",}}'],
+      ['single-quoted strings', "{'name': 'calculate', 'arguments': {'expression': '2+2'}}"],
+      ['unquoted keys', '{name: "calculate", arguments: {expression: "2+2"}}'],
+      ['Python’s True', '{"name": "calculate", "arguments": {"expression": "2+2", "exact": True}}'],
+    ] as const) {
+      const text = `Here.\n\`\`\`json\n${body}\n\`\`\`\nDone.`;
+      expect(extractTextualToolCalls(text).map((found) => found.name), malformation).toEqual(['calculate']);
+      expect(extractTextualToolCalls(text)[0]?.input['expression'], malformation).toBe('2+2');
+      expect(stripToolSyntax(text), malformation).toBe('Here.\n\nDone.');
+    }
+    // And the same body in a tag, which already ran, is unchanged.
+    const tagged = '<tool_call>{"name": "calculate", "arguments": {"expression": "2+2",}}</tool_call>';
+    expect(extractTextualToolCalls(tagged).map((found) => found.name)).toEqual(['calculate']);
+  });
+
+  it('keeps a malformed fenced block that names no offered tool, or carries no arguments', () => {
+    for (const body of [
+      // The owner's ruling: an extra key and no arguments key is words.
+      "{'id': 'call_0', 'name': 'calculate'}",
+      '{name: "calculator", version: "1.0.0",}',
+      // Names no tool the turn offered.
+      '{"name": "get_weather", "arguments": {"city": "Paris",}}',
+      // A nested tool definition, whose `function` is an object.
+      '{"type": "function", "function": {"name": "calculate",}}',
+    ]) {
+      const text = `\`\`\`json\n${body}\n\`\`\``;
+      expect(extractTextualToolCalls(text), body).toEqual([]);
+      expect(stripToolSyntax(text), body).toBe(text);
+    }
+  });
+
   it('keeps a JSON record whose "name" is no offered tool, whatever keys it holds, and reads no call from it', () => {
     const record = '```json\n{"name": "Alice Chen", "email": "alice@example.com", "age": 34}\n```';
     expect(extractTextualToolCalls(record)).toEqual([]);

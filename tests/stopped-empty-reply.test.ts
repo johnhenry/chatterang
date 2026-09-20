@@ -6129,3 +6129,74 @@ describe('a round cut short or stopped while the tool’s name was streaming', (
     expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(words);
   });
 });
+
+/* ── Round 12: a fenced call a small model malformed ────────────────── */
+
+describe('a fenced call to an offered tool with a small model’s commonest JSON malformation', () => {
+  // The fenced block was read with `JSON.parse` where every tag form's body is
+  // read as a small model writes JSON. So a block that unmistakably named an
+  // offered tool and carried its arguments was a call to neither the reader
+  // nor the stripper: the reply said it had filed the note, no tool ran, no
+  // #331 receipt said the call had not gone, and the model's own arguments sat
+  // in the stored row's words and rode in every later request — where the same
+  // body inside `<tool_call>` ran and was stripped.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [malformation, body] of [
+    ['a trailing comma', '{"name": "notes.note", "arguments": {"text": "canary-r12e",}}'],
+    ['single-quoted strings', "{'name': 'notes.note', 'arguments': {'text': 'canary-r12e'}}"],
+    ['unquoted keys', '{name: "notes.note", arguments: {text: "canary-r12e"}}'],
+  ] as const) {
+    it(`${malformation}: is sent once, recorded, and stored nowhere`, async () => {
+      const id = `r12_fenced_${malformation.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n\x60\x60\x60json\n${body}\n\x60\x60\x60\nDone.` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-r12e' });
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply holds none of the call').not.toContain('canary-r12e');
+      expect(stored.content, 'and every word the person watched arrive').toBe('Filing it now.\n\nDone.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12e');
+    });
+  }
+
+  it('the ruling stands: an extra key and no arguments key is words, malformed or not', async () => {
+    const id = 'r12_fenced_ruling';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'Such a block reads:\n\x60\x60\x60json\n{\'id\': \'call_0\', \'name\': \'notes.note\'}\n\x60\x60\x60';
+    const local = scriptedBackend([{ reply: words }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('how does a no-argument call look?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+      content: words,
+      toolCalls: undefined,
+    });
+  });
+});
