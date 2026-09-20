@@ -1300,6 +1300,13 @@ const ENDS_ITS_LINE = /^[^\S\n]*(?:\r?\n|$)/;
 const STARTS_ITS_LINE = /(?:^|\n)[^\S\n]*$/;
 
 /**
+ * Whether a call's markup wrote its own `</tool_call>`, so that a later one on
+ * a line of its own is not the close it left behind but the reply's own words:
+ * see the closing tag the reply left behind, in `callMarkup`.
+ */
+const CLOSED_ITS_TAG = /<\/tool_call>\s*$/i;
+
+/**
  * Whether what stands after a call's arguments, at `at`, is the REPLY GOING ON
  * — words the model wrote after a call it never closed — rather than what is
  * left of the close it was still writing. `closing` is the form's close as text
@@ -1461,13 +1468,20 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
   // line of its own. Prose naming both tags — "Qwen wraps each call in a
   // `<tool_call>` tag and ends it with `</tool_call>`" — has an opening no
   // reading took, and keeps every word.
+  //
+  // AND ONLY AN OPENING LEFT UNCLOSED. A call whose own `</tool_call>` was
+  // written closes nothing here: a reply that made a call and then answered a
+  // question about the format, showing the closing marker on a line of its own
+  // in a code block — or in a sentence below it — had that line taken out, and
+  // the code block the person asked for was stored empty.
   for (const match of text.matchAll(/<\/tool_call>/gi)) {
     const start = match.index;
     const end = start + match[0].length;
     if (found.some((markup) => start < markup.end && end > markup.start)) continue;
     if (!STARTS_ITS_LINE.test(text.slice(0, start)) || !ENDS_ITS_LINE.test(text.slice(end))) continue;
     const opened = text.slice(0, start).toLowerCase().lastIndexOf('<tool_call>');
-    if (opened !== -1 && found.some((markup) => markup.start === opened)) {
+    const call = opened === -1 ? undefined : found.find((markup) => markup.start === opened);
+    if (call && !CLOSED_ITS_TAG.test(text.slice(call.start, call.end))) {
       found.push({ start, end, calls: [], copy: false });
     }
   }

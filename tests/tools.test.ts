@@ -1380,6 +1380,22 @@ describe('the calls in one tag, separated as an array’s elements are', () => {
     expect(read(text)).toEqual(['6*7']);
     expect(stripToolSyntax(text)).toBe('Ok.\n\n\nFiled it.\n\n\nAnything else?');
   });
+
+  it('keeps a closing tag the reply wrote below a call that closed its own tag', () => {
+    // Only an opening left unclosed leaves a close behind. A reply that made a
+    // call and then answered a question about the format — the closing marker
+    // on a line of its own, in a code block or in a sentence — had that line
+    // taken out, so the code block the person asked for was stored empty.
+    const closed = `<tool_call>${one}</tool_call>`;
+    for (const [shape, after] of [
+      ['in a code block', '\x60\x60\x60\n</tool_call>\n\x60\x60\x60'],
+      ['in a sentence', 'You close it like this:\n\n</tool_call>\n\nand that is the whole format.'],
+    ] as const) {
+      const text = `Filed.\n${closed}\n${after}`;
+      expect(read(text), shape).toEqual(['6*7']);
+      expect(stripToolSyntax(text), shape).toBe(`Filed.\n\n${after}`);
+    }
+  });
 });
 
 describe('a call a bracket short whose brackets a later closer balances', () => {

@@ -5936,3 +5936,45 @@ describe('a call a bracket short and unclosed, with a second call below it', () 
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r12');
   });
 });
+
+/* ── Round 12: the closing marker a reply shows as content ──────────── */
+
+describe('a reply that makes a call and then shows the closing marker in its answer', () => {
+  // The pass that takes out a closing tag the reply left behind asked only
+  // that the nearest `<tool_call>` before it had been read as markup — which
+  // the call the reply had just made was. So the marker the reply wrote as
+  // content, on a line of its own, went with it: the code block the person had
+  // asked for was stored empty, and the sentence lost its example. Only an
+  // opening LEFT UNCLOSED leaves a close behind.
+  const CALL = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12c"}}</tool_call>';
+
+  for (const [shape, after] of [
+    ['in a code block', '\x60\x60\x60\n</tool_call>\n\x60\x60\x60\n\nThat is the whole format.'],
+    ['in a sentence', 'You close it like this:\n\n</tool_call>\n\nand that is the whole format.'],
+  ] as const) {
+    it(`${shape}: keeps the marker the person watched arrive`, async () => {
+      const id = `r12_shown_${shape.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it.\n${CALL}\nAnd the closing marker is:\n\n${after}` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await drainSheets(useChats.getState().send('file a note, then show me the format'));
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.content, 'the answer the person asked for').toContain(after);
+      expect(stored.content, 'and none of the call').not.toContain('canary-r12c');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12c');
+    });
+  }
+});
