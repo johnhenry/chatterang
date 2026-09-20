@@ -1237,3 +1237,85 @@ describe('a fenced <tool_call> whose body is an ARRAY of calls', () => {
     expect(words(example, 'model')).toBe(example);
   });
 });
+
+describe('a call with a closing bracket too few, written without its close, the reply going on below it', () => {
+  // `shortCall` ends such a call at the token that closes its form, and
+  // `endOfJson` at the bracket that closes its JSON. A call with NEITHER was
+  // read by nothing at all: it never ran, no receipt said it had not gone, and
+  // its whole markup, arguments and all, was stored as the reply's words and
+  // rode in every later request while the reply said it had filed a note that
+  // never went. The same call with its close, the same call ending the reply,
+  // and the well-formed call without its close were all handled: 231a841 wrote
+  // the rule this one should have fallen under and could not reach it.
+  const FORMS = [
+    ['a tag', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}'],
+    ['a tag, over several lines', '<tool_call>{\n  "name": "calculate",\n  "arguments": {"expression": "6*7"}'],
+    ['a tag, single-quoted', "<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7'}"],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] calculate({"expression": {"inner": "6*7"}'],
+    ['this app’s history form', '[tool calculate({"expression": {"inner": "6*7"}'],
+    [
+      'Qwen3-Coder’s XML, no </function>',
+      '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>',
+    ],
+  ] as const;
+  /** A round's words as the engine and the store read them: cut where it ended, then stripped. */
+  const words = (text: string, ended: 'model' | 'cut' | 'stopped'): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+  const read = (text: string, ended: 'model' | 'cut' | 'stopped') =>
+    extractFrom(text, OFFERED, [], { ended }).map((call) => call.name);
+
+  it('is read as the call it is, and none of it is left in the words', () => {
+    for (const [form, call] of FORMS) {
+      const text = `Working it out.\n${call}\nAll done — the sum is filed.`;
+      for (const ended of ['model', 'cut'] as const) {
+        expect(read(text, ended), `${form} (${ended})`).toEqual(['calculate']);
+        expect(words(text, ended), `${form} (${ended})`).toBe('Working it out.\n\nAll done — the sum is filed.');
+      }
+    }
+  });
+
+  it('carries the arguments the model wrote, the missing bracket supplied', () => {
+    const text =
+      'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}\nAll done.';
+    expect(extractFrom(text, OFFERED, [], { ended: 'model' }).map((call) => call.input)).toEqual([
+      { expression: '6*7' },
+    ]);
+  });
+
+  it('ends at the last line its JSON reaches, however many lines of words follow', () => {
+    // Its brackets never balance, so every line break after it ends a JSON
+    // prefix as well: only the ones its own tokens reach parse, and the
+    // furthest of those is where the call stops and the words begin.
+    const text =
+      'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}\nAll done.\nAnything else?';
+    expect(read(text, 'model')).toEqual(['calculate']);
+    expect(words(text, 'model')).toBe('Working it out.\n\nAll done.\nAnything else?');
+  });
+
+  it('is kept whole when it names no tool the request offered', () => {
+    // `callsOnlyTo`, as for every other call written without its close: a
+    // call-shaped example is words, and stays in them.
+    const example =
+      'Qwen’s format, a brace short:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}\nand then the closing tag.';
+    expect(read(example, 'model')).toEqual([]);
+    expect(words(example, 'model')).toBe(example);
+  });
+
+  it('is kept whole when its shape is named inside a sentence that goes on on the same line', () => {
+    // `wordsAfterCall`'s line rule: a call the model left ends the line it
+    // stands on, and a sentence that goes on past it is words whatever it names.
+    const sentence =
+      'Write <tool_call>{"name": "calculate", "arguments": {"expression": "6*7"} and then another <tool_call> tag after it.\nOk?';
+    expect(read(sentence, 'model')).toEqual([]);
+    expect(words(sentence, 'model')).toBe(sentence);
+  });
+
+  it('is kept whole when it is a sentence whose JSON never parses, over two lines', () => {
+    // `looseJson` reads the order of a call's tokens, so a line of prose inside
+    // the candidate is not a call's JSON however far the brackets stay open.
+    const doc =
+      'Look for <tool_call>{"name": "…" in the output\nand read the JSON until its brackets balance.';
+    expect(read(doc, 'model')).toEqual([]);
+    expect(words(doc, 'model')).toBe(doc);
+  });
+});

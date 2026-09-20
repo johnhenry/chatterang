@@ -5546,3 +5546,70 @@ describe('a fenced <tool_call> whose body is an array of calls', () => {
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11d');
   });
 });
+
+/* ── Round 11: a call a bracket short, written without its close ────── */
+
+describe('a call with a closing brace too few, written without its close, the reply going on below it', () => {
+  // Read by nothing at all: `shortCall` needs the form's close token and
+  // `endOfJson` needs the JSON to balance, and this call has neither. So the
+  // tool never ran, no #331 receipt said it had not gone, and the whole
+  // markup, arguments and all, was stored as the reply's words and sent back
+  // in every later request while the reply said it had filed the note.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r11e"}';
+
+  it('runs, is recorded once, and leaves none of itself stored or sent back', async () => {
+    const id = 'r11_short_no_close';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it now.\n${SHORT}\nAll done.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it now.\n\nAll done.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11e');
+  });
+
+  it('is recorded as not sent, and leaves none of itself, when Stop caught the turn after it', async () => {
+    const id = 'r11_short_no_close_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `Filing it now.\n${SHORT}\nAll done, and then`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'All done, and then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nAll done, and then');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11e');
+  });
+});

@@ -1314,7 +1314,20 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
         ({ json, end } = shortened);
       } else {
         const closed = endOfJson(text, from);
-        if (closed === -1) continue;
+        if (closed === -1) {
+          // A CLOSING BRACKET TOO FEW AND NO CLOSE EITHER, the reply going on
+          // below it: neither `shortCall` above, which needs the form's close
+          // token, nor `endOfJson`, whose brackets never balance, ends it. It
+          // ends where its JSON's tokens do: see `shortCallWithoutClose`. Read
+          // by nothing, it never ran, nothing recorded that it had not gone,
+          // and its whole markup was stored and sent back.
+          if (!ends) continue;
+          const short = shortCallWithoutClose(text, from);
+          if (!short) continue;
+          const calls = read(short.json, match, offered);
+          if (calls) unclosed({ start: match.index, end: short.end, calls, copy }, ends.text);
+          continue;
+        }
         const closing = close.exec(text.slice(closed));
         json = text.slice(from, closed);
         if (!closing) {
@@ -1546,6 +1559,58 @@ function shortCall(text: string, start: number, short: RegExp): { end: number; j
 }
 
 /**
+ * {@link shortCall}'s reading for a call WITH A CLOSING BRACKET TOO FEW AND NO
+ * CLOSE, that the reply then goes on past: the text from `start` to the end of
+ * the last line its JSON's tokens reach, and the brackets that were missing.
+ *
+ * `shortCall` ends such a call at the token that closes its form, and
+ * `endOfJson` at the bracket that closes its JSON. A call with neither —
+ * `Filing it now.\n<tool_call>{"name": "notes.note", "arguments": {"text": "…"}`
+ * and then `All done.` on the line below — was read by nothing at all: it never
+ * ran, no #331 receipt said it had not gone, and its whole markup, arguments
+ * and all, was stored as the reply's words and rode in every later request
+ * while the reply said it had filed a note that never went. Commit 231a841
+ * made a call written without its close that the reply goes on past markup;
+ * this is the same call, a bracket short, which that reading could not reach.
+ *
+ * THE LAST LINE ITS JSON REACHES. A call written over several lines ends a
+ * JSON prefix at every line break in it — the first alone reads `{`, which
+ * parses — so the furthest one that parses is where the call stops and the
+ * words begin. Read by {@link looseJson}, whose order of tokens is JSON's, so
+ * a line of prose inside the candidate fails it: a sentence naming a call's
+ * opening and going on over two lines is not a call. Whether what follows is
+ * words rather than the rest of a close is `callMarkup`'s question: see
+ * {@link wordsAfterCall}.
+ */
+function shortCallWithoutClose(text: string, start: number): { end: number; json: string } | undefined {
+  /** Each line break with its JSON still open, and the brackets open there. */
+  const breaks: { readonly at: number; readonly closers: string }[] = [];
+  const open: string[] = [];
+  for (let at = start; at < text.length; at += 1) {
+    const char = text[at];
+    if (opensString(text, at)) {
+      const end = stringEnd(text, at);
+      if (end === -1) break;
+      at = end - 1;
+    } else if (char === '{' || char === '[') {
+      open.push(char);
+    } else if (char === '}' || char === ']') {
+      open.pop();
+      // Its brackets balance: `endOfJson` ends it, and this reading is not its.
+      if (open.length === 0) return undefined;
+    } else if (char === '\n' && open.length > 0) {
+      breaks.push({ at, closers: open.map((bracket) => (bracket === '{' ? '}' : ']')).reverse().join('') });
+    }
+  }
+  for (let index = breaks.length - 1; index >= 0; index -= 1) {
+    const { at, closers } = breaks[index]!;
+    const json = text.slice(start, at) + closers;
+    if (isRecord(looseJson(json))) return { end: at, json };
+  }
+  return undefined;
+}
+
+/**
  * A call with nothing inside it at all: `<tool_call></tool_call>`, which names
  * no tool, or `[TOOL_CALLS] name()`, a call to a tool that takes no arguments.
  * The group is that name.
@@ -1637,6 +1702,8 @@ function readXmlCall(text: string, at: number): { end: number | Unended; calls: 
   if (typeof tool !== 'object') return notACall(tool);
   const { name } = tool;
   const input: Record<string, unknown> = {};
+  /** Where the last parameter's own closing tag ended: see the `</function>` step below. */
+  let wrote = -1;
   for (;;) {
     skipSpace();
     if (pos === text.length) return notACall('open');
@@ -1659,9 +1726,14 @@ function readXmlCall(text: string, at: number): { end: number | Unended; calls: 
       const value = text.slice(pos, close).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
       Object.defineProperty(input, key.name, { value, enumerable: true, writable: true, configurable: true });
       pos = close + '</parameter>'.length;
+      wrote = pos;
       continue;
     }
     step = read('</function>');
+    // WRITTEN WITHOUT ITS `</function>`, the reply going on after it: the call
+    // ends where its last parameter did, as one written without its
+    // `</tool_call>` ends where its function did. See `wordsAfterCall`.
+    if (step === false && wrote !== -1) return { end: wrote, calls: [{ name, input }], loose: true };
     if (step !== true) return notACall(step);
     const closed = pos;
     skipSpace();
