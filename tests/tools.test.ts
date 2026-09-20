@@ -1180,3 +1180,60 @@ describe('a call the model ended its reply on, written without its close', () =>
     }
   });
 });
+
+describe('a fenced <tool_call> whose body is an ARRAY of calls', () => {
+  // The tag around a fence is markup whatever its JSON holds, and `CALL_SHAPES`
+  // reads that JSON opening on `{` or `[`. The CUT's own opening read `{`
+  // alone, so a fenced tag holding an array was markup to the stripper and the
+  // reader and invisible to the cut: its whole block, name and arguments, was
+  // stored as the reply's words and sent back in every later request — after
+  // the arguments had reached the server, when the model ended its reply on it
+  // and the follow-up wrote nothing, and with no record at all when Stop or a
+  // limit on tokens landed inside it. The same array in a plain tag, and the
+  // same fenced tag around an object, were both cut.
+  const batch = '[{"name": "calculate", "arguments": {"expression": "6*7"}}]';
+  const fenced = (body: string): string => `Working it out.\n<tool_call>\`\`\`json\n${body}`;
+  /** A round's words as the engine and the store read them: cut where it ended, then stripped. */
+  const words = (text: string, ended: 'model' | 'cut' | 'stopped'): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+  const read = (text: string, ended: 'model' | 'cut' | 'stopped') =>
+    extractFrom(text, OFFERED, [], { ended }).map((call) => [call.name, call.input['expression']]);
+
+  it('is read as the call it is, and none of it is left in the words, when the model ended its reply on it', () => {
+    const text = fenced(`${batch}\n\`\`\``);
+    expect(read(text, 'model')).toEqual([['calculate', '6*7']]);
+    expect(words(text, 'model')).toBe('Working it out.');
+  });
+
+  it('leaves none of itself in the words wherever the turn was stopped or cut short inside it', () => {
+    for (const [where, body] of [
+      ['on its opening bracket', '['],
+      ['inside its arguments', '[{"name": "calculate", "arguments": {"expression": "6*'],
+      ['with its calls whole, before its fence', batch],
+      ['with its fence written, before the closing tag', `${batch}\n\`\`\``],
+    ] as const) {
+      for (const ended of ['stopped', 'cut'] as const) {
+        expect(read(fenced(body), ended), `${where} (${ended})`).toEqual([]);
+        expect(words(fenced(body), ended), `${where} (${ended})`).toBe('Working it out.');
+      }
+    }
+  });
+
+  it('is read and cut whole when its closing tag is written, as the same array in a plain tag is', () => {
+    for (const [form, text] of [
+      ['a fenced tag', fenced(`${batch}\n\`\`\`</tool_call>`)],
+      ['a plain tag', `Working it out.\n<tool_call>${batch}</tool_call>`],
+    ] as const) {
+      expect(read(text, 'model'), form).toEqual([['calculate', '6*7']]);
+      expect(words(text, 'model'), form).toBe('Working it out.');
+    }
+  });
+
+  it('keeps a fenced array in a tag that names no tool the request offered, and reads no call from it', () => {
+    // As `callsOnlyTo` keeps any other example the reply ends on: the end of
+    // the text is where an example ends too.
+    const example = fenced('[{"name": "get_weather", "arguments": {"city": "Paris"}}]\n```');
+    expect(read(example, 'model')).toEqual([]);
+    expect(words(example, 'model')).toBe(example);
+  });
+});

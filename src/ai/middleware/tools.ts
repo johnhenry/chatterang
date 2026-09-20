@@ -660,7 +660,7 @@ const NEXT_CALL = /^(?:<tool_call>|\[TOOL_CALLS?\])/i;
  * record that it had not gone.
  */
 const CALL_MARKER_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:\{|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?(?:[{[]|<\/?[a-z_]*)?\s*$|\[TOOL_CALLS?\](?:\s*[\w.:-]+\s*\(\s*|[ \t]*[\w.:-]*\s*)$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call visibly opened with nothing inside it, in a reply THE MODEL ENDED:
@@ -671,14 +671,20 @@ const CALL_MARKER_AT_END =
  * special token [TOOL_CALLS]" to "... the special token".
  */
 const CALL_OPENED_AT_END =
-  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?\{\s*$|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
+  /<tool_call>\s*(?:\x60{3}(?:json|tool)?\s*)?[{[]\s*$|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*$|\[tool\s+[^()[\]{}\n]+?\s*\(\s*$/i;
 
 /**
  * A call's opening shape with its arguments begun: `<tool_call>` and the `{`
  * or `[` a call's JSON opens with, or `[TOOL_CALL]`/`[TOOL_CALLS]`, `name(` and
  * a `{`. The match ends where the arguments' `{` or `[` starts.
  *
- * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and a `{`.
+ * A fenced call wrapped in the tag opens `<tool_call>`, a fence, and the `{` or
+ * `[` its JSON opens with — AN ARRAY OF CALLS TOO, as `CALL_SHAPES`'s own
+ * fenced-tag opening reads one. Read as `{` alone, a fenced tag holding an
+ * array was markup to the stripper and the reader but invisible to the cut: a
+ * turn stopped or cut off inside its arguments kept the whole block, and one
+ * whose call ran and whose follow-up wrote nothing kept it after the arguments
+ * had reached the server, so both stored it and sent it back.
  * Qwen3-Coder's opens `<tool_call>` and `<function=`: see `xmlCallEnd`. One
  * whose body is a name and its JSON opens `<tool_call>`, the name, and a `(` or
  * `{`: see `taggedCallsEnd`, which reads an array of calls too. This app's own
@@ -697,7 +703,7 @@ const CALL_OPENED_AT_END =
  * tests/support/source-scan.ts read a bare one in a regex literal as the start
  * of a string.
  */
-const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=\{)|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
+const CALL_OPENING = /<tool_call>\s*(?=[{[])|\[TOOL_CALLS?\]\s*[\w.:-]+\s*\(\s*(?=[{A-Za-z_])|<tool_call>\s*(?=<function=)|<tool_call>\s*\x60{3}(?:json|tool)?\s*(?=[{[])|<tool_call>\s*(?=[\w.:-]+\s*[({])|\[tool\s+[^()[\]{}\n]+?\s*\(\s*(?=\{)/gi;
 
 /**
  * Where the JSON object opening at `start` ends, just past its closing brace;
@@ -1006,7 +1012,10 @@ export function unfinishedCallAt(
       from = short;
       continue;
     }
-    const close = endOfObject(text, open);
+    // An array of calls, whose brackets `endOfObject` does not count: the
+    // fenced tag's body can be one, as the plain tag's can — and the plain
+    // tag's is read by `taggedCallsEnd` above, where a fenced one arrives here.
+    const close = text.charAt(open) === '[' ? endOfJson(text, open) : endOfObject(text, open);
     if (close === -1) {
       const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
       if (writing && beingWritten(writing === true ? 'open' : writing)) return cutFrom;

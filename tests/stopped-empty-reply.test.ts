@@ -5449,3 +5449,100 @@ describe('a call a dead local round had written in full, on a turn that diverts 
     });
   });
 });
+
+/* ── Round 11: a fenced tag holding an ARRAY of calls ───────────────── */
+
+describe('a fenced <tool_call> whose body is an array of calls', () => {
+  // `CALL_SHAPES` reads a fenced tag's JSON opening on `{` or `[`; the cut's
+  // own opening read `{` alone. So this one shape was markup to the stripper
+  // and the reader and invisible to the cut: its whole block, name and
+  // arguments, stayed in the stored row's words and rode in every later
+  // request — after the arguments had reached the server, and with no record
+  // at all when Stop or a limit on tokens landed inside it.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const OPENED = 'Filing it now.\n<tool_call>```json\n[{"name":"notes.note","arguments":{"text":"canary-r11';
+
+  it('whose call ran and whose follow-up wrote nothing leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_ran';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ reply: `${OPENED}a"}}]\n\`\`\`` }, { reply: '' }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'the arguments left for the server').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11a');
+  });
+
+  it('stopped inside its arguments leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${OPENED}b`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-r11b', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11b');
+  });
+
+  it('cut off at its limit on tokens inside its arguments leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_cut';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ cutOff: `${OPENED}c` }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11c');
+  });
+
+  it('stopped with its calls whole, before its closing tag, leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_whole';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${OPENED}d"}}]`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-r11d', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11d');
+  });
+});
