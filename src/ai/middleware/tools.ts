@@ -2214,12 +2214,18 @@ export async function runToolCalls(
      */
     destinations: ToolDestinationPolicy;
     /*
-     * The tools the request these calls answer declared to the model, as the
-     * registry held them when it was built. NEVER RUN: a call executes only
-     * from the live registry. Read only to name a call whose tool has left the
-     * registry since, so it is recorded as not sent to that server rather than
-     * answered as a name nothing stands behind (#92). Leaving it out sends
-     * nothing more, but loses that record, so both callers in this app pass it.
+     * The tools the TURN these calls answer declared to the model, as the
+     * registry held them when each of its requests was built. NEVER RUN: a
+     * call executes only from the live registry. Read only to name a call whose
+     * tool has left the registry since, so it is recorded as not sent to that
+     * server rather than answered as a name nothing stands behind (#92).
+     * Leaving it out sends nothing more, but loses that record, so both callers
+     * in this app pass it.
+     *
+     * THE TURN'S, NOT ONE REQUEST'S. `reconnect` takes every MCP tool out of
+     * the registry at once, so a round that begins after it declares none: the
+     * call it writes is to a server this turn had been talking to, and read
+     * from that round's own declarations alone it had no host to name.
      */
     declared?: readonly ChatterangTool[];
     signal?: AbortSignal;

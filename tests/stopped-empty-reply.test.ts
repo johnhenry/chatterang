@@ -5740,3 +5740,111 @@ describe('a call in a tag with a trailing comma after its JSON', () => {
     expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
   });
 });
+
+/* ── Round 11: every tool leaves the registry mid-turn ──────────────── */
+
+describe('a call a round writes after every tool has left the registry', () => {
+  // Switching an MCP server off, adding one or removing one runs `reconnect`
+  // in state/mcp.ts, which takes every MCP tool out of the registry before it
+  // puts the enabled servers' back. A turn whose round-1 call runs meanwhile
+  // starts round 2 with nothing offered — and `ran` is already true, so the
+  // stripper took the round's markup out of the words while the reader's
+  // narrower gate never looked at it: no batch, no tool result, no follow-up
+  // round, no #331 receipt. The stored reply said it had filed a note the
+  // thread and the export said nothing about.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const note = (text: string): string =>
+    `<tool_call>{"name":"notes.note","arguments":{"text":"${text}"}}</tool_call>`;
+
+  /** The MCP probe, taking its own tool out of the registry the first time it runs. */
+  function departingProbe(): ReturnType<typeof mcpProbe> {
+    const probe = mcpProbe();
+    probe.call.mockImplementation(async () => {
+      toolRegistry.unregister(probe.tool.id);
+      return { content: [{ type: 'text', text: 'filed' }] };
+    });
+    return probe;
+  }
+
+  it('is recorded as not sent, and its markup is stored and sent back by neither', async () => {
+    const id = 'r11_departed_finished';
+    const probe = departingProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `First one.\n${note('canary-r11k')}` },
+      { reply: `Filing the second.\n${note('canary-r11l')}\n\nBoth filed.` },
+      { reply: 'Done.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([{ text: 'canary-r11k' }]);
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'both calls the turn wrote').toEqual([
+      'notes.note',
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[1]?.receipt, 'the record that the second did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+    });
+    expect(stored.content, 'the words the person keeps').toContain('Both filed.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11l');
+  });
+
+  it('is recorded as not sent when Stop caught the turn after it', async () => {
+    const id = 'r11_departed_stopped';
+    const probe = departingProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `First.\n${note('canary-r11m')}` },
+      { partial: `Filing the second.\n${note('canary-r11n')}\n\nAnd then`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'And then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([{ text: 'canary-r11m' }]);
+    expect(stopped.toolCalls?.[1]?.receipt, 'the record that the second did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toContain('And then');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11n');
+  });
+
+  it('still reads nothing in a turn where no tool was offered and none ran', async () => {
+    // The gate that keeps a reply documenting Qwen's call format from having
+    // its example dispatched: a chat whose tool ids name nothing connected
+    // offers none, and nothing it writes is a call.
+    const id = 'r11_departed_none_ran';
+    const example = note('canary-r11o');
+    given(chat(id, { tools: ['mcp:notes.note'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ reply: `Qwen writes:\n${example}` }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen format a call?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls ?? [], 'the calls the turn recorded').toEqual([]);
+    expect(stored.content, 'the words the person watched arrive').toBe(`Qwen writes:\n${example}`);
+  });
+});
