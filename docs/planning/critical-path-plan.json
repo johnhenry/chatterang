@@ -1,0 +1,467 @@
+{
+ "plan": {
+  "buildNow": [
+   {
+    "name": "BN1 Bash confirm takes the turn's Stop signal",
+    "issues": [
+     "#293",
+     "#292",
+     "#170"
+    ],
+    "files": [
+     "src/shell/tool.ts",
+     "src/shell/index.ts",
+     "src/shell/register.ts",
+     "tests/shell-confirm-stop.test.ts (new)"
+    ],
+    "conflictsWith": [],
+    "brief": "WHY NOW: a relayed bash confirm (#170) must end when a turn is stopped. Today a Stop leaves the bash sheet up. Verified on main 88d7c78: register.ts:23 is `createBashTool({ confirm: (action) => useApp.getState().requestApproval(action) })`, with no signal, and `BashToolOptions.confirm(action: string)` has no signal parameter (tool.ts:33-36). The MCP destructive confirm (state/mcp.ts:178-179) and both chat egress sheets (chat.ts:1584-1606, :1713) already pass one, so #293 item 4 is only half open.\n\nSCOPE\n- Widen `BashToolOptions.confirm` to `(action: string, signal?: AbortSignal) => Promise<boolean>`.\n- ChatterangShell passes the exec signal it already receives (index.ts:459-472) into the model-actor confirm (index.ts:504-510).\n- register.ts:23 becomes `requestApproval(action, undefined, signal)`. Before relying on that argument order, read the signature at src/state/app.ts:417-441.\n- Do NOT edit src/state/app.ts, src/state/chat.ts or src/shell/commands.ts. The in-flight branches edit all three: sweep edits app.ts and chat.ts; stopped-empty-reply edits commands.ts and chat.ts.\n\nACCEPTANCE (new tests/shell-confirm-stop.test.ts, run through the real useApp store, createBashTool and ChatterangShell; each must fail on main)\n1. A model-actor command that needs a confirm is started with an AbortController (a mutating app command such as the model delete path at commands.ts:392, or any confirm-gated change). Abort while the sheet is queued: `useApp.getState().approvals` no longer holds that sheet within one microtask flush. This fails on main because no signal reaches requestApproval.\n2. The tool call settles, refused or stopped, within a bounded time (for example 100 ms of fake time) rather than hanging.\n3. A spy on the store mutation the command would perform is never called, even if the test answers yes to the removed sheet afterwards.\n4. Control, which passes on main too: the same command is not aborted, is answered yes, and runs the mutation once.\n\nMUTATION CHECKS (each must turn a test red)\n- Drop the signal in register.ts.\n- Drop it in index.ts.\n- Make the confirm resolve true on abort.\n\nINVARIANTS\n- A user-actor shell still skips confirms for local changes (index.ts:506-508).\n- No network command appears.\n- API keys never enter the VFS (stores.ts:71).\n\nPROCESS\n- Never use git stash.\n- Commit with `git commit -- <paths>`.\n- No closing keywords next to issue numbers (#293 stays open for its other items).",
+    "nativeCompileNeeded": false,
+    "size": "S"
+   },
+   {
+    "name": "BN2 Wire field for who runs the tool loop, and its refusal",
+    "issues": [
+     "#152",
+     "#159",
+     "#296"
+    ],
+    "files": [
+     "packages/tunnel/src/wire/index.ts",
+     "tests/tunnel-loop-owner.test.ts (new)"
+    ],
+    "conflictsWith": [
+     "BN10 (the adapter's turn frame gains the field after this merges; one-line follow-up)"
+    ],
+    "brief": "WHY: the #152 owner ruling (https://github.com/johnhenry/chatterang/issues/152#issuecomment-5629620946) says:\n- the request says who owns the tool loop;\n- both sides implement both paths;\n- the originating device can require that the loop stays with it;\n- the far side refuses with a defined frame;\n- the flag is part of the wire contract.\n\nNothing named loop exists in packages/tunnel/src, and REFUSALS (wire/index.ts:429-467) has no code for it. This is an engineering shape inside that ruling, not an owner question.\n\nSCOPE\n- Add a named field on the `turn` frame itself, never in `metadata.custom` (#141): `toolLoop: 'requester' | 'host'`.\n  - 'requester': the requesting device runs tools. The host serves inference only and ends at the model's tool calls.\n  - 'host': the host runs the tools its policy allows (#170).\n- Export `toolLoopOf(frame): 'requester' | 'host' | null`. It returns null for a missing field or any other value; hosts refuse on null (fail closed).\n- Add a REFUSALS row `TOOL_LOOP_UNSUPPORTED`: kind 'refused', scope 'turn', endsTurn true, beforeStart true. A host sends it for a value it does not run, and for null.\n- Read the TUNNEL_WIRE_VERSION comment before deciding whether a required field on `turn` is a version bump. No phone ships the tunnel yet; record the reasoning in the commit.\n- Do not edit packages/tunnel/src/client/index.ts (BN9 owns it). If classifyFrame needs a change for the new row, stop and coordinate. `refusalOf` should already carry an unknown or new code generically (wire :491).\n\nACCEPTANCE (tests/tunnel-loop-owner.test.ts; fails on main because the field, helper and code are absent)\n1. encodeFrame/decodeFrame round-trip a turn with each value.\n2. `toolLoopOf` returns null for a missing field, 'phone', 'HOST' and 1.\n3. REFUSALS.TOOL_LOOP_UNSUPPORTED has scope 'turn', endsTurn true and beforeStart true.\n4. Over the rung-0 loopback (pattern: tests/rung0-vocabulary.test.ts:352-378), the refusal sent before any chunk classifies as `{kind:'refused', endsTurn:true}`.\n5. The same code sent after a chunk is refused by the ledger (stream/index.ts:545-547).\n\nMUTATION CHECKS\n- `toolLoopOf` defaults unknown to 'host'.\n- endsTurn false.\n- beforeStart false.\nEach must fail.\n\nINVARIANTS\n- wire/ imports nothing (tests/layering.test.ts:438-449).\n- Existing REFUSALS rows are unchanged.\n\nPROCESS: never use git stash; commit explicit paths; no closing keywords.",
+    "nativeCompileNeeded": false,
+    "size": "S"
+   },
+   {
+    "name": "BN3 Electron probes for the hidden worker, sleep ordering and reload order (measurements only)",
+    "issues": [
+     "#7",
+     "#158",
+     "#313"
+    ],
+    "files": [
+     "dev/probe-electron-hidden-worker/ (new, not shipped)",
+     "dev/probe-electron-reload-order/ (new, not shipped)",
+     "docs/BACKGROUND-WORK-MEASUREMENTS.md (new sections)"
+    ],
+    "conflictsWith": [],
+    "brief": "WHY: several later units rest on Electron behaviour that S1 left NOT MEASURED (docs/BACKGROUND-WORK-MEASUREMENTS.md:102-105, :205-216):\n- S7c's window-all-closed handling;\n- the WorkerHost's loss mapping;\n- the power clock;\n- the #313 fix.\n\nSCOPE: build a real Electron 44 probe app under dev/, changing no shipped behaviour. Measure each item and record the date, commit, OS and Electron version, labelled per the doc's INFERENCE / NOT MEASURED convention (doc:11-12).\n1. Does `window-all-closed` fire while a `show:false` BrowserWindow exists? Does it fire when that hidden window is destroyed after the last visible window closed? main.ts:732-734 quits on non-darwin in that case, which contradicts #7 ruling 6.\n2. Does a MessagePortMain in main emit `close` when its renderer is crashed (`webContents.forcefullyCrashRenderer()`), destroyed, or reloaded? Record the order against `render-process-gone` and `destroyed`.\n3. For a hidden window with `backgroundThrottling:false`, measure stream pacing, RSS and ping round-trip, including while its page blocks the event loop for 5, 15 and 30 s. Compare against the Supervisor's 10 s ping timeout (supervisor.ts:347-356).\n4. Across a real macOS suspend (`pmset sleepnow` or a lid close), does a `setInterval` tick run before `powerMonitor` 'resume' is delivered? Repeat at least 3 times.\n5. The main-frame reload event order for #313:\n   - `did-start-navigation`, then the new document's commit event (verify the event names with ctx7 Electron docs first);\n   - when the old document's last `ipcMain.handle` call can still arrive.\n6. Tray icon visibility on any Linux desktop (GNOME, KDE) or Windows you can reach. If none is reachable, record NOT MEASURED.\n\nACCEPTANCE\n- Each result is written in the doc with its consequence stated for WorkerHost (BN4), the power clock (wave 1), #313 (wave 1) and S7c (wave 4).\n- The probe exits non-zero on any failed step (native/README.md:41-48 convention).\n\nINVARIANTS\n- Nothing under apps/*/src or src/ changes.\n- The probe opens no socket, or only loopback, so the privacy-copy listening inventory (tests/privacy-copy.test.ts:2667-2678) stays at its two entries.\n- Never log prompt text.\n\nPROCESS: never use git stash; commit explicit paths; no closing keywords (#313 stays open).",
+    "nativeCompileNeeded": false,
+    "size": "S-M"
+   },
+   {
+    "name": "BN4 WorkerHost: platform-free on-demand host for the hidden worker",
+    "issues": [
+     "#7"
+    ],
+    "files": [
+     "apps/desktop/src/bridge/worker-host.ts (new)",
+     "apps/desktop/src/bridge/protocol.ts",
+     "apps/desktop/src/bridge/index.ts",
+     "tests/desktop-worker-host.test.ts (new)"
+    ],
+    "conflictsWith": [
+     "BN5 (apps/desktop/src/bridge/index.ts export lines; trivial, merge either order)"
+    ],
+    "brief": "WHY: #7 ruling 1 (https://github.com/johnhenry/chatterang/issues/7#issuecomment-5669950639) calls for a hidden worker supervised like a host: a HostHandle whose loss is render-process-gone or destroyed, respawned under a cap, and destroyed when idle.\n\nWhat stands in the way on main:\n- A Supervisor spawns in its constructor (supervisor.ts:570).\n- Its dispose is terminal (:931-938).\n- Its restart cap is per instance (:1323-1343).\n- HostFleet builds its supervisors at boot (host-fleet.ts:111-129).\n- WorkBroker already takes `condemnExecutor` (work-broker.ts:339) and `workerLost(executor)` (:800), and main.ts:443-446 says the worker is what needs them.\n\nThe transport choice follows ruling 1 and S1's measurement (the host envelope over a MessagePort; doc:196-204), so it is settled here as engineering: one Supervisor per worker life, whose senderId is the worker's REAL webContents.id, never an invented number (work-broker.ts:76-82).\n\nSCOPE\nAdd `apps/desktop/src/bridge/worker-host.ts`, with no `electron` and no `node:` import (tests/layering.test.ts bridge guard :1095-1119) and injected timers.\n- `createWorkerHost({ spawnWorker: () => { handle: HostHandle; senderId: number }, broker, timers, policy })`.\n- Build a Supervisor only when the first unit runs. After `WORKER_IDLE_MS` with no unit, call `dispose()` and drop it; the next unit builds a new one.\n- Keep a restart budget ACROSS lives (maxRestarts / restartWindowMs), so recreating the Supervisor on admission cannot reset the cap.\n- `run(unitId, encodedTurn, signal, onFrame): Promise<terminal>` runs one unit at a time. Abort calls the stream's cancel method.\n- `condemn(executor): boolean` returns true only after the worker is killed, then calls `broker.workerLost(WORKER_EXECUTOR)`.\n- `hostedUnitOf(senderId)`, for admitLocalTurns (local-turns.ts:157-188), answers only while that worker's unit runs.\n- Export `WORKER_IDLE_MS` and `WORKER_EXECUTOR = 'worker'`.\n- In protocol.ts, add a `PeerTurn` PluginDefinition and stream spec that pass the Supervisor's name check (supervisor.ts:516-545): methods `peerTurnStart` and `peerTurnCancel`; events `peerTurnFrame` (progress) and `peerTurnEnd` (terminal). Payloads are opaque encoded tunnel frames, so S4's runner conforms later without changing this file.\n\nACCEPTANCE (tests/desktop-worker-host.test.ts, over fake MessagePorts shaped like tests/desktop-background-measurements.test.ts:505-600; fails on main because the module is absent)\n1. spawnWorker is not called before the first run.\n2. Exactly one terminal per unit on each of: completion, port close (HANDLE_LOST), abort, and an idle retire racing a new run.\n3. An idle retire does not count against the restart budget.\n4. A crash loop across N lives stops at the cap, and a later run is refused with a defined error rather than spawning.\n5. With a real WorkBroker and a unit that ignores abort, the drain timeout calls condemn. The slot frees only after kill, and workerLost ends only worker units.\n6. `hostedUnitOf` returns null before start and after the terminal.\n\nMUTATION CHECKS\n- Construct the Supervisor eagerly.\n- Reset the budget per life.\n- Return true from condemn before kill.\n- Answer hostedUnitOf after the terminal.\nEach must fail.\n\nINVARIANTS\n- supervisor.ts, work-broker.ts and local-turns.ts are called, not edited.\n- No `new Supervisor(` in main.ts (desktop-security.test.ts:704).\n- Never log payloads (main.ts:41-45).\n- main.ts is not touched in this unit.\n\nPROCESS: never use git stash; commit explicit paths; no closing keywords.",
+    "nativeCompileNeeded": false,
+    "size": "M"
+   },
+   {
+    "name": "BN5 Sleep and wake reach the work broker",
+    "issues": [
+     "#7",
+     "#158"
+    ],
+    "files": [
+     "apps/desktop/src/bridge/power-events.ts (new)",
+     "apps/desktop/src/main.ts",
+     "tests/desktop-power-events.test.ts (new)",
+     "tests/desktop-security.test.ts"
+    ],
+    "conflictsWith": [
+     "BN4 (bridge/index.ts, only if exported through it; importing the file directly avoids it)"
+    ],
+    "brief": "WHY: #7 ruling 7 (https://github.com/johnhenry/chatterang/issues/7#issuecomment-5669980734) says: no keep-awake; on suspend, stop admitting and settle running work with a defined reason.\n\nWhat exists on main: WorkBroker.suspend()/resume() are built (work-broker.ts:816-827; suspend ends everything HOST_SUSPENDED and drops held results). But `grep powerMonitor apps/desktop/src/main.ts` is empty, so nothing calls them. The rule covers the desktop's own local turns too (work-broker.ts:27-33).\n\nThe sleep CLOCK stays out of this unit; it waits on BN3's ordering probe.\n\nSCOPE\n- Add a platform-free `wirePowerEvents(source: { on(e: 'suspend' | 'resume', fn: () => void): void; removeListener(e, fn): void }, broker: Pick<WorkBroker, 'suspend' | 'resume'>): () => void`.\n- In main.ts, after `app.whenReady()` (check ctx7 Electron docs on when powerMonitor may be used), call `wirePowerEvents(powerMonitor, broker)`.\n- No powerSaveBlocker anywhere.\n\nACCEPTANCE (all fail on main)\n1. tests/desktop-power-events.test.ts, with a fake emitter plus a real WorkBroker and a fake executor:\n   - a running local unit ends HOST_SUSPENDED on 'suspend';\n   - an admit while suspended is refused HOST_SUSPENDED;\n   - after 'resume' a new admit starts;\n   - the disposer removes both listeners.\n2. tests/desktop-security.test.ts, a text check in the style of :708-735: main.ts calls `wirePowerEvents(powerMonitor, broker)` and contains no `powerSaveBlocker`.\n\nMUTATION CHECKS\n- Register only 'suspend'.\n- Call resume on 'suspend'.\n- Leak listeners from the disposer.\nEach must fail.\n\nINVARIANTS\n- `will-quit` still runs `broker.quit(); fleet.dispose()` (main.ts:629-632).\n- Exactly one `new WorkBroker(` (desktop-security.test.ts:724).\n- The test at :708 still passes, because no listener is started.\n- TunnelGate.now is untouched.\n\nPROCESS: never use git stash; `git commit -- <paths>`; no closing keywords.",
+    "nativeCompileNeeded": false,
+    "size": "XS"
+   },
+   {
+    "name": "BN6 One address enumeration in the tunnel host; the server's boot line stops promising a certificate",
+    "issues": [
+     "#252",
+     "#127",
+     "#134",
+     "#295"
+    ],
+    "files": [
+     "packages/tunnel/src/host/addresses.ts (new)",
+     "packages/tunnel/src/host/index.ts",
+     "apps/server/src/addresses.ts",
+     "apps/server/src/main.ts",
+     "tests/server-addresses.test.ts",
+     "tests/tunnel-pairing-fit.test.ts",
+     "tests/privacy-copy.test.ts (HOST_EXPORTS rows only)"
+    ],
+    "conflictsWith": [
+     "BN7 (packages/tunnel/src/host/index.ts export lines and tests/privacy-copy.test.ts HOST_EXPORTS rows; merge BN6 first, BN7 rebases)",
+     "BN8 (packages/tunnel/src/host/index.ts, a different region)"
+    ],
+    "brief": "WHY: the desktop's pairing payload needs addresses, but `networkInterfaces` is used only in apps/server/src/addresses.ts. apps/server depends on the desktop, so the desktop cannot import it. #158 wants one implementation for both apps.\n\nThe same file's header (addresses.ts:34-38) and boot line (:210-211, printed by main.ts:302-307) say the addresses go 'into every pairing code and into the certificate'. That is false twice over:\n- the server mints no pairing code yet (tunnel-identity.ts:23-25);\n- #295's ruling (https://github.com/johnhenry/chatterang/issues/295#issuecomment-5668942681) means certificates carry no address list.\n\nSCOPE\n- Move the enumeration and ranking (advertisedAddresses, its exclusions, one address per IPv6 /64, MAX_ADVERTISED 8) into packages/tunnel/src/host/addresses.ts. Add a helper that turns the list into `PairingAddress[]` for fitPairingPayload (pairing/index.ts:645-678). Export both through host/index.ts.\n- apps/server/src/addresses.ts keeps `--advertise` override semantics as a thin wrapper.\n- Rewrite the header so the list feeds the pairing payload only, and say why SANs are not a consumer.\n- The boot line says these are the addresses pairing will advertise once it is on, and never mentions a certificate. Adjust the comment at main.ts:291-301.\n- Classify every new runtime export in HOST_EXPORTS as 'binds nothing'. The inventory scans every file under host/ (privacy-copy.test.ts:2577-2590), not only index.ts.\n\nACCEPTANCE\n1. tests/server-addresses.test.ts keeps all existing cases green against the moved module.\n2. It gains an assertion that describeAdvertised output contains no 'certificate' and does not claim pairing is active. This fails on main.\n3. The parity test in tests/tunnel-pairing-fit.test.ts:318-341 points at the new path.\n4. A helper test: the enumerated list fed to fitPairingPayload fits the 296-character cap and drops addresses from the least-reachable end.\n\nMUTATION CHECKS\n- Rank CGNAT as private.\n- Include fe80::/10.\n- Drop the dedupe.\n- Restore 'and into the certificate'.\nEach must fail.\n\nINVARIANTS\n- The server's printed list is unchanged apart from the sentence.\n- src/ still cannot import it (DESKTOP_LAYER_BAN, layering.test.ts:57).\n- The listen inventory stays at two entries.\n\nPROCESS: never use git stash; commit explicit paths; write 'refs #252', never a closing keyword. #252 stays open for its #165 multi-address check.",
+    "nativeCompileNeeded": false,
+    "size": "S"
+   },
+   {
+    "name": "BN7 Paired-device registry file: verification data only, shared by both hosts",
+    "issues": [
+     "#133",
+     "#135",
+     "#179",
+     "#180",
+     "#131"
+    ],
+    "files": [
+     "packages/tunnel/src/host/device-registry.ts (new)",
+     "packages/tunnel/src/host/index.ts",
+     "tests/tunnel-device-registry.test.ts (new)",
+     "tests/privacy-copy.test.ts (HOST_EXPORTS rows only)",
+     "packages/tunnel/README.md"
+    ],
+    "conflictsWith": [
+     "BN6 (host/index.ts exports and HOST_EXPORTS rows; land after BN6)",
+     "BN8 (packages/tunnel/README.md sections)"
+    ],
+    "brief": "WHY: the only CredentialStore today is `createMemoryCredentialStore`, which forgets everything on exit (host/credential.ts:261-275). The #133 owner ruling (https://github.com/johnhenry/chatterang/issues/133#issuecomment-5670024680) puts the desktop's list in an app-data file next to the key: owner-only, sealed where available, holding what verification and revocation need and never the credential, and allowed to land tested but unreachable.\n\nThe server keeps the same records under --root (#124), and #158 wants one implementation. So the store lives beside identity-store.ts and takes its injectables: `KeyFileSystem` and `KeySealer` (identity-store.ts:156, :166) plus the same permission checks.\n\nSettled here as engineering inside the rulings:\n- Each record holds a digest or zero-byte tombstone, a name, and pairedAt. No lastSeenAt: it is neither verification nor revocation data.\n- The store is BOUND to a 32-byte `bindTo` value. The desktop passes the tunnel key pin; the server passes a digest over the pin and its operator token (#135: the token is the root).\n- A different bindTo at open clears every device and reports `cleared: 'binding-changed'` (#180: a key reset makes every device re-pair; #179: a Linux downgrade makes a new key and devices re-pair).\n- A protection mismatch in the registry file itself is refused, never rewritten (the identity-store rule).\n\nSCOPE\n- `openDeviceRegistry({ directory, fs, sealer, bindTo, platform })` returns `{ store: CredentialStore; list(): DeviceRecord[]; setName(id, name); cleared: null | 'binding-changed' }`.\n- `store` satisfies credential.ts:77-91 including the TOMBSTONE, and plugs into `createDeviceCredentials`.\n- File format: a versioned envelope ('chatterang-paired-devices', v1) recording protection. Writes are atomic (temp file then rename) and serialised. The directory is owner-only.\n- Classify every runtime export in HOST_EXPORTS as 'binds nothing'.\n- Update README.md:306-307.\n- No app calls it in this unit (tested but unreachable, per the #133 ruling).\n\nACCEPTANCE (tests/tunnel-device-registry.test.ts; all fail on main because the module is absent)\n1. Mint through createDeviceCredentials over the registry, open a NEW registry on the same files (a restart), and `verify` returns the deviceId.\n2. Revoke with a delete made to throw leaves the tombstone. A registry opened after a restart still refuses that credential.\n3. A plain envelope with a sealer present, and a sealed envelope with no sealer, are both refused with a named error, and the file bytes are unchanged.\n4. Group or other permission bits are refused, not tightened (reuse identity-store's checks, including macOS ACL).\n5. An unknown version is refused.\n6. The file bytes never contain the minted credential string or its secret half, only 32-byte digests and zero-byte tombstones. Decrypt the sealed envelope with the test sealer before searching.\n7. Opening with a different bindTo reports 'binding-changed', and every old credential then fails verify.\n8. Two concurrent mints both survive a restart.\n9. list() exposes no digest field.\n\nMUTATION CHECKS\n- Persist no tombstone.\n- Write the credential instead of its digest.\n- Skip the mode check.\n- Re-seal a plain file in place.\n- Ignore bindTo.\n- Drop the version check.\nEach must fail.\n\nINVARIANTS\n- credential.ts semantics are unchanged.\n- No socket.\n- Nothing in apps/server/src imports it in this change. #249 requires the server statelessness correction in the same commit as the server's first use.\n- Fail closed on every read error.\n\nPROCESS: never use git stash; commit explicit paths; 'refs' only.",
+    "nativeCompileNeeded": false,
+    "size": "M"
+   },
+   {
+    "name": "BN8 Pairing exchange over pair frames, with the desktop's accept before any credential is minted",
+    "issues": [
+     "#135",
+     "#129",
+     "#130",
+     "#136",
+     "#256"
+    ],
+    "files": [
+     "packages/tunnel/src/exchange/index.ts (new)",
+     "packages/tunnel/package.json (./exchange export)",
+     "tsconfig.json (explicit @chatterang/tunnel/exchange path)",
+     "vite.config.ts (explicit alias)",
+     "tests/layering.test.ts (seam regex at :1244 and entry-mapping checks at :708-738)",
+     "packages/tunnel/src/host/index.ts (PAIRING_HANDOVER_MS derivation only)",
+     "tests/tunnel-exchange.test.ts (new)",
+     "packages/tunnel/README.md"
+    ],
+    "conflictsWith": [
+     "BN6 and BN7 (packages/tunnel/src/host/index.ts, a different region; README with BN7)"
+    ],
+    "brief": "WHY: nothing can pair. PairFrame.body is `unknown` ('Its shape is the exchange's to define', wire/index.ts:262-281), and the README lists the CPace messages, confirmation and credential handover as absent (packages/tunnel/README.md:315-318). The CPace steps (pake beginExchange :338, computeConfirmation :367, finish :397) and `channelIdentifierFor` (binding :104) have no production caller.\n\nThe #129 owner ruling (https://github.com/johnhenry/chatterang/issues/129#issuecomment-5668943416) says the desktop shows an accept prompt and mints only after acceptance, and a lapse spends the secret. But PAIRING_HANDOVER_MS = 10_000 (verified at host/index.ts:191) closes the claimant's channel before a person can answer. The prompt's length is an implementation constant to name and pin, as the owner said of the relayed-prompt timeout on #170 (https://github.com/johnhenry/chatterang/issues/170#issuecomment-5668943134), so it is settled here: `PAIRING_CONFIRM_MS = 60_000`. It is defined in exchange/ so host/index.ts gains no new runtime export and HOST_EXPORTS stays unchanged.\n\nSCOPE: a platform-free new entry `@chatterang/tunnel/exchange`, using WebCrypto and noble through pake only.\n\nIt MUST NOT import host/, even type-only. Declare a structural `PairingAdmissionLike { claim(presented: Uint8Array): ClaimOutcome }` locally.\n\nInitiator (phone) and responder (host) state machines over `pair` frame bodies:\n1. Both sides contribute a sid share.\n2. CPace messages with CI = channelIdentifierFor(route, negotiated SPKI).\n3. Confirmation tags; `finish()` is the only path to a session key.\n4. The responder sends 'awaiting-accept'.\n5. The credential is sealed with AES-GCM under a key derived from the session key, or a named refusal is sent.\n\nGate mapping on the responder:\n- A bad peer tag calls `admission.claim(<bytes that cannot match>)`, so the window's budget is spent (window.ts:221-241 decrements before the compare).\n- A good tag calls `admission.claim(secret)`, which claims the window and ends the other pairing tunnels (host/index.ts:1105-1141).\n- Then it awaits an injected `confirm({ route }): Promise<'accept' | 'decline'>` bounded by PAIRING_CONFIRM_MS, and mints through an injected `mint(window)` only on 'accept'.\n- Decline or lapse cancels the window and closes the tunnel.\n\nIn host/index.ts, derive PAIRING_HANDOVER_MS from PAIRING_CONFIRM_MS plus a named mint margin.\n\nNo name step yet: what name the accept prompt shows is owner question 'Phone name'. Leave the step out; do not invent a placeholder field.\n\nLayering:\n- Ban the entry from src/ except the seam files (extend the TUNNEL_PAIRING regex at layering.test.ts:1244).\n- Map it explicitly in tsconfig and vite, with no wildcard (layering :708-738).\n\nACCEPTANCE (tests/tunnel-exchange.test.ts, on a loopback createTunnelListener with tests/support/tunnel-gate.ts; all fail on main)\n1. Scanned route, right token: confirm is called once. Accepting delivers a credential; reconnecting with TUNNEL_CREDENTIAL_HEADER is admitted as `{kind:'device'}`.\n2. Accept at 30 s of injected clock still delivers. On main the 10 s handover closes the tunnel.\n3. Typed route, five wrong codes: the window is exhausted and a sixth connection gets 401.\n4. Decline: no mint (a spy), the window is cancelled, and a second phone is refused.\n5. Lapse at PAIRING_CONFIRM_MS: identical to decline.\n6. A negotiated SPKI different from the payload pin gives pin-mismatch before any pair frame on the scanned route, and a confirmation failure on the typed route.\n7. No pair-frame body ever contains the credential string or either base64url half.\n8. An out-of-order or oversized step ends the tunnel with PAIRING_ONLY limits (MAX_PAIRING_FRAME_BYTES 16384).\n\nMUTATION CHECKS\n- Mint before accept.\n- Claim only on good tags, so a bad tag spends no budget.\n- Send the credential unencrypted.\n- Accept a second claim.\n- Use an issuer-only sid.\n- Restore the handover to 10 s.\nEach must fail.\n\nINVARIANTS\n- pairing/ imports nothing.\n- pake/ imports only noble.\n- credential.ts semantics are unchanged.\n- confirm never receives the secret.\n- The phone half runs on WebCrypto only.\n- The listen inventory is unchanged.\n\nPROCESS\n- Never use git stash; commit explicit paths; 'refs' only.\n- Typecheck from a real checkout, not only a worktree: shared node_modules can resolve cross-package types to main's copy.",
+    "nativeCompileNeeded": false,
+    "size": "L"
+   },
+   {
+    "name": "BN9 The socket plugin's whole contract and an injectable client transport (#295 U1)",
+    "issues": [
+     "#295",
+     "#256",
+     "#184",
+     "#186"
+    ],
+    "files": [
+     "packages/contracts/src/tunnel-socket.ts",
+     "packages/contracts/package.json (./tunnel-socket export)",
+     "packages/tunnel/src/client/index.ts",
+     "tests/tunnel-client-transport.test.ts (new)"
+    ],
+    "conflictsWith": [
+     "BN2 (only if classifyFrame needs a change for TOOL_LOOP_UNSUPPORTED; coordinate)",
+     "BN10 (depends on TunnelClient staying frames-only; do not change that interface)"
+    ],
+    "brief": "WHY: the phone's only transport is #181's native socket plugin (ruled: https://github.com/johnhenry/chatterang/issues/181#issuecomment-5629620799).\n\nOn main:\n- The contract declares only `negotiatedPeer` (tunnel-socket.ts:38-48). Its header still hands connect/send/close to #158, which is stale.\n- createTunnelClient hard-wires the WHATWG WebSocket global (client/index.ts:247-260) and a non-standard headers init that throws in a webview (:214-221).\n- An upgrade 401 looks the same as 'cannot reach' (:399-402).\n- No slice in the #7 synthesis owns this work.\n\nSettled as engineering: frames cross the bridge as base64 of the exact bytes, so decodeFrame's fatal UTF-8 decoder stays the only validator.\n\nSCOPE\n- Grow `TunnelSocketPlugin` while keeping contracts types-only (layering.test.ts:332-379):\n  - `connect({ url, credential? }) -> { connectionId }`;\n  - `send({ connectionId, frame: base64 })`;\n  - `close({ connectionId, code?, reason? })`;\n  - keep `negotiatedPeer`;\n  - events: `tunnelOpen { connectionId }`, `tunnelFrame { connectionId, frame: base64 }`, and exactly one terminal `tunnelClose { connectionId, code, reason, httpStatus? }`.\n- Rewrite the header (:1-15). Add the package.json export.\n- In client/index.ts, add an injectable `TunnelTransport { send(bytes); onFrame(fn); onClose(fn(code, reason, httpStatus?)); close(code?, reason?); }` option. The WebSocket global stays the default rung-0 transport.\n  - The protocol gate, sequence checks, bye and close-code mapping (:287-397) run unchanged over any transport.\n  - `carriesCredentialSafely` (:231-239) still applies to every transport.\n  - Map httpStatus 401 to a named fault (credential refused, re-pair) and 503 to another (host could not check), distinct from unreachable.\n- client/ still imports no `@capacitor/`, `node:` or `electron` (layering :540-551). Plugin adapters are passed in, never imported.\n- The `TunnelClient` interface (:65-76) is unchanged.\n\nACCEPTANCE (tests/tunnel-client-transport.test.ts; fails on main because the option and faults are absent)\n1. createTunnelClient over a test transport wrapping a real `ws` socket against a real createTunnelListener carries a credentialed turn end to end.\n2. Closes 4503, 4403 and 4410 give TUNNEL_FULL, PAIRING_ONLY and PAIRING_WINDOW_CLOSED; a cut without bye gives PEER_GONE.\n3. A 401 at upgrade (from the ws `unexpected-response` status) surfaces as its own fault, not 'cannot reach'.\n4. A transport that delivers a frame after its terminal close is ignored and counted, not decoded.\n5. The credential never appears in the URL.\n6. All existing tests/tunnel-*.test.ts stay green.\n7. Run both `npm run typecheck` and the layering test (a declaration file can hide exports from tsc).\n\nMUTATION CHECKS\n- Map every close to PEER_GONE.\n- Drop httpStatus.\n- Decode a frame after close.\nEach must fail.\n\nINVARIANTS\n- The web default refuses a credential over plaintext off loopback.\n- TunnelClient stays frames-only.\n\nPROCESS: never use git stash; commit explicit paths; no closing keywords.",
+    "nativeCompileNeeded": false,
+    "size": "S-M"
+   },
+   {
+    "name": "BN10 Tunnel BackendAdapter over an injected TunnelClient, against a fake tunnel (S10 U3)",
+    "issues": [
+     "#184",
+     "#185",
+     "#186",
+     "#188",
+     "#190"
+    ],
+    "files": [
+     "src/ai/backends/tunnel.ts (new)",
+     "tests/support/fake-tunnel.ts (new)",
+     "tests/tunnel-adapter.test.ts (new)"
+    ],
+    "conflictsWith": [
+     "BN2 (adds the toolLoop field to the turn frame after BN2 merges)",
+     "BN9 (imports the TunnelClient type only; BN9 must not change it)"
+    ],
+    "brief": "WHY: src/ai/backends/ holds only llama-cpp.ts, and nothing in src/ imports @chatterang/tunnel/client. That import is allowed: layering.test.ts:40 marks client 'allowed \u2014 web globals only'. targetFor (engine.ts:1467-1488) already takes a reach override for this adapter.\n\nDecisions settled as engineering, each following a ruling or an explicit hand-off:\n- One adapter per paired device, backendId `tunnel:<deviceId>` (#186's revoke-unregisters ruling; #191's per-device rows).\n- A minimal static capability declaration: streaming, no multimodal (#190; routing is 'explicit', engine.ts:512).\n- The taint mark stays stripped for paired in v1. engine.ts:366-379 hands that choice to 'the tunnel adapter that first produces a paired target'. Record the reason in tunnel.ts's header and leave engine.ts unedited.\n\nSCOPE\n- `class TunnelBackendAdapter implements BackendAdapter` (aimatey-types 0.5.0, adapters.d.ts:256), constructed with `{ device: PairedDevice, connect: () => Promise<TunnelClient>, onWaiting?: (position) => void }`.\n- It never calls createTunnelClient, which throws in a webview (client/index.ts:209-221).\n- Imports: @chatterang/tunnel/client (type), /wire, /stream, /codec and aimatey-types only; never host, @/state or @/features.\n- fromIR returns the `turn` frame with a codec-applied body.\n- executeStream sends the turn and yields chunk bodies. Every exit yields EXACTLY ONE terminal:\n  - done passes through, and a done without message is a failure (#260 ruling);\n  - an error chunk passes through;\n  - a `refused` frame becomes an error chunk carrying the refusal code;\n  - an abnormal `ended()` (PEER_GONE, SEQUENCE_BROKEN, TUNNEL_FULL, PAIRING_ONLY, PAIRING_WINDOW_CLOSED) becomes an error chunk with that code.\n- Abort sends `cancel` and ends with the terminal.\n- `waiting` goes to onWaiting, never into chunks.\n- HOST_DOES_NOT_RUN_TURNS reads 'this server doesn't run phone turns yet' (#7 ruling 8).\n- WAIT_LIST_FULL is busy, not a breaker failure (#186).\n- Relayed prompts (S10 U8) and attach/ack (U9) are OUT of scope.\n- tests/support/fake-tunnel.ts provides two in-memory ends, each wrapped in the real `createProtocolGate` (stream/index.ts:707), with a scriptable desktop end: N chunks, a cut without bye, a refusal code, waiting positions, a done with no message.\n\nACCEPTANCE (all fail on main because the module is absent)\n1. Registered on a real Router as 'tunnel:pair_1' with target `targetFor(..., 'tunnel:pair_1', reachPaired(device))`, engine.stream yields start, deltas, done.\n2. A cut after 3 chunks ends in 'error' with PEER_GONE, NOT the engine's generic EMPTY_RESPONSE (engine.ts:1180-1193).\n3. A sequence gap gives SEQUENCE_BROKEN before any later delta.\n4. A refusal is never done.\n5. Three WAIT_LIST_FULL refusals in a row leave the Router circuit closed (measure through the Router's circuit state).\n6. Abort sends exactly one cancel frame.\n7. A done without message is an error.\n8. With a nominated cloud fallback registered, a failing tunnel turn never calls the cloud spy.\n9. No `as unknown as` in tunnel.ts.\n\nMUTATION CHECKS\n- Remove the adapter's own terminal on abnormal end: test 2 must fail on the code.\n- Map refusals to done.\n- Route waiting into chunks.\n- Count WAIT_LIST_FULL as a failure.\nEach must fail.\n\nINVARIANTS\n- engine.ts, state/ and features/ are unedited.\n- npm test (including tests/layering.test.ts) and tsc are both green.\n- Persisted reach is NOT asserted here: the provenance boolean at chat.ts:1294 is fixed in wave 1, after stopped-empty-reply merges.\n\nPROCESS: never use git stash; commit explicit paths; no closing keywords.",
+    "nativeCompileNeeded": false,
+    "size": "M-L"
+   },
+   {
+    "name": "BN11 Pins: a paired turn is never diverted on the stream path (S10 U2)",
+    "issues": [
+     "#188",
+     "#194"
+    ],
+    "files": [
+     "tests/paired-no-divert.test.ts (new)"
+    ],
+    "conflictsWith": [],
+    "brief": "WHY: all three divert sites in stream() are gated on `runsOnThisDevice(target)` (verified at engine.ts:737, :807, :984). So a paired target never diverts today, but only complete() is pinned for paired (tests/complete-divert.test.ts:196, :221). tests/engine.test.ts has no paired stream case. The unit is tests only, in a NEW file, so it avoids tests/engine.test.ts, which the wave-1 no-divert flag edits.\n\nSCOPE\n- A describe 'a turn tunnelled to a paired device', using:\n  - a real Router;\n  - a registered recording backend 'tunnel:pair_1';\n  - a registered cloud recording backend nominated with setFallbackBackend;\n  - target `targetFor('remote', model, name, 'tunnel:pair_1', reachPaired({ id: 'pair_1', name: 'Studio' }))`.\n- A header comment names complete-divert.test.ts:196/:221 as the pair.\n\nACCEPTANCE\n(a) The tunnel backend throws, or yields an error chunk: no 'fallback' event, the cloud spy is never called, and the turn ends in 'error'.\n(b) The tunnel backend's circuit is open: the same.\n(c) checkDevicePressure is mocked hot (thermal 0.95): the tunnel backend is still called and the cloud is not.\n\nThese pin existing behaviour, so they PASS on main. The mutation checks below are the failing-first proof and must each be run and recorded in the PR.\n\nMUTATION CHECKS\n- Change `runsOnThisDevice` to `target.reach.reached !== 'third-party'`: (a), (b) and (c) fail.\n- Change it to `target.reach.host.kind !== 'third-party'`: they fail.\n- Delete the guard at :807 only: (b) fails.\n\nINVARIANTS\n- No production file is edited.\n\nPROCESS: never use git stash; commit explicit paths.",
+    "nativeCompileNeeded": false,
+    "size": "S"
+   },
+   {
+    "name": "BN12 Phone paired-device table at Dexie v10, with no credential column",
+    "issues": [
+     "#133",
+     "#125",
+     "#189"
+    ],
+    "files": [
+     "src/db/index.ts",
+     "tests/db-paired-devices.test.ts (new)",
+     "tests/shell.test.ts (VFS secret grep extended)"
+    ],
+    "conflictsWith": [],
+    "brief": "WHY: the #133 ruling (https://github.com/johnhenry/chatterang/issues/133#issuecomment-5670024680) lets the phone's table land tested but unreachable, at the next Dexie version after v9. Dexie is at v9 (src/db/index.ts:334, verified). Neither in-flight branch touches src/db.\n\nSettled as engineering: the row id is the deviceId the desktop mints (credential prefix `<deviceId>.<secret>`, host/credential.ts:29-37), the same id the desktop registry (BN7) keys on and ReachHost's PairedDevice carries (domain/chat.ts:77-82).\n\nWhere the phone keeps the credential secret is NOT ruled (#135: 'The phone still needs somewhere secret to keep it'). So this table has no credential column at all.\n\nSCOPE\n- `this.version(10).stores({ ..., pairedDevices: 'id, spkiPin' })`. The store name contains 'pair' so the structural forcing test sees it.\n- Row: id, spkiPin (base64), hostKind, name, addresses and port cache, pairedAt, capabilities ['inference'].\n- The doc comment states the exclusions (no credential, digest, transcript or model list) and that erasing on the phone never reaches the desktop's record (#131 item 6).\n- eraseEverything clears it.\n- Nothing in src/ writes the table.\n\nACCEPTANCE (fails on main because the table and version are absent)\n1. A v9 database with chats and messages opens at v10 with them intact.\n2. tests/reach.test.ts's unique-and-ordered version assertion passes.\n3. tests/privacy-copy.test.ts's structural biconditional still passes with `pairingController().available` false. The ruling allows the table alone; the panel is not mounted.\n4. eraseEverything removes rows.\n5. The tests/shell.test.ts VFS grep gains the credential shape `^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$` and passes with a seeded row.\n6. A source check finds no production writer.\n\nMUTATION CHECKS\n- Reuse version 9.\n- Add an upgrade that rewrites messages.\n- Add a `credential` field.\n- Project the table into the VFS.\nEach must fail.\n\nINVARIANTS\n- Nothing writes reach 'paired'.\n- #195 takes the next number after this, so claim v10 in the PR description.\n\nPROCESS: never use git stash; commit explicit paths; 'refs' only.",
+    "nativeCompileNeeded": false,
+    "size": "S"
+   }
+  ],
+  "waves": [
+   {
+    "wave": 1,
+    "units": [
+     "S10-U1 ProvenanceSnapshot carries Reach end to end (engine.ts:460 `local: boolean` and chat.ts:1294 `local ? REACH_DEVICE : REACH_REMOTE`), started only after stopped-empty-reply merges; its chat.ts hunk at 1271-1293 overlaps that line",
+     "S4-U5 Engine per-request no-divert flag checked at engine.ts:737, :807 and :984 (after owner question 'Cloud reach')",
+     "#313 reload-gap fix in renderer-lifecycle.ts, local-turns.ts and main.ts (after BN3's reload-order measurement)",
+     "Sleep clock: a powerMonitor-adjusted now() for HostFleet and WorkBroker timers, or a recorded reload cost (after BN3's ordering probe and BN5)",
+     "#170 tunnel surface declaration made a REQUIRED createTunnelListener/createTunnelHost option, asserted before .listen( (after BN6 and BN7 merge, to avoid host/index.ts and HOST_EXPORTS churn; the desktop's tool allowlist is added in wave 2)",
+     "#295 U2 TunnelSocket registerPlugin, a web shim that refuses, and the plugin-to-TunnelTransport adapter (after BN9)",
+     "#295 U6 negotiated SPKI into channelIdentifierFor in src/lib/pairing.ts, pairingController still unavailable (after BN9 and #295 U2)",
+     "S10-U8 phone handles relayed prompts (yes/no answer frames), waiting position and refusal sentences (after BN10 and after the sweep branch merges, since it touches state/app.ts and state/chat.ts)"
+    ],
+    "why": "Each unit waits on exactly one thing: an in-flight branch merging (both branches edit src/state/chat.ts, and sweep edits app.ts), a buildNow measurement or module, or the first owner batch. None of them waits on another wave-1 unit, so all can run in parallel once those gates clear."
+   },
+   {
+    "wave": 2,
+    "units": [
+     "S4-U1 Runner core in a new src/worker/: decoded snapshot in, frames out, no chat row, engine.stream only, toolLoop honoured, divert 'never', cachedTokens stripped (after 'Cloud reach', BN2 and S4-U5)",
+     "S4-U2 Phone policy objects and relay hook: isGranted false, prompts through an injected RelayPort, the not-sent why, an install hook in app.ts (after 'Phone tools', 'Not-sent record', BN1 and S4-U1)",
+     "#295 U5 Android TunnelSocket plugin, OkHttp plus a pin-checking X509TrustManager (NATIVE Kotlin: cap sync plus gradlew :app:assembleDebug under timeout with JBR 21, then an emulator harness reaching the host at 10.0.2.2; after BN9 and #295 U2)",
+     "S7b tunnel-to-broker controller: OwnerChannel from #308 frames, attachDevice/detachDevice, bounded stop and quit, MAX_DEVICE_TUNNELS with headroom (after BN4 and the #170 surface)",
+     "Desktop pairing host controller in main: showCode mints the payload with fitPairingPayload, one window at a time, accept prompt, mint through BN7 (after BN6, BN7, BN8, 'Phone name', and the second-batch ruling on whether showing a code needs the tunnel on)",
+     "S10-U5 Paired chip, palette arm, glyph, tokens.css and ARCHITECTURE.md:227-231 in one change (after stopped-empty-reply merges; MessageView.tsx)",
+     "S10-U4 Far-side provenance only ever widens reach (withUpstreamProvenance; host never read from the wire) (after S10-U1 and BN10)"
+    ],
+    "why": "These are the first units that carry a real turn, or that change what a person sees. They need the owner's privacy answers (cloud reach, phone tools, the not-sent record, the phone name) and the wave-1 engine and transport pieces. Android comes before iOS: the emulator reaches the host directly and has no Local Network gate, which makes it the shortest native path to a first paired turn."
+   },
+   {
+    "wave": 3,
+    "units": [
+     "Worker window, a separate worker.html entry that never imports App or initialize(), worker preload with a MessagePort path, per-sender boot manifest (MountHost never reachable), per-unit resets (shell cache, MCP sessions, breaker state), and main.ts wiring of hostedUnitOf and condemnExecutor. This merges S5c with S4-U4. (After BN4, S4-U1 and S4-U2)",
+     "Revocation composition: credentials.revoke, broker.revokeDevice and the registry record in one path (after the desktop pairing host)",
+     "S10-U7 Phone registration: connectPairedDevice/disconnectPairedDevice, tunnel ids never fallback-eligible, and credential storage (after BN12, BN10 and the second-batch credential-storage ruling)",
+     "S10-U6 Rail, picker optgroup, and chatTarget/resolveTarget agree on the paired arm (after S10-U5 and S10-U7)",
+     "Desktop 'Show pairing code' sheet, plus splitting the forcing tests into can-pair-as-client and can-host-pairing (after the desktop pairing host)",
+     "#295 U4 iOS TunnelSocket plugin with SPKI computed from SecKey plus the P-256 SPKI header (NATIVE Swift: cap sync plus xcodebuild under timeout, a simulator harness, and a hardware Local Network measurement; after BN9 and #295 U2; its purpose string follows the camera-string precedent and is approved in the PR)"
+    ],
+    "why": "This wave assembles the parts: the worker that runs S4's runner, the pairing UI over the registry and exchange, and the phone's registration and display. Each unit depends on two or more wave-2 outputs. The worker entry must exist before the listener can be started honestly under #170's 'nothing else' rule."
+   },
+   {
+    "wave": 4,
+    "units": [
+     "S7c plus S9b in ONE change: the first desktop createTunnelListener( call, on the explicit toggle only; the #170 assertion before bind; the TLS arm with port 0; the tray on every OS; before-quit (broker.quit, then bounded listener.close); window-all-closed consulting tunnel state; the paired-device README item and owner-approved inbound sentences on every CHECKLIST surface (tests/privacy-copy.test.ts:2515-2537)",
+     "Phone availability flip in one change: pairingController wired to the TunnelSocket plugin and the exchange initiator, PairedDevicesPanel mounted, the #221 copy on all six privacy bodies",
+     "S10 end-to-end rung: an Android emulator pairs with the desktop by QR, sends a turn that runs in the hidden worker on the desktop's local model, the phone's chip names the desktop, a relayed confirm answered 'no' leaves a not-sent record, and a cut socket is collected by attach (NATIVE run, not only compile)"
+    ],
+    "why": "The listener cannot merge without its privacy copy (the listening guard at privacy-copy.test.ts:2667-2678 fails otherwise), and the phone cannot pair until availability, the panel, the table and the copy flip together (the biconditional). The rung test is the definition of the first honest paired turn, so it comes last. Build the combined tree before merging these siblings."
+   },
+   {
+    "wave": 5,
+    "units": [
+     "Server: pin the current statelessness sentences (#249 test gap)",
+     "Server: HOST_DOES_NOT_RUN_TURNS dispatcher, per turn and per attach",
+     "Server: registry use plus the #249 correction in the same commit",
+     "Server: tunnel start path (a port ruling is needed first; the bridge already holds 8973)",
+     "#295 U3 Electron/Node pinned client in main, with the pin checked before the credential header is written",
+     "S10-U9 phone attach and ack with durable in-flight records",
+     "Desktop paired-devices panel rename, reset-key control, lastSeen"
+    ],
+    "why": "These are ruled and owed, but not on the path to the first phone-to-desktop turn. The server refuses turns in v1 (#7 ruling 8), and the desktop-as-client ruling (#295) does not block a phone. Schedule them after wave 4, or in parallel where files do not collide."
+   }
+  ],
+  "ownerQuestions": [
+   {
+    "header": "Cloud reach",
+    "question": "When your desktop runs a turn for your phone, may that turn ever go to a cloud provider the desktop is connected to (OpenAI and so on), for example because the desktop is hot, its model failed, or the phone picked a cloud model?",
+    "options": [
+     {
+      "label": "Never: desktop models only, no fallback (Recommended)",
+      "description": "A phone turn runs only on models installed on the desktop. Heat or a failure becomes an error on the phone, never a silent switch to the cloud. The desktop's API keys are never loaded into the worker."
+     },
+     {
+      "label": "Only a cloud model the phone explicitly picks",
+      "description": "The phone can choose one of the desktop's connected cloud models, and every tool-output send is asked on the phone. Still no silent fallback."
+     },
+     {
+      "label": "Allow the desktop's own fallback too",
+      "description": "The desktop may divert a phone turn to its nominated cloud fallback. The phone is told afterwards, in the reply's label."
+     }
+    ],
+    "blocks": [
+     "S4-U5 engine no-divert flag",
+     "S4-U1 runner core (target resolution)",
+     "worker boot (whether provider connections load)",
+     "inbound privacy copy (S9b)"
+    ],
+    "evidence": "Verified on main 88d7c78:\n- All three divert sites in engine.stream() are gated only by `runsOnThisDevice(target)` (src/ai/engine.ts:737, :807, :984). That is true for a turn the desktop serves itself.\n- App boot passes settings.fallbackBackendId and connects every stored provider (src/state/app.ts:298-323).\n- Your #152 ruling comment lists this as needing an explicit answer (https://github.com/johnhenry/chatterang/issues/152#issuecomment-5629620946, item 4).\n- Your #7 ruling 2 says nothing about the phone's conversation is stored on the desktop, but does not address sending it onward."
+   },
+   {
+    "header": "Phone tools",
+    "question": "You ruled that phone turns may use the tools the desktop allows for phones. What should those tools be able to reach on the desktop? Today the model's bash sees every desktop conversation under /chats, the folders you granted it, and commands that delete a model or open a chat. MCP calls normally remember a 'yes' per conversation.",
+    "options": [
+     {
+      "label": "Empty list by default; phone bash gets a fresh sandbox (Recommended)",
+      "description": "The phone-tools setting starts empty. If you allow bash, each phone turn gets its own empty /workspace, with no desktop chats, no granted folders, and no commands that change the desktop. Every MCP send is asked on the phone, and no 'yes' is remembered."
+     },
+     {
+      "label": "Empty by default; phone bash sees what desktop bash sees",
+      "description": "Same allowlist, but an allowed bash is the desktop's own shell, including /chats and granted folders. Every confirm is relayed to the phone."
+     },
+     {
+      "label": "No bash for phones in v1",
+      "description": "Only MCP tools can be allowed for phones at first; each send is asked on the phone."
+     }
+    ],
+    "blocks": [
+     "S4-U2 phone policy and relay hook",
+     "worker per-unit resets and plugin manifest (wave 3)",
+     "#170 surface assertion's tool allowlist",
+     "inbound privacy copy"
+    ],
+    "evidence": "- src/shell/stores.ts:47-56 projects every desktop conversation into /chats.\n- src/shell/tool.ts:92-103 exposes the OS-chooser mounts.\n- src/shell/commands.ts:368-447 has confirm-gated model delete and chat open.\n- The shell is cached for the life of the app (tool.ts:39, :86), so one phone's files carry into the next turn.\n- MCP grants are held per chat (src/state/chat.ts:1675-1727), and a phone turn has no chat.\n- Your #170 ruling (https://github.com/johnhenry/chatterang/issues/170#issuecomment-5668856693) says 'tools the desktop has already enabled' and 'no shell session of its own', but not what an allowed shell may see."
+   },
+   {
+    "header": "Not-sent log",
+    "question": "When a tool call a phone's turn wanted is refused (the phone didn't answer in time, the connection dropped, or the turn was stopped), where is the 'not sent' record kept? You ruled it is recorded 'on the desktop and on the phone', and also that nothing about the phone's conversation is stored on the desktop.",
+    "options": [
+     {
+      "label": "Phone keeps it; desktop holds it in memory until delivered (Recommended)",
+      "description": "The record, including the exact arguments, travels to the phone with the turn's result and is saved there. The desktop keeps it only in memory until the phone acknowledges it, and writes nothing to disk."
+     },
+     {
+      "label": "Also a desktop log line without the content",
+      "description": "Additionally, the desktop saves server, tool name, reason and time, but never the arguments."
+     },
+     {
+      "label": "Full record on the desktop too",
+      "description": "The desktop saves the same record the phone does, arguments included."
+     }
+    ],
+    "blocks": [
+     "S4-U2 relay hook record path",
+     "inbound privacy copy"
+    ],
+    "evidence": "- #170 ruling (https://github.com/johnhenry/chatterang/issues/170#issuecomment-5668943134): 'refused and recorded as not sent \u2014 on the desktop and on the phone'.\n- #7 ruling 2 (https://github.com/johnhenry/chatterang/issues/7#issuecomment-5669950639): 'nothing about the phone's conversation is stored on the desktop'.\n- A not-sent MCP receipt carries the call's exact argument bytes (#292).\n- WorkBroker already marks a refused prompt `notSent: true` and leaves the record to the runner (apps/desktop/src/bridge/work-broker.ts:35-38, :260)."
+   },
+   {
+    "header": "Phone name",
+    "question": "You ruled the desktop asks 'Pair with <device name>?' before trusting a phone. Where does that name come from, and what does the desktop keep in its paired-devices list?",
+    "options": [
+     {
+      "label": "The phone offers a name you can edit before pairing (Recommended)",
+      "description": "The phone's pairing sheet shows a name to send, which you can change. The desktop shows it as what the phone calls itself, keeps it in the list, and lets you rename it there. Names with hidden or direction-changing characters are refused."
+     },
+     {
+      "label": "You name it at the desktop when accepting",
+      "description": "The phone sends no name; the desktop prompt asks you to type one."
+     },
+     {
+      "label": "The phone's model name from the OS",
+      "description": "For example 'Pixel 9'. Needs a new native device plugin, and sends a hardware identifier."
+     }
+    ],
+    "blocks": [
+     "BN8 follow-up: the exchange's name step",
+     "desktop pairing host and accept prompt",
+     "phone pairing sheet",
+     "paired-devices panel"
+    ],
+    "evidence": "- No frame carries a phone name today. The pairing payload's name is the desktop's (packages/tunnel/src/pairing/index.ts:203-204), and PairingOutcome.deviceName is the host's (src/lib/pairing.ts:69-71).\n- No device-info plugin is installed (package.json).\n- #129 ruling (https://github.com/johnhenry/chatterang/issues/129#issuecomment-5668943416) fixes the prompt but not the name's source.\n- The disguising-character refusal already exists for names shown to a person (src/features/pairing/wording.ts:152-157)."
+   }
+  ],
+  "stepsRemaining": [
+   "1. In-flight branches land. IN FLIGHT, unmerged:\n   - stopped-empty-reply: 37040cc, 5 files, including a src/state/chat.ts hunk at 1271-1293.\n   - sweep-orphans-and-stale-grants: 7 commits, 16 files, including chat.ts +447, app.ts +93, mcp.ts, SettingsScreen.tsx, ChatScreen.tsx, tests/setup.ts.\n   Both edit chat.ts, so build the combined tree before merging the second.",
+   "2. First owner batch: Cloud reach, Phone tools, Not-sent log, Phone name. NOT ASKED YET (drafted here).",
+   "3. Wire vocabulary: waiting, prompt/answer, refusals and attach/ack are MERGED (#308). The tool-loop owner field is READY (BN2).",
+   "4. Desktop substrate:\n   - WorkBroker (#311) and the whole-turn shared slot (#312): MERGED.\n   - Sleep and wake reaching the broker (BN5), WorkerHost bridge (BN4), Electron probes (BN3): READY.\n   - Sleep clock and #313 reload gap: BLOCKED on BN3's measurements.",
+   "5. Turn runner (S4):\n   - Bash confirm honours Stop (BN1): READY.\n   - Engine no-divert flag and runner core: BLOCKED on 'Cloud reach' (and BN2).\n   - Phone policy and relay hook: BLOCKED on 'Phone tools' and 'Not-sent log'.",
+   "6. Hidden worker window (a separate entry, a per-sender manifest, per-unit resets, main.ts wiring): NOT STARTED. Needs BN4 and the runner.",
+   "7. Tunnel surface declaration asserted before bind (#170): NOT STARTED, wave 1 after BN6 and BN7. The desktop's tool allowlist waits on 'Phone tools'.",
+   "8. Pairing:\n   - Identity (#302/#307), QR code (#303/#309) and the credential gate (#304): MERGED.\n   - Address enumeration (BN6), registry file (BN7), exchange with accept-before-mint (BN8): READY.\n   - Desktop pairing host, then screen, then revocation: BLOCKED on 'Phone name' and a second-batch question (does showing a code require the tunnel to be on).",
+   "9. Tunnel controller (S7b): NOT STARTED, wave 2.",
+   "10. Listener start path, tray, before-quit and inbound privacy copy (S7c+S9b, one change): BLOCKED on owner-approved inbound sentences and on whether the tunnel toggle is remembered across restarts. The listening guard fails any desktop createTunnelListener( call until then.",
+   "11. Phone transport (#295):\n   - Contract and injectable transport (BN9): READY.\n   - src registration and web refusal: wave 1.\n   - Android plugin (native Kotlin compile plus emulator): wave 2.\n   - iOS plugin (native Swift compile, simulator and hardware): wave 3.",
+   "12. Phone engine and display:\n   - Tunnel adapter (BN10), no-divert pins (BN11), v10 table (BN12): READY.\n   - Provenance carries reach: BLOCKED on stopped-empty-reply merging.\n   - Relayed prompts and waiting on the phone: wave 1.\n   - Chip and palette: wave 2.\n   - Registration, credential storage and rail: wave 3, needing a second-batch credential-storage ruling.",
+   "13. Phone availability flip (controller, panel, #221 copy together): NOT STARTED, wave 4.",
+   "14. End-to-end rung on an Android emulator against the real desktop, with the chip naming the desktop: NOT STARTED, wave 4. This is the first honest paired turn."
+  ],
+  "notes": [
+   "Reader disagreements I checked myself on main 88d7c78:\n- The S5/S7 reader said stopped-empty-reply had no diff. It does: 37040cc edits src/domain/chat.ts +75, MessageView.tsx +41, src/shell/commands.ts +12, src/state/chat.ts +23 (hunk at 1271-1293), plus tests. That hunk sits right next to the provenance boolean at chat.ts:1294, so S10-U1 moved out of buildNow to wave 1.\n- The two readers put the paired-device registry in different places (apps/server/src/device-registry.ts vs packages/tunnel/src/host). I chose packages/tunnel/src/host (BN7): #158 asks for one implementation, and identity-store.ts already exports the KeyFileSystem/KeySealer injectables (:156, :166) that both hosts use.",
+   "Verified directly:\n- PAIRING_HANDOVER_MS = 10_000 (packages/tunnel/src/host/index.ts:191).\n- PairFrame.body is `unknown` (wire/index.ts:280).\n- register.ts:23 passes no signal.\n- main.ts has no powerMonitor; WorkBroker.suspend/resume exist at :816-827.\n- Divert sites gate on runsOnThisDevice at engine.ts:737, :807, :984; ProvenanceSnapshot `local: boolean` at engine.ts:460.\n- Dexie is at v9.\n- layering.test.ts:40 allows @chatterang/tunnel/client from src/.\n- The privacy-copy HOST_EXPORTS check scans every file under host/, not only index.ts (:2577-2590). So BN6 and BN7 both add rows and must merge in order.\n- #296 has no ruling on fallback; its two owner comments only restate #170 and #7. #152 item 4 explicitly asks for one.",
+   "Decisions I settled as engineering inside existing rulings, so they are not owner questions. Each is recorded in its brief so a reviewer can object:\n- toolLoop values 'requester'|'host' with a TOOL_LOOP_UNSUPPORTED refusal (#152).\n- WorkerHost over a MessagePort, with the worker's real webContents.id as senderId and a restart budget across lives (#7 ruling 1).\n- PAIRING_CONFIRM_MS = 60_000, with the handover bound derived from it (precedent: #170 calls the prompt timeout an implementation constant).\n- Registry fields limited to digest/tombstone + name + pairedAt, bound to the key pin (the server adds its token digest), with the registry cleared on a binding change (#180, #179, #135).\n- Base64 frames across the Capacitor bridge.\n- One adapter per device, `tunnel:<deviceId>`.\n- Taint mark stripped for paired in v1 (engine.ts:366-379 leaves this to the adapter author).\n- Phone table id = the minted deviceId.\n- Tunnel surface declaration as a required createTunnelListener option.",
+   "Second owner batch, not asked yet. It blocks waves 2-4, not buildNow:\n- Does 'Show pairing code' require the tunnel already on, or does showing a code turn it on?\n- Is the tunnel toggle remembered across restarts? Recommended: no.\n- Where the phone keeps its credential: OS keychain/keystore through the socket plugin, vs a Dexie row like API keys.\n- The exact inbound privacy sentences, drafted in the S7c/S9b PR for approval.\n- What happens on a Linux desktop where the tray icon cannot be shown, after BN3 measures it.\n- iOS Local Network purpose string, following the camera-string precedent; approve in the PR.\n- Server tunnel port, since the bridge holds 8973 and #130's typed default is 8973 (off-path).\n- #124's still-open 'which platforms may show the pairing entry' (D8), which shapes the capability split in the forcing tests.",
+   "The #7 synthesis slices S1-S12 have no slice for #295's socket plugin or for the pairing exchange, yet both sit on the critical path. BN8 and BN9 start them now. The first native platform should be Android: the emulator reaches a host listener at 10.0.2.2 and has no Local Network gate. iOS follows in wave 3.",
+   "Two units from the reader maps merged into one: S4-U4 (worker entry and isolation audit) and S5c (worker window, entry, preload and main wiring) describe the same worker entry. S10-U2's persisted-reach assertion (d) moves into S10-U1.",
+   "Stale citations a builder will hit:\n- main.ts webPreferences are at 658-665, not 617-624.\n- activate is at 641-643.\n- The #184 body cites llama-cpp.ts:78; the class is now at :114.\n- aimatey-types is 0.5.0, not 0.4.0.\n- docs/ARCHITECTURE.md's palette sentence is at :227-231.\n- The #296 body line 'lives outside src/' is superseded by #7 ruling 1.\n- #293 item 4 is half fixed (only the bash confirm is still open; BN1 closes it). Update the issue by comment, never with a closing keyword.",
+   "Process constraints to repeat in every brief:\n- Never use git stash (the stash stack is shared across worktrees).\n- Commit with `git commit -- <paths>`.\n- No closing keywords next to issue numbers, including in negations.\n- Native units must compile Kotlin/Swift explicitly under `timeout`, reading `$?` directly and not through a zsh pipeline. CI and tests/native-registration.test.ts are source greps only.\n- Run both vitest and tsc from a real checkout.\n- Build the combination before merging sibling PRs, especially BN6/BN7/BN8 (host/index.ts) and the wave-1 units that follow the in-flight chat.ts branches.",
+   "Environment note: several MCP servers in this session (figma, intercom, asana, atlassian, datadog, github plugin, linear, notion, pagerduty, slack) need authorization through claude.ai connector settings or /mcp. browseros-neo failed to connect. None was needed for this plan; gh CLI and local reads were enough."
+  ]
+ },
+ "critic": {
+  "corrections": [
+   "BN1, how the signal reaches the confirm (brief is wrong as written): `#invoke` (src/shell/index.ts:496-510) builds a ShellContext with no `signal`, even though ShellContext already declares `readonly signal?: AbortSignal` (src/shell/commands.ts:49). The exec signal (index.ts:459-472) is only handed to `this.#bash.exec`. Commands are wired as `defineCommand(command.name, async (args) => this.#invoke(command, args))` (index.ts:272-273), which ignores the second argument. just-bash passes that argument as a ResolvedCommandContext carrying `signal?: AbortSignal` (node_modules/just-bash/dist/custom-commands.d.ts:58, types.d.ts:239-243). Rewrite the scope: take `ctx.signal` in the defineCommand callback, pass it as `#invoke(command, args, ctx.signal)`, set `ShellContext.signal`, and call `this.#options.confirm(action, signal)`. Widen `ShellOptions.confirm` at index.ts:123 as well as `BashToolOptions.confirm` (tool.ts:33-36). Never keep a 'current signal' on the instance: the model's shell is cached for the life of the app (tool.ts:39, :86), so two concurrent tool calls would swap signals. Add a fail-first test: two concurrent execs on one shell, abort one, and only its sheet leaves `approvals`. Add a mutation check: ignore `ctx.signal` in `#start`. commands.ts still needs no edit, so the stopped-empty-reply conflict stays avoided.",
+   "BN1: the #293 item 4 claim checks out. The tool-output sheet passes `signal` (src/state/chat.ts:1588-1602) and the MCP sheet does too (:1710-1716), so only register.ts:23 is open (#293 body, section 4). Add to PROCESS: the sweep branch changes src/state/app.ts (+93 lines). Re-run tests/shell-confirm-stop.test.ts after sweep merges, because it drives the real useApp store.",
+   "BN2, the decoder drops the field today: readFrame's turn arm (packages/tunnel/src/wire/index.ts:670-672) returns `{ v, kind, turn, body }` with no key check, so a `toolLoop` field is silently removed on decode. encodeFrame runs the same validator (:631-639). The scope must change readFrame to carry `toolLoop` through. Add a mutation check: readFrame omits toolLoop, and the round-trip test must fail. Decide the decode rule explicitly. If decodeFrame refuses a missing or unknown value, the result is a TunnelWireError that closes the tunnel, and TOOL_LOOP_UNSUPPORTED can never be sent. So decode should keep the raw value, and hosts refuse through `toolLoopOf` returning null. Acceptance 2 must build the null cases by decoding raw JSON bytes, not through encodeFrame. If the TS type makes the field required, list every existing test that builds a `kind: 'turn'` frame (for example tests/rung0-vocabulary.test.ts) in `files`. Add BN9 to conflictsWith, because BN9's end-to-end credentialed turn builds turn frames.",
+   "BN2 / S4-U1: #152's ruling says 'the originating device must be able to require the loop stays here' and that the far side must not override it (issue #152, ruling comment, item 1). BN2 can only pin the helper. Add to S4-U1's acceptance: a turn with toolLoop 'requester' runs with an empty tool registry (spy on registration), ends at the model's tool calls, and a mutation that registers the desktop's enabled tools anyway must fail.",
+   "BN3, item 4 cannot run unattended: `pmset sleepnow` suspends the machine, but waking it needs a person or `sudo pmset schedule wake`, so an agent cannot repeat it 3 times. Mark item 4 as needing the owner at the machine; otherwise record NOT MEASURED. The wave-1 sleep clock should then wait on that result or ship the recorded fallback. Also remove the invariant that the privacy-copy listening inventory 'stays at two entries': workspaceSourceRoots scans only apps/*/src and packages/*/src (tests/support/source-scan.ts:134-142), so nothing under dev/ is ever counted. Replace it with an explicit assertion inside the probe that it binds only 127.0.0.1. Electron 44.0.0 is confirmed (apps/desktop/package.json:23).",
+   "BN4, type mismatch: `HostedUnitOf` is `(senderId: number) => HostedUnit | undefined`, returning `{ owner, unitId }` (apps/desktop/src/bridge/local-turns.ts:157-167). The brief says 'returns null'; change it to undefined, typed as that alias. Add a fail-first case: while a worker unit runs, `hostedUnitOf(<a visible window's id>)` is undefined. admitLocalTurns trusts this answer to identify worker windows, so a mutation that answers for any sender must fail. Note that LOCAL_EXECUTOR is 'llama' (local-turns.ts:138-139). Acceptance 5 should assert that `workerLost('worker')` leaves a running 'llama' unit untouched.",
+   "BN5, placement: `broker` is a local const created inside the function run from `app.whenReady()` (apps/desktop/src/main.ts:447 inside start(), called at :723-730), not a module-scope value. The scope should say to call `wirePowerEvents(powerMonitor, broker)` inside start(), immediately after `new WorkBroker(`. Add a user-visible acceptance test: this unit is the first to make the desktop window see local-turns.ts:219 'The generation stopped because the computer went to sleep.' Pin that sentence end to end through admitLocalTurns with a fake emitter. Otherwise the first shipped consequence of BN5 has no test on what a person sees.",
+   "BN6 WHY versus a wave-2 blocker: tests/desktop-security.test.ts:735 fails main.ts on ANY `@chatterang/tunnel/host` specifier (`/createTunnel(?:Host|Listener)\\s*\\(|@chatterang\\/tunnel\\/host/`). The desktop therefore cannot use BN6's enumeration from main.ts as the brief's WHY assumes. Add tests/desktop-security.test.ts to the files of the wave-2 'Desktop pairing host controller in main' unit. It must narrow the regex to call sites, with privacy-copy's own 'binds nothing' import control as precedent (tests/privacy-copy.test.ts, 'the matcher sees each way to listen': `import { asTlsMaterial } from '@chatterang/tunnel/host'` opens nothing). BN6 itself needs no change.",
+   "BN7, atomic write: KeyFileSystem has no `rename` (packages/tunnel/src/host/identity-store.ts:156-163). identity-store deliberately uses link plus unlink because 'rename would overwrite' (:851, :892-903), and a registry must overwrite on every mint and revoke. Replace 'temp file then rename' with: a `RegistryFileSystem` extending KeyFileSystem with `rename`, declared in device-registry.ts, and identity-store.ts left unedited. Add a fault test: when rename throws, the previous file is still readable and a revoke's tombstone still refuses after a restart. Extend acceptance 4 to Windows. #179's second ruling makes Windows a user-only-file host, and identity-store has that check (:64-83).",
+   "BN7, the Linux downgrade would brick pairing: 'a protection mismatch in the registry file is refused, never rewritten' collides with #179's ruling (on Linux a plain key is refused once a keyring exists, a NEW key is made, and devices re-pair). After that event the registry is a plain envelope with a sealer present, so under the brief it is refused forever and the desktop can never pair again. Specify the order: read `bindTo` from the envelope first (it is not secret). If it differs from the current pin, discard the file and report `cleared: 'binding-changed'`, which carries no trust forward. Only when bindTo matches is a protection mismatch refused as planted. Add both cases to acceptance, plus a mutation (refuse before comparing bindTo).",
+   "BN8, layering direction and exports: deriving PAIRING_HANDOVER_MS from exchange's PAIRING_CONFIRM_MS makes host/index.ts import exchange/, while exchange must not import host. State the allowed direction and add a layering assertion: exchange imports only wire, pairing, pake and binding, and host may import exchange. Keep the 'named mint margin' unexported. The privacy-copy HOST_EXPORTS inventory scans every runtime export under host/, so an exported margin breaks the 'HOST_EXPORTS unchanged' claim. Add the export-list assertion near tests/layering.test.ts:690-700 (it enumerates './client', './host') to the files, alongside packages/tunnel/package.json's exports (lines 8-17).",
+   "BN8 versus #129: the ruling text is 'the desktop shows \"Pair with <device name>?\"' (issue #129 ruling comment), and #127's comment repeats it. With the name step left out, `confirm({ route })` cannot render the ruled prompt. Record in the brief that BN8's confirm is engineering substrate only and never user-reachable until 'Phone name' is answered. The wave-2 desktop pairing host already waits on that question; add a test there that the prompt shows the name.",
+   "BN9, fail-first: the WebSocket default already maps 4503 to TUNNEL_FULL (packages/tunnel/src/client/index.ts:361), 4403 to PAIRING_ONLY (:371-374), 4410 to PAIRING_WINDOW_CLOSED (:384) and a cut to PEER_GONE (:396); the codes come from wire/index.ts:165, :177, :189. Acceptance 2 therefore passes on main unless it runs over the injected transport. Say that it runs only through the new option. Also confirm: tsconfig.json:34 has `@chatterang/contracts/*` and vite.config.ts:18 aliases the contracts directory, so BN9 needs only the package.json export, with no tsconfig or vite conflict with BN8.",
+   "BN9 versus a recorded key-storage decision: the contract's `connect({ url, credential? })` puts the credential in JS memory on every connect. The owner's #124 ruling comment (https://github.com/johnhenry/chatterang/issues/124#issuecomment-5643636983) records #126's decision: on iOS a device key 'belongs in the Keychain under kSecAttrAccessibleWhenUnlockedThisDeviceOnly, which is not reachable from src/'. Separately, #126 (closed) is titled 'Android's auto-backup would carry a device private key off the phone'. Before BN9 fixes the contract, either add a `credentialRef` form so the native plugin reads the secret itself, or record in the brief why passing it through JS is acceptable. Otherwise wave 2/3 native plugins build on a contract that contradicts that record.",
+   "Second-batch 'where the phone keeps its credential' is not a fresh question. Two owner comments already speak to it, and they conflict. #124's ruling comment (above) says Keychain, not IndexedDB, on the phone, which needs a second native plugin nothing owns. #180's comment (https://github.com/johnhenry/chatterang/issues/180#issuecomment-5549441995) says 'whatever the phone keeps \u2014 pin or pairing key \u2014 lives in the same store as provider credentials, is never mounted into the shell VFS'. Re-word it as a reconciliation question quoting both, and add a missing critical-path unit: phone secure credential storage (iOS Keychain ThisDeviceOnly; Android Keystore excluded from auto-backup per #126). It is native, so compile under timeout and read $? directly. It lands before S10-U7.",
+   "BN10: pin the owner-ruled sentence verbatim. #7 ruling 8 says the app renders HOST_DOES_NOT_RUN_TURNS as \"this server doesn't run phone turns yet\" (issue #7, eighth ruling comment). Add a test asserting that exact string, so a copy edit fails. Extend acceptance 5 per #186's ruling ('the tunnel adapter classifies its own transport failures before the Router ever sees them', https://github.com/johnhenry/chatterang/issues/186#issuecomment-5628299600): HOST_SUSPENDED and DESKTOP_QUITTING, like WAIT_LIST_FULL, leave the Router circuit closed. Add a mutation that counts them.",
+   "BN12, anchored regex: the credential pattern `^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$` cannot match a credential embedded in a VFS file dump, which the existing greps read whole (tests/shell.test.ts:185-194, :726). Use an unanchored pattern bounded by non-base64url characters; the shape is confirmed by packages/tunnel/src/host/credential.ts:31-37, :206-207. Also add an explicit assertion that nothing under the VFS projects `pairedDevices`. The owner's #124 ruling notes that #132's projection decision was never recorded (PROJECTED_PATHS, src/shell/vfs.ts:39-50), so pin 'not projected' here.",
+   "BN12: acceptance 3 is not load-bearing. tests/privacy-copy.test.ts:3107-3115 asserts `panel && mounted && table` equals `available`, and PairedDevicesPanel.tsx does not exist, so a pairing-named table passes on main no matter what. Name acceptance 6 (no production writer) as the real guard, and add a mutation check: a `db.pairedDevices.put(` or `.add(` anywhere in src/ must fail it. Also, eraseEverything is `db.delete(); db.open()` (src/db/index.ts:382-385), so acceptance 4 holds by construction. Keep it, but do not count it as fail-first.",
+   "Owner question 'Phone tools': the recommended option ('each phone turn gets its own empty /workspace') reads against #170's ruling text, 'a tunnelled turn reaches the engine and the desktop's enabled tools, and nothing else \u2014 no plugin surface, no shell session of its own'. It also reads against 'MCP tools stay sensitive: true and still need their grant on the desktop' (issue #170, first ruling comment), while the option says 'every MCP send is asked on the phone'. Quote both sentences in evidence. Ask explicitly whether a per-turn sandbox counts as 'a shell session of its own', and whether the phone's relayed answer replaces or adds to the desktop grant. Otherwise the owner is asked to overturn a ruling without being told.",
+   "Owner question 'Not-sent log': the recommended option (the desktop holds the record only in memory and writes nothing) narrows #170's 'recorded as not sent \u2014 on the desktop and on the phone' to 'in memory on the desktop until acknowledged'. Say that narrowing in the option's label or description, so choosing it is a conscious amendment and not an implied reading.",
+   "Missing step, OAT 0.1.1 swap: nothing in buildNow, the waves or stepsRemaining owns it. `npm view @johnhenry/oat-qr-fountain versions` returns only 0.1.0 as of 2026-09-14; package.json:54 pins 0.1.0. src/lib/oat-fountain.ts:1-37 and src/lib/oat-encode.ts:1-10 are stand-ins for the unpublished `/fountain` and `/encode` subpaths. Add a gated unit before the wave-4 phone availability flip, run once the owner publishes. It bumps the pin, changes the two specifiers, keeps qr-scan.ts's one-block guard as the second guard (qr-scan.ts:229-231), re-runs `npm run build:web` to confirm `qrcode` stays out of the scanner chunk, and re-checks the 0.1.0 guards (block-count hang, table cache) against 0.1.1.",
+   "Wave inconsistency: the wave-4 end-to-end rung includes 'a cut socket is collected by attach', but 'S10-U9 phone attach and ack with durable in-flight records' is in wave 5. Move S10-U9 to wave 3 (after BN10 and S10-U7), or drop the attach clause from the rung. Also name who handles an inbound `attach` frame on the desktop (held result from WorkBroker, RESULT_UNKNOWN, ack frees it). Add it to S7b's scope explicitly; the plan's S7b lists only attachDevice/detachDevice socket bookkeeping.",
+   "Missing unit, the desktop-wide phone tools setting: #7 ruling 2 requires 'a new setting naming the tools the desktop allows for paired phones'. S4-U2 builds only policy objects, and the #170 surface assertion's allowlist is deferred to wave 2 with no owning unit. Add a wave-2 unit (after 'Phone tools') covering: where the setting persists (main-process app-data versus renderer Dexie; the #133 ruling kept credential records out of the renderer, so decide and cite), the Settings UI, a default-empty test, and the privacy sentence pin. Make the #170 before-bind assertion read that setting.",
+   "Missing unit, phone-side revocation per #131: no unit covers #131 items 1, 3, 4 and 6. Item 1: delete the row, never `enabled: false`. Item 3: Router.unregister, reinforced by #186's 'a revoked device is unregistered rather than left to a breaker'. Item 4: drop egress grants keyed on the device's connection id, so the pinned privacy sentence 'Every grant is dropped when the provider it named is removed or switched off' stays true. Item 6: best-effort notify the desktop, with the UI saying which side was done. Add this to S10-U7 or the wave-4 availability flip. Fail-first test: after revoke, no grant names the device, and the Router has no 'tunnel:<id>' backend.",
+   "Per-chat write invariant for S10-U1 and S10-U8: both write assistant rows (reach provenance; not-sent records and waiting state) in src/state/chat.ts. That file serialises writes per chat and re-checks for a revocation or delete that started while a write was queued (chat.ts:203, :618, :693, :744), and the sweep branch rewrites 447 lines of it. Add to both briefs: write only through that queued path; rebase onto sweep AND stopped-empty-reply (build the combined tree); add a test in the style of the sweep branch's tests/chat-removal.test.ts where deleting the chat mid paired turn lands no row.",
+   "Wave-4 S7c+S9b copy scope: cite the #221 owner ruling for the form of the change. Keep the enumerated list, drop 'and only these' at README.md:104, add a fourth paired-device item, and rescope README.md:4 from mechanism to intent. Also cite the later #221 comment saying to write the sentence after #255 (IPFS) is decided, and list #255 as an input. The privacy-copy CHECKLIST also names apps/server/src/index.ts's header ('Two things, and they are the whole list') and apps/server/README.md ('and nothing else', 'Where it may listen'). Add both to that unit's files even though the listener is the desktop's, or state in the commit why they stay true.",
+   "Conflict the plan missed: BN2's required `toolLoop` on the turn frame type affects BN9 (tests/tunnel-client-transport.test.ts carries a credentialed turn) and every existing tunnel test that constructs a turn. Add 'BN9: land BN2 first or make the field optional in the type' to both units' conflictsWith. The same applies to tests/support/tunnel-gate.ts users in BN8 only if they send turn frames."
+  ]
+ }
+}
