@@ -5613,3 +5613,130 @@ describe('a call with a closing brace too few, written without its close, the re
     expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11e');
   });
 });
+
+/* ── Round 11: the calls in one tag, separated by a comma ───────────── */
+
+describe('a call in a tag with a trailing comma after its JSON', () => {
+  // Read as neither a next call nor the tag's close, the whole
+  // `<tool_call>…</tool_call>` was markup to no reader at all: the tool never
+  // ran, no follow-up was asked for, no #331 receipt said it had not gone, and
+  // the model's arguments were stored as the reply's words and sent back in
+  // every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const note = (text: string): string => `{"name":"notes.note","arguments":{"text":"${text}"}}`;
+
+  it('runs once, is recorded, and leaves none of itself stored or sent back', async () => {
+    const id = 'r11_trailing_comma';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it.\n<tool_call>\n${note('canary-r11f')},\n</tool_call>` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11f');
+  });
+
+  it('sends both of two calls a comma separates, and stores neither’s arguments', async () => {
+    const id = 'r11_comma_separated';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both.\n<tool_call>${note('canary-r11g')}, ${note('canary-r11h')}</tool_call>` },
+      { reply: 'Both filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([
+      { text: 'canary-r11g' },
+      { text: 'canary-r11h' },
+    ]);
+    expect(stored.content, 'the words the person keeps').toBe('Filing both.\n\nBoth filed.');
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('canary-r11g');
+    expect(next, 'the next request').not.toContain('canary-r11h');
+  });
+
+  it('is recorded as not sent when Stop caught the turn after it', async () => {
+    const id = 'r11_trailing_comma_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Filing it.\n<tool_call>\n${note('canary-r11i')},\n</tool_call>\nAnd then`,
+        stall: gate.promise,
+      },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'And then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it.\n\nAnd then');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11i');
+  });
+
+  it('leaves no closing tag behind when the reply went on between the call and it', async () => {
+    const id = 'r11_orphan_close';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Ok.\n<tool_call>\n${note('canary-r11j')}\n\nFiled it.\n</tool_call>` },
+      { reply: 'Done.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.content, 'the words the person keeps, with no markup left in them').toBe(
+      'Ok.\n\n\nFiled it.\n\nDone.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+});

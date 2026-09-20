@@ -1319,3 +1319,65 @@ describe('a call with a closing bracket too few, written without its close, the 
     expect(words(doc, 'model')).toBe(doc);
   });
 });
+
+describe('the calls in one tag, separated as an array’s elements are', () => {
+  // A trailing comma is the commonest JSON malformation there is. Read as
+  // neither a next call nor the tag's close, the tag ended at its last call
+  // and `wordsAfterCall` refused what followed as the rest of a close: the
+  // block was markup to no reader at all, so the tool never ran, nothing
+  // recorded that it had not gone, and the whole tag with the model's
+  // arguments was stored as the reply's words and sent back in every later
+  // request — the opposite of `stripToolSyntax`'s own contract, that in a turn
+  // which offered a tool the tag forms are markup whatever their body,
+  // malformed ones included.
+  const one = '{"name": "calculate", "arguments": {"expression": "6*7"}}';
+  const two = '{"name": "calculate", "arguments": {"expression": "6*8"}}';
+  const read = (text: string) => extractTextualToolCalls(text).map((call) => call.input['expression']);
+
+  it('runs every call in a tag whose calls a comma or a semicolon separates, and leaves none of it in the words', () => {
+    for (const [form, body, expected] of [
+      ['a trailing comma, then the closing tag', `\n${one},\n`, ['6*7']],
+      ['a trailing semicolon', `${one};`, ['6*7']],
+      ['two calls, comma separated', `${one}, ${two}`, ['6*7', '6*8']],
+      ['two calls, comma separated over lines', `\n${one},\n${two}\n`, ['6*7', '6*8']],
+      ['two calls, whitespace separated', `\n${one}\n${two}\n`, ['6*7', '6*8']],
+    ] as const) {
+      const text = `<tool_call>${body}</tool_call>`;
+      expect(read(text), form).toEqual([...expected]);
+      expect(stripToolSyntax(text), form).toBe('');
+    }
+  });
+
+  it('runs the call a trailing comma follows when the reply goes on below it, and keeps those words', () => {
+    const text = `Working it out.\n<tool_call>${one},\nAll done.`;
+    expect(read(text)).toEqual(['6*7']);
+    expect(stripToolSyntax(text)).toBe('Working it out.\n\nAll done.');
+  });
+
+  it('keeps a call’s shape named inside a sentence that goes on past its comma on the same line', () => {
+    // `wordsAfterCall`'s line rule, unchanged: the separators a call ends with
+    // are the ones on its own line, and a sentence that runs on is words.
+    const sentence = `Write <tool_call>${one}, and then the closing tag after it.`;
+    expect(read(sentence)).toEqual([]);
+    expect(stripToolSyntax(sentence)).toBe(sentence);
+  });
+
+  it('keeps a sentence that names both tags, on one line or on lines of their own', () => {
+    for (const prose of [
+      'Qwen wraps each call in a <tool_call> tag and ends it with </tool_call> after the JSON.',
+      'Qwen opens with\n<tool_call>\nand ends with\n</tool_call>\nafter the JSON.',
+    ]) {
+      expect(read(prose), prose).toEqual([]);
+      expect(stripToolSyntax(prose), prose).toBe(prose);
+    }
+  });
+
+  it('takes out the closing tag a reply left behind after going on past its call', () => {
+    // The opening it closes went with the call, so what is left is a call's
+    // markup with nothing in it: markup the person reads and the model is sent
+    // back. The words between it and the call are the person's, and stay.
+    const text = `Ok.\n<tool_call>\n${one}\n\nFiled it.\n</tool_call>\n\nAnything else?`;
+    expect(read(text)).toEqual(['6*7']);
+    expect(stripToolSyntax(text)).toBe('Ok.\n\n\nFiled it.\n\n\nAnything else?');
+  });
+});

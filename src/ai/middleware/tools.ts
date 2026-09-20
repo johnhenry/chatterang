@@ -1254,6 +1254,13 @@ const STRAY_BRACKETS = /^[^\S\n]*(?:[}\]][^\S\n]*)*/;
 const ENDS_ITS_LINE = /^[^\S\n]*(?:\r?\n|$)/;
 
 /**
+ * Whether a closing tag at the end of the text before it stands at the start of
+ * its own line, as {@link ENDS_ITS_LINE} asks of its end: see the closing tag
+ * the reply left behind, in `callMarkup`.
+ */
+const STARTS_ITS_LINE = /(?:^|\n)[^\S\n]*$/;
+
+/**
  * Whether what stands after a call's arguments, at `at`, is the REPLY GOING ON
  * — words the model wrote after a call it never closed — rather than what is
  * left of the close it was still writing. `closing` is the form's close as text
@@ -1387,6 +1394,27 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
       const markup = { start: match.index, end, calls, copy: false };
       if (loose) unclosed(markup, CALL_END.tag.text);
       else found.push(markup);
+    }
+  }
+  // A CLOSING TAG THE REPLY LEFT BEHIND. A model that writes its call in a tag,
+  // goes on writing below it and then closes the tag anyway leaves
+  // `</tool_call>` standing on a line of its own, after markup that has just
+  // been taken out: the opening it closes went with the call, so what is left
+  // is a call's markup with nothing in it, and it stayed in the stored row's
+  // words and rode in every later request.
+  //
+  // ONLY A CLOSE WHOSE OWN OPENING WAS READ AS A CALL'S MARKUP, and only on a
+  // line of its own. Prose naming both tags — "Qwen wraps each call in a
+  // `<tool_call>` tag and ends it with `</tool_call>`" — has an opening no
+  // reading took, and keeps every word.
+  for (const match of text.matchAll(/<\/tool_call>/gi)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (found.some((markup) => start < markup.end && end > markup.start)) continue;
+    if (!STARTS_ITS_LINE.test(text.slice(0, start)) || !ENDS_ITS_LINE.test(text.slice(end))) continue;
+    const opened = text.slice(0, start).toLowerCase().lastIndexOf('<tool_call>');
+    if (opened !== -1 && found.some((markup) => markup.start === opened)) {
+      found.push({ start, end, calls: [], copy: false });
     }
   }
   return found;
@@ -1754,6 +1782,29 @@ const CALL_NAME = /[\w.:-]+/y;
 const TAG_END = '</tool_call>';
 
 /**
+ * What a small model writes BETWEEN the calls in one tag, or after the last one
+ * before the closing tag, besides whitespace: a comma, as it would between an
+ * array's elements, or a semicolon. THE COMMONEST JSON MALFORMATION THERE IS.
+ *
+ * Read as neither a next call nor the tag's close, the tag ended at its last
+ * call and what followed was refused as the rest of a close (see
+ * {@link wordsAfterCall}): `<tool_call>{…},</tool_call>` was markup to no
+ * reader at all, so the tool never ran, no #331 receipt said it had not gone,
+ * and the whole tag with the model's arguments was stored as the reply's words
+ * and sent back in every later request. `<tool_call>{a}, {b}</tool_call>` lost
+ * both calls the same way.
+ */
+const CALL_SEPARATORS = /[,;]/;
+
+/**
+ * A call's separators ON THE LINE IT WAS WRITTEN ON, as {@link STRAY_BRACKETS}
+ * reads its stray closing brackets: a call the reply goes on past below it
+ * ends after the comma the model left behind, not before it, or
+ * {@link wordsAfterCall} reads the comma as the start of a close.
+ */
+const TRAILING_SEPARATORS = /^[^\S\n]*(?:[,;][^\S\n]*)*/;
+
+/**
  * Where a `<tool_call>` starting at `at` whose body is calls ends, just past its
  * `</tool_call>`; {@link Unended} when the text ends inside one; -1 when what is
  * there is not one.
@@ -1804,6 +1855,9 @@ export function taggedCallsEnd(text: string, at: number, offered: readonly strin
  * call it held: what follows is neither another call nor the closing tag, so
  * it is one more word — or, at the end of the text, a close still being
  * written. Which is `callMarkup`'s question: see {@link wordsAfterCall}.
+ *
+ * SEPARATED AS AN ARRAY'S ELEMENTS ARE, as well as by whitespace: see
+ * {@link CALL_SEPARATORS}.
  */
 function readTaggedCalls(
   text: string,
@@ -1816,14 +1870,24 @@ function readTaggedCalls(
   let lastEnd = -1;
   const calls: WrittenCall[] = [];
   const reading = (end: number | Unended): { end: number | Unended; calls: WrittenCall[] } => ({ end, calls });
-  /** The tag ends at the last call in it, its `</tool_call>` unwritten. */
+  /** The tag ends at the last call in it, the separators it left on its line with it. */
   const noClose = (): { end: number | Unended; calls: WrittenCall[]; loose?: boolean } =>
-    written > 0 && lastEnd !== -1 ? { end: lastEnd, calls, loose: true } : reading(-1);
+    written > 0 && lastEnd !== -1
+      ? { end: lastEnd + (TRAILING_SEPARATORS.exec(text.slice(lastEnd))?.[0].length ?? 0), calls, loose: true }
+      : reading(-1);
   const skipSpace = (): void => {
     while (pos < text.length && /\s/.test(text.charAt(pos))) pos += 1;
   };
-  for (;;) {
+  /** Past the whitespace and separators between one call and the next, or the closing tag. */
+  const skipBetween = (): void => {
     skipSpace();
+    while (pos < text.length && CALL_SEPARATORS.test(text.charAt(pos))) {
+      pos += 1;
+      skipSpace();
+    }
+  };
+  for (;;) {
+    skipBetween();
     if (pos === text.length) return reading(written > 0 ? 'open' : -1);
     const rest = text.slice(pos, pos + TAG_END.length).toLowerCase();
     if (rest === TAG_END) return reading(written > 0 ? pos + TAG_END.length : -1);
