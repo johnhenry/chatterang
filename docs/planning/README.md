@@ -151,8 +151,8 @@ Verified against `main` at `15749cb`, the commit this directory was added to.
 - **Eleven of the twelve `buildNow` units have merged**, several under names the
   briefs do not use: BN1 as #321, BN2 as #322, BN3 as #328, BN4 as #325, BN5 as
   #323, BN6 as #324, BN7 as #345, BN9 as #326, BN10 as #327, BN11 (S10 U2) as
-  [#319](https://github.com/johnhenry/chatterang/pull/319) rather than as the new
-  `tests/paired-no-divert.test.ts` the brief names, and BN12 as #320. **BN8**,
+  [#319](https://github.com/johnhenry/chatterang/pull/319), which added exactly
+  the one new file its brief names and nothing else, and BN12 as #320. **BN8**,
   the pairing exchange over pair frames with the desktop's accept before any
   credential is minted, has not: `packages/tunnel/src/pairing/` still holds only
   `index.ts`, `typed.ts` and `window.ts`. `docs/NEXT-STEPS.md`'s "What is on
