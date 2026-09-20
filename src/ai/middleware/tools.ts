@@ -466,9 +466,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * The arguments a call's JSON gives: the object itself, or THE OBJECT A JSON
+ * STRING HOLDS. None from anything else.
+ *
+ * OpenAI's API returns a call's arguments as a JSON-ENCODED STRING, and a model
+ * trained on that data writes one: `{"name": "calculate", "arguments":
+ * "{\"expression\": \"6*7\"}"}`. Thrown away for not being an object, the call
+ * ran with `{}` — the person watched the model call the tool and got an answer
+ * about an empty expression, an MCP server was sent an empty object, and the
+ * receipt and the send sheet reported two bytes and a `{}` preview, so the
+ * thread and the export misstated what the call had carried. The stripper and
+ * the receipt agreed; what they agreed on was the wrong call.
+ */
+function argumentsIn(raw: unknown): Record<string, unknown> {
+  if (isRecord(raw)) return raw;
+  if (typeof raw === 'string') {
+    const parsed = looseJson(raw);
+    if (isRecord(parsed)) return parsed;
+  }
+  return {};
+}
+
+/**
  * The calls a tag's JSON holds: an object naming its tool by `name`, `tool` or
  * `function` with its arguments in `arguments`, `parameters` or `input`, or an
  * array of such objects. None from anything else.
+ *
+ * OR OPENAI'S OWN WIRE SHAPE, whose `function` is an OBJECT holding the name
+ * and the arguments: `{"type": "function", "function": {"name": …, "arguments":
+ * …}}`. Read only for a string `function`, no call was read from it — so
+ * nothing ran, no follow-up round was asked for and, `runToolCalls` never
+ * having been handed the call, no #331 receipt said the server had not been
+ * reached — while the tag around it was stripped all the same, because a tag is
+ * markup whatever its body holds. The words lost a call that nothing recorded.
+ * `fencedCall` excludes a nested `function` object deliberately, to keep a tool
+ * DEFINITION in a code block from running; inside a tag the model is making a
+ * call, not printing one.
  */
 function callsInJson(parsed: unknown): WrittenCall[] {
   if (Array.isArray(parsed)) return parsed.flatMap((item) => (isRecord(item) ? callsInJson(item) : []));
@@ -476,9 +509,11 @@ function callsInJson(parsed: unknown): WrittenCall[] {
   const name = [parsed['name'], parsed['tool'], parsed['function']].find(
     (value): value is string => typeof value === 'string',
   );
-  if (name === undefined) return [];
-  const args = parsed['arguments'] ?? parsed['parameters'] ?? parsed['input'] ?? {};
-  return [{ name, input: isRecord(args) ? args : {} }];
+  if (name === undefined) {
+    const nested = parsed['function'];
+    return isRecord(nested) ? callsInJson(nested) : [];
+  }
+  return [{ name, input: argumentsIn(parsed['arguments'] ?? parsed['parameters'] ?? parsed['input']) }];
 }
 
 /** A call to `name` with `raw`'s JSON as its arguments, when that JSON is an object. */
@@ -552,8 +587,10 @@ function fencedCall(
   const keys = Object.keys(parsed);
   const carriesArguments = keys.some((key) => ARGUMENT_KEYS.has(key));
   if (!carriesArguments && !keys.every((key) => NAMING_KEYS.has(key))) return undefined;
-  const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {};
-  return { name, input: (typeof args === 'object' && args ? args : {}) as Record<string, unknown> };
+  // Its arguments as every tag form's are read, a JSON string included: see
+  // {@link argumentsIn}. The gates above are untouched, so which blocks are
+  // calls is unchanged — only what the call carries.
+  return { name, input: argumentsIn(parsed.arguments ?? parsed.parameters ?? parsed.input) };
 }
 
 /**

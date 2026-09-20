@@ -6570,3 +6570,92 @@ describe('a local Mistral writing its canonical call: the marker and then its JS
     expect(outcomes[0]?.leaked, 'the call’s arguments, sent back').toBe(false);
   });
 });
+
+/* ── Round 13: OpenAI’s own wire shapes inside a tag ────────────────── */
+
+describe('a call written in OpenAI’s wire shapes: a nested function object, and string arguments', () => {
+  // A call whose `function` is an OBJECT was read by nothing, and the tag round
+  // it was stripped all the same — a tag is markup whatever its body holds — so
+  // the words lost a call that nothing ran and no #331 receipt recorded. And a
+  // call whose `arguments` were OpenAI's JSON-encoded STRING ran with `{}`: the
+  // empty object was what left the device, and the receipt beside it said the
+  // call had carried two bytes.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [shape, body] of [
+    [
+      'a nested function object',
+      '{"type": "function", "function": {"name": "notes.note", "arguments": {"text": "canary-r13i"}}}',
+    ],
+    ['arguments as a JSON string', '{"name": "notes.note", "arguments": "{\\"text\\": \\"canary-r13i\\"}"}'],
+    [
+      'both at once',
+      '{"id": "call_0", "type": "function", "function": {"name": "notes.note", "arguments": "{\\"text\\": \\"canary-r13i\\"}"}}',
+    ],
+  ] as const) {
+    it(`${shape}: carries what the model wrote, and the receipt says so`, async () => {
+      const id = `r13_openai_${shape.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n<tool_call>${body}</tool_call>` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'what left the device').toEqual([
+        { text: 'canary-r13i' },
+      ]);
+      expect(
+        stored.toolCalls?.map((recorded) => ({
+          outcome: recorded.receipt?.outcome,
+          bytes: recorded.receipt?.bytes,
+          input: recorded.input,
+        })),
+        'the record beside it',
+      ).toEqual([{ outcome: 'sent', bytes: JSON.stringify({ text: 'canary-r13i' }).length, input: { text: 'canary-r13i' } }]);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13i');
+    });
+  }
+
+  it('stopped before a nested-function call went: it is recorded as not sent, not silently stripped', async () => {
+    const id = 'r13_openai_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const call = '{"type": "function", "function": {"name": "notes.note", "arguments": {"text": "canary-r13j"}}}';
+    const local = scriptedBackend([
+      { partial: `Filing it now.\n<tool_call>${call}</tool_call>\nDone — it is filed.`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'Done — it is filed.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nDone — it is filed.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13j');
+  });
+});

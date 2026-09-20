@@ -1776,3 +1776,69 @@ describe('Mistral’s own output: the [TOOL_CALLS] marker and then its JSON', ()
     expect(stripToolSyntax(text, { offered: [] })).toBe(text);
   });
 });
+
+describe('OpenAI’s own wire shapes: a nested function object, and arguments as a JSON string', () => {
+  // `callsInJson` read the tool's name only from a top-level `name`, `tool` or
+  // `function` that was a STRING, and the arguments only from an OBJECT. So a
+  // model writing OpenAI's own tool call inside a tag — whose `function` is an
+  // object — had no call read from it: nothing ran, no follow-up round was
+  // asked for, and `runToolCalls` was never handed it, so no #331 receipt said
+  // the server had not been reached, while the tag was stripped all the same.
+  // And a call whose `arguments` were OpenAI's JSON-encoded STRING ran with
+  // `{}`: the person watched the model call the tool and got an answer about
+  // nothing, and the receipt and the send sheet said the call had carried two
+  // bytes.
+  const input = (text: string) => extractTextualToolCalls(text).map((made) => ({ name: made.name, input: made.input }));
+
+  it('reads a call whose function is the object holding its name and arguments', () => {
+    for (const [shape, body] of [
+      ['an object’s arguments', '{"type": "function", "function": {"name": "calculate", "arguments": {"expression": "6*7"}}}'],
+      [
+        'a JSON string’s',
+        '{"type": "function", "function": {"name": "calculate", "arguments": "{\\"expression\\": \\"6*7\\"}"}}',
+      ],
+      [
+        'with an id beside it',
+        '{"id": "call_0", "type": "function", "function": {"name": "calculate", "arguments": {"expression": "6*7"}}}',
+      ],
+    ] as const) {
+      const text = `Calculating.\n<tool_call>${body}</tool_call>`;
+      expect(input(text), shape).toEqual([{ name: 'calculate', input: { expression: '6*7' } }]);
+      expect(stripToolSyntax(text), shape).toBe('Calculating.');
+    }
+  });
+
+  it('carries the arguments a JSON string holds, in every form that reads a call’s JSON', () => {
+    for (const [form, text] of [
+      ['a tag', '<tool_call>{"name": "calculate", "arguments": "{\\"expression\\": \\"6*7\\"}"}</tool_call>'],
+      [
+        'a fenced block',
+        'Here:\n\x60\x60\x60json\n{"name": "calculate", "arguments": "{\\"expression\\": \\"6*7\\"}"}\n\x60\x60\x60',
+      ],
+      ['Mistral’s marker', '[TOOL_CALLS][{"name": "calculate", "arguments": "{\'expression\': \'6*7\'}"}]'],
+    ] as const) {
+      expect(input(text), form).toEqual([{ name: 'calculate', input: { expression: '6*7' } }]);
+    }
+  });
+
+  it('a string that is not an object is no arguments at all', () => {
+    const text = '<tool_call>{"name": "calculate", "arguments": "6*7"}</tool_call>';
+    expect(input(text)).toEqual([{ name: 'calculate', input: {} }]);
+  });
+
+  it('the ruling stands: a fenced block whose function is an object is still words', () => {
+    // `fencedCall` excludes a nested `function` object so a tool DEFINITION in
+    // a code block does not run, and that is untouched: only a tag, which is
+    // the model making a call rather than printing one, reads the shape.
+    const example =
+      'A tool is declared like this:\n\x60\x60\x60json\n{"type": "function", "function": {"name": "calculate", "parameters": {}}}\n\x60\x60\x60';
+    expect(extractTextualToolCalls(example)).toEqual([]);
+    expect(stripToolSyntax(example)).toBe(example);
+  });
+
+  it('the ruling stands: an extra key and no arguments key in a fenced block is still words', () => {
+    const example = 'Such a block reads:\n\x60\x60\x60json\n{"id": "call_0", "name": "calculate"}\n\x60\x60\x60';
+    expect(extractTextualToolCalls(example)).toEqual([]);
+    expect(stripToolSyntax(example)).toBe(example);
+  });
+});
