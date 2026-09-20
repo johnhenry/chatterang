@@ -1016,13 +1016,49 @@ export function unfinishedCallAt(
     closing ??= { markup: callEndingInItsClose(text, offered) };
     return closing.markup;
   };
+  /**
+   * Where the markup that opens at `start` ENDS, as `callMarkup` reads it, or
+   * undefined where it reads none: the furthest, where two readings of one
+   * opening disagree (a tag holding two calls is read loosely at the first and
+   * whole at the last). Looked for once, and only when there is an opening to
+   * ask about.
+   *
+   * A CALL THIS READING ALREADY FINISHES IS NOT ONE BEING WRITTEN. The cut and
+   * `callMarkup` read the same call by different scanners, and where they
+   * disagreed the cut won and the words went. A call with a closing bracket too
+   * few and no close, which `shortCallWithoutClose` ends at its own JSON's last
+   * line, is JSON still being written to the end of the text to
+   * {@link writesJson} — which accepts the bare word a text ends in — so every
+   * word the reply wrote below it was cut, and a reply stopped after that word
+   * was stored with none and shown as "Stopped before its first word". The same
+   * call with a whole one below it was cut at the SECOND call's opening, which
+   * left the first at the end of the cut text, where `wordsAfterCall` refuses
+   * it and nothing else reads a call a text ends on: its markup, arguments and
+   * all, was stored and sent back in every later request.
+   *
+   * IT DOES NOT SAY THE TEXT ENDS NOWHERE INSIDE A CALL. A tag holding more
+   * calls is read loosely at its first, and the text can still end inside a
+   * later one: that is `taggedCallsEnd`'s reading, below, which this leaves to
+   * decide as it did.
+   */
+  let read: Map<number, number> | undefined;
+  const finishedAt = (start: number): number | undefined => {
+    read ??= callMarkup(text, offered).reduce(
+      (ends, markup) => ends.set(markup.start, Math.max(ends.get(markup.start) ?? -1, markup.end)),
+      new Map<number, number>(),
+    );
+    return read.get(start);
+  };
   for (const match of text.matchAll(CALL_OPENING)) {
     if (match.index < from) continue;
     if (match.index !== next) chain = undefined;
     const cutFrom = chain ?? match.index;
+    const finished = finishedAt(match.index);
     // THE TEXT ENDS IN THIS CALL'S CLOSE, what is left of it unwritten, as
-    // `callEndingInItsClose` reads it.
-    const ending = closingCall();
+    // `callEndingInItsClose` reads it. Never where the call is already read
+    // and stripped here: that reading appends what is left of a close, and a
+    // call whose words below it end the round has none left to write.
+    const ending = finished === undefined ? closingCall() : undefined;
     if (ending?.start === match.index) {
       // Stopped or cut short, a call still being written, whatever its
       // brackets. A call with a closing bracket too few was cut by nothing
@@ -1100,6 +1136,13 @@ export function unfinishedCallAt(
     // tag's is read by `taggedCallsEnd` above, where a fenced one arrives here.
     const close = text.charAt(open) === '[' ? endOfJson(reading, open) : endOfObject(reading, open);
     if (close === -1) {
+      // Its brackets never balance — a call a closing bracket short. Where the
+      // reading above already ends it and the reply goes on below it, it is a
+      // call this text finished, not one it was writing: see {@link finishedAt}.
+      if (finished !== undefined) {
+        from = finished;
+        continue;
+      }
       const writing = writesJson(text, open, { tagged: form === CALL_END.tag || form === CALL_END.fencedTag, offered });
       if (writing && beingWritten(writing === true ? 'open' : writing)) return cutFrom;
       continue;
@@ -1111,7 +1154,12 @@ export function unfinishedCallAt(
     const stray = /^[\s}\]]*/.exec(text.slice(close))?.[0].length ?? 0;
     const after = text.slice(close + stray);
     const rest = after.replace(/\s+/g, '').toLowerCase();
-    if (form.text.startsWith(rest)) return cutFrom;
+    // What is left of the close unwritten — none of it, or part. A close
+    // WHOLLY written closes the call, and the reading above ends it there: a
+    // reply whose last call was whole was cut at that call's opening, which
+    // stranded a call written without its close above it at the end of the cut
+    // text, markup no reader takes out. See {@link finishedAt}.
+    if (finished === undefined && form.text.startsWith(rest)) return cutFrom;
     // Or partway into the opening of a next call, the one that would end this
     // call written without its close (see `NEXT_CALL`).
     const unclosable = form === CALL_END.tag || form === CALL_END.paren;
@@ -1458,13 +1506,23 @@ function callMarkup(text: string, offered: readonly string[]): CallMarkup[] {
           const calls = read(json, match, offered);
           if (!calls) continue;
           let at = closed + (STRAY_BRACKETS.exec(text.slice(closed))?.[0].length ?? 0);
+          // WHAT IS LEFT OF THE CLOSE ONCE `half` IS TAKEN IN. A fenced tag
+          // whose fence is written and whose `</tool_call>` is still arriving
+          // was asked whether `</tool_` is the whole close being written, and
+          // `\x60\x60\x60</tool_call>` does not begin with it: the call read as
+          // one the reply went on past, so a turn stopped there was not cut
+          // from it and the tail of its markup stayed in the stored words.
+          let closingText = ends.text;
           if (half) {
             // A fenced tag writes its fence on the line below its JSON.
             const gap = /^\s*/.exec(text.slice(at))?.[0].length ?? 0;
             const part = half.exec(text.slice(at + gap))?.[0].length ?? 0;
-            if (part > 0) at += gap + part;
+            if (part > 0) {
+              at += gap + part;
+              closingText = ends.text.slice(part);
+            }
           }
-          unclosed({ start: match.index, end: at, calls, copy }, ends.text);
+          unclosed({ start: match.index, end: at, calls, copy }, closingText);
           continue;
         }
         end = closed + closing[0].length;

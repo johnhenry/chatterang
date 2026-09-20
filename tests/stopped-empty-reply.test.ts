@@ -6200,3 +6200,117 @@ describe('a fenced call to an offered tool with a small model’s commonest JSON
     });
   });
 });
+
+/* ── Round 13: a call a bracket short and unclosed, the cut and the words ─ */
+
+describe('a call a bracket short, written without its close, with one line below it', () => {
+  // The cut and `callMarkup` read the same call by different scanners, and
+  // where they disagreed the cut won. `shortCallWithoutClose` ends this call at
+  // the last line its own JSON reaches and runs it; `writesJson` reads it as
+  // JSON still being written to the end of the text, because it accepts the
+  // bare word a text ends in. So the one word the reply wrote below its call
+  // was cut out of the stored reply and out of every later request — and, when
+  // Stop landed after that word had arrived on screen, the row was stored with
+  // no words at all and shown as stopped before its first word.
+  //
+  // With a WHOLE call below it instead, the cut landed on that call's opening,
+  // which left the first call at the end of the cut text: `wordsAfterCall`
+  // refuses a call a text ends on, so its whole markup, arguments and all, was
+  // stored as the reply's words and sent back in every later request, while
+  // both calls really ran.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13a"}';
+  const WHOLE = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13b"}}</tool_call>';
+
+  it('sends it once, records it, and keeps the word the person watched arrive', async () => {
+    const id = 'r13_short_then_word';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it now.\n${SHORT}\nDone.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([{ text: 'canary-r13a' }]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'every word the person watched arrive').toBe('Filing it now.\n\nDone.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13a');
+  });
+
+  it('stopped once that word is on screen: it stays, and the reply is not called stopped', async () => {
+    const id = 'r13_short_then_word_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${SHORT}\nDone.`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'Done.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ words: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      words: 'Done.',
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'shown as stopped before its first word').toBeNull();
+      expect(bodyText(), 'what the person reads').toBe('Done.');
+    });
+    expect(renderTranscript(chat(id), [stopped]), 'and the export says the same').not.toContain(STOPPED_NOTE);
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13a');
+  });
+
+  it('with a whole call below it whose follow-up writes nothing: neither is stored or sent back', async () => {
+    // The follow-up round writes no words, so the joined text still ends on the
+    // markup: a second strip cannot save it, and the stranded call is what the
+    // row keeps and what every later request carries.
+    const id = 'r13_short_then_whole';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both now.\n${SHORT}\n${WHOLE}` },
+      { reply: '' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r13a' },
+      { text: 'canary-r13b' },
+    ]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'their records').toEqual(['sent', 'sent']);
+    expect(stored.content, 'the stored reply').toBe('Filing both now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13');
+  });
+});

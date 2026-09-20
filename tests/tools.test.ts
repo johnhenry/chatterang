@@ -1560,3 +1560,88 @@ describe('a call a bracket short whose brackets a later closer balances', () => 
     expect(stripToolSyntax(`Ok.${malformed}Done.`), malformed).toBe('Ok.Done.');
   });
 });
+
+describe('a call a bracket short and unclosed: one reading for the cut and the stripper', () => {
+  // `callMarkup` ends such a call at the last line its own JSON's tokens reach
+  // and runs it; `writesJson` read the SAME call as JSON still being written to
+  // the end of the text, because it accepts the bare word a text ends in. The
+  // cut won, so a reply that wrote one word below its call was stored without
+  // that word — and, stopped just after it arrived, with no words at all and
+  // shown as stopped before its first word.
+  //
+  // And where a whole call stood below instead, the cut landed on THAT call's
+  // opening: the first call was left at the end of the cut text, where
+  // `wordsAfterCall` refuses it and nothing else reads a call a text ends on,
+  // so its markup, arguments and all, was stored and sent back in every later
+  // request while both calls ran.
+  const SHORT = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}';
+  const WHOLE = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*8"}}</tool_call>';
+  const ENDINGS = ['model', 'stopped', 'cut'] as const;
+  const cutThenStrip = (text: string, ended: (typeof ENDINGS)[number]): string =>
+    stripToolSyntax(cutUnfinishedCall(text, { ended, offered: OFFERED }));
+  const sums = (text: string, ended: (typeof ENDINGS)[number]) =>
+    extractFrom(text, OFFERED, [], { ended }).map((call) => call.input['expression']);
+
+  it('keeps the one line the reply wrote below it, whatever that line is', () => {
+    for (const [shape, line] of [
+      ['one word', 'Done.'],
+      ['a bare number', '42'],
+      ['a quoted line', '"Buy milk"'],
+      ['a JSON answer', '{"ok": true}'],
+    ] as const) {
+      const text = `Filing it now.\n${SHORT}\n${line}`;
+      for (const ended of ENDINGS) {
+        expect(sums(text, ended), `${shape} (${ended})`).toEqual(['6*7']);
+        expect(cutThenStrip(text, ended), `${shape} (${ended})`).toBe(`Filing it now.\n\n${line}`);
+      }
+    }
+  });
+
+  it('leaves none of itself in the words when a whole call ends the reply below it', () => {
+    const text = `Filing both now.\n${SHORT}\n${WHOLE}`;
+    for (const ended of ENDINGS) {
+      expect(sums(text, ended), ended).toEqual(['6*7', '6*8']);
+      expect(cutThenStrip(text, ended), ended).toBe('Filing both now.');
+    }
+  });
+
+  it('leaves none of itself in the words when a whole call and a sentence follow it', () => {
+    const text = `Filing both now.\n${SHORT}\n${WHOLE}\nBoth queued.`;
+    expect(sums(text, 'model')).toEqual(['6*7', '6*8']);
+    expect(cutThenStrip(text, 'model')).toBe('Filing both now.\n\n\nBoth queued.');
+  });
+
+  it('keeps every word when it names no tool the request offered', () => {
+    // `callsOnlyTo`, unchanged: a call-shaped example is words, and the line
+    // below it is the reply going on. The line is more than one word, because
+    // `writesJson` reads a single word a text ends in as a JSON token half
+    // written — which is why the same call to an OFFERED tool needed the
+    // reading above, and is the accepted limit for one that names none.
+    const example =
+      'Qwen’s format, a brace short:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}\nDone. Anything else?';
+    for (const ended of ENDINGS) {
+      expect(sums(example, ended), ended).toEqual([]);
+      expect(cutThenStrip(example, ended), ended).toBe(example);
+    }
+  });
+
+  it('keeps every word when its shape is named inside a sentence that goes on on the same line', () => {
+    // `wordsAfterCall`'s line rule, unchanged.
+    const sentence = `Write ${SHORT} and then the closing tag.\nOk?`;
+    expect(sums(sentence, 'model')).toEqual([]);
+    expect(cutThenStrip(sentence, 'model')).toBe(sentence);
+  });
+
+  it('still cuts a fenced tag whose fence is written and whose closing tag is not', () => {
+    // The part of the close a form can have without the rest is taken in as the
+    // call's; what is LEFT of the close is what the words after it are weighed
+    // against. Weighed against the whole of it, a `</tool_` still arriving read
+    // as the reply going on, so a turn stopped there was not cut from its call
+    // and the tail of its markup stayed in the stored words.
+    const text =
+      'Checking.\n<tool_call>\n\x60\x60\x60json\n{"name": "calculate", "arguments": {"expression": "6*7"}}\n\x60\x60\x60\n</tool_';
+    for (const ended of ['stopped', 'cut'] as const) {
+      expect(cutThenStrip(text, ended), ended).toBe('Checking.');
+    }
+  });
+});
