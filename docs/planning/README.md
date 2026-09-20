@@ -115,7 +115,7 @@ Each section, and where else the ruling is recorded:
 | "Earlier today": pairing code URI cap, addresses, multi-block OAT (#127) | 2026-09-14 | [#127 comment](https://github.com/johnhenry/chatterang/issues/127#issuecomment-5670808085) |
 | "Earlier today": stopped reply; draft discarded with its chat | 2026-09-14 | **this file only** |
 | Tool-call parsing (`stopped-empty-reply`) | 2026-09-14 | **this file only** |
-| Tool-call shapes | 2026-09-19 | **this file only** — see below |
+| Tool-call shapes | 2026-09-19 | [#7 comment](https://github.com/johnhenry/chatterang/issues/7#issuecomment-5746872476) — posted after this file was written; see below |
 
 The two dates in `RULINGS.md` are local (UTC-7); the linked comments show UTC,
 so the 2026-09-14 batch is timestamped `2026-09-15T03:36Z` and the 2026-09-15
@@ -173,16 +173,22 @@ rule both the way the branch already has them, which is also what `NEXT-STEPS.md
 recommends. So nothing contradicts; `NEXT-STEPS.md` is simply one revision
 behind on two rows.
 
-**Those two rulings are recorded here and nowhere else.** They are not a comment
-on #7 or on any other issue: #7 carries seven comments, the most recent dated
-2026-09-15, and the only issue comments made in this repository since 2026-09-16
-are four notes on #315–#318 about #333. Two owner actions follow, and neither
-has been taken:
+**Those two rulings are also on #7**, where every other ruling lives. The owner
+posted them as the eighth comment on that issue at 2026-09-19 18:56 local
+(`2026-09-20T01:56Z`) — after `RULINGS.md` was last written, and four minutes
+before this directory was committed:
+[#7 comment](https://github.com/johnhenry/chatterang/issues/7#issuecomment-5746872476).
+It carries both rulings in the owner's voice, with the same examples and the
+same rejected alternatives, so `RULINGS.md`'s last section is a copy of it
+rather than the only record of it. The two rows above it in the table — the
+stopped-reply and draft-discarded rulings, and the tool-call parsing ruling —
+are the ones still in `RULINGS.md` alone.
 
-1. Post them as a comment on #7, so they live where every other ruling lives.
-2. Strike the two rows from `NEXT-STEPS.md`'s "Decisions still needed", and the
-   "Rule on `stopped-empty-reply`'s two choices" item from its "Owner actions
-   outside the code".
+One owner action follows from the two shape rulings, and it has not been taken:
+
+- Strike the two rows from `NEXT-STEPS.md`'s "Decisions still needed", and the
+  "Rule on `stopped-empty-reply`'s two choices" item from its "Owner actions
+  outside the code".
 
 ## Reading notes
 
