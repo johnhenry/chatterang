@@ -109,6 +109,12 @@ What can leave the device, each only when you turn it on:
 2. **Messages to a remote provider**, if you connect one. Each provider states
    plainly what connecting it means, self-hosted endpoints are grouped
    separately from cloud ones, and every remote reply is marked in the thread.
+   A persona you wrote yourself can prefer a connection you have set up
+   without asking again — you already decided. A persona imported from a file
+   or acquired from the marketplace asks once, naming the destination, before
+   its first message goes there; declining sends nothing to it and the chat
+   falls back the same way it would with no preference at all, and the
+   allowance can be revoked from the persona's own editor at any time.
 3. **Tool output, and anything derived from it**, when a tool runs in a chat a
    remote model is serving — for `bash` that is this app's own data. The app
    asks first and withholds it if you decline. "Derived" is meant literally: a
