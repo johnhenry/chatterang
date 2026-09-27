@@ -18,6 +18,155 @@ import type { Capability, SamplerSettings } from './manifest';
 
 export type PersonaKind = 'assistant' | 'character';
 
+/* ══ Agent configuration (#7: personas become configurable on everything) ══
+ *
+ * Owner ruling, 2026-09-27: one `Persona` type, not a second "agent persona"
+ * shape. `agentConfig` is an optional block on top of the thin fields above
+ * (`preferredModelId`, `sampler`, `tools`, `requires`, `showThinking`), which
+ * keep working unchanged — a persona written before this field existed reads
+ * back with `agentConfig` absent, and nothing here requires it to be present.
+ *
+ * Everything this block can ask for narrows what the app already allows; it
+ * can never widen it. That is enforced in two places, deliberately not here:
+ *  - `state/chat.ts`'s `narrowToolPolicy` (built on the existing
+ *    `unsensitive`) intersects `toolPolicy.toolIds` with what the chat
+ *    already allows and drops sensitive tools regardless of what a card asks
+ *    for, and clamps `maxToolRounds` to the engine's own per-turn limit.
+ *  - `mcpServerIds` only ever selects among MCP servers the user has already
+ *    added and enabled; a persona carries no server definition, URL or
+ *    token, so importing one can never add a new egress path.
+ * This module's job is narrower: hold the type, and refuse to let anything
+ * outside its known shape survive an import (`sanitizeAgentConfig`).
+ */
+
+/** How this persona reaches a model. `cli-agent` is a placeholder: it is a
+ * recognised string so a persona can name it and round-trip it, but nothing
+ * in this pass resolves it to a backend — another track owns that target
+ * kind. */
+export type PersonaProviderKind = 'local' | 'remote-connection' | 'cli-agent';
+
+export interface PersonaProviderPreference {
+  readonly kind: PersonaProviderKind;
+  /** A `ProviderConnection` id, for `remote-connection` (and, later, `cli-agent`). */
+  readonly connectionId?: string;
+  /** A specific model id on that provider; absent falls back like a missing `preferredModelId`. */
+  readonly modelId?: string;
+}
+
+/** Confirmation strictness a persona may ask for. Deliberately closed: there
+ * is no value here that skips a confirmation the app would otherwise ask
+ * for, because a card is not the place that decision gets made. */
+export type PersonaToolConfirmPolicy = 'always-ask' | 'app-default';
+
+export interface PersonaToolPolicy {
+  /** Tool ids this persona prefers; narrowed against what the chat allows. */
+  readonly toolIds?: readonly string[];
+  /** MCP server ids this persona prefers, among the ones the user added. */
+  readonly mcpServerIds?: readonly string[];
+  readonly confirmPolicy?: PersonaToolConfirmPolicy;
+  /** Per-turn tool-round cap this persona prefers; clamped to the engine's own limit. */
+  readonly maxToolRounds?: number;
+}
+
+/** Where this persona (or its agent preferences) came from, for the one-time
+ * consent an imported remote/cli provider needs before anything is sent —
+ * built in a later pass; this just carries the provenance it will need. */
+export interface PersonaSource {
+  readonly author?: string;
+  readonly url?: string;
+  readonly publishedAt?: number;
+  /** Which surface this was published for, e.g. `'marketplace'`. */
+  readonly forSurface?: string;
+}
+
+export interface PersonaAgentConfig {
+  readonly provider?: PersonaProviderPreference;
+  readonly toolPolicy?: PersonaToolPolicy;
+  readonly source?: PersonaSource;
+}
+
+const PERSONA_PROVIDER_KINDS: ReadonlySet<string> = new Set<PersonaProviderKind>([
+  'local',
+  'remote-connection',
+  'cli-agent',
+]);
+
+const PERSONA_CONFIRM_POLICIES: ReadonlySet<string> = new Set<PersonaToolConfirmPolicy>([
+  'always-ask',
+  'app-default',
+]);
+
+/**
+ * Validate and strip an `agentConfig` that arrived from outside this app — a
+ * Character Card extension, or later a marketplace listing.
+ *
+ * Anything not in the shape above is dropped, not coerced: an unknown
+ * `provider.kind` loses the whole `provider` rather than being guessed at, a
+ * `confirmPolicy` outside the two known values is dropped rather than
+ * defaulted (a wrong default here would be a silent widening), and
+ * `maxToolRounds` must be a plain non-negative integer or it is dropped. This
+ * function only knows the SHAPE is valid; it has no registry to check tool or
+ * connection ids against, so `toolIds` / `mcpServerIds` / `connectionId` are
+ * kept as given and narrowed later, where the app's actual allow-lists live.
+ */
+export function sanitizeAgentConfig(raw: unknown): PersonaAgentConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const value = raw as Record<string, unknown>;
+  const result: { -readonly [K in keyof PersonaAgentConfig]?: PersonaAgentConfig[K] } = {};
+
+  const provider = value.provider;
+  if (provider && typeof provider === 'object') {
+    const p = provider as Record<string, unknown>;
+    if (typeof p.kind === 'string' && PERSONA_PROVIDER_KINDS.has(p.kind)) {
+      result.provider = {
+        kind: p.kind as PersonaProviderKind,
+        connectionId: typeof p.connectionId === 'string' ? p.connectionId : undefined,
+        modelId: typeof p.modelId === 'string' ? p.modelId : undefined,
+      };
+    }
+  }
+
+  const toolPolicy = value.toolPolicy;
+  if (toolPolicy && typeof toolPolicy === 'object') {
+    const t = toolPolicy as Record<string, unknown>;
+    const policy: { -readonly [K in keyof PersonaToolPolicy]?: PersonaToolPolicy[K] } = {};
+
+    if (Array.isArray(t.toolIds)) {
+      policy.toolIds = t.toolIds.filter((id): id is string => typeof id === 'string');
+    }
+    if (Array.isArray(t.mcpServerIds)) {
+      policy.mcpServerIds = t.mcpServerIds.filter((id): id is string => typeof id === 'string');
+    }
+    if (typeof t.confirmPolicy === 'string' && PERSONA_CONFIRM_POLICIES.has(t.confirmPolicy)) {
+      policy.confirmPolicy = t.confirmPolicy as PersonaToolConfirmPolicy;
+    }
+    if (typeof t.maxToolRounds === 'number' && Number.isInteger(t.maxToolRounds) && t.maxToolRounds >= 0) {
+      policy.maxToolRounds = t.maxToolRounds;
+    }
+
+    if (Object.keys(policy).length > 0) result.toolPolicy = policy;
+  }
+
+  const source = value.source;
+  if (source && typeof source === 'object') {
+    const s = source as Record<string, unknown>;
+    const src: { -readonly [K in keyof PersonaSource]?: PersonaSource[K] } = {};
+    if (typeof s.author === 'string') src.author = s.author;
+    if (typeof s.url === 'string') src.url = s.url;
+    if (typeof s.publishedAt === 'number') src.publishedAt = s.publishedAt;
+    if (typeof s.forSurface === 'string') src.forSurface = s.forSurface;
+    if (Object.keys(src).length > 0) result.source = src;
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/** Namespaced Character Card v2 extension this app writes and reads back. */
+interface ChatterangCardExtension {
+  readonly schemaVersion: 1;
+  readonly agentConfig?: unknown;
+}
+
 /** Character Book — retrieval entries injected when their keys match. */
 export interface LoreEntry {
   readonly id: string;
@@ -74,6 +223,9 @@ export interface Persona {
   readonly requires?: readonly Capability[];
   /** Whether reasoning traces should be shown by default in this persona. */
   readonly showThinking?: boolean;
+  /** Provider, tool-policy and provenance preferences (#7). Optional and
+   * additive: everything above still works with this absent. */
+  readonly agentConfig?: PersonaAgentConfig;
 
   /* ── Provenance ───────────────────────────────────────────────────── */
   readonly creator?: string;
@@ -204,6 +356,13 @@ interface CharacterCardV2Data {
     token_budget?: number;
     scan_depth?: number;
   };
+  /** Third-party extensions, namespaced by app. Unknown keys pass through
+   * untouched on export; only `chatterang` is ever read on import, and only
+   * once it passes {@link sanitizeAgentConfig}. */
+  extensions?: {
+    chatterang?: ChatterangCardExtension;
+    [namespace: string]: unknown;
+  };
 }
 
 export interface CharacterCardV2 {
@@ -235,6 +394,12 @@ export function fromCharacterCard(card: CharacterCardV2): PersonaDraft {
       }
     : undefined;
 
+  // Only OUR namespace is ever read, and only once it passes sanitization —
+  // a card from another app that has its own `extensions.someOtherApp` (or
+  // no `extensions` at all) must import with `agentConfig` absent, not
+  // invented from whatever else happens to be in that block.
+  const agentConfig = sanitizeAgentConfig(data.extensions?.chatterang?.agentConfig);
+
   return {
     kind: 'character',
     name,
@@ -252,6 +417,7 @@ export function fromCharacterCard(card: CharacterCardV2): PersonaDraft {
     creator: data.creator,
     tags: data.tags ?? [],
     showThinking: false,
+    agentConfig,
   };
 }
 
@@ -288,6 +454,12 @@ export function toCharacterCard(persona: Persona): CharacterCardV2 {
               case_sensitive: entry.caseSensitive ?? false,
             })),
           }
+        : undefined,
+      // Namespaced and schema-tagged, so a future schema change to this
+      // extension can tell its own shape apart from whatever v1 wrote, and so
+      // this app never reads or overwrites another app's extension block.
+      extensions: persona.agentConfig
+        ? { chatterang: { schemaVersion: 1, agentConfig: persona.agentConfig } }
         : undefined,
     },
   };
