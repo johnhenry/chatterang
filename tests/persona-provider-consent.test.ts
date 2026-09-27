@@ -52,7 +52,7 @@ vi.mock('@/db', () => ({
   writeSetting: writeSettingMock,
 }));
 
-const { useChats } = await import('@/state/chat');
+const { useChats, providerConsentPending } = await import('@/state/chat');
 const { useApp } = await import('@/state/app');
 const { useModels } = await import('@/state/models');
 const { usePersonas } = await import('@/state/personas');
@@ -106,10 +106,25 @@ interface Dispatch {
   readonly target: Record<string, unknown> | null;
 }
 
+/**
+ * `send` now asks for consent interactively (feat/persona-editor track)
+ * before it ever reaches `resolveTarget`, through the SAME
+ * `requestApproval` queue the shell tool uses. Every test in this file is
+ * about the STORED grant, arranged directly through `useProviderConsent`
+ * before `dispatch` is called — not about the interactive sheet, which
+ * `tests/persona-provider-consent-sheet.test.ts` covers — so this default
+ * stub answers "no" immediately. Left unstubbed, an ungranted persona's
+ * `send` would await a `requestApproval` nobody ever answers, and because
+ * `runGeneration`'s `finally` only runs once that await settles, the turn
+ * it claimed would never release, wedging every dispatch after it in the
+ * same test file (this is exactly what happened before this stub existed:
+ * one test timed out and every test after it failed on an empty target).
+ */
 async function dispatch(personaId: string): Promise<Dispatch> {
   let seen: Record<string, unknown> | null = null;
   useApp.setState({
     toasts: [],
+    requestApproval: async () => false,
     engine: {
       async *stream({ target }: { target: Record<string, unknown> }) {
         seen = { ...target };
@@ -256,5 +271,52 @@ describe('a persona row from before `origin` existed', () => {
 
     const sent = await dispatch('p_legacy');
     expect((sent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+  });
+});
+
+/*
+ * ROUND 2 FOLLOW-UP (feat/persona-editor track): `providerConsentPending`
+ * must agree with `resolvePersonaProvider` about what "nothing concrete to
+ * ask about yet" means — that function only ever routes to an ENABLED
+ * connection, so the pending query must not tell a UI to ask about a
+ * connection that is disabled, since allowing it would grant a consent that
+ * still resolves to the ordinary fallback and never actually visits that
+ * destination.
+ */
+describe('providerConsentPending — must match resolvePersonaProvider’s own enabled check', () => {
+  it('is NOT pending for a remote-connection that exists but is disabled', async () => {
+    const personaId = await usePersonas.getState().importCard(marketplaceClaimingCard('conn_anthropic'));
+    const persona = usePersonas.getState().byId[personaId]!;
+
+    expect(providerConsentPending(persona, [OPENAI, { ...ANTHROPIC, enabled: false }])).toBe(false);
+  });
+
+  it('(paired) IS pending for the same connection once it is enabled', async () => {
+    const personaId = await usePersonas.getState().importCard(marketplaceClaimingCard('conn_anthropic'));
+    const persona = usePersonas.getState().byId[personaId]!;
+
+    expect(providerConsentPending(persona, [OPENAI, ANTHROPIC])).toBe(true);
+  });
+});
+
+describe('useProviderConsent.grantsFor — the persona editor’s revoke list', () => {
+  it('lists every destination this persona has a live grant for, and no other persona’s', async () => {
+    await useProviderConsent.getState().grant('p1', 'conn_anthropic');
+    await useProviderConsent.getState().grant('p1', 'cli-agent');
+    await useProviderConsent.getState().grant('p2', 'conn_anthropic');
+
+    const grants = useProviderConsent.getState().grantsFor('p1');
+    expect(grants.map((g) => g.destination).sort()).toEqual(['cli-agent', 'conn_anthropic']);
+    expect(grants.every((g) => typeof g.grantedAt === 'number')).toBe(true);
+  });
+
+  it('is empty for a persona with no grants', () => {
+    expect(useProviderConsent.getState().grantsFor('nobody')).toEqual([]);
+  });
+
+  it('drops a revoked destination', async () => {
+    await useProviderConsent.getState().grant('p1', 'conn_anthropic');
+    await useProviderConsent.getState().revoke('p1', 'conn_anthropic');
+    expect(useProviderConsent.getState().grantsFor('p1')).toEqual([]);
   });
 });

@@ -67,7 +67,7 @@ import {
   type McpServerConfig,
   type ToolDestination,
 } from '@/domain/mcp';
-import type { ProviderConnection } from '@/ai/providers';
+import { getProvider, type ProviderConnection } from '@/ai/providers';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -1460,6 +1460,39 @@ async function runGeneration(
   // read: nothing below waits before that.
   if (get().activeChatId !== chat.id) return false;
 
+  // Ask before an imported or marketplace persona's remote/cli-agent
+  // provider preference is ever resolved (#23, #122). Asked HERE — the one
+  // place both `send` and `regenerate` funnel through — rather than inside
+  // `resolveTarget`, because `resolveTarget` is a plain, synchronous
+  // decision and asking is not. `providerConsentPending` already agrees
+  // with `resolveTarget`'s own `resolvePersonaProvider` about what counts
+  // as "something concrete to ask about" (an enabled connection, or a
+  // cli-agent preference at all) — see that function's own doc comment.
+  const persona = chat.personaId ? usePersonas.getState().byId[chat.personaId] : undefined;
+  const provider = persona?.agentConfig?.provider;
+  if (persona && provider && providerConsentPending(persona, app.connections)) {
+    const destination = providerDestinationLabel(provider, app.connections);
+    const allowed = await app.requestApproval(
+      `send this chat's messages to ${destination}`,
+      {
+        title: `Let "${persona.name}" send to ${destination}?`,
+        body:
+          `This persona was ${persona.origin === 'imported' ? 'imported from a file' : 'added from the marketplace'} ` +
+          `and asks to use ${destination}. Once allowed, this chat's messages go there until you revoke it ` +
+          `from the persona's "Allowed destinations".`,
+        confirmLabel: 'Allow',
+        cancelLabel: 'Not now',
+      },
+      controller.signal,
+    );
+    if (allowed) {
+      await useProviderConsent.getState().grant(persona.id, providerConsentDestination(provider));
+    }
+    // Declined or allowed, `resolveTarget` below re-resolves fresh: allowed
+    // now routes there; declined falls back exactly as pending consent
+    // always has (the same shape as a missing connection).
+  }
+
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
     app.toast('Choose a model first — none is installed or connected yet.', 'warn');
@@ -2181,8 +2214,30 @@ function routesProviderSilently(origin: PersonaOrigin | undefined): boolean {
  * (a `cli-agent` preference with no `connectionId` yet, since that target
  * kind has no connections of its own in this app).
  */
-function providerConsentDestination(provider: PersonaProviderPreference): string {
+export function providerConsentDestination(provider: PersonaProviderPreference): string {
   return provider.connectionId ?? provider.kind;
+}
+
+/**
+ * A human-readable name for a provider preference's destination, for the
+ * consent sheet and anywhere else that needs to say WHERE messages would go
+ * — "cloud" or "self-hosted" worded exactly as the provider catalog
+ * (`ai/providers.ts`'s `ProviderDescriptor.kind`) describes that connection,
+ * not guessed from anything else on it.
+ */
+export function providerDestinationLabel(
+  provider: PersonaProviderPreference,
+  connections: readonly ProviderConnection[],
+): string {
+  if (provider.kind === 'remote-connection') {
+    const connection = connections.find((entry) => entry.id === provider.connectionId);
+    if (!connection) return 'a remote provider';
+    const descriptor = getProvider(connection.providerId);
+    const kind = descriptor?.kind === 'self-hosted' ? 'self-hosted' : 'cloud';
+    return `${connection.label} (${kind})`;
+  }
+  // 'cli-agent': no connection of its own in this app yet (#23, #122).
+  return 'a command-line agent';
 }
 
 /**
@@ -2260,7 +2315,11 @@ export function providerConsentPending(
   if (routesProviderSilently(persona.origin)) return false;
   if (useProviderConsent.getState().isGranted(persona.id, providerConsentDestination(provider))) return false;
   if (provider.kind === 'remote-connection') {
-    return connections.some((entry) => entry.id === provider.connectionId);
+    // Matches `resolvePersonaProvider`'s own connection lookup exactly: that
+    // function only ever routes to an ENABLED connection, so asking about a
+    // disabled one would grant a consent that still falls back — there is
+    // nothing concrete for the user to be saying yes to yet.
+    return connections.some((entry) => entry.id === provider.connectionId && entry.enabled);
   }
   return true; // 'cli-agent'
 }
