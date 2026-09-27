@@ -8,6 +8,7 @@ import { usePersonas } from '@/state/personas';
 import { useBench } from '@/state/bench';
 import { useImages } from '@/state/images';
 import { useMcp } from '@/state/mcp';
+import { useProviderConsent } from '@/state/provider-consent';
 import { Onboarding } from '@/features/onboarding/Onboarding';
 
 import { ChatScreen } from '@/features/chat/ChatScreen';
@@ -52,6 +53,10 @@ export function App(): ReactNode {
         // are contained in the store's own state — an unreachable server must
         // not stop the app booting.
         useMcp.getState().load(),
+        // The one-time consent an imported/marketplace persona's remote or
+        // cli-agent provider preference needs before anything routes there
+        // (#23, #122). Loaded before any chat can resolve a target.
+        useProviderConsent.getState().load(),
       ]);
     })();
   }, [initialize]);

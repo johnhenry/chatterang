@@ -61,8 +61,14 @@ import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
 import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
 
-/** Execute → tools → execute round trips permitted per turn. */
-const TOOL_ITERATIONS = 4;
+/**
+ * Execute → tools → execute round trips permitted per turn.
+ *
+ * Exported so a persona's `agentConfig.toolPolicy.maxToolRounds` (#23) has
+ * something to be clamped against — a persona may ask for FEWER rounds than
+ * this, never more.
+ */
+export const TOOL_ITERATIONS = 4;
 
 /* ── Tool-output egress ─────────────────────────────────────────────── */
 

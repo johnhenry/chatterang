@@ -29,7 +29,16 @@ import {
   type MessageVariant,
   type ToolInvocation,
 } from '@/domain/chat';
-import { renderLore, renderSystemPrompt, selectLore } from '@/domain/persona';
+import {
+  renderLore,
+  renderSystemPrompt,
+  selectLore,
+  type Persona,
+  type PersonaAgentConfig,
+  type PersonaOrigin,
+  type PersonaProviderPreference,
+  type PersonaToolConfirmPolicy,
+} from '@/domain/persona';
 import {
   DEFAULT_SAMPLER,
   canChat,
@@ -40,6 +49,7 @@ import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 import {
   runsOnThisDevice,
   targetFor,
+  TOOL_ITERATIONS,
   type EngineTarget,
   type ToolEgressPolicy,
 } from '@/ai/engine';
@@ -75,8 +85,10 @@ import {
   installMcpToolPruner,
   useApp,
 } from '@/state/app';
+import { useMcp } from '@/state/mcp';
 import { useModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
+import { useProviderConsent } from '@/state/provider-consent';
 
 /**
  * Hard ceiling on turns considered, before token budgeting narrows it further.
@@ -883,12 +895,28 @@ export const useChats = create<ChatState>((set, get) => ({
     const persona = personaId ? personas.byId[personaId] : undefined;
     const settings = useApp.getState().settings;
 
+    // Added-and-enabled servers only (#23): a server the user removed, or has
+    // switched off, is not in this list, so it cannot reach
+    // `narrowToolPolicy`'s `allowedMcpServerIds` no matter what a persona's
+    // `agentConfig.toolPolicy.mcpServerIds` names.
+    const allowedMcpServerIds = useMcp
+      .getState()
+      .servers.filter((server) => server.enabled)
+      .map((server) => server.id);
+    const narrowedTools = narrowToolPolicy(persona?.tools, persona?.agentConfig, allowedMcpServerIds);
+
+    const provider = resolvePersonaProvider(persona, useApp.getState().connections);
+
     const chat: Chat = {
       id: newId('chat'),
       title: options.mode === 'task' ? 'Task' : 'New chat',
       mode: options.mode ?? 'chat',
       personaId: personaId ?? null,
-      modelId: persona?.preferredModelId ?? useModels.getState().activeModelId,
+      // `agentConfig.provider`'s modelId, when it resolved to one, takes the
+      // place `preferredModelId` has always had here — a persona naming both
+      // is naming the same preference twice, not two different ones.
+      modelId: provider.modelId ?? persona?.preferredModelId ?? useModels.getState().activeModelId,
+      preferredConnectionId: provider.preferredConnectionId,
       sampler: null,
       // A persona may PREFER tools; it may not grant the sensitive ones. `bash`
       // reaches this app's own data and every MCP tool leaves the sandbox, so
@@ -897,7 +925,14 @@ export const useChats = create<ChatState>((set, get) => ({
       // in-repo array and `fromCharacterCard` never sets `tools` — so this is
       // the guard that keeps a future import route from being a privilege
       // escalation rather than a fix for a live leak.
-      tools: unsensitive(persona?.tools),
+      //
+      // `agentConfig.toolPolicy`, when a persona carries one (#23), only
+      // narrows this further — see `narrowToolPolicy` — so a persona written
+      // before that field existed is unaffected.
+      tools: narrowedTools.toolIds,
+      // A candidate list only — every MCP tool is still `sensitive`, so this
+      // does not itself enable anything; see the field's own comment.
+      mcpServerIds: narrowedTools.mcpServerIds,
       showThinking: persona?.showThinking ?? settings.showThinking,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -2106,6 +2141,130 @@ type TargetChoice =
   | { readonly kind: 'refused'; readonly message: string }
   | { readonly kind: 'none' };
 
+/** What a persona's `agentConfig.provider` resolved to, for `newChat`. */
+interface ResolvedProvider {
+  /** Takes the place `preferredModelId` has always had, when set. */
+  readonly modelId?: string;
+  /** A connection `resolveTarget` should prefer at fallback time. */
+  readonly preferredConnectionId?: string;
+}
+
+/** The fields `resolvePersonaProvider` and `providerConsentPending` need from a persona. */
+type PersonaProviderContext = Pick<Persona, 'id' | 'origin' | 'agentConfig'>;
+
+/**
+ * Whether this persona's `agentConfig.provider` routes without asking.
+ *
+ * Owner ruling (2026-09-27, adversarial review HIGH on #23/#122): a
+ * self-authored persona's provider preference is the user's own decision,
+ * made in this app, and routes silently. Anything else — imported from a
+ * Character Card, acquired from the marketplace, or a persona row from
+ * before `origin` existed — is data this app did not vouch for, and needs
+ * the one-time consent in `useProviderConsent` before a `remote-connection`
+ * or `cli-agent` preference sends anything. Built-ins are the one other
+ * silent case: they ship with the app, so they are trusted the way the
+ * app's own code is.
+ *
+ * `origin === undefined` — a row from before this field existed — is
+ * treated as NOT silent, i.e. the SAME as imported. See {@link PersonaOrigin}
+ * for why: no such row can actually carry an `agentConfig.provider` today
+ * (that field did not exist when they were written either), so this is a
+ * defensive default rather than a live gap, but it is the conservative one.
+ */
+function routesProviderSilently(origin: PersonaOrigin | undefined): boolean {
+  return origin === 'authored' || origin === 'builtin';
+}
+
+/**
+ * A stable key for "this provider preference, as far as consent cares" —
+ * the connection it names, or the provider kind itself when it names none
+ * (a `cli-agent` preference with no `connectionId` yet, since that target
+ * kind has no connections of its own in this app).
+ */
+function providerConsentDestination(provider: PersonaProviderPreference): string {
+  return provider.connectionId ?? provider.kind;
+}
+
+/**
+ * Resolve a persona's `agentConfig.provider` against the connections the
+ * user has actually added, and — for an imported or marketplace persona —
+ * against the one-time consent it needs before anything routes to a remote
+ * or cli-agent provider (#23, #122; owner rulings 2026-09-27).
+ *
+ *  - `'local'` just names a model id, the same as `preferredModelId` always
+ *    has; whether that model is installed is `resolveTarget`'s question, not
+ *    this one. Never gated: nothing here leaves the device.
+ *  - `'remote-connection'` additionally says WHICH connection to prefer once
+ *    a fallback happens. A missing or disabled `connectionId` resolves to
+ *    `{}` — falling back exactly like a missing `preferredModelId`, not
+ *    partially: the model id is not carried over either, because a
+ *    `modelId` naming a model on a connection that is not there is not a
+ *    preference `resolveTarget` can act on. Consent, when this persona needs
+ *    it, is checked before the connection lookup — ungranted consent gives
+ *    exactly this same `{}`, so a UI never has to tell "no connection" apart
+ *    from "not consented yet" by reading anything other than the pending
+ *    query below.
+ *  - `'cli-agent'` is a placeholder (#23, #122): it round-trips through
+ *    `agentConfig` and is validated by `sanitizeAgentConfig`, and IS
+ *    consent-gated below (the ruling names it explicitly), but nothing
+ *    resolves it to a backend in this pass either way — another track owns
+ *    that target kind — so it resolves to `{}` regardless of consent.
+ */
+function resolvePersonaProvider(
+  persona: PersonaProviderContext | undefined,
+  connections: readonly ProviderConnection[],
+): ResolvedProvider {
+  const provider = persona?.agentConfig?.provider;
+  if (!provider) return {};
+
+  if (provider.kind === 'local') {
+    return provider.modelId ? { modelId: provider.modelId } : {};
+  }
+
+  // Both remaining kinds leave the device once wired, so both are gated the
+  // same way — checked before either does anything else with `provider`.
+  if (
+    persona &&
+    !routesProviderSilently(persona.origin) &&
+    !useProviderConsent.getState().isGranted(persona.id, providerConsentDestination(provider))
+  ) {
+    return {};
+  }
+
+  if (provider.kind === 'remote-connection') {
+    const connection = provider.connectionId
+      ? connections.find((entry) => entry.id === provider.connectionId && entry.enabled)
+      : undefined;
+    if (!connection) return {};
+    return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
+  }
+
+  // 'cli-agent': recognised, consent-gated above, resolved to nothing here.
+  return {};
+}
+
+/**
+ * Whether an imported or marketplace persona's provider preference is
+ * waiting on the one-time consent above — for a UI to ask about. `false` for
+ * a self-authored persona (nothing to ask), for a `'local'` provider
+ * (nothing leaves the device), and for a `remote-connection` naming a
+ * connection the user does not actually have (nothing concrete to ask about
+ * yet — the ordinary "missing connection" fallback already covers that).
+ */
+export function providerConsentPending(
+  persona: PersonaProviderContext | undefined,
+  connections: readonly ProviderConnection[],
+): boolean {
+  const provider = persona?.agentConfig?.provider;
+  if (!persona || !provider || provider.kind === 'local') return false;
+  if (routesProviderSilently(persona.origin)) return false;
+  if (useProviderConsent.getState().isGranted(persona.id, providerConsentDestination(provider))) return false;
+  if (provider.kind === 'remote-connection') {
+    return connections.some((entry) => entry.id === provider.connectionId);
+  }
+  return true; // 'cli-agent'
+}
+
 /** Decide which backend and model serve this chat. */
 function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
   const models = useModels.getState();
@@ -2148,16 +2307,35 @@ function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
     }
   }
 
-  // Fall back to the first enabled remote connection, if any.
-  const connection = app.connections.find((entry) => entry.enabled);
+  // Fall back to the connection a persona's agentConfig.provider names, if
+  // one is (still) resolvable — re-derived fresh from the CURRENT persona
+  // and CURRENT connections/consent, not from anything decided at `newChat`
+  // time (#23, #122). This is deliberate, not merely convenient:
+  // `chat.preferredConnectionId` is a snapshot, and a snapshot cannot notice
+  // a connection disabled since, a persona's provider edited since, or —
+  // the reason this re-derivation exists at all — a consent granted or
+  // revoked since. Re-resolving on every call is what makes every one of
+  // those take effect on the very next turn, not just the next new chat.
+  const persona = chat.personaId ? usePersonas.getState().byId[chat.personaId] : undefined;
+  const resolved = resolvePersonaProvider(persona, app.connections);
+  const preferred = resolved.preferredConnectionId
+    ? app.connections.find((entry) => entry.id === resolved.preferredConnectionId && entry.enabled)
+    : undefined;
+  const connection = preferred ?? app.connections.find((entry) => entry.enabled);
   if (connection) {
+    // Only for the PREFERRED connection does `resolved.modelId` name a model
+    // on THIS connection — `resolvePersonaProvider` set the two together.
+    // The ordinary fallback (no preference, or the preferred one gone) still
+    // uses the connection's own default, exactly as before this field
+    // existed.
+    const remoteModelId = preferred ? resolved.modelId ?? connection.defaultModel : connection.defaultModel;
     return {
       kind: 'target',
       target: {
         backendId: connection.id,
         engine: 'remote',
-        modelId: connection.defaultModel,
-        modelName: `${connection.label} · ${connection.defaultModel}`,
+        modelId: remoteModelId,
+        modelName: `${connection.label} · ${remoteModelId}`,
         reach: REACH_REMOTE,
       },
     };
@@ -2371,6 +2549,71 @@ export function unsensitive(tools: readonly string[] | undefined): string[] {
     const tool = toolRegistry.get(id) ?? toolRegistry.getByName(id);
     return tool !== undefined && !tool.sensitive;
   });
+}
+
+/** What `narrowToolPolicy` decided a persona actually gets. */
+export interface NarrowedToolPolicy {
+  /** Non-sensitive tool ids this persona may pre-enable. */
+  readonly toolIds: string[];
+  /** MCP server ids this persona may pre-enable, among ones already added and on. */
+  readonly mcpServerIds: string[];
+  /** `'always-ask'` only; `undefined` means the app's own default applies. */
+  readonly confirmPolicy?: PersonaToolConfirmPolicy;
+  /** At most `TOOL_ITERATIONS`; `undefined` means the persona asked for nothing. */
+  readonly maxToolRounds?: number;
+}
+
+/**
+ * Narrow a persona's tool preferences — its legacy `tools` list AND its
+ * `agentConfig.toolPolicy`, if it has one — against what this app already
+ * allows (#23, owner ruling 2026-09-27).
+ *
+ * Never widens:
+ *  - `toolIds` is `unsensitive()` applied to the INTERSECTION of the legacy
+ *    list and `toolPolicy.toolIds` when both are given; a tool named by only
+ *    one of them is not a candidate, so a card cannot use the new field to
+ *    ask for something the persona's own thin field never granted, and
+ *    cannot use the thin field to smuggle in something only the new field
+ *    named either. When only one is given, that one alone is the candidate
+ *    list — with no `agentConfig`, this is exactly `unsensitive(tools)`, so
+ *    every chat created before this field existed keeps behaving the same.
+ *  - `allowedMcpServerIds` (added and enabled servers) further narrows
+ *    `toolPolicy.mcpServerIds`, so a server the user removed or switched off
+ *    is never carried into `mcpServerIds`, however the persona is written.
+ *  - `confirmPolicy` can only be `'always-ask'` or absent — there is no value
+ *    in {@link PersonaToolConfirmPolicy} that skips a confirmation, so this
+ *    step has nothing to loosen; `'app-default'` and an absent policy both
+ *    resolve to `undefined`, the app's own choice.
+ *  - `maxToolRounds` is clamped to at most `TOOL_ITERATIONS`, the engine's
+ *    own per-turn cap — a persona may ask for fewer rounds, never more.
+ */
+export function narrowToolPolicy(
+  legacyTools: readonly string[] | undefined,
+  agentConfig: PersonaAgentConfig | undefined,
+  allowedMcpServerIds: readonly string[] = [],
+): NarrowedToolPolicy {
+  const requestedToolIds = agentConfig?.toolPolicy?.toolIds;
+  // `legacyTools !== undefined` on purpose, not `legacyTools?.length`: a
+  // persona whose `tools` field is a defined, EMPTY array explicitly grants
+  // nothing, and that grant of nothing must narrow `toolPolicy.toolIds` down
+  // to nothing too — an absent `tools` field (`undefined`) is the only shape
+  // that means "nothing to intersect against", not an empty one.
+  const candidates =
+    requestedToolIds !== undefined && legacyTools !== undefined
+      ? legacyTools.filter((id) => requestedToolIds.includes(id))
+      : requestedToolIds ?? legacyTools;
+
+  const requestedServerIds = agentConfig?.toolPolicy?.mcpServerIds ?? [];
+  const mcpServerIds = requestedServerIds.filter((id) => allowedMcpServerIds.includes(id));
+
+  const confirmPolicy: PersonaToolConfirmPolicy | undefined =
+    agentConfig?.toolPolicy?.confirmPolicy === 'always-ask' ? 'always-ask' : undefined;
+
+  const requestedRounds = agentConfig?.toolPolicy?.maxToolRounds;
+  const maxToolRounds =
+    typeof requestedRounds === 'number' ? Math.min(requestedRounds, TOOL_ITERATIONS) : undefined;
+
+  return { toolIds: unsensitive(candidates), mcpServerIds, confirmPolicy, maxToolRounds };
 }
 
 function sortChats(chats: Chat[]): Chat[] {

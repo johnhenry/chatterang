@@ -517,10 +517,36 @@ export interface Chat {
   readonly mode: ChatMode;
   personaId: string | null;
   modelId: string | null;
+  /**
+   * A snapshot of which `ProviderConnection` a persona's `agentConfig.provider`
+   * named, as of `newChat` (#23, #122) — informational only. `resolveTarget`
+   * does NOT read this field: it re-resolves the persona's provider
+   * preference fresh on every turn (against the current connections AND the
+   * current one-time-consent state, see `state/chat.ts`'s
+   * `resolvePersonaProvider`), because a snapshot taken once at chat
+   * creation cannot reflect a connection disabled since, a persona edited
+   * since, or a consent granted or revoked since. This field exists for a
+   * UI that wants to show "this chat prefers X" without recomputing it.
+   * Absent on every chat from before this field existed, and on a chat
+   * whose named connection was missing, disabled, or not yet consented to
+   * at creation time — all of which read as "no preference" at the time,
+   * the same fallback a missing `preferredModelId` has always had.
+   */
+  preferredConnectionId?: string;
   /** Per-chat sampler overrides on top of the model defaults. */
   sampler: Partial<SamplerSettings> | null;
   /** Tool ids enabled for this chat. */
   tools: string[];
+  /**
+   * MCP server ids a persona's `agentConfig.toolPolicy` pre-selected for this
+   * chat (#23), already narrowed to servers the user had added and enabled at
+   * the time the chat was created — see `narrowToolPolicy`. This is a
+   * candidate list only: every MCP tool is still `sensitive`, so nothing here
+   * pre-enables a tool by itself, and the picker (and later, the one-time
+   * consent for an imported remote-connection persona) still decides. Absent
+   * on chats from before this field existed, which reads as "none".
+   */
+  mcpServerIds?: string[];
   /**
    * Destinations this conversation has agreed may receive tool output.
    *

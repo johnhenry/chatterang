@@ -422,6 +422,26 @@ class ChatterangDatabase extends Dexie {
      * #195 (a durable queue) takes v11.
      */
     this.version(10).stores({ pairedDevices: 'id, spkiPin' });
+
+    /**
+     * v11 — `Persona.agentConfig` (#23, #122: configurable personas — owner ruling
+     * 2026-09-27), landing at the version the ruling names.
+     *
+     * ADDITIVE, NO UPGRADE FUNCTION, as `mcpServers` at v2 and `pairedDevices`
+     * at v10: `agentConfig` is optional, and no index mentions it, so a v10
+     * row simply reads back with the field absent — there is nothing to
+     * convert, because a persona written before this field existed carries no
+     * opinion for it to have invented. The store is restated so the version
+     * has one, as v4 through v10 all do for the same reason.
+     *
+     * ON THE VERSION NUMBER: v10's own note above says "#195 (a durable
+     * queue) takes v11." That was true when it was written and may not be
+     * true by the time this merges — whichever of the two lands second must
+     * re-read this note and take v12, the same way v7's note asked v8 and v9
+     * to. Ruled here only because the owner named v11 specifically for this
+     * feature on 2026-09-27, after that note was written.
+     */
+    this.version(11).stores({ personas: 'id, name, kind, updatedAt, builtin' });
   }
 }
 
