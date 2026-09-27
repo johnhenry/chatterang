@@ -782,3 +782,94 @@ describe('tool enablement is enforced', () => {
     expect(first.execute).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * `confirmEachCall` (#23, #122): a persona's `agentConfig.toolPolicy.
+ * confirmPolicy === 'always-ask'` must be able to ask before a NON-
+ * destination tool runs — `calculator`, `datetime`, anything with no
+ * server it sends to — which today runs with no question asked at all.
+ * `destinations.request` already asks about a call WITH a destination, so
+ * `confirmEachCall` is consulted only for one WITHOUT — asking twice about
+ * the same call would be the "second sheet" this codebase's own comments
+ * elsewhere say people learn to tap through.
+ */
+describe('runToolCalls — confirmEachCall (always-ask for non-destination tools)', () => {
+  function spyTool(id: string, name = id) {
+    const execute = vi.fn(async () => ({ output: `${id} ran` }));
+    const tool: ChatterangTool = {
+      id, name, summary: id, description: id, parameters: { type: 'object' }, execute,
+    };
+    return { tool, execute };
+  }
+
+  it('a decline runs nothing and records a refusal, not a silent drop', async () => {
+    const local = spyTool('calculator');
+    const confirmEachCall = vi.fn(async () => false);
+    const { results, executed } = await runToolCalls(
+      new ToolRegistry([local.tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'calculator', input: {} }],
+      { enabledIds: [local.tool.id], destinations: { isGranted: () => false }, confirmEachCall },
+    );
+    expect(confirmEachCall).toHaveBeenCalledOnce();
+    expect(local.execute).not.toHaveBeenCalled();
+    expect(executed).toHaveLength(1);
+    expect(executed[0]?.isError).toBe(true);
+    // The model still reads a `tool_result` saying so — declined, not vanished.
+    expect(results).toHaveLength(1);
+  });
+
+  it('approval lets the call run exactly as it would with no confirmEachCall at all', async () => {
+    const local = spyTool('calculator');
+    const confirmEachCall = vi.fn(async () => true);
+    const { executed } = await runToolCalls(
+      new ToolRegistry([local.tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'calculator', input: {} }],
+      { enabledIds: [local.tool.id], destinations: { isGranted: () => false }, confirmEachCall },
+    );
+    expect(confirmEachCall).toHaveBeenCalledOnce();
+    expect(local.execute).toHaveBeenCalledOnce();
+    expect(executed[0]?.isError).toBeFalsy();
+  });
+
+  it('is never consulted for a call that already has a destination — that call asks through `destinations.request` instead', async () => {
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const spy = spyTool('mcp:notes.note', 'notes.note');
+    const tool: ChatterangTool = { ...spy.tool, destination };
+    const confirmEachCall = vi.fn(async () => {
+      throw new Error('must not be called for a destination-bearing call');
+    });
+    const request = vi.fn(async (): Promise<'calls'> => 'calls');
+
+    const { executed } = await runToolCalls(
+      new ToolRegistry([tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'notes.note', input: {} }],
+      {
+        enabledIds: [tool.id],
+        destinations: { isGranted: () => false, request },
+        confirmEachCall,
+      },
+    );
+
+    expect(confirmEachCall).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+    expect(spy.execute).toHaveBeenCalledOnce();
+    expect(executed[0]?.isError).toBeFalsy();
+  });
+
+  it('absent (the app default), a non-destination tool still runs with no question asked', async () => {
+    const local = spyTool('calculator');
+    const { executed } = await runToolCalls(
+      new ToolRegistry([local.tool]),
+      [{ type: 'tool_use' as const, id: 'c0', name: 'calculator', input: {} }],
+      { enabledIds: [local.tool.id], destinations: { isGranted: () => false } },
+    );
+    expect(local.execute).toHaveBeenCalledOnce();
+    expect(executed[0]?.isError).toBeFalsy();
+  });
+});

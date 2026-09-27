@@ -45,7 +45,7 @@ import {
   nonChatRole,
   type SamplerSettings,
 } from '@/domain/manifest';
-import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
+import type { IRMessage, MessageContent, ToolUseContent } from '@johnhenry/aimatey-types';
 import {
   runsOnThisDevice,
   targetFor,
@@ -1620,13 +1620,38 @@ async function runGeneration(
     const discarding = options.beforeEngine?.();
     // Only so a stream that throws first does not leave it unhandled.
     discarding?.catch(() => {});
+
+    /*
+     * RE-DERIVED FRESH, LIKE THE PROVIDER (#23, #122; adversarial review,
+     * MEDIUM) — NOT FROM `chat.tools`. `chat.tools` is the user's own live,
+     * per-chat tool selection (the picker can add or remove from it any
+     * time after `newChat`, including sensitive tools the persona could
+     * never pre-enable), and stays exactly as it is. `confirmPolicy` and
+     * `maxToolRounds` have no per-chat picker of their own — they are pure
+     * persona preferences — so, as with `resolvePersonaProvider`, they are
+     * computed fresh from the CURRENT persona on every turn rather than
+     * trusted from a value decided once at `newChat` and then never
+     * updated, which is exactly what left them computed and discarded: a
+     * persona's toolPolicy was narrowed at `newChat` for the tool
+     * CHECKLIST, and never carried anywhere the engine could act on it.
+     */
+    const turnPersona = chat.personaId ? usePersonas.getState().byId[chat.personaId] : undefined;
+    const turnAllowedMcpServerIds = useMcp
+      .getState()
+      .servers.filter((server) => server.enabled)
+      .map((server) => server.id);
+    const turnToolPolicy = narrowToolPolicy(turnPersona?.tools, turnPersona?.agentConfig, turnAllowedMcpServerIds);
+    const alwaysAsk = turnToolPolicy.confirmPolicy === 'always-ask';
+
     const stream = engine.stream({
       messages: built.messages,
       target,
       sampler: resolveSampler(chat, target.modelId),
       toolIds: chat.tools,
-      egress: egressPolicy(chat.id, built.derivedReplies),
-      mcpEgress: mcpEgressPolicy(chat.id),
+      egress: egressPolicy(chat.id, built.derivedReplies, alwaysAsk),
+      mcpEgress: mcpEgressPolicy(chat.id, alwaysAsk),
+      maxToolRounds: turnToolPolicy.maxToolRounds,
+      confirmEachCall: alwaysAsk ? confirmEachToolCall : undefined,
       signal: controller.signal,
     });
 
@@ -1999,14 +2024,49 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
 }
 
 /**
+ * Asks before a non-destination tool call runs — the enforcement for
+ * `agentConfig.toolPolicy.confirmPolicy === 'always-ask'` on a tool that,
+ * absent that preference, runs with no question asked at all (#23, #122).
+ *
+ * A call with a destination is never routed here (`runToolCalls` only
+ * consults this for one without) — that one already asks through
+ * `egressPolicy`/`mcpEgressPolicy` above, and `alwaysAsk` there is what
+ * stops a standing grant from skipping THAT ask. This is the other half:
+ * the tool that never had a destination-shaped ask to begin with.
+ */
+function confirmEachToolCall(call: ToolUseContent, signal?: AbortSignal): Promise<boolean> {
+  return useApp.getState().requestApproval(
+    `run ${call.name}`,
+    {
+      title: `Run ${call.name}?`,
+      body:
+        `This persona asks to confirm every tool call, even ones the app would otherwise run ` +
+        `without asking.`,
+      confirmLabel: 'Run it',
+      cancelLabel: 'Skip',
+    },
+    signal,
+  );
+}
+
+/**
  * The consent side of the engine's rule, in the app's own voice.
  *
  * Read live from the store rather than captured when the turn started: a grant
  * made in the sheet has to be visible to the check that raised it, and the
  * chat record may have moved on by then. `earlier` is the exception, fixed for
  * the turn, because it describes the history this turn's prompt was built from.
+ *
+ * `alwaysAsk` (#23, #122): a persona's `agentConfig.toolPolicy.confirmPolicy
+ * === 'always-ask'` makes `isGranted` refuse a standing "for this
+ * conversation" grant it would otherwise honour — the sheet is raised again
+ * even though this exact destination was already allowed earlier in the
+ * same chat. `onGranted` is untouched: an "Allow" answered while always-ask
+ * is on still persists a grant, for the day the persona no longer asks for
+ * it (edited, or the chat's own picker overrides it); it is simply never
+ * CONSULTED to skip asking while always-ask stands.
  */
-function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgressPolicy {
+function egressPolicy(chatId: string, earlier: readonly DerivedReply[], alwaysAsk = false): ToolEgressPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
 
@@ -2014,6 +2074,7 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     // Not while a grant for this connection may be one being withdrawn: the
     // store holds it until the revocation's write lands. See `withdrawals`.
     isGranted: (backendId) =>
+      !alwaysAsk &&
       !providerWithdrawals.unsettled(backendId) &&
       holdsGrant(grantsFor(), { kind: 'provider', connectionId: backendId }),
 
@@ -2124,8 +2185,14 @@ export function mcpSendSheet({ destination, calls }: DestinationRequest): McpSen
  * it. The count is the one from BEFORE the sheet was raised: an answer given
  * while the server's grants were being withdrawn covers the calls it listed,
  * and nothing of it is kept. See `withdrawals`.
+ *
+ * `alwaysAsk` (#23, #122), as `egressPolicy`'s: a persona's `confirmPolicy
+ * === 'always-ask'` refuses BOTH sources `isGranted` would otherwise honour
+ * — a stored "for this conversation" grant, and `answered`'s own within-turn
+ * memory of an earlier call in this same turn — so the sheet is raised for
+ * every MCP call, not just the first.
  */
-function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
+function mcpEgressPolicy(chatId: string, alwaysAsk = false): ToolDestinationPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
   const answered = new Map<string, number>();
@@ -2137,6 +2204,7 @@ function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
     // holds it until the revocation's write lands, and the dispatcher reads a
     // held grant again just before each call.
     isGranted: (destination) =>
+      !alwaysAsk &&
       !mcpWithdrawals.unsettled(destination.serverId) &&
       (answered.get(keyOf(destination)) === mcpWithdrawals.count(destination.serverId) ||
         holdsGrant(grantsFor(), {

@@ -24,6 +24,7 @@ import type {
   IRMessage,
   IRStreamChunk,
   Middleware,
+  ToolUseContent,
 } from '@johnhenry/aimatey-types';
 
 import {
@@ -421,6 +422,20 @@ export interface GenerationRequest {
    * An unattended caller must leave out `request`; see `ToolDestinationPolicy`.
    */
   readonly mcpEgress?: ToolDestinationPolicy;
+  /**
+   * A persona's `agentConfig.toolPolicy.maxToolRounds`, already narrowed to
+   * at most `TOOL_ITERATIONS` by `narrowToolPolicy` (#23, #122) — clamped
+   * AGAIN here regardless, since this request field is the one thing an
+   * untrusted caller could hand a larger number to. Absent means the
+   * engine's own `TOOL_ITERATIONS` applies, unchanged.
+   */
+  readonly maxToolRounds?: number;
+  /**
+   * Asked before a NON-destination tool call runs — `runToolCalls`'s
+   * `confirmEachCall`, threaded through. The enforcement for
+   * `agentConfig.toolPolicy.confirmPolicy === 'always-ask'` (#23, #122).
+   */
+  readonly confirmEachCall?: (call: ToolUseContent, signal?: AbortSignal) => Promise<boolean>;
   readonly signal?: AbortSignal;
 }
 
@@ -868,6 +883,17 @@ export class ChatterangEngine {
       request.egress?.revocations?.(backendId);
     let toolEgress: 'granted' | 'withheld' | undefined;
 
+    // Clamped, never trusted: `narrowToolPolicy` (state/chat.ts) already
+    // clamps a persona's `maxToolRounds` to at most `TOOL_ITERATIONS` before
+    // it ever reaches a request, but this is the one place a larger number
+    // could still arrive, so it is clamped again here (#23, #122). A
+    // persona may ask for FEWER rounds than the engine's own limit, never
+    // more — absent, the engine's own limit applies unchanged.
+    const effectiveMaxRounds =
+      typeof request.maxToolRounds === 'number'
+        ? Math.max(0, Math.min(request.maxToolRounds, TOOL_ITERATIONS))
+        : TOOL_ITERATIONS;
+
     for (let iteration = 0; iteration <= TOOL_ITERATIONS; iteration += 1) {
       // The check sits here, between the message array and the backend,
       // because that is the only place that knows both — and because `target`
@@ -1005,6 +1031,7 @@ export class ChatterangEngine {
               destinations: this.#mcpDestinations(request.mcpEgress),
               declared: offered,
               signal: request.signal,
+              confirmEachCall: request.confirmEachCall,
             });
             tools.push(...batch.executed);
             for (const tool of batch.executed) yield { type: 'tool', tool };
@@ -1055,7 +1082,7 @@ export class ChatterangEngine {
       // never dispatched: the limit means no more tool rounds (#293). Reading
       // it is what lets `runToolCalls` below record it as `round-limit`
       // rather than let it vanish with only `stripToolSyntax` as a witness.
-      const roundLimitReached = iteration >= TOOL_ITERATIONS;
+      const roundLimitReached = iteration >= effectiveMaxRounds;
       // Tool calls only become readable once the turn has finished.
       const calls = request.toolIds?.length
         ? findToolCalls({ role: 'assistant', content: turn.text })
@@ -1076,6 +1103,7 @@ export class ChatterangEngine {
         declared: offered,
         signal: request.signal,
         roundLimitReached,
+        confirmEachCall: request.confirmEachCall,
       });
       tools.push(...batch.executed);
       for (const tool of batch.executed) yield { type: 'tool', tool };
