@@ -9,7 +9,7 @@ import { ChatterangEngine } from '@/ai/engine';
 import type { FallbackEvent } from '@/ai/middleware/resilience';
 import { LlamaCpp, type DeviceCapabilities, type ThermalState } from '@/plugins/llama-cpp';
 import { db, readSetting, writeSetting } from '@/db';
-import type { ProviderConnection } from '@/ai/providers';
+import { getProvider, type ProviderConnection } from '@/ai/providers';
 import { DEFAULT_SAMPLER, type ModelManifest, type SamplerSettings } from '@/domain/manifest';
 import { newId } from '@/domain/chat';
 import { serializedByKey, withoutOne } from '@/lib/serialize';
@@ -438,7 +438,26 @@ export const useApp = create<AppState>((set, get) => ({
       readSetting<Settings>('settings', DEFAULT_SETTINGS),
       db.connections.toArray(),
     ]);
-    const merged = { ...DEFAULT_SETTINGS, ...settings };
+    let merged = { ...DEFAULT_SETTINGS, ...settings };
+
+    // #42/#115, round 6: a fallback stored BEFORE this connection existed, or
+    // before it was ever kind-checked, must not reach the engine's
+    // constructor at all -- that constructor assigns `fallbackBackendId`
+    // unchecked, and `connectProvider` (which WOULD know) has not run yet at
+    // this point. Checked here, against the connections just loaded, rather
+    // than trusting the stored value until something downstream catches it.
+    if (merged.fallbackBackendId) {
+      const flagged = connections.find((entry) => entry.id === merged.fallbackBackendId);
+      const isCliFallback = flagged ? getProvider(flagged.providerId)?.kind === 'local-cli' : false;
+      if (isCliFallback) {
+        merged = { ...merged, fallbackBackendId: null };
+        await writeSetting('settings', merged);
+        get().toast(
+          `Cleared the saved cloud fallback: "${flagged?.label}" is a local agent CLI, and a CLI can never be the fallback.`,
+          'warn',
+        );
+      }
+    }
 
     const device = await LlamaCpp.getCapabilities().catch(() => null);
 

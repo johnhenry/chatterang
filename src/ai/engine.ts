@@ -58,6 +58,7 @@ import {
 import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { fallbackWarning, mergeWarnings, warningsOf, type TurnWarning } from '@/ai/warnings';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
+import { CliBackendAdapter } from '@/ai/backends/cli';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
 import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
@@ -671,8 +672,19 @@ export class ChatterangEngine {
 
     const adapter = await descriptor.load(connectionConfig(connection));
     this.#remotes.set(connection.id, adapter);
-    if (descriptor.kind === 'local-cli') this.#cliConnectionIds.add(connection.id);
-    else this.#cliConnectionIds.delete(connection.id);
+    if (descriptor.kind === 'local-cli') {
+      this.#cliConnectionIds.add(connection.id);
+      // Round 6: `#resolveFallback` already refuses this id regardless, but
+      // clearing the STORED value here too means `fallbackBackendId` (the
+      // getter `app.ts` reads back to decide whether to correct the
+      // persisted setting) stops lying the moment this connection's real
+      // kind is known — not just at the one call site that reads it.
+      if (this.#options.fallbackBackendId === connection.id) {
+        this.#options = { ...this.#options, fallbackBackendId: null };
+      }
+    } else {
+      this.#cliConnectionIds.delete(connection.id);
+    }
 
     // Reconnecting an existing provider — the user rotated their API key, or
     // changed the endpoint — swaps the adapter in place. `register` would
@@ -1337,6 +1349,22 @@ export class ChatterangEngine {
     if (!id) return null;
     const adapter = this.router.get(id);
     if (!adapter) return null;
+    /*
+     * #42/#115, round 6: `setFallbackBackend` refuses to ASSIGN a CLI
+     * connection id, but the constructor assigns `options.fallbackBackendId`
+     * unchecked (`src/state/app.ts`'s `initialize()` passes the persisted
+     * setting in before `connectProvider` has even run, so at construction
+     * time nothing yet knows this id names a CLI). This is the actual point
+     * of use, and it checks the resolved ADAPTER's real kind directly --
+     * `instanceof CliBackendAdapter` -- rather than `#cliConnectionIds.has(id)`
+     * alone. The set is still maintained (`connectProvider`,
+     * `disconnectProvider`) and still guards the setter, but a set is
+     * bookkeeping that could fall out of sync with what is actually
+     * registered; the adapter under `id` on the router right now cannot.
+     * Whatever path put a `CliBackendAdapter` here -- `connectProvider`
+     * today, a future caller tomorrow -- this refuses it the same way.
+     */
+    if (adapter instanceof CliBackendAdapter) return null;
     return { name: id, adapter, modelId: this.#fallbackModels.get(id) };
   }
 
