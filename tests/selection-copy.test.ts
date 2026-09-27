@@ -1461,6 +1461,12 @@ function markingEngine(): unknown {
           modelId: target.modelId,
           modelName: runsOnThisDevice(target) ? QWEN.name : `${PROVIDER.label} · ${target.modelId}`,
           local: runsOnThisDevice(target),
+          // #42, #112: the real engine now hands over `reach` itself, not
+          // merely the boolean this mirror already reported -- omitting it
+          // here would make `state/chat.ts`'s `reach: event.provenance.reach`
+          // undefined, and `ranOnDevice` would read that as "left the
+          // device" even for the ON-DEVICE branch above.
+          reach: target.reach,
         },
         stats: { promptTokens: 8, completionTokens: 4 },
       };

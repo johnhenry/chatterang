@@ -510,6 +510,18 @@ export interface ProvenanceSnapshot {
   modelId: string;
   modelName: string;
   local: boolean;
+  /**
+   * The full three-valued reach, alongside `local` rather than instead of it
+   * (#42, #112). `local` is `runsOnThisDevice(target)` — true for BOTH
+   * `REACH_DEVICE` and `REACH_LOCAL_VIA_THIRD_PARTY`, since a local agent CLI
+   * genuinely does run here — so a reader that reconstructed `Reach` from
+   * `local` alone (as `state/chat.ts` used to) could never tell those two
+   * apart: exactly `src/domain/chat.ts`'s `ranThroughLocalCli` needing more
+   * than `ranOnDevice` to answer the question a reader is actually owed.
+   * `local` stays for the callers pinned on it as a boolean (`tests/engine.test.ts`);
+   * this field is what a caller that needs the real shape reads instead.
+   */
+  reach: Reach;
   fallbackFrom?: string;
   fallbackReason?: FallbackReason;
   /**
@@ -1434,6 +1446,7 @@ export class ChatterangEngine {
       modelId: target.modelId,
       modelName: target.modelName,
       local: fallback ? false : runsOnThisDevice(target),
+      reach: fallback ? REACH_REMOTE : target.reach,
       fallbackFrom: fallback?.from,
       fallbackReason: fallback?.reason,
       // Omitted rather than empty: a chip that renders `warnings` should not

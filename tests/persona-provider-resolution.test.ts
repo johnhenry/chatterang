@@ -24,7 +24,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ProviderConnection } from '@/ai/providers';
 import type { Persona } from '@/domain/persona';
-import { REACH_REMOTE } from '@/domain/chat';
+import { REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE } from '@/domain/chat';
 
 const tables = vi.hoisted(() => ({
   chats: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
@@ -266,6 +266,60 @@ describe('agentConfig.provider — remote-connection', () => {
 
     const sent = await dispatchFrom([OPENAI]);
     expect((sent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+  });
+});
+
+describe('agentConfig.provider — remote-connection, naming a local-cli connection (#42, #115)', () => {
+  const CLAUDE_CLI: ProviderConnection = {
+    id: 'conn_cli_claude',
+    providerId: 'cli-claude',
+    label: 'Claude Code',
+    apiKey: '',
+    baseUrl: '',
+    defaultModel: '',
+    enabled: true,
+    models: [],
+    createdAt: 3,
+  };
+
+  beforeEach(() => {
+    useModels.setState({ activeModelId: null, installed: {} });
+  });
+
+  it('produces REACH_LOCAL_VIA_THIRD_PARTY, never REACH_REMOTE, for the CLI connection', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'remote-connection', connectionId: 'conn_cli_claude' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, CLAUDE_CLI]);
+
+    expect(sent.target).toEqual({
+      backendId: CLAUDE_CLI.id,
+      engine: 'remote',
+      modelId: '',
+      modelName: CLAUDE_CLI.label,
+      reach: REACH_LOCAL_VIA_THIRD_PARTY,
+    });
+  });
+
+  it('falls back to the ordinary first-enabled connection exactly as before when the CLI one is disabled', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'remote-connection', connectionId: 'conn_cli_claude' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, { ...CLAUDE_CLI, enabled: false }]);
+    expect((sent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+    expect((sent.target as { reach?: unknown } | null)?.reach).toEqual(REACH_REMOTE);
   });
 });
 

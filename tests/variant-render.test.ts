@@ -73,7 +73,9 @@ const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { MessageView } = await import('@/features/chat/MessageView');
 const { renderTranscript } = await import('@/shell/commands');
 const { buildTranscript } = await import('@/lib/export');
-const { ranOnDevice, REACH_DEVICE, REACH_REMOTE } = await import('@/domain/chat');
+const { ranOnDevice, REACH_DEVICE, REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE } = await import(
+  '@/domain/chat'
+);
 
 const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
 
@@ -108,6 +110,20 @@ const ON_DEVICE: Provenance = {
   modelId: QWEN.id,
   modelName: 'Qwen3 4B Instruct',
   reach: REACH_DEVICE,
+};
+
+/**
+ * A local agent CLI's reply (#42, #112): it ran HERE, and still reached a
+ * third party under the user's own CLI login. `ON_DEVICE` and `REMOTE` above
+ * are the two-valued split every OTHER provenance already fits; this shape
+ * is the one `ranOnDevice` alone would misfile as `ON_DEVICE`'s chip.
+ */
+const CLI: Provenance = {
+  backendId: 'conn_cli_claude',
+  engine: 'remote',
+  modelId: 'claude',
+  modelName: 'Claude Code',
+  reach: REACH_LOCAL_VIA_THIRD_PARTY,
 };
 
 const TOOL: ToolInvocation = {
@@ -149,8 +165,11 @@ const SENT = `Sent 30 bytes of arguments to notes.example (notes) at ${new Date(
  * pass a test about deriving it.
  */
 function snapshotOf(provenance: Provenance): Record<string, unknown> {
-  const { reach: _derived, ...rest } = provenance;
-  return { ...rest, local: ranOnDevice(provenance) };
+  // #42, #112: the engine now hands over `reach` itself (see
+  // `src/ai/engine.ts`'s `ProvenanceSnapshot`), alongside the pinned `local`
+  // boolean -- no longer removed and reconstructed, since `local` alone
+  // cannot tell `REACH_DEVICE` apart from `REACH_LOCAL_VIA_THIRD_PARTY`.
+  return { ...provenance, local: ranOnDevice(provenance) };
 }
 
 interface Turn {
@@ -497,6 +516,49 @@ describe('the chip is the displayed generation’s, not the row’s', () => {
         expect(toolNames(), 'nor the row’s tool block').toEqual([]);
       },
     );
+  });
+});
+
+/* ── The local-cli chip (#42, #112) ───────────────────────────────────── */
+
+describe('the local-cli chip never claims "On device" (#42, #112)', () => {
+  it('names the local CLI and its vendor, not the device, and not merely "Remote"', async () => {
+    script = [{ text: 'CLI ANSWER', provenance: CLI }];
+    await useChats.getState().send('hello');
+
+    await mounted(createElement(LiveMessage), async () => {
+      expect(bodyText()).toBe('CLI ANSWER');
+      // `ranOnDevice(CLI)` is true -- `reach.host.kind` really is `'device'`
+      // -- so the OLD two-valued check would have rendered this exact case as
+      // "On device". This is the regression the new predicate closes.
+      expect(ranOnDevice(CLI)).toBe(true);
+      expect(chips()).toEqual(['Local CLI, reached its vendor']);
+      expect(chips()).not.toContain('On device');
+      expect(chips()).not.toContain('Remote');
+      expect(chipClasses()).toEqual(['chip chip--remote']);
+      expect(who()).toBe(CLI.modelName);
+    });
+  });
+
+  it('reverts to "On device" cleanly when a regenerate switches back to a local reply', async () => {
+    script = [
+      { text: 'CLI ANSWER', provenance: CLI },
+      { text: 'LOCAL ANSWER', provenance: ON_DEVICE },
+    ];
+    await useChats.getState().send('hello');
+    await useChats.getState().regenerate(assistantRow().id);
+
+    await mounted(createElement(LiveMessage), async () => {
+      expect(bodyText()).toBe('LOCAL ANSWER');
+      expect(chips()).toEqual(['On device']);
+
+      await act(async () => {
+        byLabel('Previous version').click();
+      });
+
+      expect(bodyText()).toBe('CLI ANSWER');
+      expect(chips()).toEqual(['Local CLI, reached its vendor']);
+    });
   });
 });
 

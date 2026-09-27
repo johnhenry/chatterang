@@ -19,7 +19,7 @@ import {
   holdsGrant,
   newId,
   splitThinking,
-  REACH_DEVICE,
+  REACH_LOCAL_VIA_THIRD_PARTY,
   REACH_REMOTE,
   type Attachment,
   type Chat,
@@ -1757,15 +1757,15 @@ async function runGeneration(
               engine: event.provenance.engine,
               modelId: event.provenance.modelId,
               modelName: event.provenance.modelName,
-              // The engine still reports a boolean: `EngineTarget.local` gates
-              // the fallback and the egress sheet, and widening it is #188's
-              // and #144's, not this record's. So this is the one place the
-              // boolean becomes a `Reach`, and today it can only produce two
-              // of the three — nothing registers a paired target yet. When one
-              // does, the snapshot gains the device and this line reads it;
-              // until then the third value exists in the type and in the
-              // migration, and no runtime path reaches it.
-              reach: event.provenance.local ? REACH_DEVICE : REACH_REMOTE,
+              // #42, #112: the engine's `ProvenanceSnapshot` now carries the
+              // real three-valued `reach` alongside its pinned `local`
+              // boolean, which this used to reconstruct FROM (`local ?
+              // REACH_DEVICE : REACH_REMOTE`) — lossy the moment a local
+              // agent CLI's `REACH_LOCAL_VIA_THIRD_PARTY` existed, since
+              // `local` is true for that reach too. Reading the field
+              // directly is what lets `ranThroughLocalCli`
+              // (`src/domain/chat.ts`) tell the two apart downstream.
+              reach: event.provenance.reach,
               fallbackFrom: event.provenance.fallbackFrom,
               fallbackReason: event.provenance.fallbackReason,
               toolEgress: event.provenance.toolEgress,
@@ -2475,14 +2475,24 @@ function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
     // uses the connection's own default, exactly as before this field
     // existed.
     const remoteModelId = preferred ? resolved.modelId ?? connection.defaultModel : connection.defaultModel;
+    // #42, #115: a local-cli connection runs a subprocess HERE but reaches
+    // its own vendor there — REACH_LOCAL_VIA_THIRD_PARTY, never REACH_REMOTE,
+    // is what keeps `runsOnThisDevice`/`leavesThisDevice`/`keepsTaintMark`
+    // (`src/ai/engine.ts`) and the thread chip (`ranThroughLocalCli`,
+    // `src/domain/chat.ts`) telling this apart from an ordinary provider. The
+    // engine's own `setFallbackBackend` guard is the second, independent
+    // reason a CLI connection is never diverted to; this is the first —
+    // there being nothing to divert FROM in the first place, since
+    // `runsOnThisDevice` is still true for this reach.
+    const cli = getProvider(connection.providerId)?.kind === 'local-cli';
     return {
       kind: 'target',
       target: {
         backendId: connection.id,
         engine: 'remote',
         modelId: remoteModelId,
-        modelName: `${connection.label} · ${remoteModelId}`,
-        reach: REACH_REMOTE,
+        modelName: cli ? connection.label : `${connection.label} · ${remoteModelId}`,
+        reach: cli ? REACH_LOCAL_VIA_THIRD_PARTY : REACH_REMOTE,
       },
     };
   }

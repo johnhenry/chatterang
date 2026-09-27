@@ -54,6 +54,16 @@ export interface Providerish {
   readonly id: string;
   readonly label: string;
   readonly enabled: boolean;
+  /**
+   * True when this connection's descriptor is `kind: 'local-cli'` (#42,
+   * #115). Structural rather than a full `ProviderKind` for the same reason
+   * the rest of this interface is structural: `chatTarget` needs to route
+   * this ONE case to `{kind:'cli'}` instead of `{kind:'remote'}`, not the
+   * whole provider-catalog vocabulary. Absent (or false) means "remote",
+   * which is what every existing caller passing a bare `ProviderConnection`
+   * already gets, unchanged.
+   */
+  readonly cli?: boolean;
 }
 
 /**
@@ -149,5 +159,8 @@ export function chatTarget(
     return canChat(model.manifest) ? { kind: 'local', model } : { kind: 'refused', model };
   }
   const provider = connections.find((connection) => connection.enabled);
-  return provider ? { kind: 'remote', provider } : { kind: 'none' };
+  if (!provider) return { kind: 'none' };
+  return provider.cli
+    ? { kind: 'cli', cli: { id: provider.id, label: provider.label } }
+    : { kind: 'remote', provider };
 }
