@@ -19,18 +19,30 @@
  * `src/peer-turn-worker.ts` reads `window.__peerTurn`.
  *
  * STRUCTURED INPUT (#119), THE WHOLE POINT OF THIS FILE EXISTING SEPARATELY
- * FROM `src/ai/prompt.ts`. `fromIR` hands the CLI the IR's OWN message
- * objects, unmodified — never `renderPrompt`'s output, which is prompt TEXT
- * built for a template the CLI does not use and would not accept. A CLI
- * builds its own system prompt and its own turn structure; concatenating
- * this app's messages into one string before handing them over would be
- * exactly the mistake #119 exists to name and refuse.
+ * FROM `src/ai/prompt.ts`. `fromIR` calls `encodeCliTurnInput`
+ * (`cli-encode.ts`, beside `cli-stream.ts`) — role-tagged message OBJECTS
+ * for `claude`, a clearly-labelled transcript for `codex`/`gemini` — never
+ * `renderPrompt`'s output, which is prompt TEXT built for a chat-model
+ * template neither of these CLIs uses. `encodeCliTurnInput` is also where
+ * `sanitiseMessages` runs, so tainted content is encoded through the SAME
+ * gate the local prompt renderer uses, not a second one this file invented.
+ * See that file's header for why.
  *
- * THE TAINT/CLEARING GATE STAYS UPSTREAM OF THIS FILE. `executeStream` takes
- * whatever `IRChatRequest.messages` the engine gives it — the engine is what
- * calls `clearForDestination` before it ever reaches an adapter (#141, #145),
- * and this file does not re-decide that; it is not this file's gate to keep
- * or to weaken.
+ * THE ONE THING THIS FILE ADDS TO ARGV, AND WHY IT IS NOT #119's MESSAGE
+ * CONTENT. `encodeCliTurnInput` may return a `systemPrompt` — this app's OWN
+ * persona/system text, pulled out because `claude` accepts it as a separate
+ * flag value rather than a stdin frame. It crosses to `CliTurnBridge.start`
+ * as its OWN named field, never folded into a generic argv array: the
+ * far side (once wired) is the only place that turns it into
+ * `['--append-system-prompt', value]`, as two separate argv elements, so a
+ * persona string that happens to start with `--` is a flag'S VALUE and
+ * never a second flag — proved in `tests/desktop-cli-turn-argv.test.ts`.
+ *
+ * THE TAINT/CLEARING GATE STAYS UPSTREAM OF THIS FILE, TWICE OVER. The
+ * engine calls `clearForDestination` before any adapter sees a message
+ * (#141, #145) — this file does not re-decide that — and `encodeCliTurnInput`
+ * calls `sanitiseMessages` before any text reaches a CLI's stdin. Neither
+ * gate is this file's to keep or to weaken; it only calls the second one.
  */
 
 import type {
@@ -39,11 +51,11 @@ import type {
   IRChatRequest,
   IRChatResponse,
   IRChatStream,
-  IRMessage,
   IRStreamChunk,
   IRUsage,
 } from '@johnhenry/aimatey-types';
 
+import { encodeCliTurnInput, type CliTurnInput } from './cli-encode';
 import {
   CliLineOverflowError,
   createCliLineSplitter,
@@ -69,9 +81,19 @@ export interface CliBridgeHandle {
   cancel(): void;
 }
 
-/** The one call this file needs from the far side: start a turn with structured messages, get a handle back. */
+/**
+ * The one call this file needs from the far side: start a turn with the
+ * already-encoded input, get a handle back.
+ *
+ * `stdin` and `systemPrompt` — never `messages` — is deliberate: this shape
+ * cannot carry a free-form argv (there is no field for one), and
+ * `systemPrompt` is typed as one opaque string, not an array a caller could
+ * pad with extra flags. What the far side does with `systemPrompt` is that
+ * side's decision (`apps/desktop/src/bridge/cli-specs.ts`'s
+ * `buildCliTurnArgv`); this file hands over text, never argv.
+ */
 export interface CliTurnBridge {
-  start(options: { readonly cliId: string; readonly messages: readonly IRMessage[] }): CliBridgeHandle;
+  start(options: { readonly cliId: string } & CliTurnInput): CliBridgeHandle;
 }
 
 /** Every CLI this build has a stream translator for (#115). `gemini` is not here yet — see `cli-stream.ts`'s closing note. */
@@ -116,9 +138,13 @@ export class CliBackendAdapter implements BackendAdapter {
     };
   }
 
-  /** #119: the request's own message objects, unmodified — never a concatenated prompt string. */
-  fromIR(request: IRChatRequest): { readonly messages: readonly IRMessage[] } {
-    return { messages: request.messages };
+  /**
+   * #119: structured turns, never a concatenated prompt string. Delegates
+   * entirely to `encodeCliTurnInput` — this method exists to satisfy
+   * `BackendAdapter`'s shape, not to do any of the encoding itself.
+   */
+  fromIR(request: IRChatRequest): CliTurnInput {
+    return encodeCliTurnInput(this.#cliId, request.messages);
   }
 
   toIR(
@@ -147,7 +173,7 @@ export class CliBackendAdapter implements BackendAdapter {
   }
 
   executeStream(request: IRChatRequest, signal?: AbortSignal): IRChatStream {
-    const { messages } = this.fromIR(request);
+    const input = this.fromIR(request);
     const cliId = this.#cliId;
     const bridge = this.#bridge;
     const requestId = `cli_${cliId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -168,7 +194,7 @@ export class CliBackendAdapter implements BackendAdapter {
         emittedCount += chunks.length;
       };
 
-      const handle = bridge.start({ cliId, messages });
+      const handle = bridge.start({ cliId, ...input });
 
       handle.onData((chunk, stream) => {
         if (stream !== 'stdout' || ended) return;

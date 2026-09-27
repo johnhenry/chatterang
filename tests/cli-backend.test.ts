@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { IRChatRequest, IRMessage, IRStreamChunk } from '@johnhenry/aimatey-types';
 
 import { CliBackendAdapter, isSupportedCliId, type CliBridgeExit, type CliBridgeHandle, type CliTurnBridge } from '@/ai/backends/cli';
+import type { CliTurnInput } from '@/ai/backends/cli-encode';
 
 /**
  * CliBackendAdapter (#42, #115, #119), driven by a FAKE `CliTurnBridge` that
@@ -20,7 +21,7 @@ function fixture(name: string): string {
 
 /** A bridge whose `start()` replays one fixture's bytes, split into arbitrary chunks, then exits. */
 function fakeBridge(fixtureName: string, chunkSize: number, exit: CliBridgeExit = { code: 0, signal: null }) {
-  const startCalls: { cliId: string; messages: readonly IRMessage[] }[] = [];
+  const startCalls: ({ cliId: string } & CliTurnInput)[] = [];
   let cancelled = false;
 
   const bridge: CliTurnBridge = {
@@ -72,14 +73,33 @@ describe('isSupportedCliId', () => {
 });
 
 describe('CliBackendAdapter.fromIR (#119)', () => {
-  it('hands over the request messages unmodified — never a concatenated string', () => {
+  it('delegates to encodeCliTurnInput -- structured turns, never a concatenated string', () => {
     const { bridge } = fakeBridge('claude-pong.jsonl', 64);
     const adapter = new CliBackendAdapter('claude', bridge);
     const messages: readonly IRMessage[] = [
       { role: 'system', content: 'be terse' },
       { role: 'user', content: 'Reply with the single word: pong' },
     ];
-    expect(adapter.fromIR(request(messages))).toEqual({ messages });
+    expect(adapter.fromIR(request(messages))).toEqual({
+      stdin: '{"type":"user","message":{"role":"user","content":"Reply with the single word: pong"}}\n',
+      systemPrompt: 'be terse',
+    });
+  });
+
+  it('carries a persona/system prompt starting with "--" as a plain string field, not as argv', () => {
+    // This app's own persona text, authored ahead of time -- not model or
+    // tool output. `encodeCliTurnInput` puts it in `systemPrompt`, a single
+    // opaque string; `CliTurnBridge.start`'s type has no `args`/argv field
+    // at all for it to hide inside. Whether the flag it eventually becomes
+    // (`--append-system-prompt`, on the far side) stays safe with a value
+    // that starts with `--` is `tests/desktop-cli-turn-argv.test.ts`'s claim,
+    // not this file's -- this test only pins that the value reaches here
+    // completely unmodified, as data, never re-parsed as a flag along the way.
+    const { bridge } = fakeBridge('claude-pong.jsonl', 64);
+    const adapter = new CliBackendAdapter('claude', bridge);
+    const persona = '--dangerously-skip-permissions';
+    const result = adapter.fromIR(request([{ role: 'system', content: persona }, { role: 'user', content: 'hi' }]));
+    expect(result.systemPrompt).toBe(persona);
   });
 });
 
@@ -92,7 +112,13 @@ describe('CliBackendAdapter.executeStream, over a fake bridge replaying a real f
     const chunks: IRStreamChunk[] = [];
     for await (const chunk of adapter.executeStream(request(messages))) chunks.push(chunk);
 
-    expect(startCalls).toEqual([{ cliId: 'claude', messages }]);
+    expect(startCalls).toEqual([
+      {
+        cliId: 'claude',
+        stdin: '{"type":"user","message":{"role":"user","content":"Reply with the single word: pong"}}\n',
+        systemPrompt: undefined,
+      },
+    ]);
     expect(chunks.filter((c) => c.type === 'start')).toHaveLength(1);
     expect(chunks.filter((c) => c.type === 'content').map((c) => (c as { delta: string }).delta)).toEqual([
       'p',

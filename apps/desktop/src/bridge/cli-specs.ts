@@ -104,34 +104,56 @@ export const CLI_SPECS: readonly CliBinarySpec[] = [CLAUDE_SPEC, CODEX_SPEC, GEM
  * `--help` output only — no prompt was run to verify these combine at
  * runtime; see each `case` below for what is and is not confirmed).
  *
- * `opts` carries nothing per-turn today — deliberately. Every flag here is
- * fixed per CLI, not per message, and the type has no field a message could
- * ever populate. `tests/desktop-cli-turn-argv.test.ts` pins this: the argv
- * for a given `cliId` is IDENTICAL no matter what a turn's message content
- * is, because this function never receives message content in the first
- * place. The field exists only so a later, legitimate PER-TURN need (a model
- * override, an extra `--add-dir`) has somewhere to go without this function
- * growing a second parameter — and whoever adds one is bound by the same
- * test to prove it stays disconnected from message text.
+ * `opts.systemPrompt` IS THE ONE LEGITIMATE PER-TURN VARIATION, AND IT IS
+ * NOT MESSAGE CONTENT. `src/ai/backends/cli-encode.ts` pulls a conversation's
+ * `system`-role text out separately, because it is THIS APP'S OWN authored
+ * persona text — never model- or tool-derived — and `claude` accepts exactly
+ * that as `--append-system-prompt <value>`, a flag `claude --help` documents.
+ * It is appended here as TWO SEPARATE ARGV ELEMENTS
+ * (`['--append-system-prompt', value]`), never `--append-system-prompt=value`
+ * and never string-concatenated into one argument: `child_process.spawn`
+ * with an argv array never invokes a shell, so there is no shell-quoting
+ * question, and the residual question — whether a value starting with `--`
+ * could be re-read as a second flag by `claude`'s OWN argument parser rather
+ * than as the previous flag's value — is closed by never joining them into
+ * one string in the first place. `--append-system-prompt` takes exactly one
+ * value (it is not documented as repeatable/variadic in `--help`), so the
+ * immediately-following argv element is unambiguously its value regardless
+ * of what it starts with. `tests/desktop-cli-turn-argv.test.ts` pins the
+ * exact two-element shape for a value starting with `--`.
+ *
+ * `codex`/`gemini` document no system-prompt flag, so `systemPrompt` is
+ * unused for them here — `cli-encode.ts` folds that text into the stdin
+ * transcript for those two instead, which is a decision this function has
+ * no part in.
+ *
+ * EVERY OTHER FIELD THIS TYPE MIGHT GROW STAYS TO THE SAME STANDARD: a named,
+ * app-authored value with nowhere for message content to hide, never a
+ * second `args`/argv array. `tests/desktop-cli-turn-argv.test.ts` pins that
+ * the argv for a given `cliId` and `opts` is identical no matter what a
+ * turn's MESSAGE text is, because this function never receives message text
+ * at all — only what `cli-encode.ts` already decided was safe to name.
  */
 export interface CliTurnArgvOptions {
-  // Intentionally empty. See this function's own doc.
+  /** This app's own persona/system text (see this function's own doc). Never model- or tool-derived. */
+  readonly systemPrompt?: string;
 }
 
 /**
  * Every CLI's own claim about what argv turns off, and — just as loud —
  * what it does NOT turn off. `claude`'s combination is the strong one #115
- * asked for. `codex`'s is not, and says so rather than pretending: `-s
- * read-only` is a FILESYSTEM policy on the model's shell tool, not a switch
- * that removes the tool or blocks the network calls a shell command can
- * make, and neither `codex --help` nor `codex exec --help` documents a flag
- * that does either. `gemini`'s is a best effort against a `--help` that
- * offers nothing as strong as `claude`'s `--tools ""`.
+ * asked for. `codex`'s keeps its shell-command tool — an owner-approved
+ * probe measured it actually invoking one, confined by `-s read-only` to no
+ * writes and no network (see `CODEX_TURN_ARGV`'s own doc for the exact
+ * measurement). `gemini`'s is a best effort against a `--help` that offers
+ * nothing as strong as `claude`'s `--tools ""`.
  */
-export function buildCliTurnArgv(cliId: CliId, _opts: CliTurnArgvOptions = {}): readonly string[] {
+export function buildCliTurnArgv(cliId: CliId, opts: CliTurnArgvOptions = {}): readonly string[] {
   switch (cliId) {
     case 'claude':
-      return CLAUDE_TURN_ARGV;
+      return opts.systemPrompt !== undefined
+        ? [...CLAUDE_TURN_ARGV, '--append-system-prompt', opts.systemPrompt]
+        : CLAUDE_TURN_ARGV;
     case 'codex':
       return CODEX_TURN_ARGV;
     case 'gemini':
@@ -317,6 +339,8 @@ export function spawnCliBinaryTurn(
     readonly cwdRoot: string;
     readonly parentEnv: Readonly<Record<string, string | undefined>>;
     readonly stdin?: string;
+    /** This app's own persona/system text — see {@link buildCliTurnArgv}'s doc. Never message content. */
+    readonly systemPrompt?: string;
     readonly onData: (chunk: Uint8Array, stream: 'stdout' | 'stderr') => void;
     readonly onExit: (exit: CliTurnExit) => void;
   },
@@ -325,7 +349,7 @@ export function spawnCliBinaryTurn(
   return spawnCliTurn(
     {
       binaryPath: options.binaryPath,
-      args: buildCliTurnArgv(cliId),
+      args: buildCliTurnArgv(cliId, { systemPrompt: options.systemPrompt }),
       cwd: options.cwd,
       cwdRoot: options.cwdRoot,
       parentEnv: options.parentEnv,

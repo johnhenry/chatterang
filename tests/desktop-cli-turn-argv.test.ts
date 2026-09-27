@@ -73,6 +73,84 @@ describe('buildCliTurnArgv', () => {
   });
 });
 
+describe('opts.systemPrompt, our own persona text, on the claude flag it becomes (#119)', () => {
+  it('appends --append-system-prompt and the value as two separate argv elements', () => {
+    const argv = buildCliTurnArgv('claude', { systemPrompt: 'Be terse.' });
+    expect(argv.slice(-2)).toEqual(['--append-system-prompt', 'Be terse.']);
+    // Everything before it is untouched.
+    expect(argv.slice(0, -2)).toEqual(buildCliTurnArgv('claude'));
+  });
+
+  it('keeps a value starting with "--" as that flag\'s value, never a second flag, at the array level', () => {
+    // No shell is ever involved (`child_process.spawn` with an argv array),
+    // so the only question is whether THIS array puts the value next to its
+    // flag as one unambiguous pair -- which it does, by construction: two
+    // consecutive elements, the value never merged into the flag string.
+    const adversarial = '--dangerously-skip-permissions';
+    const argv = buildCliTurnArgv('claude', { systemPrompt: adversarial });
+    const flagIndex = argv.indexOf('--append-system-prompt');
+    expect(flagIndex).toBeGreaterThan(-1);
+    expect(argv[flagIndex + 1]).toBe(adversarial);
+    // The adversarial text is not, itself, a recognised flag anywhere else
+    // in the array -- it appears exactly once, as the value slot.
+    expect(argv.filter((arg) => arg === adversarial)).toHaveLength(1);
+  });
+
+  it('is absent from the argv entirely when no systemPrompt is given', () => {
+    expect(buildCliTurnArgv('claude')).not.toContain('--append-system-prompt');
+    expect(buildCliTurnArgv('claude', {})).not.toContain('--append-system-prompt');
+  });
+
+  it('does nothing for codex and gemini, which document no system-prompt flag', () => {
+    expect(buildCliTurnArgv('codex', { systemPrompt: 'Be terse.' })).toEqual(buildCliTurnArgv('codex'));
+    expect(buildCliTurnArgv('gemini', { systemPrompt: 'Be terse.' })).toEqual(buildCliTurnArgv('gemini'));
+  });
+
+  it('reaches spawnCliBinaryTurn\'s real argv, end to end, still as two separate elements', async () => {
+    let capturedArgv: readonly string[] | undefined;
+    const deps: CliSpawnDeps = {
+      path: { resolve: (...s) => s.join('/'), relative: () => '', isAbsolute: (p) => p.startsWith('/') },
+      spawn: (_binaryPath, args) => {
+        capturedArgv = args;
+        const listeners: Record<string, ((...a: unknown[]) => void)[]> = {};
+        return {
+          pid: 4242,
+          stdout: { on: () => {} },
+          stderr: { on: () => {} },
+          stdin: {
+            write: () => {},
+            end: () => queueMicrotask(() => (listeners.close ?? []).forEach((l) => l(0, null))),
+          },
+          on: (event: string, listener: (...a: unknown[]) => void) => {
+            (listeners[event] ??= []).push(listener);
+          },
+        } as unknown as CliChildProcess;
+      },
+      killProcessGroup: () => {},
+    };
+
+    await new Promise<void>((resolveDone) => {
+      spawnCliBinaryTurn(
+        'claude',
+        {
+          binaryPath: '/usr/local/bin/claude',
+          cwd: '/root',
+          cwdRoot: '/root',
+          parentEnv: {},
+          systemPrompt: '--dangerously-skip-permissions',
+          onData: () => {},
+          onExit: () => resolveDone(),
+        },
+        deps,
+      );
+    });
+
+    const flagIndex = capturedArgv?.indexOf('--append-system-prompt') ?? -1;
+    expect(flagIndex).toBeGreaterThan(-1);
+    expect(capturedArgv?.[flagIndex + 1]).toBe('--dangerously-skip-permissions');
+  });
+});
+
 describe('message content never reaches argv (#119)', () => {
   // buildCliTurnArgv's signature does not even accept message text — this
   // is the integration-level proof: a full spawnCliBinaryTurn call, given a
