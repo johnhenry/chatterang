@@ -3,13 +3,25 @@ import { useShallow } from 'zustand/react/shallow';
 
 import type { InstalledModel } from '@/db';
 import { Icon } from '@/ui/Icon';
-import { Segmented, Sheet } from '@/ui/primitives';
-import type { CharacterBook, LoreEntry, Persona, PersonaDraft } from '@/domain/persona';
+import { Segmented, Sheet, Slider, Switch } from '@/ui/primitives';
+import type {
+  CharacterBook,
+  LoreEntry,
+  Persona,
+  PersonaAgentConfig,
+  PersonaDraft,
+  PersonaProviderPreference,
+} from '@/domain/persona';
 import { newId } from '@/domain/chat';
 import { catalogEntry } from '@/data/catalog';
-import { canChat, nonChatRole } from '@/domain/manifest';
+import { canChat, DEFAULT_SAMPLER, nonChatRole, SAMPLER_RANGES } from '@/domain/manifest';
 import { useModels, chatModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
+import { useApp } from '@/state/app';
+import { useMcp } from '@/state/mcp';
+import { useProviderConsent } from '@/state/provider-consent';
+import { narrowToolPolicy, providerDestinationLabel } from '@/state/chat';
+import { TOOL_ITERATIONS } from '@/ai/engine';
 import { toolRegistry } from '@/ai/tools/registry';
 import { Avatar } from '@/features/personas/Avatar';
 
@@ -85,6 +97,44 @@ export function PersonaEditor({
     preferredId && !models.some((model) => model.id === preferredId)
       ? { id: preferredId, label: strandedLabel(installedById[preferredId], preferredId) }
       : null;
+
+  // Only models that satisfy every capability this persona `requires` — a
+  // model select that offered one missing a capability the persona depends
+  // on would be a picker the persona itself could never actually use.
+  const requiredCaps = draft.requires ?? [];
+  const modelsForRequires =
+    requiredCaps.length === 0
+      ? models
+      : models.filter((model) => requiredCaps.every((cap) => model.manifest.capabilities.includes(cap)));
+
+  const connections = useApp(useShallow((state) => state.connections));
+  const mcpServers = useMcp(useShallow((state) => state.servers));
+  const allowedMcpServerIds = mcpServers.filter((server) => server.enabled).map((server) => server.id);
+
+  const agentConfig = draft.agentConfig;
+  const setAgentConfig = (patch: Partial<PersonaAgentConfig>): void => {
+    set('agentConfig', { ...agentConfig, ...patch });
+  };
+  const setProvider = (provider: PersonaProviderPreference | undefined): void => {
+    setAgentConfig({ provider });
+  };
+  const setToolPolicy = (patch: Partial<NonNullable<PersonaAgentConfig['toolPolicy']>>): void => {
+    setAgentConfig({ toolPolicy: { ...agentConfig?.toolPolicy, ...patch } });
+  };
+
+  const providerKind = agentConfig?.provider?.kind ?? 'local';
+
+  // What this draft would ACTUALLY be narrowed to if saved right now — the
+  // same function `newChat` runs against the saved persona — so the tool
+  // checklist below can never look wider on screen than it will behave once
+  // saved (#23, #122).
+  const narrowedTools = narrowToolPolicy(draft.tools, draft.agentConfig, allowedMcpServerIds);
+
+  // Subscribed so a grant/revoke made from THIS sheet re-renders it; the
+  // list itself is read fresh from the store rather than kept in local
+  // state, since it is not this component's to own.
+  useProviderConsent((state) => state.granted);
+  const grants = persona ? useProviderConsent.getState().grantsFor(persona.id) : [];
 
   return (
     <Sheet
@@ -253,67 +303,166 @@ export function PersonaEditor({
         </>
       ) : (
         <>
-          <div className="field">
-            <label className="field__label" htmlFor="persona-model">
-              Preferred model
-            </label>
-            <select
-              id="persona-model"
-              className="select"
-              value={preferredId}
-              onChange={(event) => set('preferredModelId', event.target.value || undefined)}
-            >
-              <option value="">Whatever is active</option>
-              {models.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.manifest.name}
-                </option>
-              ))}
+          <div className="section">
+            <div className="section__head">
+              <h2>Model & provider</h2>
+            </div>
+            <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="chip chip--button"
+                aria-pressed={providerKind === 'local'}
+                onClick={() => setProvider(undefined)}
+              >
+                Local model
+              </button>
+              <button
+                type="button"
+                className="chip chip--button"
+                aria-pressed={providerKind === 'remote-connection'}
+                disabled={connections.length === 0}
+                title={connections.length === 0 ? 'Connect a provider in Settings first' : undefined}
+                onClick={() =>
+                  setProvider({ kind: 'remote-connection', connectionId: connections[0]?.id })
+                }
+              >
+                One of your connections
+              </button>
               {/*
-                DISABLED, for the reason the chat sheet's orphan option is.
-
-                Selectedness and selectability are different things: the option
-                exists so the control can DISPLAY a value the list cannot
-                offer, and `value=` still lands on it while `disabled` keeps it
-                out of the user's reach. Without that, this control hands back
-                the very model it just told them cannot chat — one click on the
-                sheet that exists to explain the refusal re-creates it.
+                Recognised by the domain type and round-tripped by
+                sanitizeAgentConfig (#23, #122), but nothing resolves it to a
+                backend yet — another track owns that target kind. Disabled
+                here rather than hidden, so the persona editor's shape is
+                already the one this will slot into.
               */}
-              {strandedPreference ? (
-                <option key={strandedPreference.id} value={strandedPreference.id} disabled>
-                  {strandedPreference.label}
-                </option>
-              ) : null}
-            </select>
-            <span className="field__hint">
-              {strandedPreference
-                ? 'This persona still points at the model above, and every new chat it starts ' +
-                  'inherits it. Pick one from the list to fix that, then save.'
-                : /*
-                   * WHERE THE TURN GOES, MEASURED RATHER THAN GUESSED.
-                   *
-                   * Two earlier sentences stood here. "If the model is not
-                   * installed, the active one is used instead." is false:
-                   * `newChat` copies this id into `chat.modelId`, and
-                   * `resolveTarget` reads `chat.modelId ?? activeModelId`, so a
-                   * set-but-uninstalled id short-circuits the active model. Its
-                   * replacement — "it leaves the new chat with nothing to send
-                   * to" — is false in the direction that matters most here:
-                   * `resolveTarget` misses the id in `models.installed`, drops
-                   * out of the whole `if (modelId)` block, and falls through to
-                   * `app.connections.find(entry => entry.enabled)`. Measured end
-                   * to end with a recording engine, the turn was dispatched to
-                   * `conn_openai` — it left the device, on a persona pointing at
-                   * a local model.
-                   *
-                   * So the sentence names the provider route and stops there.
-                   * It does not say "off this device": `ollama` and `lmstudio`
-                   * are connections too, and default to localhost.
-                   */
-                  'Used when a chat starts with this persona. A preference that is not installed ' +
-                  'does not fall back to the active model — the turn goes to the first provider ' +
-                  'you have enabled instead, and is refused if you have none.'}
-            </span>
+              <button
+                type="button"
+                className="chip chip--button"
+                aria-pressed={false}
+                disabled
+                title="Coming soon — the command-line agent track hasn't landed yet"
+              >
+                CLI agent (coming soon)
+              </button>
+            </div>
+
+            {providerKind === 'remote-connection' ? (
+              <div className="field">
+                <label className="field__label" htmlFor="persona-connection">
+                  Connection
+                </label>
+                <select
+                  id="persona-connection"
+                  className="select"
+                  value={agentConfig?.provider?.connectionId ?? ''}
+                  onChange={(event) =>
+                    setProvider({ kind: 'remote-connection', connectionId: event.target.value || undefined })
+                  }
+                >
+                  <option value="">Choose a connection</option>
+                  {connections.map((connection) => (
+                    <option key={connection.id} value={connection.id}>
+                      {connection.label}
+                    </option>
+                  ))}
+                </select>
+                <span className="field__hint">
+                  {agentConfig?.provider
+                    ? `Messages in chats from this persona go to ${providerDestinationLabel(
+                        agentConfig.provider,
+                        connections,
+                      )}.`
+                    : 'Messages in chats from this persona will go to whichever connection is chosen here.'}
+                </span>
+              </div>
+            ) : (
+              <div className="field">
+                <label className="field__label" htmlFor="persona-model">
+                  Preferred model
+                </label>
+                <select
+                  id="persona-model"
+                  className="select"
+                  value={preferredId}
+                  onChange={(event) => set('preferredModelId', event.target.value || undefined)}
+                >
+                  <option value="">Whatever is active</option>
+                  {modelsForRequires.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.manifest.name}
+                    </option>
+                  ))}
+                  {/*
+                    DISABLED, for the reason the chat sheet's orphan option is.
+
+                    Selectedness and selectability are different things: the option
+                    exists so the control can DISPLAY a value the list cannot
+                    offer, and `value=` still lands on it while `disabled` keeps it
+                    out of the user's reach. Without that, this control hands back
+                    the very model it just told them cannot chat — one click on the
+                    sheet that exists to explain the refusal re-creates it.
+                  */}
+                  {strandedPreference ? (
+                    <option key={strandedPreference.id} value={strandedPreference.id} disabled>
+                      {strandedPreference.label}
+                    </option>
+                  ) : null}
+                </select>
+                <span className="field__hint">
+                  {strandedPreference
+                    ? 'This persona still points at the model above, and every new chat it starts ' +
+                      'inherits it. Pick one from the list to fix that, then save.'
+                    : /*
+                       * WHERE THE TURN GOES, MEASURED RATHER THAN GUESSED.
+                       *
+                       * Two earlier sentences stood here. "If the model is not
+                       * installed, the active one is used instead." is false:
+                       * `newChat` copies this id into `chat.modelId`, and
+                       * `resolveTarget` reads `chat.modelId ?? activeModelId`, so a
+                       * set-but-uninstalled id short-circuits the active model. Its
+                       * replacement — "it leaves the new chat with nothing to send
+                       * to" — is false in the direction that matters most here:
+                       * `resolveTarget` misses the id in `models.installed`, drops
+                       * out of the whole `if (modelId)` block, and falls through to
+                       * `app.connections.find(entry => entry.enabled)`. Measured end
+                       * to end with a recording engine, the turn was dispatched to
+                       * `conn_openai` — it left the device, on a persona pointing at
+                       * a local model.
+                       *
+                       * So the sentence names the provider route and stops there.
+                       * It does not say "off this device": `ollama` and `lmstudio`
+                       * are connections too, and default to localhost.
+                       */
+                      'Used when a chat starts with this persona. A preference that is not installed ' +
+                      'does not fall back to the active model — the turn goes to the first provider ' +
+                      'you have enabled instead, and is refused if you have none.'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="section">
+            <div className="section__head">
+              <h2>Sampler</h2>
+            </div>
+            <Slider
+              label={SAMPLER_RANGES.temperature.label}
+              hint={SAMPLER_RANGES.temperature.hint}
+              value={draft.sampler?.temperature ?? DEFAULT_SAMPLER.temperature}
+              min={SAMPLER_RANGES.temperature.min}
+              max={SAMPLER_RANGES.temperature.max}
+              step={SAMPLER_RANGES.temperature.step}
+              onChange={(value) => set('sampler', { ...draft.sampler, temperature: value })}
+            />
+            <Slider
+              label={SAMPLER_RANGES.maxTokens.label}
+              hint={SAMPLER_RANGES.maxTokens.hint}
+              value={draft.sampler?.maxTokens ?? DEFAULT_SAMPLER.maxTokens}
+              min={SAMPLER_RANGES.maxTokens.min}
+              max={SAMPLER_RANGES.maxTokens.max}
+              step={SAMPLER_RANGES.maxTokens.step}
+              onChange={(value) => set('sampler', { ...draft.sampler, maxTokens: value })}
+            />
           </div>
 
           <div className="section">
@@ -329,9 +478,16 @@ export function PersonaEditor({
                     type="button"
                     className="chip chip--button"
                     aria-pressed={enabled}
+                    // LOCKED, not merely discouraged: a sensitive tool cannot
+                    // be pre-enabled by any persona (`unsensitive`,
+                    // `narrowToolPolicy`) — the app enforces this again at
+                    // every chat regardless of what a draft saves, but the
+                    // control here refuses to pretend otherwise.
+                    disabled={tool.sensitive}
                     title={
                       tool.sensitive
-                        ? `${tool.summary} — asked for per chat, not pre-enabled here`
+                        ? `${tool.summary} — locked: reaches this app's own data or leaves its ` +
+                          'sandbox, so it is asked for per chat, never pre-enabled by a persona'
                         : tool.summary
                     }
                     onClick={() =>
@@ -343,18 +499,86 @@ export function PersonaEditor({
                       )
                     }
                   >
-                    <Icon name="tool" size={11} />
+                    <Icon name={tool.sensitive ? 'shield' : 'tool'} size={11} />
                     {tool.name}
-                    {tool.sensitive ? ' *' : ''}
                   </button>
                 );
               })}
             </div>
             <span className="field__hint">
-              A persona chooses which tools a new chat <em>starts</em> with. Tools marked * reach
-              this app’s own data or leave its sandbox, so a persona cannot switch them on for you
-              — you turn those on yourself, per chat, in the tool picker.
+              A persona chooses which tools a new chat <em>starts</em> with. Locked tools reach this
+              app’s own data or leave its sandbox, so a persona cannot switch them on for you — you
+              turn those on yourself, per chat, in the tool picker.
             </span>
+
+            <div className="field">
+              <label className="field__label">MCP servers</label>
+              {mcpServers.filter((server) => server.enabled).length === 0 ? (
+                <span className="field__hint">
+                  Add and enable an MCP server in Settings to offer one here.
+                </span>
+              ) : (
+                <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
+                  {mcpServers
+                    .filter((server) => server.enabled)
+                    .map((server) => {
+                      const selected = agentConfig?.toolPolicy?.mcpServerIds?.includes(server.id) ?? false;
+                      const current = agentConfig?.toolPolicy?.mcpServerIds ?? [];
+                      return (
+                        <button
+                          key={server.id}
+                          type="button"
+                          className="chip chip--button"
+                          aria-pressed={selected}
+                          title={`${server.name} — every MCP tool is still asked for per call`}
+                          onClick={() =>
+                            setToolPolicy({
+                              mcpServerIds: selected
+                                ? current.filter((id) => id !== server.id)
+                                : [...current, server.id],
+                            })
+                          }
+                        >
+                          {server.name}
+                        </button>
+                      );
+                    })}
+                </div>
+              )}
+              <span className="field__hint">
+                Only servers you have already added and switched on — a persona can never carry a
+                server of its own.
+              </span>
+            </div>
+
+            <div className="field">
+              <Switch
+                label="Always ask, even where the app would not"
+                checked={agentConfig?.toolPolicy?.confirmPolicy === 'always-ask'}
+                onChange={(checked) => setToolPolicy({ confirmPolicy: checked ? 'always-ask' : undefined })}
+              />
+              <span className="field__hint">
+                Tightens confirmation for this persona; there is no setting here that skips one the
+                app would otherwise ask for.
+              </span>
+            </div>
+
+            <Slider
+              label="Max tool rounds"
+              hint={`Capped at ${TOOL_ITERATIONS}, the engine's own limit per turn — this can only ask for fewer.`}
+              value={agentConfig?.toolPolicy?.maxToolRounds ?? TOOL_ITERATIONS}
+              min={0}
+              max={TOOL_ITERATIONS}
+              step={1}
+              onChange={(value) => setToolPolicy({ maxToolRounds: Math.min(value, TOOL_ITERATIONS) })}
+            />
+
+            {narrowedTools.toolIds.length === 0 && (draft.tools?.length ?? 0) === 0 ? null : (
+              <span className="field__hint">
+                What a new chat actually starts with:{' '}
+                {narrowedTools.toolIds.length > 0 ? narrowedTools.toolIds.join(', ') : 'nothing pre-enabled'}.
+              </span>
+            )}
           </div>
         </>
       )}
@@ -372,8 +596,72 @@ export function PersonaEditor({
           onChange={(event) => set('postHistoryInstructions', event.target.value)}
         />
       </div>
+
+      {persona ? (
+        <div className="section">
+          <div className="section__head">
+            <h2>Allowed destinations</h2>
+          </div>
+          {grants.length === 0 ? (
+            <span className="field__hint">
+              Nothing has been allowed to send this persona's messages anywhere outside this app yet.
+            </span>
+          ) : (
+            <ul className="list">
+              {grants.map((grant) => (
+                <li key={grant.destination} className="list__item">
+                  <div className="list__main">
+                    <span className="list__title">{destinationName(grant.destination, connections)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn--secondary btn--sm"
+                    onClick={() => void useProviderConsent.getState().revoke(persona.id, grant.destination)}
+                  >
+                    Revoke
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
+      <div className="section">
+        <div className="section__head">
+          <h2>Source</h2>
+        </div>
+        <p className="section__hint">{sourceDescription(draft, persona)}</p>
+      </div>
     </Sheet>
   );
+}
+
+/** A destination key (a connection id, or a provider kind for one with none) named for a human. */
+function destinationName(destination: string, connections: { id: string; label: string }[]): string {
+  const connection = connections.find((entry) => entry.id === destination);
+  if (connection) return connection.label;
+  if (destination === 'cli-agent') return 'A command-line agent';
+  return `An unknown destination (${destination})`;
+}
+
+/** What "Source" says, read-only, about where this persona (and its content) came from. */
+function sourceDescription(draft: PersonaDraft, persona: Persona | null): string {
+  switch (draft.origin) {
+    case 'imported':
+      return 'Imported from a Character Card file. Its content — including any provider or tool preference — came from outside this app.';
+    case 'marketplace':
+      return 'Added from the marketplace. Its content — including any provider or tool preference — came from outside this app.';
+    case 'builtin':
+      return 'Built into the app.';
+    case 'authored':
+    case undefined:
+      return persona
+        ? 'Authored in this app.'
+        : 'Will be marked as authored in this app once saved.';
+    default:
+      return 'Authored in this app.';
+  }
 }
 
 /**
