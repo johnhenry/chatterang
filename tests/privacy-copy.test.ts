@@ -2302,6 +2302,42 @@ describe('README.md’s privacy list', () => {
     expect(section).toMatch(/`privacy`/);
     expect(section).toMatch(/generated from the code/i);
   });
+
+  /**
+   * The local-cli route (#42, #115), folded into item 2 rather than given a
+   * new numbered item: `src/shell/commands.ts`'s "messages you send to"
+   * bullet is already generic over any enabled connection's label, CLI or
+   * not, so the command's own bullet COUNT does not change when a CLI
+   * connection exists -- only which labels it names. Giving the README a
+   * SIXTH item here would therefore desynchronise the two counts this file
+   * pins elsewhere ("has exactly five numbered items" / "has exactly five
+   * routes"), which is precisely the drift this whole describe block exists
+   * to catch.
+   */
+  it('names the local-cli route truthfully, off until one is added, inside the existing provider item (#42, #115)', async () => {
+    expect(section).toMatch(/local agent\s+CLI/i);
+    expect(section).toContain('Claude Code, Codex');
+    // Never claims the CLI's process running locally means nothing left --
+    // the exact promise `CONTAINMENT_PROMISE` above pins against, and the
+    // exact thing the thread chip (`ranThroughLocalCli`,
+    // `src/domain/chat.ts`) exists to correct.
+    expect(section).not.toMatch(CONTAINMENT_PROMISE);
+    expect(section).toContain('Chatterang never sees or stores a key for it');
+    expect(section).toContain('never merely "on device."');
+    // "off until you add one" is item 2's own opening clause, and the CLI
+    // sentence rides on it rather than repeating "off by default" a second
+    // time in different words.
+    expect(section).toMatch(/off until you add\s+one/);
+
+    // And the command's own bullet, which the README sentence describes,
+    // actually names a CLI connection's label the identical way it names
+    // any other enabled provider's -- the same pairing style the other
+    // routes in this block are checked with.
+    const output = await privacyOutput({
+      providers: [{ id: 'c1', label: 'Claude Code', enabled: true, defaultModel: '' }],
+    });
+    expect(output).toContain('messages you send to: Claude Code');
+  });
 });
 
 /**
