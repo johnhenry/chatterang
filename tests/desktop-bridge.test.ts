@@ -944,11 +944,29 @@ describe('listener lifecycle', () => {
     expect(dropped).toHaveLength(0);
   });
 
-  it('refuses a subscription to an event the plugin does not declare', async () => {
+  it('a subscription to an event the plugin does not declare resolves inert, not rejected', async () => {
+    // WAS a `.rejects.toThrow(/emits no event/)` assertion, pinning
+    // `nativeCallback`'s addListener branch to reject on refusal. That is
+    // exactly the promise real `@capacitor/core` cannot safely reject:
+    // `addListenerNative` (`node_modules/@capacitor/core/dist/index.js`) does
+    // `call.then(() => resolve({remove}))` with no `onRejected`, so a
+    // rejection here never reaches the page — the awaiting call hangs
+    // forever instead — which is the bug behind the "stuck on THINKING"
+    // report this test suite now also covers end-to-end (see "registerPlugin
+    // in src/ resolves to the desktop bridge" > "addListener for an event the
+    // plugin does not declare …", above). `capacitor-shim.ts`'s
+    // `nativeCallback` now resolves an undeclared event to an inert
+    // subscription instead — no different, to the caller, from a declared
+    // event that simply never fires. The refusal itself is not lost: the
+    // underlying `PreloadBridge.addListener` (`renderer.ts`) still answers
+    // `{ok:false}` with the same message; this is what nativeCallback reads
+    // to decide not to relay it as a Promise rejection.
     const h = harness(scripted(async (o) => endEvent(o.requestId, 'stop')));
+    // -1: the sentinel `nativeCallback` resolves with — nothing is
+    // subscribed, so nothing is there for `removeListener` to remove.
     await expect(
       h.bridge.addListener(LLAMA_PLUGIN.name, 'llamaWhatever', () => undefined),
-    ).rejects.toThrow(/emits no event "llamaWhatever"/);
+    ).resolves.toBe(-1);
     expect(h.host.subscriptionCount()).toBe(0);
   });
 });
@@ -1289,6 +1307,63 @@ describe('registerPlugin in src/ resolves to the desktop bridge', () => {
     expect(capacitor.PluginHeaders[0]?.name).toBe('LlamaCpp');
     expect(capacitor.PluginHeaders[0]?.methods.map((m) => m.name)).toContain('addListener');
     expect(capacitor.PluginHeaders[0]?.methods.map((m) => m.name)).toContain('generate');
+  });
+
+  it('addListener for an event the plugin does not declare settles instead of hanging forever', async () => {
+    // THE BUG. `LLAMA_PLUGIN`'s events are `llamaToken`, `llamaEnd`,
+    // `llamaThermal` (protocol.ts) — `llamaWaiting` is not among them, and
+    // `src/ai/backends/llama-cpp.ts` deliberately subscribes to it anyway,
+    // wrapped in `.catch(() => null)`, tolerating exactly this refusal.
+    //
+    // With a plugin header, `Plugins.LlamaCpp.addListener` is Capacitor's own
+    // `addListenerNative` (`node_modules/@capacitor/core/dist/index.js`),
+    // which does `call.then(() => resolve({remove}))` with NO `onRejected`.
+    // When `call` (our `nativeCallback`'s promise) rejects — which it did,
+    // because the bridge refuses an undeclared event — that `.then()` callback
+    // never runs, `resolve` is never called, and the promise this test awaits
+    // never settles. The `.catch(() => null)` in llama-cpp.ts never even gets
+    // a chance to run: there is nothing to catch.
+    //
+    // This is reproduced against the REAL `@capacitor/core`, not a mock of
+    // it, which is why `tests/llama-waiting.test.ts` (a hand-rolled fake
+    // plugin whose `addListener` rejects directly) stays green while this
+    // hangs: the fake never goes through `addListenerNative` at all.
+    const raced = await Promise.race([
+      (LlamaCpp as unknown as { addListener(name: string, cb: () => void): Promise<unknown> })
+        .addListener('llamaWaiting', () => undefined)
+        .then(() => 'resolved' as const)
+        .catch(() => 'rejected' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 200)),
+    ]);
+    expect(raced).not.toBe('timeout');
+  });
+
+  it('addListener for an event the plugin does not declare raises no unhandled rejection', async () => {
+    // THE SECOND BUG. Even once the promise above is made to settle, the
+    // rejection Capacitor's proxy generates internally
+    // (`call.then(() => resolve({remove}))` returns its OWN derived promise,
+    // discarded, with no rejection handler of its own) is a genuine
+    // `@capacitor/core` defect this repo cannot patch. The fix therefore has
+    // to stop the rejection from happening in the first place, at
+    // `nativeCallback` — not merely add a `.catch()` somewhere downstream,
+    // which cannot reach a promise it never gets a reference to.
+    let unhandled: unknown = null;
+    const onUnhandled = (reason: unknown): void => {
+      unhandled = reason;
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await (
+        LlamaCpp as unknown as { addListener(name: string, cb: () => void): Promise<unknown> }
+      )
+        .addListener('llamaWaiting', () => undefined)
+        .catch(() => undefined);
+      // Flush microtasks so a same-tick unhandled rejection has been reported.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toBeNull();
   });
 });
 
