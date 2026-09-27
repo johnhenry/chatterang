@@ -552,6 +552,18 @@ export class ChatterangEngine {
   #remotes = new Map<string, BackendAdapter>();
   /** Default model per registered backend, used when a fallback retargets. */
   #fallbackModels = new Map<string, string>();
+  /**
+   * Connection ids whose descriptor is `kind: 'local-cli'` (#42, #115).
+   *
+   * A CLI backend runs on THIS device but reaches its own vendor over a
+   * login this app never sees — a divert to it would be the honest opposite
+   * of what a cloud-pressure fallback is for. `setFallbackBackend` below is
+   * the one place `#options.fallbackBackendId` is ever assigned, so refusing
+   * a CLI connection id there is sufficient to keep `#resolveFallback` (the
+   * one place that id is ever read back) from ever handing a divert to one —
+   * there is no second path that sets this option.
+   */
+  #cliConnectionIds = new Set<string>();
   #pendingTools: ExecutedTool[] = [];
   #lastFallback: FallbackEvent | null = null;
   /** `metadata.warnings` from the response this turn produced (#149). */
@@ -647,6 +659,8 @@ export class ChatterangEngine {
 
     const adapter = await descriptor.load(connectionConfig(connection));
     this.#remotes.set(connection.id, adapter);
+    if (descriptor.kind === 'local-cli') this.#cliConnectionIds.add(connection.id);
+    else this.#cliConnectionIds.delete(connection.id);
 
     // Reconnecting an existing provider — the user rotated their API key, or
     // changed the endpoint — swaps the adapter in place. `register` would
@@ -665,6 +679,7 @@ export class ChatterangEngine {
   disconnectProvider(connectionId: string): void {
     this.#remotes.delete(connectionId);
     this.#fallbackModels.delete(connectionId);
+    this.#cliConnectionIds.delete(connectionId);
 
     // Unregistering an absent backend still throws, so a double-disconnect
     // must not be able to take the settings screen down with it.
@@ -685,6 +700,14 @@ export class ChatterangEngine {
   }
 
   setFallbackBackend(backendId: string | null): void {
+    // #42/#115: a local agent CLI is never fallback-eligible. Refusing here,
+    // the one place `fallbackBackendId` is ever assigned, is what makes it
+    // true regardless of what any future UI offers — see `#cliConnectionIds`.
+    if (backendId !== null && this.#cliConnectionIds.has(backendId)) {
+      throw new Error(
+        `"${backendId}" is a local agent CLI connection and can never be the cloud-pressure fallback.`,
+      );
+    }
     this.#options = { ...this.#options, fallbackBackendId: backendId };
   }
 

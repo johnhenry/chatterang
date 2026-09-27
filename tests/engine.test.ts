@@ -1186,3 +1186,76 @@ describe('a stream that ends without a terminal chunk fails the turn (#260)', ()
     expect(events.some((event) => event.type === 'error')).toBe(false);
   });
 });
+
+describe('a local-cli connection is never fallback-eligible (#42, #115)', () => {
+  it('setFallbackBackend refuses a connection whose descriptor is kind local-cli', async () => {
+    const { getProvider } = await import('@/ai/providers');
+    const descriptor = getProvider('cli-claude');
+    if (!descriptor) throw new Error('expected the "cli-claude" provider descriptor to exist');
+    expect(descriptor.kind).toBe('local-cli');
+
+    // `connectProvider` calls `descriptor.load(...)` for real, which would
+    // reach for the `Cli` Capacitor plugin -- irrelevant to what this test
+    // measures, so the descriptor's own `load` is stubbed for this one call.
+    const loadSpy = vi.spyOn(descriptor, 'load').mockResolvedValue(scriptedBackend(['hi']));
+    try {
+      const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+      await engine.connectProvider({
+        id: 'conn_cli_claude',
+        providerId: 'cli-claude',
+        label: 'Claude Code',
+        apiKey: '',
+        baseUrl: '',
+        defaultModel: '',
+        enabled: true,
+        models: [],
+        createdAt: Date.now(),
+      });
+
+      expect(() => engine.setFallbackBackend('conn_cli_claude')).toThrow(/local agent CLI/);
+      // The refusal is not merely thrown and ignored -- the option genuinely
+      // never changes, so a caller who (wrongly) swallowed the exception
+      // still cannot have diverted a turn to it.
+      expect(engine.fallbackBackendId).toBeNull();
+    } finally {
+      loadSpy.mockRestore();
+    }
+  });
+
+  it('an ordinary remote connection is still fallback-eligible, the paired control', async () => {
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register('conn_openai', scriptedBackend(['hi']));
+    expect(() => engine.setFallbackBackend('conn_openai')).not.toThrow();
+    expect(engine.fallbackBackendId).toBe('conn_openai');
+  });
+
+  it('disconnecting a CLI connection and reconnecting a same-id remote one clears the refusal', async () => {
+    // Guards against a stale id lingering in the refusal set past a
+    // disconnect -- `disconnectProvider` must actually clear it, not just the
+    // backend map, or a connection id reused later would inherit a refusal
+    // that no longer describes what is registered under it.
+    const { getProvider } = await import('@/ai/providers');
+    const descriptor = getProvider('cli-claude');
+    if (!descriptor) throw new Error('expected the "cli-claude" provider descriptor to exist');
+    const loadSpy = vi.spyOn(descriptor, 'load').mockResolvedValue(scriptedBackend(['hi']));
+    try {
+      const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+      await engine.connectProvider({
+        id: 'conn_reused',
+        providerId: 'cli-claude',
+        label: 'Claude Code',
+        apiKey: '',
+        baseUrl: '',
+        defaultModel: '',
+        enabled: true,
+        models: [],
+        createdAt: Date.now(),
+      });
+      engine.disconnectProvider('conn_reused');
+      engine.router.register('conn_reused', scriptedBackend(['hi']));
+      expect(() => engine.setFallbackBackend('conn_reused')).not.toThrow();
+    } finally {
+      loadSpy.mockRestore();
+    }
+  });
+});

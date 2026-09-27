@@ -2,9 +2,11 @@ import { useState, type ReactNode } from 'react';
 
 import { Icon } from '@/ui/Icon';
 import { Confirm, Sheet, Switch } from '@/ui/primitives';
-import { PROVIDERS, type ProviderConnection, type ProviderDescriptor } from '@/ai/providers';
+import { PROVIDERS, getProvider, type ProviderConnection, type ProviderDescriptor } from '@/ai/providers';
 import { newId } from '@/domain/chat';
 import { useApp } from '@/state/app';
+import { capabilities } from '@/lib/platform';
+import { Cli, type CliDiscoverResult } from '@/plugins/cli';
 
 /**
  * Remote provider management (PRD §3.5).
@@ -29,6 +31,7 @@ export function ProvidersPanel(): ReactNode {
     'self-hosted': PROVIDERS.filter((provider) => provider.kind === 'self-hosted'),
     cloud: PROVIDERS.filter((provider) => provider.kind === 'cloud'),
     aggregator: PROVIDERS.filter((provider) => provider.kind === 'aggregator'),
+    'local-cli': PROVIDERS.filter((provider) => provider.kind === 'local-cli'),
   };
 
   return (
@@ -102,6 +105,11 @@ export function ProvidersPanel(): ReactNode {
               <option value="">Never fall back — fail instead</option>
               {connections
                 .filter((connection) => connection.enabled)
+                // #42/#115: a local agent CLI is never fallback-eligible --
+                // it is not "the cloud", and the engine's own
+                // `setFallbackBackend` refuses one regardless, but the
+                // option should never be offered here either.
+                .filter((connection) => getProvider(connection.providerId)?.kind !== 'local-cli')
                 .map((connection) => (
                   <option key={connection.id} value={connection.id}>
                     {connection.label}
@@ -137,8 +145,34 @@ export function ProvidersPanel(): ReactNode {
         providers={grouped.aggregator}
         onPick={setAdding}
       />
+      {/*
+       * #42/#115: a local agent CLI is a subprocess on THIS device, not an
+       * HTTP endpoint -- but reaches its own vendor under a login this app
+       * never sees, so it is grouped on its own rather than folded into
+       * "self-hosted" (nothing here is a server) or "cloud" (nothing here
+       * is a key this app holds). Shown on every platform -- never hidden --
+       * so `tests/ollama-origins.test.tsx` and `tests/privacy-copy.test.ts`'s
+       * generic "every provider gets a list item with a note" loops need no
+       * platform mock to find it; what changes on a non-desktop platform is
+       * the hint text and the sheet's own controls, not whether the row
+       * exists.
+       */}
+      <ProviderGroup
+        title="Local CLIs"
+        hint={
+          capabilities().cliAgents
+            ? 'Runs a CLI you already have installed and signed in to, as a subprocess on this device. Messages go to that CLI’s own vendor under your own login there — Chatterang never sees or stores a key for it.'
+            : 'Local agent CLIs run as a subprocess on this device, so they are available in the desktop app only.'
+        }
+        providers={grouped['local-cli']}
+        onPick={setAdding}
+      />
 
-      {adding ? <ConnectSheet provider={adding} onClose={() => setAdding(null)} /> : null}
+      {adding
+        ? adding.kind === 'local-cli'
+          ? <CliConnectSheet provider={adding} onClose={() => setAdding(null)} />
+          : <ConnectSheet provider={adding} onClose={() => setAdding(null)} />
+        : null}
 
       <Confirm
         open={confirmRemove !== null}
@@ -343,6 +377,169 @@ function ConnectSheet({
           onChange={(event) => setDefaultModel(event.target.value)}
         />
       </div>
+    </Sheet>
+  );
+}
+
+/** `provider.id`'s `cli-` prefix stripped, the `cliId` the `Cli` plugin and `cli.ts`'s `SupportedCliId` both use. */
+function cliIdFor(provider: ProviderDescriptor): string {
+  return provider.id.replace(/^cli-/, '');
+}
+
+/**
+ * The four failure states `CliDiscoverResult` can report, in plain words —
+ * no jargon, no "sandboxed" (cli-specs.ts's own ruling on Codex's residual;
+ * see `note` in `providers.ts`, rendered above this sheet's Find button).
+ */
+function discoveryMessage(result: CliDiscoverResult, label: string): string {
+  switch (result.status) {
+    case 'not-found':
+      return `No ${label} binary was found on your PATH.`;
+    case 'not-executable':
+      return `Found a file at ${result.path}, but it is not executable.`;
+    case 'version-unreadable':
+      return `Found ${result.path}, but its version could not be read.`;
+    case 'not-signed-in':
+      return `Found ${result.path} (version ${result.version}), but it is not signed in. Sign in with ${label} itself, then Find again.`;
+    case 'found':
+      return `Found ${result.path} (version ${result.version}).`;
+  }
+}
+
+/**
+ * The Add sheet for a `local-cli` provider (#42, #115, #116).
+ *
+ * NOT `ConnectSheet`, on purpose: there is no key field, no base-URL field,
+ * and no default-model field to type — the CLI is signed in on the user's
+ * own behalf, outside this app, and `providers.ts`'s local-cli `load()`
+ * ignores every field of the config those other fields would fill in. What
+ * this sheet needs instead is an explicit "Find" (#116: never ambient —
+ * nothing here probes for a binary until this button is pressed), which
+ * calls the SAME `Cli.discover` the real backend never calls itself, and a
+ * plain-words report of whichever of the four failure states (or the one
+ * success state) it came back with. Add is disabled until that report says
+ * `found`.
+ *
+ * NO "CHOOSE FILE…" OVERRIDE. The task that added this sheet asked for one,
+ * "if the codebase already has a file picker on desktop" — there is a
+ * FOLDER picker (`MountHost.pick()`, `apps/desktop/src/main.ts`'s
+ * `dialog.showOpenDialog` with `properties: ['openDirectory']`, behind
+ * #246's shell-mount grant flow), but no picker for a single FILE anywhere
+ * in this codebase, and CLI discovery is deliberately PATH-based rather than
+ * a path a user types or browses to (`apps/desktop/src/bridge/cli-discovery.ts`).
+ * Building a new file-picker plugin, wiring it through a `contextBridge`
+ * boundary, and deciding what confinement rule applies to an arbitrary
+ * chosen binary is real, undone work outside this unit's scope — so this is
+ * skipped, noted here rather than silently, and Find-by-PATH is the only way
+ * in for now.
+ */
+function CliConnectSheet({
+  provider,
+  onClose,
+}: {
+  provider: ProviderDescriptor;
+  onClose: () => void;
+}): ReactNode {
+  const desktop = capabilities().cliAgents;
+  const cliId = cliIdFor(provider);
+  const [label, setLabel] = useState(provider.label);
+  const [finding, setFinding] = useState(false);
+  const [result, setResult] = useState<CliDiscoverResult | null>(null);
+
+  const ready = desktop && result?.status === 'found' && label.trim().length > 0;
+
+  const find = (): void => {
+    setFinding(true);
+    void Cli.discover({ cliId })
+      .then((discovered) => setResult(discovered))
+      .finally(() => setFinding(false));
+  };
+
+  return (
+    <Sheet
+      open
+      title={`Add ${provider.label}`}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn btn--secondary grow" onClick={onClose}>
+            Cancel
+          </button>
+          {desktop ? (
+            <button
+              type="button"
+              className="btn btn--remote grow"
+              disabled={!ready}
+              onClick={() => {
+                const connection: ProviderConnection = {
+                  id: newId('conn'),
+                  providerId: provider.id,
+                  label: label.trim(),
+                  apiKey: '',
+                  baseUrl: '',
+                  defaultModel: '',
+                  enabled: true,
+                  models: [],
+                  createdAt: Date.now(),
+                };
+                void useApp.getState().addConnection(connection);
+                onClose();
+              }}
+            >
+              Add
+            </button>
+          ) : null}
+        </>
+      }
+    >
+      <div className="card card--remote">
+        <div className="row" style={{ gap: 'var(--s-2)' }}>
+          <Icon name="cloud" size={16} />
+          <span className="card__title grow">What this means</span>
+        </div>
+        <p style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>{provider.note}</p>
+      </div>
+
+      {desktop ? (
+        <>
+          <div className="field">
+            <label className="field__label" htmlFor="cli-conn-label">
+              Name
+            </label>
+            <input
+              id="cli-conn-label"
+              className="input"
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+            />
+            <span className="field__hint">How it appears in the model picker.</span>
+          </div>
+
+          <div className="field">
+            <button
+              type="button"
+              className="btn btn--secondary"
+              disabled={finding}
+              onClick={find}
+            >
+              {finding ? 'Finding…' : 'Find'}
+            </button>
+            <span className="field__hint">
+              Looks for a {cliId} binary on your PATH — nothing is checked until you press this.
+            </span>
+            {result ? (
+              <p role="status" style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>
+                {discoveryMessage(result, provider.label)}
+              </p>
+            ) : null}
+          </div>
+        </>
+      ) : (
+        <p className="section__hint">
+          {provider.label} runs as a subprocess on this device, so adding it needs the desktop
+          app — this platform cannot spawn one.
+        </p>
+      )}
     </Sheet>
   );
 }
