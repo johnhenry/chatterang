@@ -2323,8 +2323,13 @@ export function providerDestinationLabel(
     const kind = descriptor?.kind === 'self-hosted' ? 'self-hosted' : 'cloud';
     return `${connection.label} (${kind})`;
   }
-  // 'cli-agent': no connection of its own in this app yet (#23, #122).
-  return 'a command-line agent';
+  // 'cli-agent' (#42, #115): a real local-cli connection, once one is named
+  // and actually added -- "a command-line agent" stays the fallback for a
+  // preference that names none yet, or names one since removed.
+  const connection = connections.find(
+    (entry) => entry.id === provider.connectionId && getProvider(entry.providerId)?.kind === 'local-cli',
+  );
+  return connection ? `${connection.label} (local CLI)` : 'a command-line agent';
 }
 
 /**
@@ -2346,11 +2351,13 @@ export function providerDestinationLabel(
  *    exactly this same `{}`, so a UI never has to tell "no connection" apart
  *    from "not consented yet" by reading anything other than the pending
  *    query below.
- *  - `'cli-agent'` is a placeholder (#23, #122): it round-trips through
- *    `agentConfig` and is validated by `sanitizeAgentConfig`, and IS
- *    consent-gated below (the ruling names it explicitly), but nothing
- *    resolves it to a backend in this pass either way — another track owns
- *    that target kind — so it resolves to `{}` regardless of consent.
+ *  - `'cli-agent'` (#42, #115) resolves exactly like `'remote-connection'`
+ *    now, restricted to a connection whose descriptor is `kind: 'local-cli'`
+ *    — a persona preference naming an ordinary remote connection under this
+ *    kind resolves to `{}`, the same as naming one that was removed. Consent
+ *    is checked the same way and at the same point as `'remote-connection'`
+ *    (the ruling named `cli-agent` explicitly, before either kind actually
+ *    resolved to anything).
  */
 function resolvePersonaProvider(
   persona: PersonaProviderContext | undefined,
@@ -2381,8 +2388,19 @@ function resolvePersonaProvider(
     return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
   }
 
-  // 'cli-agent': recognised, consent-gated above, resolved to nothing here.
-  return {};
+  // 'cli-agent' (#42, #115): the same resolution as 'remote-connection',
+  // restricted to a connection whose descriptor is actually `local-cli` --
+  // never a plain remote one a persona card mislabelled.
+  const connection = provider.connectionId
+    ? connections.find(
+        (entry) =>
+          entry.id === provider.connectionId &&
+          entry.enabled &&
+          getProvider(entry.providerId)?.kind === 'local-cli',
+      )
+    : undefined;
+  if (!connection) return {};
+  return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
 }
 
 /**
@@ -2408,7 +2426,16 @@ export function providerConsentPending(
     // nothing concrete for the user to be saying yes to yet.
     return connections.some((entry) => entry.id === provider.connectionId && entry.enabled);
   }
-  return true; // 'cli-agent'
+  // 'cli-agent' (#42, #115): matches `resolvePersonaProvider`'s own
+  // restricted lookup exactly -- an enabled connection whose descriptor is
+  // actually `local-cli`, same reasoning as the `remote-connection` branch
+  // above: nothing concrete to consent to otherwise.
+  return connections.some(
+    (entry) =>
+      entry.id === provider.connectionId &&
+      entry.enabled &&
+      getProvider(entry.providerId)?.kind === 'local-cli',
+  );
 }
 
 /** Decide which backend and model serve this chat. */
