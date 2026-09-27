@@ -26,10 +26,25 @@
  * renderer can reach this plugin. This is slightly wasteful (the login shell
  * is asked twice for two turns of the same CLI moments apart) and
  * deliberately so.
+ *
+ * A TURN OUTLIVES NEITHER ITS WINDOW NOR THE APP. `PluginHost` has no
+ * teardown hook of its own — every OTHER long-lived thing this app spawns
+ * (`WorkBroker`'s local turns, the worker host, the inference fleet) is
+ * released by `main.ts` calling into it directly from the SAME renderer
+ * teardown and `will-quit` handlers that release everything else, and this
+ * is that seam for `Cli`: {@link createCliPlugin} returns its
+ * `PluginImplementation` augmented with two methods `main.ts` calls
+ * directly, never through `PluginHost.invoke` (they are not in
+ * `CLI_METHODS`, so a renderer cannot reach them either) —
+ * `releaseRenderer(ownerId)` cancels every turn that window started, and
+ * `disposeAll()` cancels every turn there is. Without this, `spawnCliTurn`'s
+ * `detached: true` process group — the very thing that lets `cancel()` kill
+ * a whole tree — is exactly what lets an orphaned turn survive its window,
+ * or the app itself, with nothing left to signal it.
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { access, mkdir, stat } from 'node:fs/promises';
+import { access, mkdir, rm, stat } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
@@ -148,9 +163,22 @@ function execBinary(path: string, args: readonly string[]): Promise<CliExecResul
 }
 
 /**
+ * The `PluginImplementation` `PluginHost.register(CLI_PLUGIN, …)` takes,
+ * plus the two teardown methods `main.ts` calls directly (never through
+ * `PluginHost.invoke` -- see this file's header). Both are safe to call when
+ * nothing is running: an empty `turns` map makes either one a no-op.
+ */
+export type CliPluginImplementation = PluginImplementation & {
+  /** Cancel every turn `ownerId` started. Called from the same renderer-teardown path `localTurns.releaseRenderer` is. */
+  readonly releaseRenderer: (ownerId: number) => void;
+  /** Cancel every turn there is, regardless of owner. Called from `app.once('will-quit', ...)`. */
+  readonly disposeAll: () => void;
+};
+
+/**
  * Build the main-process implementation `PluginHost.register(CLI_PLUGIN, …)` takes.
  */
-export function createCliPlugin(options: CliPluginOptions): PluginImplementation {
+export function createCliPlugin(options: CliPluginOptions): CliPluginImplementation {
   const parentEnv = options.parentEnv ?? process.env;
   const turns = new Map<string, { readonly ownerId: number; readonly handle: CliTurnHandle }>();
 
@@ -211,6 +239,12 @@ export function createCliPlugin(options: CliPluginOptions): PluginImplementation
         onExit: (exit: CliTurnExit) => {
           turns.delete(requestId);
           options.notify('cliExit', { requestId, code: exit.code, signal: exit.signal }, ownerId);
+          // Best-effort, every time a turn ends however it ends -- a
+          // natural exit, a cancel, a releaseRenderer/disposeAll sweep. Never
+          // awaited: nothing here is on a path anyone is waiting for, and a
+          // scratch directory that fails to delete (a file still open a
+          // beat longer on some platform) is not a reason to hold anything up.
+          void rm(cwd, { recursive: true, force: true }).catch(() => undefined);
         },
       },
       spawnDeps,
@@ -232,6 +266,21 @@ export function createCliPlugin(options: CliPluginOptions): PluginImplementation
     turn.handle.cancel();
   }
 
+  /** Cancel every turn matching `predicate`. Shared by `releaseRenderer` and `disposeAll`. */
+  function cancelWhere(predicate: (ownerId: number) => boolean): void {
+    for (const turn of turns.values()) {
+      if (predicate(turn.ownerId)) turn.handle.cancel();
+    }
+  }
+
+  function releaseRenderer(ownerId: number): void {
+    cancelWhere((candidate) => candidate === ownerId);
+  }
+
+  function disposeAll(): void {
+    cancelWhere(() => true);
+  }
+
   const implementation: Record<string, PluginMethod> = {
     discover: discover as PluginMethod,
     startTurn: startTurn as PluginMethod,
@@ -239,5 +288,7 @@ export function createCliPlugin(options: CliPluginOptions): PluginImplementation
   };
   return Object.assign(implementation, {
     [SENDER_SCOPED]: ['startTurn', 'cancelTurn'],
-  }) as unknown as PluginImplementation;
+    releaseRenderer,
+    disposeAll,
+  }) as unknown as CliPluginImplementation;
 }

@@ -180,9 +180,10 @@ describe('the main process actually installs it, down the bridge', () => {
     expect(main).toContain('Menu.setApplicationMenu');
     // The first window is created by this call. #7 S6 renamed its middle
     // argument (the teardown now reaches the work broker as well as the fleet),
-    // and the old literal's -1 turned this into "expected N to be less than -1";
-    // so the call is now asserted to exist before it is compared against.
-    const firstWindow = main.indexOf('createWindow(pluginHost, localTurns, senders)');
+    // and #118 added a fourth (the CLI plugin's own teardown methods); the old
+    // literal's -1 turned this into "expected N to be less than -1", so the
+    // call is now asserted to exist before it is compared against.
+    const firstWindow = main.indexOf('createWindow(pluginHost, localTurns, senders, cliPlugin)');
     expect(firstWindow, 'main.ts no longer creates its first window with this call').toBeGreaterThan(-1);
     expect(call).toBeLessThan(firstWindow);
   });

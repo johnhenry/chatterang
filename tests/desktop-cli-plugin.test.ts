@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
@@ -79,15 +79,13 @@ function stand(scriptPath: string) {
     listener(structuredClone(payload.data));
     return true;
   });
-  host.register(
-    CLI_PLUGIN,
-    createCliPlugin({
-      turnRoot: freshTurnRoot(),
-      notify: (eventName, data, ownerId) => host.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
-      discoveryDeps: fakeDiscoveryDeps(scriptPath),
-      spawnDeps: REAL_SPAWN_DEPS,
-    }),
-  );
+  const cliPlugin = createCliPlugin({
+    turnRoot: freshTurnRoot(),
+    notify: (eventName, data, ownerId) => host.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
+    discoveryDeps: fakeDiscoveryDeps(scriptPath),
+    spawnDeps: REAL_SPAWN_DEPS,
+  });
+  host.register(CLI_PLUGIN, cliPlugin);
 
   let nextSubscription = 0;
   const listen = (ownerId: number, eventName: string, listener: (event: unknown) => void): void => {
@@ -96,7 +94,10 @@ function stand(scriptPath: string) {
     subscribers.set(`${ownerId}:${nextSubscription}`, listener);
   };
 
-  return { host, listen };
+  // The two teardown methods `main.ts` calls DIRECTLY on the object
+  // `createCliPlugin` returns -- never through `host.invoke`, since they are
+  // not in `CLI_PLUGIN.methods` and a renderer has no way to reach them.
+  return { host, listen, cliPlugin };
 }
 
 describe('discover, through PluginHost (#116: explicit add, never ambient)', () => {
@@ -228,4 +229,152 @@ describe('cancelTurn, through PluginHost, kills the whole process group (#115, #
     });
     await expect(host.invoke(OWNER, CLI_PLUGIN.name, 'cancelTurn', [{ requestId: 'req-5' }])).resolves.toBeUndefined();
   });
+});
+
+describe('releaseRenderer/disposeAll -- the teardown methods main.ts calls directly, never through PluginHost (#42, #115)', () => {
+  async function startHungTurn(
+    stood: ReturnType<typeof stand>,
+    requestId: string,
+    ownerId: number,
+  ): Promise<{ pid: number; grandchildPid: number }> {
+    return new Promise((resolveStarted) => {
+      stood.listen(ownerId, 'cliData', (event) => {
+        const { stream, chunk } = event as { readonly stream: string; readonly chunk: Uint8Array };
+        if (stream !== 'stderr') return;
+        const text = new TextDecoder().decode(chunk);
+        if (!text.includes('grandchildPid')) return;
+        resolveStarted(JSON.parse(text.trim()) as { pid: number; grandchildPid: number });
+      });
+      void stood.host.invoke(ownerId, CLI_PLUGIN.name, 'startTurn', [{ requestId, cliId: 'claude' }]);
+    });
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function waitUntilDead(...pids: readonly number[]): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (pids.some((pid) => isAlive(pid)) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  it('releaseRenderer kills every turn a window owns -- process group, grandchild too -- and turns owned by another window survive', async () => {
+    const stood = stand(HANG_SCRIPT);
+    const mine = await startHungTurn(stood, 'req-owned', OWNER);
+    const theirs = await startHungTurn(stood, 'req-other', OTHER_OWNER);
+    const myExits: unknown[] = [];
+    stood.listen(OWNER, 'cliExit', (event) => myExits.push(event));
+
+    stood.cliPlugin.releaseRenderer(OWNER);
+    await waitUntilDead(mine.pid, mine.grandchildPid);
+
+    expect(isAlive(mine.pid)).toBe(false);
+    expect(isAlive(mine.grandchildPid)).toBe(false);
+    // Exactly one cliExit for the released turn -- the coordinator's "going
+    // nowhere" case is exercised by NOT keeping a listener at all for
+    // OTHER_OWNER below; this listener exists only to prove releaseRenderer
+    // produces exactly one terminal event, not zero and not two.
+    expect(myExits).toHaveLength(1);
+    expect(myExits[0]).toMatchObject({ requestId: 'req-owned', signal: 'SIGTERM' });
+
+    // The other window's turn is untouched by releasing THIS window.
+    expect(isAlive(theirs.pid)).toBe(true);
+    expect(isAlive(theirs.grandchildPid)).toBe(true);
+
+    // Clean up for real, so this test does not leak a hung process.
+    stood.cliPlugin.disposeAll();
+    await waitUntilDead(theirs.pid, theirs.grandchildPid);
+  }, 15000);
+
+  it('releaseRenderer emits its one cliExit even when nothing is listening for it any more (the window is already gone)', async () => {
+    const stood = stand(HANG_SCRIPT);
+    const mine = await startHungTurn(stood, 'req-gone', OWNER);
+    // No listener kept -- simulates the window having already been torn
+    // down. `PluginHost.notifyListeners` finding no subscriber is not an
+    // error (core PluginHost behaviour, exercised elsewhere); the claim
+    // here is narrower: releaseRenderer still reaches the process itself.
+    stood.cliPlugin.releaseRenderer(OWNER);
+    await waitUntilDead(mine.pid, mine.grandchildPid);
+    expect(isAlive(mine.pid)).toBe(false);
+    expect(isAlive(mine.grandchildPid)).toBe(false);
+  }, 10000);
+
+  it('disposeAll kills every turn regardless of owner', async () => {
+    const stood = stand(HANG_SCRIPT);
+    const a = await startHungTurn(stood, 'req-a', OWNER);
+    const b = await startHungTurn(stood, 'req-b', OTHER_OWNER);
+
+    stood.cliPlugin.disposeAll();
+    await waitUntilDead(a.pid, a.grandchildPid, b.pid, b.grandchildPid);
+
+    expect(isAlive(a.pid)).toBe(false);
+    expect(isAlive(a.grandchildPid)).toBe(false);
+    expect(isAlive(b.pid)).toBe(false);
+    expect(isAlive(b.grandchildPid)).toBe(false);
+  }, 15000);
+
+  it('both methods are no-ops, not throws, when nothing is running', () => {
+    const stood = stand(REPLAY_SCRIPT);
+    expect(() => stood.cliPlugin.releaseRenderer(OWNER)).not.toThrow();
+    expect(() => stood.cliPlugin.disposeAll()).not.toThrow();
+  });
+});
+
+describe('a turn cleans up its own scratch cwd (#120: LOW)', () => {
+  it('removes <turnRoot>/<requestId> once the turn ends naturally', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    let turnCwd: string | undefined;
+    await new Promise<void>((resolveDone) => {
+      stood.listen(OWNER, 'cliData', (event) => {
+        const { stream, chunk } = event as { readonly stream: string; readonly chunk: Uint8Array };
+        if (stream !== 'stderr') return;
+        const text = new TextDecoder().decode(chunk);
+        const parsed = JSON.parse(text.trim()) as { cwd?: string };
+        if (parsed.cwd !== undefined) turnCwd = parsed.cwd;
+      });
+      stood.listen(OWNER, 'cliExit', () => resolveDone());
+      void stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-cleanup', cliId: 'claude' }]);
+    });
+
+    expect(turnCwd).toBeDefined();
+    // Give the fire-and-forget rm() a moment: it runs from inside the same
+    // onExit handler that already fired cliExit, but is never awaited by it.
+    const deadline = Date.now() + 2000;
+    while (existsSync(turnCwd!) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(existsSync(turnCwd!)).toBe(false);
+  });
+
+  it('removes the scratch cwd when the turn is cancelled via releaseRenderer/disposeAll too', async () => {
+    const stood = stand(HANG_SCRIPT);
+    let turnCwd: string | undefined;
+    await new Promise<void>((resolveStarted) => {
+      stood.listen(OWNER, 'cliData', (event) => {
+        const { stream, chunk } = event as { readonly stream: string; readonly chunk: Uint8Array };
+        if (stream !== 'stderr') return;
+        const text = new TextDecoder().decode(chunk);
+        const parsed = JSON.parse(text.trim()) as { grandchildPid?: number };
+        if (parsed.grandchildPid !== undefined) resolveStarted();
+      });
+      void stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-cleanup-2', cliId: 'claude' }]);
+    });
+    turnCwd = join(turnRoot, 'req-cleanup-2');
+    expect(existsSync(turnCwd)).toBe(true);
+
+    stood.cliPlugin.disposeAll();
+
+    const deadline = Date.now() + 5000;
+    while (existsSync(turnCwd) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(existsSync(turnCwd)).toBe(false);
+  }, 10000);
 });

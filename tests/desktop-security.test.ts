@@ -776,7 +776,13 @@ describe('main.ts wiring', () => {
     // and `localTurns` is built over the fleet. FAULT INJECTED: pointing the
     // teardown back at `fleet.releaseRenderer` fails the first assertion, and
     // building `admitLocalTurns` without `fleet` fails the second.
-    expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*localTurns\.releaseRenderer\(/);
+    // The optional `\{?` tolerates the block body #42/#115's own guard, two
+    // tests below, needs (that callback now also calls
+    // `cliPlugin.releaseRenderer`) -- it still requires `localTurns
+    // .releaseRenderer(` to be the very next thing after `=>` (plus the
+    // optional brace and whitespace), so the fault this test names --
+    // pointing the teardown back at `fleet.releaseRenderer` -- still fails it.
+    expect(source).toMatch(/releaseRenderer:\s*\(id, reason\) =>\s*\{?\s*localTurns\.releaseRenderer\(/);
     expect(source).toMatch(/admitLocalTurns\(\{[^}]*\bfleet,/);
     // And over the notifier the broker was built with, so a departed window is
     // forgotten there too.
@@ -887,12 +893,46 @@ describe('main.ts wiring', () => {
     // in tests/desktop-cli-plugin.test.ts green (they construct their own
     // PluginHost and never load main.ts), which is exactly the blind spot
     // this describe block exists to close for every other registration.
-    expect(code).toMatch(/pluginHost\.register\(\s*CLI_PLUGIN,\s*createCliPlugin\(/);
+    //
+    // Kept as a `const cliPlugin = createCliPlugin(...)` rather than an
+    // inline argument to `.register` -- the two teardown methods below are
+    // called on that SAME reference, never re-created.
+    expect(code).toMatch(/const cliPlugin = createCliPlugin\(/);
+    expect(code).toMatch(/pluginHost\.register\(CLI_PLUGIN,\s*cliPlugin\)/);
     // And the turn root is `cacheRoot()`-derived, not a bare literal a future
     // edit could point at the model directory or the app's own source tree.
     const registration = code.slice(code.indexOf('createCliPlugin('), code.indexOf('createCliPlugin(') + 400);
     expect(registration).toContain('cacheRoot()');
     expect(registration).not.toContain('dataRoot()');
+  });
+
+  it('#42, #115: a departed renderer’s CLI turns are released from the SAME teardown localTurns.releaseRenderer is', () => {
+    // A CLI turn is a detached process GROUP with no other owner once its
+    // window is gone -- close, destroyed, or crashed, the same three
+    // departures RENDERER_TEARDOWN_EVENTS names. This is the blind spot: a
+    // turn released only through the renderer's own explicit cancelTurn
+    // call survives every one of those three exactly as before this guard
+    // existed, and nothing else in this file's "[6]" test can see it,
+    // because it drives `RENDERER_TEARDOWN_EVENTS` against `contents.on(...)`
+    // registrations, never against what `releaseRendererOn`'s OWN callback
+    // does once one of those fires.
+    const at = code.indexOf('releaseRenderer: (id, reason)');
+    expect(at, 'the releaseRenderer callback passed to releaseRendererOn').toBeGreaterThan(-1);
+    const callback = code.slice(at, code.indexOf('forget:', at));
+    expect(callback).toContain('localTurns.releaseRenderer(id, reason)');
+    expect(callback).toContain('cliPlugin.releaseRenderer(id)');
+  });
+
+  it('#42, #115: will-quit disposes every CLI turn, not only the broker/fleet/worker host', () => {
+    // The same blind spot as above, at the other end of the app's life: a
+    // turn started by a window that is still open when the app quits has no
+    // teardown event to release it at all -- only `will-quit` ever runs for
+    // that case, and this is the one place that stops nothing else from
+    // orphaning it.
+    const at = code.indexOf("app.once('will-quit'");
+    expect(at, "app.once('will-quit', ...)").toBeGreaterThan(-1);
+    const handler = code.slice(at, code.indexOf('});', at));
+    expect(handler).toContain('cliPlugin.disposeAll()');
   });
 });
 
