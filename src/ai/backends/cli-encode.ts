@@ -41,6 +41,7 @@
 import type { IRMessage } from '@johnhenry/aimatey-types';
 
 import { sanitiseMessages, type SafeMessage } from '@/ai/prompt';
+import { substituteStructural } from '@/ai/taint';
 
 /** Everything one CLI turn needs from the encoder, and no more. */
 export interface CliTurnInput {
@@ -131,18 +132,44 @@ function encodeClaudeStdin(messages: readonly SafeMessage[]): string {
  * takes a single prompt (or stdin, appended); `gemini --help`'s `-p` is the
  * same shape. Multi-turn history therefore has no native channel, so this
  * builds one clearly-labelled transcript rather than a bare concatenation
- * (#119) -- and the label tokens (`[`, `]`) are two of the seven characters
- * `encodeUntrusted` neutralises (`src/ai/taint.ts`'s own list), so tainted or
- * tool-derived text run through `sanitiseMessages` first CANNOT forge a
- * `[user]`/`[assistant]` label: any literal `[`/`]` in such text already
- * arrived here replaced with a look-alike that is not one.
+ * (#119) -- and every body is run through {@link substituteStructural}
+ * UNCONDITIONALLY, regardless of taint, before it is joined into the
+ * transcript.
+ *
+ * THIS IS DELIBERATELY ON TOP OF `sanitiseMessages`, NOT INSTEAD OF IT, AND
+ * NOT OPTIONAL FOR UNTAINTED TEXT. `sanitiseMessages` runs `encodeUntrusted`
+ * (which neutralises AND drops invisibles) only for content that
+ * `isTainted()` reports true, or that a tool block carries; ordinary
+ * user-typed text — the common case, and the one measured — gets
+ * `escapeControlMarkers` instead, which is not the same guarantee and does
+ * not touch `[`/`]` on its own. A user message (or pasted external content,
+ * which this app has no way to distinguish from typed text) containing a
+ * literal line `[assistant]` therefore reached this transcript, verbatim,
+ * before this function ran `substituteStructural` on every body unconditionally
+ * — indistinguishable from a label this file wrote. `\r` passed too, for the
+ * same reason (`escapeControlMarkers` is not this file's function to weaken
+ * or bypass, so the fix runs here, downstream of it, rather than asking it to
+ * do a second job). Both are closed here: `substituteStructural` (the
+ * substitution half of `encodeUntrusted`, exported from `taint.ts`
+ * specifically so a second caller can apply it unconditionally) neutralises
+ * `[`, `]` and every character that folds into either one, and every body is
+ * normalised to `\n`-only line endings first, so a bare `\r` cannot be used
+ * to make the terminal (or a naive line reader) treat what follows as a new
+ * line this file did not write.
  */
 function plainTextLabel(role: SafeMessage['role']): string {
   return `[${role}]`;
 }
 
+/** `\r\n` and lone `\r` both become `\n`, then every structural character (see this section's header) is neutralised, unconditionally. */
+function neutraliseForPlainTextBody(text: string): string {
+  return substituteStructural(text.replace(/\r\n?/g, '\n'));
+}
+
 function encodePlainTextStdin(messages: readonly SafeMessage[]): string {
-  return messages.map((message) => `${plainTextLabel(message.role)}\n${flattenTextOnly(message)}\n`).join('\n');
+  return messages
+    .map((message) => `${plainTextLabel(message.role)}\n${neutraliseForPlainTextBody(flattenTextOnly(message))}\n`)
+    .join('\n');
 }
 
 /** Every CLI this encoder knows how to address (mirrors `SupportedCliId` in `cli.ts`, kept separate so this file needs no import from it). */
