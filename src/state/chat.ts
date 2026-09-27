@@ -1491,6 +1491,25 @@ async function runGeneration(
     // Declined or allowed, `resolveTarget` below re-resolves fresh: allowed
     // now routes there; declined falls back exactly as pending consent
     // always has (the same shape as a missing connection).
+
+    /*
+     * THE CHECKPOINT ABOVE SAID "NOTHING BELOW WAITS BEFORE THAT" — AND THEN
+     * THIS AWAIT WAS ADDED BELOW IT (adversarial review, HIGH, refs #23,
+     * #122). `requestApproval` sits on a real person, for as long as the
+     * consent sheet is on screen; anything that checkpoint verified can have
+     * changed in that time: `newChat()` can have made a different chat
+     * active, this chat's delete can have been asked for, and Stop can have
+     * been pressed. Measured without this: open the sheet for chat A, switch
+     * to chat B, answer Allow — chat A's target still resolves and its reply
+     * lands in `get().messages`, which by then is chat B's live array.
+     *
+     * So every check the checkpoint made is made again, in the same order,
+     * for the same reason — nothing here is new, only repeated across the
+     * gap this await opened.
+     */
+    if (removedChats.has(chat.id)) return false;
+    if (get().activeChatId !== chat.id) return false;
+    if (controller.signal.aborted) return false;
   }
 
   const choice = resolveTarget(chat, options.overrideModelId);
