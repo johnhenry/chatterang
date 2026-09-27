@@ -29,7 +29,13 @@ import {
   type MessageVariant,
   type ToolInvocation,
 } from '@/domain/chat';
-import { renderLore, renderSystemPrompt, selectLore } from '@/domain/persona';
+import {
+  renderLore,
+  renderSystemPrompt,
+  selectLore,
+  type PersonaAgentConfig,
+  type PersonaToolConfirmPolicy,
+} from '@/domain/persona';
 import {
   DEFAULT_SAMPLER,
   canChat,
@@ -40,6 +46,7 @@ import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
 import {
   runsOnThisDevice,
   targetFor,
+  TOOL_ITERATIONS,
   type EngineTarget,
   type ToolEgressPolicy,
 } from '@/ai/engine';
@@ -897,7 +904,11 @@ export const useChats = create<ChatState>((set, get) => ({
       // in-repo array and `fromCharacterCard` never sets `tools` — so this is
       // the guard that keeps a future import route from being a privilege
       // escalation rather than a fix for a live leak.
-      tools: unsensitive(persona?.tools),
+      //
+      // `agentConfig.toolPolicy`, when a persona carries one (#7), only
+      // narrows this further — see `narrowToolPolicy` — so a persona written
+      // before that field existed is unaffected.
+      tools: narrowToolPolicy(persona?.tools, persona?.agentConfig).toolIds,
       showThinking: persona?.showThinking ?? settings.showThinking,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -2371,6 +2382,66 @@ export function unsensitive(tools: readonly string[] | undefined): string[] {
     const tool = toolRegistry.get(id) ?? toolRegistry.getByName(id);
     return tool !== undefined && !tool.sensitive;
   });
+}
+
+/** What `narrowToolPolicy` decided a persona actually gets. */
+export interface NarrowedToolPolicy {
+  /** Non-sensitive tool ids this persona may pre-enable. */
+  readonly toolIds: string[];
+  /** MCP server ids this persona may pre-enable, among ones already added and on. */
+  readonly mcpServerIds: string[];
+  /** `'always-ask'` only; `undefined` means the app's own default applies. */
+  readonly confirmPolicy?: PersonaToolConfirmPolicy;
+  /** At most `TOOL_ITERATIONS`; `undefined` means the persona asked for nothing. */
+  readonly maxToolRounds?: number;
+}
+
+/**
+ * Narrow a persona's tool preferences — its legacy `tools` list AND its
+ * `agentConfig.toolPolicy`, if it has one — against what this app already
+ * allows (#7, owner ruling 2026-09-27).
+ *
+ * Never widens:
+ *  - `toolIds` is `unsensitive()` applied to the INTERSECTION of the legacy
+ *    list and `toolPolicy.toolIds` when both are given; a tool named by only
+ *    one of them is not a candidate, so a card cannot use the new field to
+ *    ask for something the persona's own thin field never granted, and
+ *    cannot use the thin field to smuggle in something only the new field
+ *    named either. When only one is given, that one alone is the candidate
+ *    list — with no `agentConfig`, this is exactly `unsensitive(tools)`, so
+ *    every chat created before this field existed keeps behaving the same.
+ *  - `allowedMcpServerIds` (added and enabled servers) further narrows
+ *    `toolPolicy.mcpServerIds`, so a server the user removed or switched off
+ *    is never carried into `mcpServerIds`, however the persona is written.
+ *  - `confirmPolicy` can only be `'always-ask'` or absent — there is no value
+ *    in {@link PersonaToolConfirmPolicy} that skips a confirmation, so this
+ *    step has nothing to loosen; `'app-default'` and an absent policy both
+ *    resolve to `undefined`, the app's own choice.
+ *  - `maxToolRounds` is clamped to at most `TOOL_ITERATIONS`, the engine's
+ *    own per-turn cap — a persona may ask for fewer rounds, never more.
+ */
+export function narrowToolPolicy(
+  legacyTools: readonly string[] | undefined,
+  agentConfig: PersonaAgentConfig | undefined,
+  allowedMcpServerIds: readonly string[] = [],
+): NarrowedToolPolicy {
+  const requestedToolIds = agentConfig?.toolPolicy?.toolIds;
+  const candidates =
+    requestedToolIds && legacyTools?.length
+      ? legacyTools.filter((id) => requestedToolIds.includes(id))
+      : requestedToolIds ?? legacyTools;
+
+  const requestedServerIds = agentConfig?.toolPolicy?.mcpServerIds ?? [];
+  const mcpServerIds = requestedServerIds.filter((id) => allowedMcpServerIds.includes(id));
+
+  const confirmPolicy: PersonaToolConfirmPolicy | undefined =
+    agentConfig?.toolPolicy?.confirmPolicy === 'always-ask' ? 'always-ask' : undefined;
+
+  const requestedRounds = agentConfig?.toolPolicy?.maxToolRounds;
+  const maxToolRounds =
+    typeof requestedRounds === 'number' ? Math.min(requestedRounds, TOOL_ITERATIONS) : undefined;
+
+  return { toolIds: unsensitive(candidates), mcpServerIds, confirmPolicy, maxToolRounds };
 }
 
 function sortChats(chats: Chat[]): Chat[] {
