@@ -334,7 +334,7 @@ describe('the surface the shipped registration puts on the wire', () => {
 
 /* ── What is off ──────────────────────────────────────────────────────── */
 
-describe('the nine surfaces that are off', () => {
+describe('the ten surfaces that are off', () => {
   it('are refused by the channel table, before any implementation is looked up', async () => {
     const stood = await stand();
     const peer = await connect(stood);
@@ -391,6 +391,18 @@ describe('the nine surfaces that are off', () => {
         plugins: [...SERVER_PLUGINS, { name: 'Shell', methods: ['exec'], events: [] }],
       }),
     ).toThrow(/Shell/);
+
+    // AND `Cli` NAMED, EXPLICITLY (#118): a local agent CLI is desktop-only
+    // by #115's own ruling, and #42/#112 both turn on it being run on THIS
+    // machine's own credentials, reaching a vendor -- exactly the kind of
+    // capability a server that merely serves a bundle to a peer must never
+    // pick up as a fifth registration.
+    expect(() =>
+      assertServerSurface({
+        platform: 'server',
+        plugins: [...SERVER_PLUGINS, { name: 'Cli', methods: ['startTurn', 'cancelTurn'], events: [] }],
+      }),
+    ).toThrow(/Cli/);
     // And it does NOT refuse a smaller surface: a plugin missing is a
     // functionality problem, not a security one, and only the security one
     // gets to stop the process. See `surface.ts`.

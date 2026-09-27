@@ -376,6 +376,88 @@ export const PEER_TURN_PLUGIN: PluginDefinition = Object.freeze({
 });
 
 /**
+ * A LOCAL AGENT CLI, AS A RENDERER PLUGIN (#42, #115, #116, #118).
+ *
+ * `startTurn`/`cancelTurn` mirror `PeerTurn`'s shape deliberately —
+ * `requestId`-keyed, opaque payload — for the same reason: this protocol
+ * names no CLI vocabulary of its own, so a change to `claude`/`codex`/
+ * `gemini`'s wire format never touches this file. `discover` is the one
+ * method with no `PeerTurn` analogue: #116's own ruling is "explicit add,
+ * never ambient" — a renderer that wants to know whether a CLI is on this
+ * machine has to ASK, on a method call a user action triggers, never a
+ * subscription the app opens for itself at launch. Its result is
+ * {@link CliDiscovery} verbatim (`cli-discovery.ts`, in this same
+ * directory) — the four failure states plus `found`, not a second shape
+ * that could drift from the one `discoverCli` actually returns.
+ *
+ * `addListener`/`removeAllListeners` are absent for the reason recorded
+ * above `LLAMA_METHODS`: the bridge serves them.
+ */
+export const CLI_METHODS = Object.freeze(['discover', 'startTurn', 'cancelTurn'] as const);
+
+/** `cliData`: one chunk of stdout/stderr. `cliExit`: the turn's one end. */
+export const CLI_EVENTS = Object.freeze(['cliData', 'cliExit'] as const);
+
+export const CLI_PLUGIN: PluginDefinition = Object.freeze({
+  name: 'Cli',
+  methods: CLI_METHODS,
+  events: CLI_EVENTS,
+});
+
+/** `discover`'s one argument: which CLI to look for. Never run ambiently — see this section's own header. */
+export interface CliDiscoverRequest {
+  readonly cliId: string;
+}
+
+/**
+ * `discover`'s result, structurally IDENTICAL to `discoverCli`'s own
+ * `CliDiscovery` (`cli-discovery.ts`) but NOT imported from it: this file
+ * sits on `host-runtime.ts`'s pinned import closure
+ * (`tests/layering.test.ts`'s "the hidden worker's call path" measurement),
+ * and a value import here would grow that closure for a path that has
+ * nothing to do with a CLI. `tests/desktop-bridge.test.ts` (or a sibling)
+ * pins that the two stay identical by construction.
+ */
+export type CliDiscoverResult =
+  | { readonly status: 'not-found'; readonly id: string }
+  | { readonly status: 'not-executable'; readonly id: string; readonly path: string }
+  | { readonly status: 'version-unreadable'; readonly id: string; readonly path: string }
+  | { readonly status: 'not-signed-in'; readonly id: string; readonly path: string; readonly version: string }
+  | { readonly status: 'found'; readonly id: string; readonly path: string; readonly version: string };
+
+/**
+ * `startTurn`'s one argument. `stdin` and `systemPrompt` are already-encoded
+ * text (`src/ai/backends/cli-encode.ts` on the renderer side) — this
+ * protocol carries them opaquely, the same way `PeerTurnStart.frame` carries
+ * an encoded tunnel frame without this file knowing what is in it.
+ */
+export interface CliStartTurn {
+  readonly requestId: string;
+  readonly cliId: string;
+  readonly stdin: string;
+  readonly systemPrompt?: string;
+}
+
+/** `cancelTurn`'s one argument. */
+export interface CliCancelTurn {
+  readonly requestId: string;
+}
+
+/** `cliData`: one chunk of the process's stdout or stderr, verbatim bytes. */
+export interface CliDataEvent {
+  readonly requestId: string;
+  readonly chunk: Uint8Array;
+  readonly stream: 'stdout' | 'stderr';
+}
+
+/** `cliExit`: the turn's one end, mirroring `spawnCliTurn`'s own `CliTurnExit` shape. */
+export interface CliExitEvent {
+  readonly requestId: string;
+  readonly code: number | null;
+  readonly signal: string | null;
+}
+
+/**
  * The stream names of `PEER_TURN_PLUGIN`, as data.
  *
  * `bridge/worker-host.ts` builds the `EngineSpec` from these, adding the

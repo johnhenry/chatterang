@@ -148,6 +148,9 @@ export {
   LLAMA_PLUGIN,
   MOUNT_METHODS,
   MOUNT_PLUGIN,
+  CLI_EVENTS,
+  CLI_METHODS,
+  CLI_PLUGIN,
   ONNX_EVENTS,
   ONNX_METHODS,
   ONNX_PLUGIN,
@@ -165,6 +168,12 @@ export {
 export type {
   BootManifest,
   BridgePlatform,
+  CliCancelTurn,
+  CliDataEvent,
+  CliDiscoverRequest,
+  CliDiscoverResult,
+  CliExitEvent,
+  CliStartTurn,
   DshStatus,
   HostBoot,
   HostCall,
@@ -185,3 +194,16 @@ export type {
   PluginDefinition,
   WireError,
 } from './protocol.js';
+export { discoverCli } from './cli-discovery.js';
+export type { CliBinarySpec, CliDiscovery, CliDiscoveryDeps, CliExecResult } from './cli-discovery.js';
+export { CLAUDE_SPEC, CLI_SPECS, CODEX_SPEC, GEMINI_SPEC, buildCliTurnArgv, spawnCliBinaryTurn } from './cli-specs.js';
+export type { CliId, CliTurnArgvOptions } from './cli-specs.js';
+export { CLI_ENV_ALLOWLIST, buildCliEnv, confineCwd, spawnCliTurn } from './cli-turns.js';
+export type {
+  CliChildProcess,
+  CliPathOps,
+  CliSpawnDeps,
+  CliTurnExit,
+  CliTurnHandle,
+  CliTurnOptions,
+} from './cli-turns.js';

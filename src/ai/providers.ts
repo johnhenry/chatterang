@@ -13,7 +13,23 @@
 
 import type { ApiKeyBackendAdapterConfig, BackendAdapter } from '@johnhenry/aimatey-types';
 
-export type ProviderKind = 'cloud' | 'self-hosted' | 'aggregator';
+/**
+ * `local-cli` (#108, #39): a local agent CLI (`claude`, `codex`, `gemini`),
+ * run as a subprocess on this device. It is not `cloud` — the process is
+ * local, not an HTTP endpoint this app calls — not `self-hosted` — the user
+ * runs no server, there is nothing at a base URL to reach — and not
+ * `aggregator`. `needsKey` is false for a reason distinct from every
+ * self-hosted entry above: `ollama` needs no key because there is no
+ * account; a CLI needs no key *from this app* because it already has one we
+ * cannot see (it is signed in on the user's behalf, outside this app).
+ * `ProviderDescriptor`'s `needsBaseUrl`/`defaultBaseUrl`/`load()` shape is an
+ * HTTP shape a CLI descriptor does not fit either — that is binary-discovery
+ * and spawn work (#116, apps/desktop), deliberately not built here. This kind
+ * exists now, on its own, so `ChatTarget`'s `cli` arm (`src/ui/target.ts`,
+ * #39) and the reach it produces (`REACH_LOCAL_VIA_THIRD_PARTY`, #112) have a
+ * provider-catalog vocabulary to point at before that later work lands.
+ */
+export type ProviderKind = 'cloud' | 'self-hosted' | 'aggregator' | 'local-cli';
 
 /** Part of a note: plain words, or a value to type exactly, shown as code. */
 export type NotePart = string | { readonly code: string };

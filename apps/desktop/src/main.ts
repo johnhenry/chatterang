@@ -69,6 +69,7 @@ import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
   BOOTSTRAP_CHANNEL,
+  CLI_PLUGIN,
   COMMAND_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
@@ -111,6 +112,8 @@ import {
 import { createFilesystemPlugin } from './fs/filesystem.js';
 import { createMountPlugin } from './fs/mounts.js';
 import { createTunnelSocketPlugin } from './net/tunnel-socket.js';
+import { createCliPlugin } from './cli/cli-plugin.js';
+import type { CliPluginImplementation } from './cli/cli-plugin.js';
 import { buildMenuTemplate } from './menu.js';
 import type { MenuTemplateItem } from './menu.js';
 
@@ -714,6 +717,26 @@ function start(): void {
     }),
   );
 
+  /*
+   * `Cli` — a local agent CLI (#42, #115, #116, #118). Every turn's scratch
+   * cwd is confined under `cacheRoot()`: ephemeral, regenerable, and already
+   * this app's answer to "where does something short-lived and disposable
+   * live" (`filesystemRoots()`'s own `CACHE` entry, above). Discovery and
+   * spawning use the real `node:child_process`/`node:path` wiring
+   * `cli/cli-plugin.ts` builds by default — `discoveryDeps`/`spawnDeps` are
+   * left unset here, unlike `tests/desktop-cli-plugin.test.ts`, which
+   * overrides both to stay off real CLIs.
+   */
+  // Kept, not discarded: `releaseRenderer`/`disposeAll` are this plugin's own
+  // teardown methods, called directly below and from `will-quit` -- never
+  // through `PluginHost.invoke` (see `cli-plugin.ts`'s own header for why a
+  // renderer cannot reach them the same way).
+  const cliPlugin = createCliPlugin({
+    turnRoot: join(cacheRoot(), 'cli-turns'),
+    notify: (eventName, data, ownerId) => pluginHost.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
+  });
+  pluginHost.register(CLI_PLUGIN, cliPlugin);
+
   const router = createMainRouter(pluginHost);
   const manifest = router.bootstrap();
   const emptyManifest: BootManifest = { platform: 'electron', plugins: [] };
@@ -756,6 +779,10 @@ function start(): void {
     broker.quit();
     workerHost.dispose();
     fleet.dispose();
+    // A CLI turn is a detached process GROUP (#115's "cancel kills the
+    // process group"), which is exactly what would otherwise survive the
+    // app quitting with nothing left to signal it.
+    cliPlugin.disposeAll();
   });
 
   // Before the first window, so the menu is up by the time it can be used.
@@ -764,9 +791,9 @@ function start(): void {
   // carries the standard roles as well as ours. See `./menu.ts`.
   installMenu();
 
-  createWindow(pluginHost, localTurns, senders);
+  createWindow(pluginHost, localTurns, senders, cliPlugin);
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, localTurns, senders);
+    if (BrowserWindow.getAllWindows().length === 0) createWindow(pluginHost, localTurns, senders, cliPlugin);
   });
 }
 
@@ -774,6 +801,7 @@ function createWindow(
   pluginHost: PluginHost,
   localTurns: LocalTurns,
   senders: Map<number, WebContents>,
+  cliPlugin: CliPluginImplementation,
 ): BrowserWindow {
   const window = new BrowserWindow({
     width: 1180,
@@ -817,7 +845,13 @@ function createWindow(
       // in `admitLocalTurns` over `HostFleet`, where
       // `tests/desktop-local-turns.test.ts` drives it, and this call site cannot
       // name one host.
-      releaseRenderer: (id, reason) => localTurns.releaseRenderer(id, reason),
+      releaseRenderer: (id, reason) => {
+        localTurns.releaseRenderer(id, reason);
+        // Same seam, same three departures (close, destroyed, crashed) --
+        // a CLI turn that window started is a detached process group with
+        // no other owner, so it is released here or nowhere.
+        cliPlugin.releaseRenderer(id);
+      },
       forget: (id) => {
         senders.delete(id);
         // Only after `destroyed`: the requestIds this window's teardowns
