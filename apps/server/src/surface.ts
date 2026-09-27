@@ -1,5 +1,5 @@
 /**
- * THE FOUR PLUGINS THIS SERVER REGISTERS, AND THE NINE IT DOES NOT.
+ * THE FOUR PLUGINS THIS SERVER REGISTERS, AND THE TEN IT DOES NOT.
  *
  * `index.ts` says the reachable surface of this server is the manifest and
  * nothing else, and that "the shell is not exposed" is the absence of a row
@@ -131,7 +131,7 @@ export function servedUri(roots: ServedRoots): (real: string) => string {
 }
 
 /**
- * The nine surfaces that are OFF, named so a test can probe each one.
+ * The ten surfaces that are OFF, named so a test can probe each one.
  *
  * These are not plugin names that exist anywhere — that is the point. Each is
  * a capability the app has on some platform and that this server does not put
@@ -140,7 +140,7 @@ export function servedUri(roots: ServedRoots): (real: string) => string {
  * addressed to each and watch the router's channel table refuse it before any
  * implementation is looked up.
  *
- * The nine, and where each lives when it is not here:
+ * The ten, and where each lives when it is not here:
  *
  *   Shell        `src/shell/index.ts` — a live command surface over the VFS.
  *   Bash         `src/shell/tool.ts` — the `just-bash` tool the model can call.
@@ -150,8 +150,16 @@ export function servedUri(roots: ServedRoots): (real: string) => string {
  *   Providers    `src/db/index.ts:connections` — provider connections and keys.
  *   Leaderboard  `src/lib/leaderboard.ts` — an upload, off this machine.
  *   Billing      `src/lib/billing.ts` — a store that does not exist here.
+ *   Cli          `apps/desktop/src/bridge/cli-turns.ts` — spawning a local
+ *                agent CLI (#118). Desktop-only by #115's own ruling, and off
+ *                here for the same reason `Shell`/`Bash` are: this server has
+ *                no operator-confined sandbox around a subprocess it would
+ *                spawn on someone else's request, and a CLI reaches a vendor
+ *                (#112's `REACH_LOCAL_VIA_THIRD_PARTY`) on THIS machine's
+ *                credentials — a peer who is merely served this bundle has
+ *                no business spending them.
  *   Commands     `bridge/channels.ts:COMMAND_CHANNEL` — the menu accelerator
- *                channel, and the sharpest of the nine: on desktop it is the
+ *                channel, and the sharpest of the ten: on desktop it is the
  *                only INBOUND push to a page, so a server that could send on
  *                it would be a way for whoever holds the machine to drive
  *                somebody else's app. It is off by being absent from the wire
@@ -159,7 +167,7 @@ export function servedUri(roots: ServedRoots): (real: string) => string {
  *                subscription the contract requires and the server never sends
  *                on it.
  *
- * The first eight are off because they are not registered. That is the whole
+ * The first nine are off because they are not registered. That is the whole
  * mechanism, and it is stronger than a filter: `createMainRouter` builds its
  * channel table from the manifest, so a name with no row has no channel, and
  * the call is refused before `PluginHost` is asked about it.
@@ -173,6 +181,7 @@ export const OFF_SURFACES: readonly string[] = Object.freeze([
   'Providers',
   'Leaderboard',
   'Billing',
+  'Cli',
   'Commands',
 ]);
 
