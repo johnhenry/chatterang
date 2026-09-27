@@ -137,7 +137,28 @@ export function installCapacitorShim(
       // `addListenerNative` awaits this and uses the value as the callback id
       // it later hands back to `removeListener`. Our subscription id IS that
       // value, so the two stay in step with no extra bookkeeping.
-      return unwrap(await bridge.addListener(pluginName, String(options?.['eventName']), callback));
+      //
+      // A REFUSAL MUST NOT REJECT THIS PROMISE. Read the real
+      // `addListenerNative` (`node_modules/@capacitor/core/dist/index.js`):
+      // it does `call.then(() => resolve({remove}))` on the promise this
+      // function returns — an `onFulfilled` with no `onRejected`. If this
+      // promise rejects, that `.then()` never runs `resolve`, so the promise
+      // the PAGE is awaiting (e.g. `LlamaCpp.addListener('llamaWaiting', …)`
+      // in `src/ai/backends/llama-cpp.ts`, deliberately tolerating exactly
+      // this refusal with `.catch(() => null)`) never settles — it hangs
+      // forever, with nothing left for that `.catch()` to catch. Separately,
+      // the `.then()` call itself returns its OWN derived promise, discarded
+      // and unhandled, which is the "Uncaught (in promise)" this produced.
+      // There is no patch point in vendor code, so the fix lives here: an
+      // undeclared event resolves to an inert subscription — no different,
+      // to the caller, from one that is declared but simply never fires.
+      // `bridge.removeListener` on an id nothing subscribed under is a
+      // documented no-op (`PluginHost.removeListener`), so the `remove()`
+      // Capacitor builds from this id is safe to call and does nothing.
+      const NO_SUBSCRIPTION_CALLBACK_ID = -1;
+      const answer = await bridge.addListener(pluginName, String(options?.['eventName']), callback);
+      if (!answer.ok) return NO_SUBSCRIPTION_CALLBACK_ID;
+      return unwrap(answer);
     }
     if (methodName === 'removeListener') {
       return unwrap(await bridge.removeListener(Number(options?.['callbackId'])));
