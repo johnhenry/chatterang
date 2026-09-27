@@ -200,19 +200,28 @@ const CLAUDE_TURN_ARGV: readonly string[] = Object.freeze([
 ]);
 
 /**
- * `codex`'s BEST AVAILABLE combination, and the RESIDUAL CAPABILITY it keeps
- * that this build cannot document a flag to close.
+ * `codex`'s BEST AVAILABLE combination, and its RESIDUAL CAPABILITY — no
+ * longer a documentation gap, per the owner's decision below: codex ships,
+ * with this residual stated exactly rather than implied.
  *
  * `exec --json`
  *     Non-interactive JSONL streaming (#115).
  * `-s read-only`
  *     A SANDBOX POLICY on "commands the model generates" (`codex exec
- *     --help`'s own words), and every one of its three named values
- *     (`read-only`, `workspace-write`, `danger-full-access`) is spelled as a
- *     FILESYSTEM permission level. It is not, and does not claim to be, a
- *     switch that removes the shell-command tool: the model can still ask to
- *     run a command, and the sandbox answers by confining what that command
- *     can WRITE, not whether it runs.
+ *     --help`'s own words). `--help` spells its three named values
+ *     (`read-only`, `workspace-write`, `danger-full-access`) as FILESYSTEM
+ *     permission levels only — it does not claim to remove the shell-command
+ *     tool, and it does not. OWNER-APPROVED PROBE (codex-cli 0.144.1, this
+ *     exact argv, an empty scratch dir, 2026-09-27): asked to run
+ *     `curl https://example.com`, the model DID invoke `/bin/zsh -lc
+ *     "curl ..."` — the shell tool runs — and the command failed inside the
+ *     sandbox with `curl: (6) Could not resolve host: example.com`, while the
+ *     identical command from the host shell returned 200. `-s read-only`
+ *     denies network, measured, not merely inferred from `--help`'s
+ *     filesystem-only wording. A requested `touch probe.txt` created no file,
+ *     consistent with (but not directly confirmed as) the same read-only
+ *     policy — the stream showed no `command_execution` event for it, only
+ *     the model's own claim of "Operation not permitted".
  * `--ignore-user-config`
  *     "Do not load $CODEX_HOME/config.toml" (`codex exec --help`) — which is
  *     where a user's own MCP servers are configured, so this is the closest
@@ -231,17 +240,18 @@ const CLAUDE_TURN_ARGV: readonly string[] = Object.freeze([
  * NEVER: `--dangerously-bypass-approvals-and-sandbox`, `--dangerously-bypass-hook-trust`, `--search`
  * (web search is opt-in per `codex --help`; simply never passing it keeps it off).
  *
- * WHAT THIS DOES NOT CLOSE, STATED PLAINLY RATHER THAN IMPLIED: neither
- * `codex --help` nor `codex exec --help` documents ANY flag that disables
- * the shell-command tool itself, or that denies network access from a
- * command the sandbox does allow to run. `-s read-only`'s own three possible
- * values are all filesystem levels; none of them, and no other flag or `-c`
- * key shown in `--help`, mentions network at all. So `codex` — unlike
- * `claude` — CANNOT be given an argv that guarantees "no shell, no network"
- * from this app's own flags. This is not a gap this build papers over: the
- * owner has been told directly (see this ticket's report) and gets to decide
- * whether `codex` ships as a source at all before tools are ever admitted as
- * their own later unit.
+ * THE RESIDUAL, STATED PLAINLY, THE SAME WAY THIS DOC ALWAYS HAS: `codex` CAN
+ * run a shell command of its own choosing. Measured under `-s read-only`: the
+ * command runs confined to the turn's cwd with WRITES refused and NETWORK
+ * refused (the curl probe above). This is the source's own real-time
+ * capability whenever it decides to reach for the shell — not a hypothetical
+ * — and it is why #115's later MCP unit (Chatterang's own tools over an
+ * in-process MCP server, with the CLI's native tools disabled outright via
+ * `--sandbox-permissions`/an equivalent full lockdown once decided) is what
+ * makes this source's tool story match `claude`'s. Until then, whoever
+ * surfaces this source in product copy states this residual to the user in
+ * those same terms — not "sandboxed", which reads as "safe", but "can run
+ * shell commands confined to this turn's folder with network denied".
  */
 const CODEX_TURN_ARGV: readonly string[] = Object.freeze([
   'exec',

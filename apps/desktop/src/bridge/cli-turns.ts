@@ -36,11 +36,11 @@
  *     three CLIs are themselves capable of spawning further processes — a
  *     shell command, for `claude` and `codex`. `buildCliTurnArgv`
  *     (`cli-specs.ts`) gives `claude` a turn argv with no tools declared at
- *     all (`--tools ""`), so nothing is there to spawn one; `codex`'s own
- *     `--help` documents no flag that removes its shell-command tool, only
- *     a filesystem sandbox policy on what a command it does run may write —
- *     see `cli-specs.ts`'s `CODEX_TURN_ARGV` doc for exactly what that does
- *     and does not close. Either way, `cancel()` has to reach the whole
+ *     all (`--tools ""`), so nothing is there to spawn one; `codex` keeps
+ *     its shell-command tool — the owner-approved probe in
+ *     `cli-specs.ts`'s `CODEX_TURN_ARGV` doc measured it actually invoking
+ *     `/bin/zsh` — confined by `-s read-only` to no network and (per that
+ *     same probe) no writes. Either way, `cancel()` has to reach the whole
  *     process tree, not assume there is only one process in it. The real
  *     `deps.spawn` is expected to pass `detached: true` (its own POSIX
  *     process group, pgid === pid), and `cancel()` calls

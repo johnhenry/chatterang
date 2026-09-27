@@ -281,11 +281,12 @@ export function createClaudeTranslator(requestId: string): CliStreamTranslator {
  * (`command_execution`, etc.) is not translated: this app never asked for
  * one to run, and a translator that rendered one as text would be showing
  * the user something outside that ask. This is NOT the same claim as "codex
- * cannot run one" — `apps/desktop/src/bridge/cli-specs.ts`'s `CODEX_TURN_ARGV`
- * doc says plainly that no flag `codex --help` documents removes its
- * shell-command tool. If one ever appears in a real stream, this translator
- * silently drops it rather than rendering it, which is a translator-level
- * containment, not a guarantee that the CLI never ran it.
+ * cannot run one" — it demonstrably can (the owner-approved probe in
+ * `apps/desktop/src/bridge/cli-specs.ts`'s `CODEX_TURN_ARGV` doc measured
+ * it invoking `/bin/zsh`, confined by `-s read-only` to no writes and no
+ * network). If one ever appears in a real stream, this translator silently
+ * drops it rather than rendering it, which is a translator-level
+ * containment, not a claim that the CLI never ran it.
  *
  * Lines this translator acts on:
  *   - `{"type":"thread.started",...}` -> `start`
