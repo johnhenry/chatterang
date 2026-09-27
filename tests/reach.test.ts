@@ -783,6 +783,17 @@ describe('what a chat target will produce', () => {
     );
   });
 
+  it('labels a local CLI target ran-here-reached-a-third-party, not remote (#39, #112)', () => {
+    // A CLI target is neither `local` (it is not on-device inference) nor
+    // `remote` (there is no provider connection). Filing it under `REACH_REMOTE`
+    // would say the process is not on this machine, which is false; filing it
+    // under `REACH_DEVICE` would say nothing left, which is also false.
+    const reach = reachOf({ kind: 'cli', cli: { id: 'claude', label: 'Claude Code' } });
+    expect(reach).toEqual(REACH_LOCAL_VIA_THIRD_PARTY);
+    expect(ranOnDevice({ reach })).toBe(true);
+    expect(reachedThirdParty({ reach })).toBe(true);
+  });
+
   it('produces nothing for the targets where no turn runs', () => {
     // `refused` and `none` are not destinations; giving them one would put a
     // label on a reply that never came back.
@@ -795,6 +806,14 @@ describe('what a chat target will produce', () => {
     // label makes that label false for at least one row in the list.
     const paired = reachOf({ kind: 'paired', device: { id: 'p1', name: 'Studio' } })!;
     expect(reachKind({ reach: paired })).toBe('paired');
+    // A CLI target is the opposite case from `paired`: `reachKind` DOES fold
+    // it into `remote` (chat.ts's own comment on `reachKind` says so — it
+    // projects DESTINATION, "where the bytes went", not host), and that is by
+    // design rather than a gap. `ranOnDevice`/`reachedThirdParty` above are
+    // the pair of functions that read the HOST axis a chip needing both
+    // (#210/#211) would use instead.
+    const cli = reachOf({ kind: 'cli', cli: { id: 'claude', label: 'Claude Code' } })!;
+    expect(reachKind({ reach: cli })).toBe('remote');
     expect(reachKind({ reach: REACH_DEVICE })).toBe('device');
     expect(reachKind({ reach: REACH_REMOTE })).toBe('remote');
   });

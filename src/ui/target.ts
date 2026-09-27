@@ -18,8 +18,29 @@
  */
 
 import { canChat } from '@/domain/manifest';
-import { REACH_DEVICE, REACH_REMOTE, reachPaired, type PairedDevice, type Reach } from '@/domain/chat';
+import {
+  REACH_DEVICE,
+  REACH_LOCAL_VIA_THIRD_PARTY,
+  REACH_REMOTE,
+  reachPaired,
+  type PairedDevice,
+  type Reach,
+} from '@/domain/chat';
 import type { InstalledModel } from '@/db';
+
+/**
+ * A local agent CLI, chosen as a chat target (#39, #115).
+ *
+ * Structural, like {@link Providerish}: the picker and the rail need an `id`
+ * to key on and a `label` to print, not the whole binary-discovery record
+ * (#116) — the same reason `Providerish` does not demand a full
+ * `ProviderConnection`. Exported so a later persona track (#5) can reference
+ * this shape without reaching into `target.ts`'s private union.
+ */
+export interface CliSource {
+  readonly id: string;
+  readonly label: string;
+}
 
 /**
  * A provider connection, structurally — id, label, and whether it is on.
@@ -52,6 +73,17 @@ export type ChatTarget =
    */
   | { readonly kind: 'paired'; readonly device: PairedDevice }
   | { readonly kind: 'remote'; readonly provider: Providerish }
+  /**
+   * A local agent CLI (#39, #115): `claude`, `codex`, `gemini`, run as a
+   * subprocess on THIS device. Neither `local` (it is not on-device
+   * inference — the reply comes from whatever vendor the CLI is signed in
+   * to) nor `remote` (there is no provider connection, no base URL, no key
+   * this app holds). `reachOf` labels it {@link REACH_LOCAL_VIA_THIRD_PARTY}
+   * (#112) rather than either existing arm, for the same reason `paired`
+   * got its own arm in #191: folding it into `local` or `remote` makes that
+   * arm's label false for at least one row in the list.
+   */
+  | { readonly kind: 'cli'; readonly cli: CliSource }
   | { readonly kind: 'refused'; readonly model: InstalledModel }
   | { readonly kind: 'none' };
 
@@ -74,6 +106,8 @@ export function reachOf(target: ChatTarget): Reach | undefined {
       return reachPaired(target.device);
     case 'remote':
       return REACH_REMOTE;
+    case 'cli':
+      return REACH_LOCAL_VIA_THIRD_PARTY;
     case 'refused':
     case 'none':
       return undefined;
