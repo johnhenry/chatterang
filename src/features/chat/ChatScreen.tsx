@@ -792,9 +792,24 @@ function ChatSettingsSheet({
   // name a value that list has dropped.
   const pinned = useModels((state) => (chat?.modelId ? state.installed[chat.modelId] : undefined));
   const connections = useApp((state) => state.connections);
+  const installedAll = useModels((state) => state.installed);
   const update = useChats((state) => state.updateChat);
   const toast = useApp((state) => state.toast);
   const [exporting, setExporting] = useState(false);
+
+  // #42: whether THIS chat currently targets a local-cli connection --
+  // needed only for the honest "tools will not be sent" note below, so
+  // computed the same way `chatTarget`'s other two callers do rather than
+  // adding a third field to `Providerish` for one reader.
+  const cliTarget = useMemo(() => {
+    if (!chat) return null;
+    const connectionsForTarget = connections.map((connection) => ({
+      ...connection,
+      cli: getProvider(connection.providerId)?.kind === 'local-cli',
+    }));
+    const target = chatTarget(chat.modelId, installedAll, connectionsForTarget);
+    return target.kind === 'cli' ? target : null;
+  }, [chat, connections, installedAll]);
 
   // Declared before the early return so the hook order is stable; `chat` is
   // re-checked inside.
@@ -917,6 +932,17 @@ function ChatSettingsSheet({
           model, and off this device with it when the model is remote — that one the app asks
           about, every turn until you answer for the whole conversation.
         </p>
+        {cliTarget ? (
+          // #42: a local agent CLI has no tool support yet
+          // (`CliBackendAdapter.metadata.capabilities.tools` is false) —
+          // the engine never hands it a tool to call, so any chip turned on
+          // below is truthfully described as inert for this chat rather
+          // than left to look like it works and silently not firing.
+          <p className="section__hint" style={{ color: 'var(--warn)' }}>
+            This chat currently runs through {cliTarget.cli.label}, which has no tool support
+            yet — any tool turned on below will not be sent to it.
+          </p>
+        ) : null}
         <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
           {toolRegistry.list().map((tool) => {
             const enabled = chat.tools.includes(tool.id);

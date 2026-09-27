@@ -128,6 +128,18 @@ describe('the Local CLIs section, on the desktop platform', () => {
     platform.cliAgents = true;
   });
 
+  it('states plainly that adding it is the one-time consent (#42)', async () => {
+    await mounted(async (host) => {
+      const item = findItem(host, 'Claude Code');
+      await act(async () => {
+        item.click();
+      });
+      expect(document.body.textContent).toContain(
+        'Adding it below is what allows this — there is no separate confirmation before your first message reaches Claude Code.',
+      );
+    });
+  });
+
   it('calls discover only after Find is pressed, never ambiently', async () => {
     cli.discover.mockResolvedValue({ status: 'not-found', id: 'claude' });
     await mounted(async (host) => {

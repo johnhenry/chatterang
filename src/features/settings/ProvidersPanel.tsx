@@ -498,6 +498,21 @@ function CliConnectSheet({
           <span className="card__title grow">What this means</span>
         </div>
         <p style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>{provider.note}</p>
+        {/*
+         * #42's consent question, answered the same way it already is for
+         * every remote provider (`ProvidersPanel`'s own header comment):
+         * adding the connection IS the one-time consent -- there is no
+         * separate "are you sure" before the first message reaches it.
+         * Stated here rather than assumed, since a local CLI's "runs on this
+         * device" framing could otherwise read as needing no such moment at
+         * all.
+         */}
+        {desktop ? (
+          <p style={{ fontSize: 'var(--t-sm)', color: 'var(--ink-2)' }}>
+            Adding it below is what allows this — there is no separate confirmation before your
+            first message reaches {provider.label}.
+          </p>
+        ) : null}
       </div>
 
       {desktop ? (

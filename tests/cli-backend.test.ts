@@ -215,3 +215,43 @@ describe('CliBackendAdapter ends a turn on a line-splitter overflow (#120)', () 
     expect(exitListener).toBeDefined();
   });
 });
+
+describe('a CLI backend has no tool support yet, and reaches for none (#42)', () => {
+  it('declares metadata.capabilities.tools false', () => {
+    const { bridge } = fakeBridge('claude-pong.jsonl', 64);
+    const adapter = new CliBackendAdapter('claude', bridge);
+    expect(adapter.metadata.capabilities.tools).toBe(false);
+  });
+
+  it('never carries a tool definition into bridge.start, even when the IR request carries one', async () => {
+    const { bridge, startCalls } = fakeBridge('claude-pong.jsonl', 64);
+    const adapter = new CliBackendAdapter('claude', bridge);
+
+    // The shape the engine's own `#toIR` (`src/ai/engine.ts`) would attach
+    // when a chat has tools enabled -- built here directly, so this test
+    // does not depend on the engine actually refusing to attach one, only
+    // on what happens if it did (defence in depth: `fromIR` below reads only
+    // `request.messages`, so this can never leak regardless).
+    const withTools: IRChatRequest = {
+      messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
+      tools: [
+        { name: 'calculate', description: 'Evaluate an arithmetic expression.', parameters: {} },
+      ],
+      toolChoice: 'auto',
+      metadata: { requestId: 'req_test', timestamp: 0 },
+    } as IRChatRequest;
+
+    for await (const _chunk of adapter.executeStream(withTools)) {
+      // Draining is the point -- what is asserted is what `bridge.start` saw.
+    }
+
+    expect(startCalls).toHaveLength(1);
+    const sent = startCalls[0]!;
+    expect(Object.keys(sent).sort()).toEqual(['cliId', 'stdin', 'systemPrompt'].filter((key) => key in sent).sort());
+    expect(sent).not.toHaveProperty('tools');
+    expect(sent).not.toHaveProperty('toolChoice');
+    // Nothing about the tool the request carried appears anywhere in what
+    // was actually handed to the bridge.
+    expect(JSON.stringify(sent)).not.toContain('calculate');
+  });
+});

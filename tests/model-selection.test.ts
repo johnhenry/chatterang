@@ -447,6 +447,21 @@ describe('the surfaces that offer a model for a chat', () => {
     expect(setActive).toBeLessThan(refused);
     expect(refused).toBeGreaterThan(affirmative);
   });
+
+  it('states in the Tools section that a local-cli chat sends no tool (#42)', () => {
+    // A local agent CLI has no tool support yet
+    // (`CliBackendAdapter.metadata.capabilities.tools` is false,
+    // `tests/cli-backend.test.ts`), so the Tools sheet has to say so rather
+    // than let a user believe a chip they turned on will fire.
+    const chatScreen = src('features/chat/ChatScreen.tsx');
+    const body = componentBody(chatScreen, 'ChatSettingsSheet');
+    expect(body).toContain('cliTarget');
+    expect(body).toContain('has no tool support');
+    expect(body).toContain('will not be sent to it.');
+    // Gated, not unconditional: the sentence only renders inside a
+    // `cliTarget ?` guard, so an ordinary chat never sees it.
+    expect(body).toMatch(/cliTarget\s*\?[\s\S]{0,400}no tool support/);
+  });
 });
 
 /* ══ 5. The value an older build already wrote to IndexedDB ═══════════ */
