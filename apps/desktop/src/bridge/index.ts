@@ -187,3 +187,4 @@ export type {
 } from './protocol.js';
 export { discoverCli } from './cli-discovery.js';
 export type { CliBinarySpec, CliDiscovery, CliDiscoveryDeps, CliExecResult } from './cli-discovery.js';
+export { CLAUDE_SPEC, CLI_SPECS, CODEX_SPEC, GEMINI_SPEC } from './cli-specs.js';
