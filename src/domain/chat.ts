@@ -517,6 +517,17 @@ export interface Chat {
   readonly mode: ChatMode;
   personaId: string | null;
   modelId: string | null;
+  /**
+   * A `ProviderConnection` id that `resolveTarget` should prefer over "the
+   * first enabled connection" once `modelId` misses the installed models
+   * (#7) — set from a persona's `agentConfig.provider` at `newChat`, when it
+   * named a `remote-connection` that was still added and enabled. Absent on
+   * every chat from before this field existed, and on a chat whose named
+   * connection was missing or disabled at creation time, both of which read
+   * as "no preference" — the same fallback a missing `preferredModelId` has
+   * always had.
+   */
+  preferredConnectionId?: string;
   /** Per-chat sampler overrides on top of the model defaults. */
   sampler: Partial<SamplerSettings> | null;
   /** Tool ids enabled for this chat. */

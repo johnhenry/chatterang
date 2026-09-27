@@ -34,6 +34,7 @@ import {
   renderSystemPrompt,
   selectLore,
   type PersonaAgentConfig,
+  type PersonaProviderPreference,
   type PersonaToolConfirmPolicy,
 } from '@/domain/persona';
 import {
@@ -901,12 +902,18 @@ export const useChats = create<ChatState>((set, get) => ({
       .map((server) => server.id);
     const narrowedTools = narrowToolPolicy(persona?.tools, persona?.agentConfig, allowedMcpServerIds);
 
+    const provider = resolvePersonaProvider(persona?.agentConfig?.provider, useApp.getState().connections);
+
     const chat: Chat = {
       id: newId('chat'),
       title: options.mode === 'task' ? 'Task' : 'New chat',
       mode: options.mode ?? 'chat',
       personaId: personaId ?? null,
-      modelId: persona?.preferredModelId ?? useModels.getState().activeModelId,
+      // `agentConfig.provider`'s modelId, when it resolved to one, takes the
+      // place `preferredModelId` has always had here — a persona naming both
+      // is naming the same preference twice, not two different ones.
+      modelId: provider.modelId ?? persona?.preferredModelId ?? useModels.getState().activeModelId,
+      preferredConnectionId: provider.preferredConnectionId,
       sampler: null,
       // A persona may PREFER tools; it may not grant the sensitive ones. `bash`
       // reaches this app's own data and every MCP tool leaves the sandbox, so
@@ -2131,6 +2138,54 @@ type TargetChoice =
   | { readonly kind: 'refused'; readonly message: string }
   | { readonly kind: 'none' };
 
+/** What a persona's `agentConfig.provider` resolved to, for `newChat`. */
+interface ResolvedProvider {
+  /** Takes the place `preferredModelId` has always had, when set. */
+  readonly modelId?: string;
+  /** A connection `resolveTarget` should prefer at fallback time. */
+  readonly preferredConnectionId?: string;
+}
+
+/**
+ * Resolve a persona's `agentConfig.provider` against the connections the
+ * user has actually added (#7, owner ruling 2026-09-27).
+ *
+ *  - `'local'` just names a model id, the same as `preferredModelId` always
+ *    has; whether that model is installed is `resolveTarget`'s question, not
+ *    this one.
+ *  - `'remote-connection'` additionally says WHICH connection to prefer once
+ *    a fallback happens. A missing or disabled `connectionId` resolves to
+ *    `{}` — falling back exactly like a missing `preferredModelId`, not
+ *    partially: the model id is not carried over either, because a
+ *    `modelId` naming a model on a connection that is not there is not a
+ *    preference `resolveTarget` can act on.
+ *  - `'cli-agent'` is a placeholder (#7): it round-trips through
+ *    `agentConfig` and is validated by `sanitizeAgentConfig`, but nothing
+ *    resolves it to a backend in this pass — another track owns that target
+ *    kind — so it resolves to `{}`, the same as no provider at all.
+ */
+function resolvePersonaProvider(
+  provider: PersonaProviderPreference | undefined,
+  connections: readonly ProviderConnection[],
+): ResolvedProvider {
+  if (!provider) return {};
+
+  if (provider.kind === 'local') {
+    return provider.modelId ? { modelId: provider.modelId } : {};
+  }
+
+  if (provider.kind === 'remote-connection') {
+    const connection = provider.connectionId
+      ? connections.find((entry) => entry.id === provider.connectionId && entry.enabled)
+      : undefined;
+    if (!connection) return {};
+    return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
+  }
+
+  // 'cli-agent': recognised, not resolved here.
+  return {};
+}
+
 /** Decide which backend and model serve this chat. */
 function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
   const models = useModels.getState();
@@ -2173,16 +2228,31 @@ function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
     }
   }
 
-  // Fall back to the first enabled remote connection, if any.
-  const connection = app.connections.find((entry) => entry.enabled);
+  // Fall back to the connection a persona's agentConfig.provider named,
+  // if it is (still) enabled (#7); otherwise the first enabled one, as
+  // before. `chat.preferredConnectionId` is only ever set to a connection
+  // that WAS enabled at `newChat` time, so re-checking `enabled` here is
+  // what turns "was disconnected since" into the ordinary fallback rather
+  // than a dead end.
+  const preferred = chat.preferredConnectionId
+    ? app.connections.find((entry) => entry.id === chat.preferredConnectionId && entry.enabled)
+    : undefined;
+  const connection = preferred ?? app.connections.find((entry) => entry.enabled);
   if (connection) {
+    // Only for the PREFERRED connection does `chat.modelId` name a model on
+    // THIS connection — `resolvePersonaProvider` set the two together. The
+    // ordinary fallback (no preference, or the preferred one gone) still
+    // uses the connection's own default, exactly as before this field
+    // existed: `chat.modelId` there is either unset or names a LOCAL model
+    // that just isn't installed, never a model of this connection's.
+    const remoteModelId = preferred ? chat.modelId ?? connection.defaultModel : connection.defaultModel;
     return {
       kind: 'target',
       target: {
         backendId: connection.id,
         engine: 'remote',
-        modelId: connection.defaultModel,
-        modelName: `${connection.label} · ${connection.defaultModel}`,
+        modelId: remoteModelId,
+        modelName: `${connection.label} · ${remoteModelId}`,
         reach: REACH_REMOTE,
       },
     };
