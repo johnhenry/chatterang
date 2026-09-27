@@ -286,7 +286,7 @@ const v6 = versions.find((version) => version._cfg?.version === 6)?._cfg?.conten
 const v7 = versions.find((version) => version._cfg?.version === 7)?._cfg?.contentUpgrade;
 
 describe('the versions these migrations claim', () => {
-  it('are 6, 7, 8, 9 and 10, each declared once, in order, with 10 the highest', () => {
+  it('are 6, 7, 8, 9, 10 and 11, each declared once, in order, with 11 the highest', () => {
     /*
      * Two `.version(n)` calls sharing an n is worse than the bug being fixed:
      * Dexie keeps the last and the other migration silently never runs.
@@ -302,9 +302,16 @@ describe('the versions these migrations claim', () => {
      * edited is a guard that was read.
      *
      * #133's paired-device table is v10 (`tests/db-paired-devices.test.ts`).
-     * #195 takes 11. Uniqueness alone does not catch a reused number: Dexie
-     * hands a second `.version(n)` the same Version object and merges into it,
-     * so `_versions` stays unique. The highest bound is what catches that.
+     * This comment used to say "#195 takes 11" — written before either #195
+     * or #7 (configurable personas) had landed. #7's `Persona.agentConfig`
+     * took v11 instead, on an explicit owner ruling dated 2026-09-27 that
+     * named that version for it (`tests/db-persona-agent-config.test.ts`).
+     * Whichever of #195 and anything else still unbuilt lands next must
+     * re-read this note, as v7's did, and take v12 — this bound is exactly
+     * what stops it from silently reusing 11 instead. Uniqueness alone does
+     * not catch a reused number: Dexie hands a second `.version(n)` the same
+     * Version object and merges into it, so `_versions` stays unique. The
+     * highest bound is what catches that.
      */
     const declared = versions.map((version) => Number(version._cfg?.version));
 
@@ -313,8 +320,9 @@ describe('the versions these migrations claim', () => {
     expect(declared).toContain(8);
     expect(declared).toContain(9);
     expect(declared).toContain(10);
+    expect(declared).toContain(11);
     expect(new Set(declared).size).toBe(declared.length);
-    expect(Math.max(...declared)).toBe(10);
+    expect(Math.max(...declared)).toBe(11);
     expect([...declared]).toEqual([...declared].sort((a, b) => a - b));
   });
 
