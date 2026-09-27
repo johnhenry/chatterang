@@ -188,3 +188,12 @@ export type {
 export { discoverCli } from './cli-discovery.js';
 export type { CliBinarySpec, CliDiscovery, CliDiscoveryDeps, CliExecResult } from './cli-discovery.js';
 export { CLAUDE_SPEC, CLI_SPECS, CODEX_SPEC, GEMINI_SPEC } from './cli-specs.js';
+export { CLI_ENV_ALLOWLIST, buildCliEnv, confineCwd, spawnCliTurn } from './cli-turns.js';
+export type {
+  CliChildProcess,
+  CliPathOps,
+  CliSpawnDeps,
+  CliTurnExit,
+  CliTurnHandle,
+  CliTurnOptions,
+} from './cli-turns.js';
