@@ -56,6 +56,13 @@ interface ProviderConsentState {
   isGranted: (personaId: string, destination: string) => boolean;
   grant: (personaId: string, destination: string) => Promise<void>;
   revoke: (personaId: string, destination: string) => Promise<void>;
+  /**
+   * Every destination this persona has a live grant for, for the persona
+   * editor's "Allowed destinations" list — the one place a grant can be
+   * revoked without waiting for a connection to be deleted or a provider
+   * preference to be edited into invalidating it on its own.
+   */
+  grantsFor: (personaId: string) => { destination: string; grantedAt: number }[];
 }
 
 export const useProviderConsent = create<ProviderConsentState>((set, get) => ({
@@ -93,5 +100,12 @@ export const useProviderConsent = create<ProviderConsentState>((set, get) => ({
     const granted = { ...get().granted };
     delete granted[key];
     set({ granted });
+  },
+
+  grantsFor(personaId) {
+    const prefix = providerConsentKey(personaId, '');
+    return Object.entries(get().granted)
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([key, grantedAt]) => ({ destination: key.slice(prefix.length), grantedAt }));
   },
 }));

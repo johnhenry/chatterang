@@ -45,11 +45,11 @@ import {
   nonChatRole,
   type SamplerSettings,
 } from '@/domain/manifest';
-import type { IRMessage, MessageContent } from '@johnhenry/aimatey-types';
+import type { IRMessage, MessageContent, ToolUseContent } from '@johnhenry/aimatey-types';
 import {
+  clampToolRounds,
   runsOnThisDevice,
   targetFor,
-  TOOL_ITERATIONS,
   type EngineTarget,
   type ToolEgressPolicy,
 } from '@/ai/engine';
@@ -67,7 +67,7 @@ import {
   type McpServerConfig,
   type ToolDestination,
 } from '@/domain/mcp';
-import type { ProviderConnection } from '@/ai/providers';
+import { getProvider, type ProviderConnection } from '@/ai/providers';
 import { toolRegistry } from '@/ai/tools/registry';
 import {
   contextBudget,
@@ -1460,6 +1460,58 @@ async function runGeneration(
   // read: nothing below waits before that.
   if (get().activeChatId !== chat.id) return false;
 
+  // Ask before an imported or marketplace persona's remote/cli-agent
+  // provider preference is ever resolved (#23, #122). Asked HERE — the one
+  // place both `send` and `regenerate` funnel through — rather than inside
+  // `resolveTarget`, because `resolveTarget` is a plain, synchronous
+  // decision and asking is not. `providerConsentPending` already agrees
+  // with `resolveTarget`'s own `resolvePersonaProvider` about what counts
+  // as "something concrete to ask about" (an enabled connection, or a
+  // cli-agent preference at all) — see that function's own doc comment.
+  const persona = chat.personaId ? usePersonas.getState().byId[chat.personaId] : undefined;
+  const provider = persona?.agentConfig?.provider;
+  if (persona && provider && providerConsentPending(persona, app.connections)) {
+    const destination = providerDestinationLabel(provider, app.connections);
+    const allowed = await app.requestApproval(
+      `send this chat's messages to ${destination}`,
+      {
+        title: `Let "${persona.name}" send to ${destination}?`,
+        body:
+          `This persona was ${persona.origin === 'imported' ? 'imported from a file' : 'added from the marketplace'} ` +
+          `and asks to use ${destination}. Once allowed, this chat's messages go there until you revoke it ` +
+          `from the persona's "Allowed destinations".`,
+        confirmLabel: 'Allow',
+        cancelLabel: 'Not now',
+      },
+      controller.signal,
+    );
+    if (allowed) {
+      await useProviderConsent.getState().grant(persona.id, providerConsentDestination(provider));
+    }
+    // Declined or allowed, `resolveTarget` below re-resolves fresh: allowed
+    // now routes there; declined falls back exactly as pending consent
+    // always has (the same shape as a missing connection).
+
+    /*
+     * THE CHECKPOINT ABOVE SAID "NOTHING BELOW WAITS BEFORE THAT" — AND THEN
+     * THIS AWAIT WAS ADDED BELOW IT (adversarial review, HIGH, refs #23,
+     * #122). `requestApproval` sits on a real person, for as long as the
+     * consent sheet is on screen; anything that checkpoint verified can have
+     * changed in that time: `newChat()` can have made a different chat
+     * active, this chat's delete can have been asked for, and Stop can have
+     * been pressed. Measured without this: open the sheet for chat A, switch
+     * to chat B, answer Allow — chat A's target still resolves and its reply
+     * lands in `get().messages`, which by then is chat B's live array.
+     *
+     * So every check the checkpoint made is made again, in the same order,
+     * for the same reason — nothing here is new, only repeated across the
+     * gap this await opened.
+     */
+    if (removedChats.has(chat.id)) return false;
+    if (get().activeChatId !== chat.id) return false;
+    if (controller.signal.aborted) return false;
+  }
+
   const choice = resolveTarget(chat, options.overrideModelId);
   if (choice.kind === 'none') {
     app.toast('Choose a model first — none is installed or connected yet.', 'warn');
@@ -1568,13 +1620,38 @@ async function runGeneration(
     const discarding = options.beforeEngine?.();
     // Only so a stream that throws first does not leave it unhandled.
     discarding?.catch(() => {});
+
+    /*
+     * RE-DERIVED FRESH, LIKE THE PROVIDER (#23, #122; adversarial review,
+     * MEDIUM) — NOT FROM `chat.tools`. `chat.tools` is the user's own live,
+     * per-chat tool selection (the picker can add or remove from it any
+     * time after `newChat`, including sensitive tools the persona could
+     * never pre-enable), and stays exactly as it is. `confirmPolicy` and
+     * `maxToolRounds` have no per-chat picker of their own — they are pure
+     * persona preferences — so, as with `resolvePersonaProvider`, they are
+     * computed fresh from the CURRENT persona on every turn rather than
+     * trusted from a value decided once at `newChat` and then never
+     * updated, which is exactly what left them computed and discarded: a
+     * persona's toolPolicy was narrowed at `newChat` for the tool
+     * CHECKLIST, and never carried anywhere the engine could act on it.
+     */
+    const turnPersona = chat.personaId ? usePersonas.getState().byId[chat.personaId] : undefined;
+    const turnAllowedMcpServerIds = useMcp
+      .getState()
+      .servers.filter((server) => server.enabled)
+      .map((server) => server.id);
+    const turnToolPolicy = narrowToolPolicy(turnPersona?.tools, turnPersona?.agentConfig, turnAllowedMcpServerIds);
+    const alwaysAsk = turnToolPolicy.confirmPolicy === 'always-ask';
+
     const stream = engine.stream({
       messages: built.messages,
       target,
       sampler: resolveSampler(chat, target.modelId),
       toolIds: chat.tools,
-      egress: egressPolicy(chat.id, built.derivedReplies),
-      mcpEgress: mcpEgressPolicy(chat.id),
+      egress: egressPolicy(chat.id, built.derivedReplies, alwaysAsk),
+      mcpEgress: mcpEgressPolicy(chat.id, alwaysAsk),
+      maxToolRounds: turnToolPolicy.maxToolRounds,
+      confirmEachCall: alwaysAsk ? confirmEachToolCall : undefined,
       signal: controller.signal,
     });
 
@@ -1947,14 +2024,49 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
 }
 
 /**
+ * Asks before a non-destination tool call runs — the enforcement for
+ * `agentConfig.toolPolicy.confirmPolicy === 'always-ask'` on a tool that,
+ * absent that preference, runs with no question asked at all (#23, #122).
+ *
+ * A call with a destination is never routed here (`runToolCalls` only
+ * consults this for one without) — that one already asks through
+ * `egressPolicy`/`mcpEgressPolicy` above, and `alwaysAsk` there is what
+ * stops a standing grant from skipping THAT ask. This is the other half:
+ * the tool that never had a destination-shaped ask to begin with.
+ */
+function confirmEachToolCall(call: ToolUseContent, signal?: AbortSignal): Promise<boolean> {
+  return useApp.getState().requestApproval(
+    `run ${call.name}`,
+    {
+      title: `Run ${call.name}?`,
+      body:
+        `This persona asks to confirm every tool call, even ones the app would otherwise run ` +
+        `without asking.`,
+      confirmLabel: 'Run it',
+      cancelLabel: 'Skip',
+    },
+    signal,
+  );
+}
+
+/**
  * The consent side of the engine's rule, in the app's own voice.
  *
  * Read live from the store rather than captured when the turn started: a grant
  * made in the sheet has to be visible to the check that raised it, and the
  * chat record may have moved on by then. `earlier` is the exception, fixed for
  * the turn, because it describes the history this turn's prompt was built from.
+ *
+ * `alwaysAsk` (#23, #122): a persona's `agentConfig.toolPolicy.confirmPolicy
+ * === 'always-ask'` makes `isGranted` refuse a standing "for this
+ * conversation" grant it would otherwise honour — the sheet is raised again
+ * even though this exact destination was already allowed earlier in the
+ * same chat. `onGranted` is untouched: an "Allow" answered while always-ask
+ * is on still persists a grant, for the day the persona no longer asks for
+ * it (edited, or the chat's own picker overrides it); it is simply never
+ * CONSULTED to skip asking while always-ask stands.
  */
-function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgressPolicy {
+function egressPolicy(chatId: string, earlier: readonly DerivedReply[], alwaysAsk = false): ToolEgressPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
 
@@ -1962,6 +2074,7 @@ function egressPolicy(chatId: string, earlier: readonly DerivedReply[]): ToolEgr
     // Not while a grant for this connection may be one being withdrawn: the
     // store holds it until the revocation's write lands. See `withdrawals`.
     isGranted: (backendId) =>
+      !alwaysAsk &&
       !providerWithdrawals.unsettled(backendId) &&
       holdsGrant(grantsFor(), { kind: 'provider', connectionId: backendId }),
 
@@ -2072,8 +2185,14 @@ export function mcpSendSheet({ destination, calls }: DestinationRequest): McpSen
  * it. The count is the one from BEFORE the sheet was raised: an answer given
  * while the server's grants were being withdrawn covers the calls it listed,
  * and nothing of it is kept. See `withdrawals`.
+ *
+ * `alwaysAsk` (#23, #122), as `egressPolicy`'s: a persona's `confirmPolicy
+ * === 'always-ask'` refuses BOTH sources `isGranted` would otherwise honour
+ * — a stored "for this conversation" grant, and `answered`'s own within-turn
+ * memory of an earlier call in this same turn — so the sheet is raised for
+ * every MCP call, not just the first.
  */
-function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
+function mcpEgressPolicy(chatId: string, alwaysAsk = false): ToolDestinationPolicy {
   const grantsFor = (): readonly EgressGrant[] =>
     useChats.getState().chats.find((entry) => entry.id === chatId)?.egressGrants ?? [];
   const answered = new Map<string, number>();
@@ -2085,6 +2204,7 @@ function mcpEgressPolicy(chatId: string): ToolDestinationPolicy {
     // holds it until the revocation's write lands, and the dispatcher reads a
     // held grant again just before each call.
     isGranted: (destination) =>
+      !alwaysAsk &&
       !mcpWithdrawals.unsettled(destination.serverId) &&
       (answered.get(keyOf(destination)) === mcpWithdrawals.count(destination.serverId) ||
         holdsGrant(grantsFor(), {
@@ -2181,8 +2301,30 @@ function routesProviderSilently(origin: PersonaOrigin | undefined): boolean {
  * (a `cli-agent` preference with no `connectionId` yet, since that target
  * kind has no connections of its own in this app).
  */
-function providerConsentDestination(provider: PersonaProviderPreference): string {
+export function providerConsentDestination(provider: PersonaProviderPreference): string {
   return provider.connectionId ?? provider.kind;
+}
+
+/**
+ * A human-readable name for a provider preference's destination, for the
+ * consent sheet and anywhere else that needs to say WHERE messages would go
+ * — "cloud" or "self-hosted" worded exactly as the provider catalog
+ * (`ai/providers.ts`'s `ProviderDescriptor.kind`) describes that connection,
+ * not guessed from anything else on it.
+ */
+export function providerDestinationLabel(
+  provider: PersonaProviderPreference,
+  connections: readonly ProviderConnection[],
+): string {
+  if (provider.kind === 'remote-connection') {
+    const connection = connections.find((entry) => entry.id === provider.connectionId);
+    if (!connection) return 'a remote provider';
+    const descriptor = getProvider(connection.providerId);
+    const kind = descriptor?.kind === 'self-hosted' ? 'self-hosted' : 'cloud';
+    return `${connection.label} (${kind})`;
+  }
+  // 'cli-agent': no connection of its own in this app yet (#23, #122).
+  return 'a command-line agent';
 }
 
 /**
@@ -2260,7 +2402,11 @@ export function providerConsentPending(
   if (routesProviderSilently(persona.origin)) return false;
   if (useProviderConsent.getState().isGranted(persona.id, providerConsentDestination(provider))) return false;
   if (provider.kind === 'remote-connection') {
-    return connections.some((entry) => entry.id === provider.connectionId);
+    // Matches `resolvePersonaProvider`'s own connection lookup exactly: that
+    // function only ever routes to an ENABLED connection, so asking about a
+    // disabled one would grant a consent that still falls back — there is
+    // nothing concrete for the user to be saying yes to yet.
+    return connections.some((entry) => entry.id === provider.connectionId && entry.enabled);
   }
   return true; // 'cli-agent'
 }
@@ -2609,9 +2755,19 @@ export function narrowToolPolicy(
   const confirmPolicy: PersonaToolConfirmPolicy | undefined =
     agentConfig?.toolPolicy?.confirmPolicy === 'always-ask' ? 'always-ask' : undefined;
 
+  // `clampToolRounds` (ai/engine.ts) is the one place a round count becomes
+  // trustworthy — shared with the engine's own boundary so a malformed
+  // value (NaN, Infinity, a string) is fixed once, not twice (#23, #122;
+  // adversarial review, MEDIUM: `Math.min(NaN, TOOL_ITERATIONS)` is `NaN`,
+  // and `typeof NaN === 'number'` let it straight through the old guard
+  // here, then `iteration >= NaN` at the engine never fired). Only called
+  // when the persona actually set something, however malformed — an
+  // ABSENT preference stays `undefined` ("asked for nothing"), which is a
+  // different fact than "asked for something clampToolRounds had to
+  // default": both end up giving the engine `TOOL_ITERATIONS` in the end,
+  // but only one of them is a persona that asked for anything at all.
   const requestedRounds = agentConfig?.toolPolicy?.maxToolRounds;
-  const maxToolRounds =
-    typeof requestedRounds === 'number' ? Math.min(requestedRounds, TOOL_ITERATIONS) : undefined;
+  const maxToolRounds = requestedRounds === undefined ? undefined : clampToolRounds(requestedRounds);
 
   return { toolIds: unsensitive(candidates), mcpServerIds, confirmPolicy, maxToolRounds };
 }

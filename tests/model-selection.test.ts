@@ -412,7 +412,11 @@ describe('the surfaces that offer a model for a chat', () => {
   it('builds a persona’s preferred model from chatModels', () => {
     const editor = src('features/personas/PersonaEditor.tsx');
     expect(editor).toContain('useShallow(chatModels)');
-    expect(editor).toContain('models.map(');
+    // The select maps `modelsForRequires` (#23, #122: further narrowed by
+    // `persona.requires`), itself derived from `models` — the `chatModels`
+    // subscription above — never the unfiltered table.
+    expect(editor).toContain('modelsForRequires.map(');
+    expect(editor).toMatch(/modelsForRequires\s*=[\s\S]{0,200}\bmodels\b/);
     // A persona's model is a chat model by definition — nothing else runs a turn.
     expect(editor).not.toContain('installedModels');
   });

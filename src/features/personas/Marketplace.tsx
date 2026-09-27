@@ -143,8 +143,20 @@ export function Marketplace(): ReactNode {
                 <button
                   type="button"
                   className="btn btn--primary btn--sm grow"
-                  disabled={has || purchasing === listing.id || !canAcquire(listing, storeReady)}
-                  onClick={() => void usePersonas.getState().acquire(listing)}
+                  disabled={has || purchasing === listing.id}
+                  // OPENS THE DISCLOSURE — does not acquire (adversarial
+                  // review, HIGH, refs #23, #122). This button used to call
+                  // `acquire()` directly, the same one tap as "Preview" but
+                  // skipping what "Preview" shows: the README's "full
+                  // instructions visible before purchase" promise, now
+                  // extended to a listing's provider and tool policy. Every
+                  // listing opens the sheet — not just ones with
+                  // `agentConfig` — because the system prompt shown there is
+                  // itself "full instructions" the README already promised.
+                  // `acquire()` is now reachable from exactly one place:
+                  // `ListingSheet`'s own footer button, which still checks
+                  // `canAcquire` (tests/platform.test.ts).
+                  onClick={() => setDetail(listing)}
                 >
                   {purchasing === listing.id ? <span className="spinner" /> : null}
                   {has ? (
@@ -200,7 +212,8 @@ export function Marketplace(): ReactNode {
   );
 }
 
-function ListingSheet({
+/** Exported for tests: the detail sheet, driven directly rather than through the full store/pricing flow. */
+export function ListingSheet({
   listing,
   priceLabel,
   owned,
@@ -278,6 +291,61 @@ function ListingSheet({
           </span>
         </div>
       ) : null}
+
+      {/*
+        Shown unconditionally, before the footer's "Get for …" button is
+        even reachable — this is the disclosure the README promises
+        ("full instructions visible before purchase"), and it renders for
+        nothing that has no `agentConfig` (#23, #122). A `remote-connection`
+        or `cli-agent` preference here is still consent-gated the same way
+        any other imported/marketplace persona's is (`origin: 'marketplace'`
+        is set at `acquire()`, not by anything on the listing) — this text
+        says so rather than describing a connection that may not even exist
+        for whoever is reading it, since the listing cannot know that.
+      */}
+      {persona.agentConfig ? (
+        <div className="card card--quiet">
+          <span className="label">Provider & tools</span>
+          {persona.agentConfig.provider ? <p>{providerDisclosure(persona.agentConfig.provider.kind)}</p> : null}
+          {persona.agentConfig.toolPolicy ? (
+            <ul style={{ margin: 0, paddingLeft: 'var(--s-4)', color: 'var(--ink-2)', fontSize: 'var(--t-sm)' }}>
+              {persona.agentConfig.toolPolicy.toolIds?.length ? (
+                <li>Asks to pre-enable: {persona.agentConfig.toolPolicy.toolIds.join(', ')}</li>
+              ) : null}
+              {persona.agentConfig.toolPolicy.mcpServerIds?.length ? (
+                <li>
+                  Asks to use MCP servers you have added: {persona.agentConfig.toolPolicy.mcpServerIds.join(', ')}
+                </li>
+              ) : null}
+              {persona.agentConfig.toolPolicy.confirmPolicy === 'always-ask' ? (
+                <li>Always asks before a tool call, even where the app would not.</li>
+              ) : null}
+              {typeof persona.agentConfig.toolPolicy.maxToolRounds === 'number' ? (
+                <li>Up to {persona.agentConfig.toolPolicy.maxToolRounds} tool round(s) per turn.</li>
+              ) : null}
+            </ul>
+          ) : null}
+          <span className="field__hint">
+            None of this can ask for more than the app already allows — a sensitive tool or a
+            server you have not added stays out regardless of what a persona asks for.
+          </span>
+        </div>
+      ) : null}
     </Sheet>
   );
+}
+
+/** One honest sentence about a persona's provider preference, for the marketplace disclosure. */
+function providerDisclosure(kind: 'local' | 'remote-connection' | 'cli-agent'): string {
+  switch (kind) {
+    case 'local':
+      return 'Prefers to run on a model on your device.';
+    case 'remote-connection':
+      return (
+        'Prefers a remote connection — cloud or self-hosted, depending on which you set up. ' +
+        'You will be asked before anything is sent there.'
+      );
+    case 'cli-agent':
+      return 'Prefers a command-line agent — not available in this app yet.';
+  }
 }

@@ -311,6 +311,16 @@ export async function runToolCalls(
     declared?: readonly ChatterangTool[];
     signal?: AbortSignal;
     onToolExecuted?: (tool: ExecutedTool) => void;
+    /**
+     * Asked before a call WITHOUT a destination runs — the enforcement for a
+     * persona's `agentConfig.toolPolicy.confirmPolicy === 'always-ask'`
+     * (#23, #122). A call WITH a destination already asks through
+     * `destinations.request`; this is never consulted for one, so a call is
+     * never asked about twice. Absent is the app's own default: a
+     * non-destination tool (`calculator`, `datetime`, …) runs with no
+     * question asked, as it always has.
+     */
+    confirmEachCall?: (call: ToolUseContent, signal?: AbortSignal) => Promise<boolean>;
     /*
      * This batch was read from a turn past the turn's limit on tool rounds
      * (#293). Nothing in it runs — the limit means no more tool rounds, full
@@ -492,6 +502,18 @@ export async function runToolCalls(
         }
       } else if (!tool) {
         output = `No tool named "${call.name}" is available.`;
+        isError = true;
+      } else if (
+        !tool.destination &&
+        options.confirmEachCall &&
+        !(await options.confirmEachCall(call, options.signal))
+      ) {
+        // ALWAYS-ASK, DECLINED. Only for a call with no destination: one WITH
+        // a destination already asked through `destinations.request` above,
+        // and a second ask over the same call is the "second sheet" people
+        // learn to tap through. No receipt — a receipt names a server this
+        // call was not sent to, and a local tool has none.
+        output = `Declined: "${call.name}" was not run.`;
         isError = true;
       } else {
         try {
