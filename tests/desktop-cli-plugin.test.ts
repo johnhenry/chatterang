@@ -36,11 +36,29 @@ const OTHER_OWNER = 8;
 
 let turnRoot: string;
 afterEach(() => {
-  if (turnRoot) rmSync(turnRoot, { recursive: true, force: true });
+  // Removing `turnRootParent` (turnRoot's own parent, see `freshTurnRoot`
+  // below) also removes `turnRoot` itself -- one recursive delete cleans up
+  // both the unique per-test parent and whatever fake turns wrote under it.
+  if (turnRoot) rmSync(dirname(turnRoot), { recursive: true, force: true });
 });
 
+/**
+ * `turnRoot`'s own parent -- a directory NOTHING but this file's own tests
+ * ever create anything else under (round 6, MEDIUM: this test file failed
+ * 2 of 3 full-suite runs, reproduced alongside `tests/shell.test.ts`,
+ * `tests/download.test.ts` and others, because the traversal test below
+ * used to snapshot the WHOLE shared OS `tmpdir()` before/after a turn --
+ * and every other test file's own `mkdtempSync` calls into that same shared
+ * directory changed the listing out from under it, whether or not anything
+ * this file did was actually at fault). One fresh, unique `mkdtemp` parent
+ * per test is the fix: `turnRoot` is a subdirectory of it, so
+ * `dirname(turnRoot)` is THIS directory rather than the shared `tmpdir()`,
+ * and nothing outside this file ever has a reason to create a sibling
+ * inside it.
+ */
 function freshTurnRoot(): string {
-  turnRoot = mkdtempSync(join(tmpdir(), 'chatterang-cli-plugin-'));
+  const turnRootParent = mkdtempSync(join(tmpdir(), 'chatterang-cli-plugin-parent-'));
+  turnRoot = mkdtempSync(join(turnRootParent, 'root-'));
   return turnRoot;
 }
 
