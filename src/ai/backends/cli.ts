@@ -45,6 +45,7 @@ import type {
 } from '@johnhenry/aimatey-types';
 
 import {
+  CliLineOverflowError,
   createCliLineSplitter,
   createClaudeTranslator,
   createCodexTranslator,
@@ -157,17 +158,43 @@ export class CliBackendAdapter implements BackendAdapter {
       const queue: IRStreamChunk[] = [];
       let ended = false;
       let wake: (() => void) | undefined;
+      // Mirrors the translator's own sequence counter, which this file
+      // never sees directly: every chunk the translator has ever emitted
+      // (push or finish) advances this by exactly one, so it is always the
+      // next number the translator's own counter would use (#120).
+      let emittedCount = 0;
+      const emit = (chunks: readonly IRStreamChunk[]): void => {
+        queue.push(...chunks);
+        emittedCount += chunks.length;
+      };
 
       const handle = bridge.start({ cliId, messages });
 
       handle.onData((chunk, stream) => {
-        if (stream !== 'stdout') return;
-        for (const line of splitter.push(chunk)) queue.push(...translator.push(line));
+        if (stream !== 'stdout' || ended) return;
+        try {
+          for (const line of splitter.push(chunk)) emit(translator.push(line));
+        } catch (error) {
+          if (!(error instanceof CliLineOverflowError)) throw error;
+          // One error terminal, same as any other translator-level failure
+          // -- and the process is still running, unlike a translator.finish()
+          // case, so it has to be told to stop rather than merely reported on.
+          ended = true;
+          emit([
+            {
+              type: 'error',
+              sequence: emittedCount,
+              error: { code: 'cli_line_overflow', message: error.message },
+            },
+          ]);
+          handle.cancel();
+        }
         wake?.();
       });
       handle.onExit((exit) => {
-        for (const line of splitter.flush()) queue.push(...translator.push(line));
-        queue.push(...translator.finish(exit));
+        if (ended) return;
+        for (const line of splitter.flush()) emit(translator.push(line));
+        emit(translator.finish(exit));
         ended = true;
         wake?.();
       });

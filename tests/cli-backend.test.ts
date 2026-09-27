@@ -148,3 +148,44 @@ describe('CliBackendAdapter.executeStream, over a fake bridge replaying a real f
     // an abort reaches the bridge's cancel(), which is this adapter's job.
   });
 });
+
+describe('CliBackendAdapter ends a turn on a line-splitter overflow (#120)', () => {
+  it('emits exactly one error terminal chunk and cancels the bridge, without waiting for onExit', async () => {
+    let cancelled = false;
+    let exitListener: ((exit: CliBridgeExit) => void) | undefined;
+
+    const bridge: CliTurnBridge = {
+      start() {
+        return {
+          onData(listener) {
+            // One huge line with no newline at all -- well past
+            // CLI_LINE_SPLITTER_MAX_BUFFERED_BYTES (8 MiB) -- delivered as
+            // one chunk, which is enough to trip the cap on its own.
+            queueMicrotask(() => listener(new Uint8Array(9 * 1024 * 1024).fill(65), 'stdout'));
+          },
+          onExit(listener) {
+            exitListener = listener;
+            // Deliberately never actually called from this test: the
+            // overflow must end the turn WITHOUT waiting for it.
+          },
+          cancel() {
+            cancelled = true;
+          },
+        };
+      },
+    };
+
+    const adapter = new CliBackendAdapter('claude', bridge);
+    const chunks: IRStreamChunk[] = [];
+    for await (const chunk of adapter.executeStream(request([{ role: 'user', content: 'ping' }]))) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject({ type: 'error', error: { code: 'cli_line_overflow' } });
+    expect(cancelled).toBe(true);
+    // Confirms the "without waiting for onExit" half of this test's claim --
+    // the stream already ended above despite this never firing.
+    expect(exitListener).toBeDefined();
+  });
+});

@@ -61,8 +61,41 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
 const NEWLINE = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
 
-/** Byte-level line splitter (#120): buffers across `push()` calls, decodes only complete lines. */
-export function createCliLineSplitter(): CliLineSplitter {
+/**
+ * A GENEROUS, NOT TIGHT, CAP (#120). `createCliLineSplitter` buffers bytes
+ * with no newline in them yet — a real JSONL line from any of these three
+ * CLIs is at most a few KB, so this is not sized to real traffic; it is
+ * sized so that a CLI that stops emitting newlines (a bug, a hang, a
+ * malicious binary someone pointed #116's override at) cannot make this
+ * process hold an unbounded buffer for the lifetime of a turn.
+ */
+export const CLI_LINE_SPLITTER_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Thrown by {@link CliLineSplitter.push} when the buffered, still-undelimited
+ * tail exceeds the splitter's cap. The caller's job — `src/ai/backends/cli.ts`'s
+ * `executeStream` — is to end the turn with exactly one `error` terminal
+ * chunk, the same as any other translator-level failure, never to let this
+ * propagate as an unhandled rejection.
+ */
+export class CliLineOverflowError extends Error {
+  override readonly name = 'CliLineOverflowError';
+  constructor(maxBufferedBytes: number) {
+    super(
+      `cli-stream: buffered more than ${maxBufferedBytes} bytes with no newline. ` +
+        'Refusing to keep growing an unbounded line.',
+    );
+  }
+}
+
+/**
+ * Byte-level line splitter (#120): buffers across `push()` calls, decodes
+ * only complete lines, and refuses to buffer past `maxBufferedBytes` of
+ * still-undelimited tail (see {@link CLI_LINE_SPLITTER_MAX_BUFFERED_BYTES}).
+ */
+export function createCliLineSplitter(
+  maxBufferedBytes: number = CLI_LINE_SPLITTER_MAX_BUFFERED_BYTES,
+): CliLineSplitter {
   let buffered: Uint8Array = new Uint8Array(0);
   const decoder = new TextDecoder('utf-8');
 
@@ -83,7 +116,13 @@ export function createCliLineSplitter(): CliLineSplitter {
   return {
     push(chunk) {
       buffered = concatBytes(buffered, chunk);
-      return drain();
+      const lines = drain();
+      // Checked AFTER draining every complete line out: the cap is about one
+      // line that never ends, not about total throughput across many lines.
+      if (buffered.length > maxBufferedBytes) {
+        throw new CliLineOverflowError(maxBufferedBytes);
+      }
+      return lines;
     },
     flush() {
       if (buffered.length === 0) return [];

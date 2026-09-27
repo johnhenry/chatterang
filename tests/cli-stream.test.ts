@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  CliLineOverflowError,
   createCliLineSplitter,
   createClaudeTranslator,
   createCodexTranslator,
@@ -87,6 +88,40 @@ describe('createCliLineSplitter (#120)', () => {
     const splitter = createCliLineSplitter();
     splitter.push(utf8('{"a":1}\n'));
     expect(splitter.flush()).toEqual([]);
+  });
+});
+
+describe('createCliLineSplitter caps its buffered bytes (#120)', () => {
+  it('accepts a line right up to the cap', () => {
+    const splitter = createCliLineSplitter(16);
+    // 15 bytes buffered, no newline yet -- under the 16-byte cap.
+    expect(() => splitter.push(utf8('a'.repeat(15)))).not.toThrow();
+  });
+
+  it('throws CliLineOverflowError once the still-undelimited tail exceeds the cap', () => {
+    const splitter = createCliLineSplitter(16);
+    expect(() => splitter.push(utf8('a'.repeat(17)))).toThrow(CliLineOverflowError);
+  });
+
+  it('checks the cap AFTER draining complete lines, not on total bytes ever seen', () => {
+    const splitter = createCliLineSplitter(16);
+    // Many short, complete lines -- each drained away, so the buffered tail
+    // never grows past one line's worth of bytes. Total bytes pushed here
+    // (30) exceeds the cap; the buffered TAIL never does.
+    for (let i = 0; i < 10; i++) {
+      expect(() => splitter.push(utf8('{"a":1}\n'))).not.toThrow();
+    }
+  });
+
+  it('reports the configured limit in its message', () => {
+    const splitter = createCliLineSplitter(16);
+    try {
+      splitter.push(utf8('a'.repeat(17)));
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(CliLineOverflowError);
+      expect((error as Error).message).toContain('16');
+    }
   });
 });
 
