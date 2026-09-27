@@ -185,3 +185,5 @@ export type {
   PluginDefinition,
   WireError,
 } from './protocol.js';
+export { discoverCli } from './cli-discovery.js';
+export type { CliBinarySpec, CliDiscovery, CliDiscoveryDeps, CliExecResult } from './cli-discovery.js';
