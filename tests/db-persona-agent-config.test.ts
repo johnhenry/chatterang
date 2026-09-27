@@ -1,5 +1,5 @@
 /**
- * `Persona.agentConfig`'s Dexie bump (#7, owner ruling 2026-09-27: v10 -> v11,
+ * `Persona.agentConfig`'s Dexie bump (#23, #122, owner ruling 2026-09-27: v10 -> v11,
  * additive, no upgrade function).
  *
  * As `tests/db-paired-devices.test.ts` explains for v10: this project has no

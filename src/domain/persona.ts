@@ -18,7 +18,29 @@ import type { Capability, SamplerSettings } from './manifest';
 
 export type PersonaKind = 'assistant' | 'character';
 
-/* ══ Agent configuration (#7: personas become configurable on everything) ══
+/**
+ * Where a persona came from, set only by this app's own code paths — never
+ * read from card-supplied data, because a card's own claim about itself
+ * (`agentConfig.source.forSurface`, or anything else in the file) is exactly
+ * what an attacker controls (refs #23, #122; adversarial review, HIGH).
+ *
+ *  - `'authored'`: written or edited in this app's own persona editor.
+ *  - `'imported'`: brought in from a Character Card file.
+ *  - `'marketplace'`: acquired from the in-app marketplace listing.
+ *  - `'builtin'`: shipped with the app.
+ *
+ * `undefined` — a persona row written before this field existed — is NOT
+ * the same as `'authored'`: it is treated as untrusted for the one thing
+ * this field currently gates (`state/chat.ts`'s consent check on
+ * `agentConfig.provider`), even though in practice no such row can carry an
+ * `agentConfig` at all, since that field did not exist when they were
+ * written either. Gating it anyway costs nothing today and is the safer
+ * failure mode if a future migration ever back-fills `agentConfig` onto an
+ * old row without also setting `origin`.
+ */
+export type PersonaOrigin = 'authored' | 'imported' | 'marketplace' | 'builtin';
+
+/* ══ Agent configuration (#23, #122: personas become configurable on everything) ══
  *
  * Owner ruling, 2026-09-27: one `Persona` type, not a second "agent persona"
  * shape. `agentConfig` is an optional block on top of the thin fields above
@@ -211,6 +233,15 @@ export interface Persona {
   /** Injected after the conversation history, just before generation. */
   readonly postHistoryInstructions?: string;
   readonly characterBook?: CharacterBook;
+  /**
+   * Another app's `data.extensions` entries, everything except our own
+   * `chatterang` key, carried opaquely (refs #122: where a persona's content
+   * came from). Never read or interpreted by anything in this app — only
+   * `sanitizeAgentConfig`'s namespace is ever trusted for behaviour — but
+   * kept and written back on export, so re-sharing a card this app imported
+   * does not silently erase what another app put on it.
+   */
+  readonly foreignCardExtensions?: Readonly<Record<string, unknown>>;
 
   /* ── Assistant-style fields ───────────────────────────────────────── */
   /** Preferred model id; the router falls back if it is not installed. */
@@ -223,7 +254,7 @@ export interface Persona {
   readonly requires?: readonly Capability[];
   /** Whether reasoning traces should be shown by default in this persona. */
   readonly showThinking?: boolean;
-  /** Provider, tool-policy and provenance preferences (#7). Optional and
+  /** Provider, tool-policy and provenance preferences (#23, #122). Optional and
    * additive: everything above still works with this absent. */
   readonly agentConfig?: PersonaAgentConfig;
 
@@ -237,6 +268,13 @@ export interface Persona {
   readonly listingId?: string;
   /** Built-in personas cannot be deleted, only duplicated. */
   readonly builtin?: boolean;
+  /**
+   * Set by this app's own code — never by card-supplied data — at the point
+   * a persona is authored, imported, acquired or seeded. See
+   * {@link PersonaOrigin}. `undefined` on a row written before this field
+   * existed.
+   */
+  readonly origin?: PersonaOrigin;
 }
 
 export type PersonaDraft = Omit<Persona, 'id' | 'createdAt' | 'updatedAt' | 'version'> &
@@ -400,6 +438,13 @@ export function fromCharacterCard(card: CharacterCardV2): PersonaDraft {
   // invented from whatever else happens to be in that block.
   const agentConfig = sanitizeAgentConfig(data.extensions?.chatterang?.agentConfig);
 
+  // Everything else in `extensions` is another app's, carried opaquely (refs
+  // #122) rather than dropped: only `chatterang` is ever read for behaviour,
+  // but a card round-tripped through this app should not come back missing
+  // what a different app put on it.
+  const { chatterang: _ours, ...foreignExtensions } = data.extensions ?? {};
+  const foreignCardExtensions = Object.keys(foreignExtensions).length > 0 ? foreignExtensions : undefined;
+
   return {
     kind: 'character',
     name,
@@ -418,6 +463,7 @@ export function fromCharacterCard(card: CharacterCardV2): PersonaDraft {
     tags: data.tags ?? [],
     showThinking: false,
     agentConfig,
+    foreignCardExtensions,
   };
 }
 
@@ -458,9 +504,18 @@ export function toCharacterCard(persona: Persona): CharacterCardV2 {
       // Namespaced and schema-tagged, so a future schema change to this
       // extension can tell its own shape apart from whatever v1 wrote, and so
       // this app never reads or overwrites another app's extension block.
-      extensions: persona.agentConfig
-        ? { chatterang: { schemaVersion: 1, agentConfig: persona.agentConfig } }
-        : undefined,
+      // `foreignCardExtensions` is written back untouched (refs #122) —
+      // whatever another app's card carried here on import goes back out
+      // the same, even though nothing in this app ever looked inside it.
+      extensions:
+        persona.agentConfig || persona.foreignCardExtensions
+          ? {
+              ...persona.foreignCardExtensions,
+              ...(persona.agentConfig
+                ? { chatterang: { schemaVersion: 1, agentConfig: persona.agentConfig } }
+                : {}),
+            }
+          : undefined,
     },
   };
 }

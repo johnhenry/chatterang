@@ -424,7 +424,7 @@ class ChatterangDatabase extends Dexie {
     this.version(10).stores({ pairedDevices: 'id, spkiPin' });
 
     /**
-     * v11 — `Persona.agentConfig` (#7: configurable personas — owner ruling
+     * v11 — `Persona.agentConfig` (#23, #122: configurable personas — owner ruling
      * 2026-09-27), landing at the version the ruling names.
      *
      * ADDITIVE, NO UPGRADE FUNCTION, as `mcpServers` at v2 and `pairedDevices`

@@ -11,7 +11,7 @@ import type { Persona } from '@/domain/persona';
 const now = Date.UTC(2026, 0, 1);
 
 function builtin(persona: Omit<Persona, 'createdAt' | 'updatedAt' | 'version' | 'builtin'>): Persona {
-  return { ...persona, createdAt: now, updatedAt: now, version: 1, builtin: true };
+  return { ...persona, createdAt: now, updatedAt: now, version: 1, builtin: true, origin: 'builtin' };
 }
 
 export const BUILT_IN_PERSONAS: readonly Persona[] = [

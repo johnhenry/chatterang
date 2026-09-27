@@ -1,5 +1,5 @@
 /**
- * MCP server allowlist narrowing (#7, owner ruling 2026-09-27).
+ * MCP server allowlist narrowing (#23, owner ruling 2026-09-27).
  *
  * "mcpServerIds only select among servers the user already added and
  * enabled (a persona can never carry an MCP server definition/URL/token)."

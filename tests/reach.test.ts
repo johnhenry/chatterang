@@ -303,9 +303,10 @@ describe('the versions these migrations claim', () => {
      *
      * #133's paired-device table is v10 (`tests/db-paired-devices.test.ts`).
      * This comment used to say "#195 takes 11" — written before either #195
-     * or #7 (configurable personas) had landed. #7's `Persona.agentConfig`
-     * took v11 instead, on an explicit owner ruling dated 2026-09-27 that
-     * named that version for it (`tests/db-persona-agent-config.test.ts`).
+     * or #23/#122 (configurable personas) had landed. #23/#122's
+     * `Persona.agentConfig` took v11 instead, on an explicit owner ruling
+     * dated 2026-09-27 that named that version for it
+     * (`tests/db-persona-agent-config.test.ts`).
      * Whichever of #195 and anything else still unbuilt lands next must
      * re-read this note, as v7's did, and take v12 — this bound is exactly
      * what stops it from silently reusing 11 instead. Uniqueness alone does

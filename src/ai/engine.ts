@@ -64,7 +64,7 @@ import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
 /**
  * Execute → tools → execute round trips permitted per turn.
  *
- * Exported so a persona's `agentConfig.toolPolicy.maxToolRounds` (#7) has
+ * Exported so a persona's `agentConfig.toolPolicy.maxToolRounds` (#23) has
  * something to be clamped against — a persona may ask for FEWER rounds than
  * this, never more.
  */

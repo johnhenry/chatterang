@@ -1,5 +1,5 @@
 /**
- * Provider/model resolution from a persona's `agentConfig.provider` (#7).
+ * Provider/model resolution from a persona's `agentConfig.provider` (#23, #122).
  *
  * `newChat` already copies `persona.preferredModelId` into `chat.modelId`,
  * and `resolveTarget` falls back to the first enabled connection when that
@@ -75,6 +75,13 @@ const ANTHROPIC: ProviderConnection = {
   createdAt: 2,
 };
 
+/**
+ * A self-authored persona (`origin: 'authored'`), the ordinary case this
+ * file's tests are about — provider resolution for a persona the user
+ * configured themselves, which routes without the one-time consent
+ * `tests/persona-provider-consent.test.ts` covers for an imported or
+ * marketplace one (#23, #122).
+ */
 function persona(overrides: Partial<Persona> = {}): Persona {
   return {
     id: 'p1',
@@ -87,6 +94,7 @@ function persona(overrides: Partial<Persona> = {}): Persona {
     tags: [],
     createdAt: 0,
     updatedAt: 0,
+    origin: 'authored',
     ...overrides,
   };
 }

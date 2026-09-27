@@ -81,6 +81,13 @@ export const usePersonas = create<PersonaState>((set, get) => ({
       updatedAt: now,
       version: (existing?.version ?? 0) + 1,
       builtin: false,
+      // Sticky across edits: re-saving an imported persona through the
+      // editor does not launder its origin into 'authored' just because the
+      // editor is where the save happened (#23, #122) — only a caller that
+      // explicitly sets `draft.origin` (today, only `importCard`) overrides
+      // it. A brand new persona with nothing set here — the ordinary editor
+      // "create" path — is what 'authored' actually means.
+      origin: draft.origin ?? existing?.origin ?? 'authored',
     };
 
     await db.personas.put(persona);
@@ -115,7 +122,12 @@ export const usePersonas = create<PersonaState>((set, get) => ({
 
   async importCard(card) {
     const draft = fromCharacterCard(card);
-    const id = await get().save(draft);
+    // Set here, from the import CODE PATH — never from the card's own
+    // `agentConfig.source.forSurface`, which is attacker-controlled data
+    // (#23, #122; adversarial review, HIGH). This is what gates a remote or
+    // cli-agent `agentConfig.provider` behind the one-time consent in
+    // `state/chat.ts`'s `resolvePersonaProvider`.
+    const id = await get().save({ ...draft, origin: 'imported' });
     useApp.getState().toast(`Imported ${draft.name}.`, 'good');
     return id;
   },
@@ -164,6 +176,9 @@ export const usePersonas = create<PersonaState>((set, get) => ({
       updatedAt: now,
       version: 1,
       builtin: false,
+      // From the acquisition code path, not from `listing.persona` itself
+      // (#23, #122) — same reasoning as `importCard`.
+      origin: 'marketplace',
     };
     await db.personas.put(persona);
     set({ byId: { ...get().byId, [persona.id]: persona } });
@@ -200,6 +215,7 @@ export const usePersonas = create<PersonaState>((set, get) => ({
             updatedAt: now,
             version: 1,
             builtin: false,
+            origin: 'marketplace',
           });
           added += 1;
         }

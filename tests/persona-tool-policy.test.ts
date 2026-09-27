@@ -1,5 +1,5 @@
 /**
- * Narrow-only tool policy (#7, owner ruling 2026-09-27).
+ * Narrow-only tool policy (#23, owner ruling 2026-09-27).
  *
  * `unsensitive()` already refused to let a persona's `tools` list widen past
  * what the app allows — a sensitive tool is dropped, not the whole list
@@ -117,6 +117,26 @@ describe('narrowToolPolicy — toolIds', () => {
   });
 
   it('uses toolPolicy.toolIds alone when there is no legacy tools list', () => {
+    const result = narrowToolPolicy(undefined, { toolPolicy: { toolIds: ['safe_calc'] } });
+    expect(result.toolIds).toEqual(['safe_calc']);
+  });
+
+  /*
+   * ADVERSARIAL REVIEW FINDING (MEDIUM): a defined-but-EMPTY legacy `tools`
+   * list — a persona that explicitly grants nothing — was being read the
+   * same as an ABSENT one, because `legacyTools?.length` is falsy for both
+   * `[]` and `undefined`. That let `toolPolicy.toolIds` stand alone and
+   * widen past the explicit empty grant. Paired with the case just above,
+   * which must keep passing: `undefined` (no legacy field at all) still
+   * lets `toolPolicy.toolIds` stand alone, because there is nothing there to
+   * have narrowed against.
+   */
+  it('treats a defined-but-empty legacy tools list as an explicit grant of nothing, not as absent', () => {
+    const result = narrowToolPolicy([], { toolPolicy: { toolIds: ['safe_calc'] } });
+    expect(result.toolIds).toEqual([]);
+  });
+
+  it('(paired) still uses toolPolicy.toolIds alone when the legacy field is truly absent, not merely empty', () => {
     const result = narrowToolPolicy(undefined, { toolPolicy: { toolIds: ['safe_calc'] } });
     expect(result.toolIds).toEqual(['safe_calc']);
   });

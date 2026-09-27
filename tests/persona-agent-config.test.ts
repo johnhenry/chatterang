@@ -1,5 +1,5 @@
 /**
- * `Persona.agentConfig` (#7 track: configurable personas — owner ruling
+ * `Persona.agentConfig` (#23, #122: configurable personas — owner ruling
  * 2026-09-27) — the domain-layer half: the type, its Character Card v2
  * round trip, and import sanitization.
  *
@@ -141,6 +141,69 @@ describe('Character Card v2 round trip with agentConfig', () => {
     };
     const draft = fromCharacterCard(foreignCard);
     expect(draft.agentConfig).toBeUndefined();
+  });
+
+  /*
+   * ADVERSARIAL REVIEW FINDING (LOW): `toCharacterCard` dropped every OTHER
+   * app's `extensions.*` entry on re-export, keeping only our own
+   * `chatterang` key. A card round-tripped through this app for its
+   * provider/tool-policy settings came back with a third-party app's data
+   * silently gone. Preserved opaquely instead: read once on import, carried
+   * on the persona, never interpreted, written back untouched on export.
+   */
+  it('carries another app’s extensions opaquely through import', () => {
+    const foreignCard: CharacterCardV2 = {
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: { name: 'Foreign', extensions: { someOtherApp: { anything: true }, another: 'x' } },
+    };
+    const draft = fromCharacterCard(foreignCard);
+    expect(draft.foreignCardExtensions).toEqual({ someOtherApp: { anything: true }, another: 'x' });
+  });
+
+  it('writes those foreign extensions back on export, byte for byte', () => {
+    const draft = fromCharacterCard({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: { name: 'Foreign', extensions: { someOtherApp: { anything: true } } },
+    });
+    const card = toCharacterCard({ ...draft, id: 'x', version: 1, createdAt: 0, updatedAt: 0 } as Persona);
+    expect(card.data.extensions?.someOtherApp).toEqual({ anything: true });
+  });
+
+  it('writes both a foreign extension AND our own chatterang key together', () => {
+    const draft = fromCharacterCard({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: { name: 'Both', extensions: { someOtherApp: { anything: true } } },
+    });
+    const card = toCharacterCard({
+      ...draft,
+      id: 'x',
+      version: 1,
+      createdAt: 0,
+      updatedAt: 0,
+      agentConfig: FULL_CONFIG,
+    } as Persona);
+    expect(card.data.extensions?.someOtherApp).toEqual({ anything: true });
+    expect(card.data.extensions?.chatterang?.agentConfig).toEqual(FULL_CONFIG);
+  });
+
+  it('never reads a foreign extension’s content as if it were our own — it is carried, not interpreted', () => {
+    // A foreign extension named exactly like an attempt to sneak agentConfig
+    // in under a different key must not be picked up by anything.
+    const draft = fromCharacterCard({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'Sneaky',
+        extensions: { notChatterang: { agentConfig: { provider: { kind: 'remote-connection' } } } },
+      },
+    });
+    expect(draft.agentConfig).toBeUndefined();
+    expect(draft.foreignCardExtensions).toEqual({
+      notChatterang: { agentConfig: { provider: { kind: 'remote-connection' } } },
+    });
   });
 
   it('sanitizes an imported agentConfig, dropping the unrecognised parts', () => {
