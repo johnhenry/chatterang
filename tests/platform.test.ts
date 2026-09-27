@@ -463,14 +463,28 @@ void openSink;
 });
 
 /**
- * The marketplace's SECOND purchase entry point.
+ * The marketplace's purchase entry point(s).
  *
  * `storeReady` gated the card's button and the Restore button. It did not gate
- * the detail sheet's "Get for …", which is an equal route to the same
+ * the detail sheet's "Get for …", which was an EQUAL route to the same
  * `acquire()` — so on the web and in the desktop shell one button was
  * correctly disabled and an identical one, a single tap further in, was live
  * and ended at the Billing stub's throw. `billingAvailable()` had the answer
  * the whole time; one of the two callers was never asked to consult it.
+ *
+ * UPDATED (adversarial review of feat/persona-editor, HIGH, refs #23, #122):
+ * that second route was not merely ungated the same way this test caught —
+ * it also skipped the sheet's disclosure of the listing's `agentConfig`
+ * (provider and tool policy) entirely, since acquiring is what the card's
+ * button did, without ever showing what "Preview" shows. Rather than gate a
+ * second acquire site the same way twice, the card's buy button now opens
+ * the sheet — the one place `acquire()` is called from — so the README's
+ * "full instructions visible before purchase" promise cannot be walked
+ * around by whichever button someone happens to tap. `.acquire(` is
+ * expected to appear EXACTLY once now, not "more than once but every one
+ * gated": a second site reappearing is exactly the regression this test
+ * still exists to catch, just with the bound tightened to match the
+ * simpler, correct shape.
  */
 describe('every route into a purchase asks the seam', () => {
   const marketplace = readFileSync(
@@ -478,19 +492,20 @@ describe('every route into a purchase asks the seam', () => {
     'utf8',
   );
 
-  it('gates exactly as many purchase entry points as it has', () => {
+  it('has exactly one purchase entry point, and it is gated', () => {
     /*
-     * A COUNT, not a spot check, because the defect was an entry point nobody
-     * had counted. There is no React renderer in this repo, so the assertion
-     * is on the source — and a count is the shape of assertion that survives a
-     * THIRD button being added, which a test naming the two existing ones
-     * would not.
+     * A COUNT, not a spot check, because the original defect was an entry
+     * point nobody had counted. The assertion is on the source — and a count
+     * is the shape of assertion that survives a SECOND button being added
+     * back, which a test naming only the current one call site would not.
      *
-     * FAULT INJECTED: `!canAcquire(listing, storeReady)` removed from the
-     * sheet's `disabled`. Observed: 2 acquire sites against 1 gate, exit 1.
+     * FAULT INJECTED (original version of this test): `!canAcquire(listing,
+     * storeReady)` removed from the sheet's `disabled`. Observed: 2 acquire
+     * sites against 1 gate, exit 1. Re-verified after the card's button
+     * stopped calling `acquire()` directly: exactly 1 site now, still gated.
      */
     const acquires = [...marketplace.matchAll(/\.acquire\(/g)];
-    expect(acquires.length).toBeGreaterThan(1);
+    expect(acquires.length).toBe(1);
 
     /*
      * TIED TO THE `disabled` ATTRIBUTE, not merely present in the file.

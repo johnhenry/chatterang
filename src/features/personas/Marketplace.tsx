@@ -143,8 +143,20 @@ export function Marketplace(): ReactNode {
                 <button
                   type="button"
                   className="btn btn--primary btn--sm grow"
-                  disabled={has || purchasing === listing.id || !canAcquire(listing, storeReady)}
-                  onClick={() => void usePersonas.getState().acquire(listing)}
+                  disabled={has || purchasing === listing.id}
+                  // OPENS THE DISCLOSURE — does not acquire (adversarial
+                  // review, HIGH, refs #23, #122). This button used to call
+                  // `acquire()` directly, the same one tap as "Preview" but
+                  // skipping what "Preview" shows: the README's "full
+                  // instructions visible before purchase" promise, now
+                  // extended to a listing's provider and tool policy. Every
+                  // listing opens the sheet — not just ones with
+                  // `agentConfig` — because the system prompt shown there is
+                  // itself "full instructions" the README already promised.
+                  // `acquire()` is now reachable from exactly one place:
+                  // `ListingSheet`'s own footer button, which still checks
+                  // `canAcquire` (tests/platform.test.ts).
+                  onClick={() => setDetail(listing)}
                 >
                   {purchasing === listing.id ? <span className="spinner" /> : null}
                   {has ? (
