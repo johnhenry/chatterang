@@ -169,6 +169,32 @@ describe('narrowToolPolicy — maxToolRounds', () => {
   it('leaves maxToolRounds undefined when the persona asks for nothing', () => {
     expect(narrowToolPolicy([], undefined).maxToolRounds).toBeUndefined();
   });
+
+  /*
+   * ROUND 2 FOLLOW-UP (adversarial review, MEDIUM, refs #23, #122):
+   * `typeof NaN === 'number'` let a NaN maxToolRounds straight through the
+   * old `Math.min(requestedRounds, TOOL_ITERATIONS)` guard here — itself
+   * `NaN` — and on to the engine, where `iteration >= NaN` never fires and
+   * a 5th tool round ran (`TOOL_ITERATIONS` 4). Fixed by routing through
+   * the same `clampToolRounds` the engine's own boundary now uses
+   * (`Number.isFinite`, not `typeof … === 'number'`).
+   */
+  it('a NaN maxToolRounds is clamped to TOOL_ITERATIONS, not left as NaN', () => {
+    expect(narrowToolPolicy([], { toolPolicy: { maxToolRounds: NaN } }).maxToolRounds).toBe(TOOL_ITERATIONS);
+  });
+
+  it('Infinity and -Infinity are non-finite, so both default to TOOL_ITERATIONS like an absent value', () => {
+    expect(narrowToolPolicy([], { toolPolicy: { maxToolRounds: Infinity } }).maxToolRounds).toBe(
+      TOOL_ITERATIONS,
+    );
+    expect(narrowToolPolicy([], { toolPolicy: { maxToolRounds: -Infinity } }).maxToolRounds).toBe(
+      TOOL_ITERATIONS,
+    );
+  });
+
+  it('a non-integer is truncated rather than rejected', () => {
+    expect(narrowToolPolicy([], { toolPolicy: { maxToolRounds: 2.5 } }).maxToolRounds).toBe(2);
+  });
 });
 
 describe('newChat wires narrowToolPolicy into chat.tools', () => {

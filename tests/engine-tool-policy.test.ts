@@ -112,6 +112,83 @@ describe('GenerationRequest.maxToolRounds', () => {
   });
 });
 
+/*
+ * ROUND 2 FOLLOW-UP: A MALFORMED `maxToolRounds` WIDENED THE CAP INSTEAD OF
+ * FALLING BACK TO IT (adversarial review, MEDIUM, refs #23, #122).
+ *
+ * `typeof NaN === 'number'`, so the old guard here — `typeof x === 'number'
+ * ? Math.max(0, Math.min(x, TOOL_ITERATIONS)) : TOOL_ITERATIONS` — let `NaN`
+ * through into `Math.min(NaN, TOOL_ITERATIONS)`, which is `NaN`, and
+ * `iteration >= NaN` is never true for any `iteration`. The loop's OWN hard
+ * bound (`iteration <= TOOL_ITERATIONS`) was the only ceiling left — one
+ * round WIDER than a persona that asked for nothing gets. Reproduced: 5
+ * calls dispatched with `TOOL_ITERATIONS` at 4 and `maxToolRounds: NaN`,
+ * against 4 with no `maxToolRounds` field at all.
+ *
+ * `clampToolRounds` (ai/engine.ts) is the fix, shared with
+ * `narrowToolPolicy` (state/chat.ts) so this is fixed once: every value
+ * below fails `Number.isFinite` or `typeof … === 'number'`, and every one
+ * of them must behave EXACTLY as an absent `maxToolRounds` does — never
+ * more calls than `TOOL_ITERATIONS`, and specifically not the 5-call
+ * regression above.
+ */
+describe('GenerationRequest.maxToolRounds — malformed values fall back to TOOL_ITERATIONS, never widen it', () => {
+  afterEach(() => {
+    toolRegistry.unregister('mcp:notes.note');
+  });
+
+  async function callsMadeWith(maxToolRounds: unknown): Promise<number> {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+    const turns = Array.from({ length: 6 }, () => MCP_CALL);
+    engine.router.register('scripted', recordingBackend(turns).adapter);
+
+    await drainEvents(
+      engine.stream({
+        messages: [{ role: 'user', content: 'file my note' }],
+        target: local(),
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        // `GenerationRequest['maxToolRounds']` is typed `number | undefined`;
+        // the point of this test is exactly that an untyped caller — a
+        // value that slipped past validation somewhere upstream — can still
+        // hand the engine something else entirely.
+        maxToolRounds: maxToolRounds as number,
+      }),
+    );
+
+    toolRegistry.unregister(probe.tool.id);
+    return probe.call.mock.calls.length;
+  }
+
+  it.each([
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+    ['-Infinity', -Infinity],
+    ['2.5 (truncated to 2, not rejected)', 2.5],
+    ["the string '1' (never parsed)", '1'],
+  ] as const)('%s never exceeds TOOL_ITERATIONS calls', async (_label, value) => {
+    const { TOOL_ITERATIONS } = await import('@/ai/engine');
+    expect(await callsMadeWith(value)).toBeLessThanOrEqual(TOOL_ITERATIONS);
+  });
+
+  it('NaN behaves EXACTLY like an absent maxToolRounds — the exact regression reproduced', async () => {
+    const withNaN = await callsMadeWith(NaN);
+    const absent = await callsMadeWith(undefined);
+    expect(withNaN).toBe(absent);
+  });
+
+  it('a string is never parsed — "1" behaves like absent (TOOL_ITERATIONS calls), not like the number 1', async () => {
+    const { TOOL_ITERATIONS } = await import('@/ai/engine');
+    expect(await callsMadeWith('1')).toBe(TOOL_ITERATIONS);
+  });
+
+  it('2.5 truncates to 2, rather than being rejected as non-finite', async () => {
+    expect(await callsMadeWith(2.5)).toBe(2);
+  });
+});
+
 describe('GenerationRequest.confirmEachCall — always-ask for a non-destination tool', () => {
   afterEach(() => {
     toolRegistry.unregister('leaky');

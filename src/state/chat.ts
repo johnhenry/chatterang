@@ -47,9 +47,9 @@ import {
 } from '@/domain/manifest';
 import type { IRMessage, MessageContent, ToolUseContent } from '@johnhenry/aimatey-types';
 import {
+  clampToolRounds,
   runsOnThisDevice,
   targetFor,
-  TOOL_ITERATIONS,
   type EngineTarget,
   type ToolEgressPolicy,
 } from '@/ai/engine';
@@ -2755,9 +2755,19 @@ export function narrowToolPolicy(
   const confirmPolicy: PersonaToolConfirmPolicy | undefined =
     agentConfig?.toolPolicy?.confirmPolicy === 'always-ask' ? 'always-ask' : undefined;
 
+  // `clampToolRounds` (ai/engine.ts) is the one place a round count becomes
+  // trustworthy — shared with the engine's own boundary so a malformed
+  // value (NaN, Infinity, a string) is fixed once, not twice (#23, #122;
+  // adversarial review, MEDIUM: `Math.min(NaN, TOOL_ITERATIONS)` is `NaN`,
+  // and `typeof NaN === 'number'` let it straight through the old guard
+  // here, then `iteration >= NaN` at the engine never fired). Only called
+  // when the persona actually set something, however malformed — an
+  // ABSENT preference stays `undefined` ("asked for nothing"), which is a
+  // different fact than "asked for something clampToolRounds had to
+  // default": both end up giving the engine `TOOL_ITERATIONS` in the end,
+  // but only one of them is a persona that asked for anything at all.
   const requestedRounds = agentConfig?.toolPolicy?.maxToolRounds;
-  const maxToolRounds =
-    typeof requestedRounds === 'number' ? Math.min(requestedRounds, TOOL_ITERATIONS) : undefined;
+  const maxToolRounds = requestedRounds === undefined ? undefined : clampToolRounds(requestedRounds);
 
   return { toolIds: unsensitive(candidates), mcpServerIds, confirmPolicy, maxToolRounds };
 }
