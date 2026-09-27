@@ -41,12 +41,42 @@
  * `detached: true` process group — the very thing that lets `cancel()` kill
  * a whole tree — is exactly what lets an orphaned turn survive its window,
  * or the app itself, with nothing left to signal it.
+ *
+ * THE RELEASE ITSELF HAD A RACE, AND `TrackedTurn.cancelled` IS THE FIX.
+ * `startTurn` is `async`: between recording that a turn exists and the
+ * process actually being spawned, it suspends at `await discoverCli(...)`
+ * and `await mkdir(...)`. A `releaseRenderer`/`disposeAll` arriving in that
+ * window used to find nothing to cancel — the turn was not in `turns` yet —
+ * and `startTurn` would go on to spawn a process for a window (or an app)
+ * that had already gone. Reproduced. The fix records a `TrackedTurn` with
+ * `handle: undefined` SYNCHRONOUSLY, before the first `await`; a release
+ * that arrives while it is pending sets `cancelled` (there is no handle yet
+ * to call `cancel()` on); `startTurn` checks `cancelled` (and the plugin's
+ * own `disposing` flag) after every `await` and aborts — never spawns,
+ * removes the scratch cwd if one was already created, and rejects its own
+ * promise rather than emit a `cliExit` for a process that never existed.
+ * `disposeAll` additionally sets `disposing` for good: once the app is
+ * quitting there is no scenario where a NEW turn should be allowed to
+ * start, pending or not.
+ *
+ * `requestId` IS VALIDATED TWICE, ON PURPOSE. It becomes a directory name
+ * (`<turnRoot>/<requestId>`) before anything else happens to it, and a
+ * renderer chooses it — `requireRequestId`'s `/^[A-Za-z0-9_-]{1,128}$/`
+ * check, at the IPC boundary, is the first gate a value like
+ * `../outside-marker` fails outright, on the `.`/`/` alone; `confineCwd`
+ * (`cli-turns.ts`, the same function `spawnCliTurn` itself uses) is the
+ * second, independent check on the SAME value, computed before the one
+ * filesystem call (`mkdir`) that follows it. Neither is a substitute for
+ * the other: the pattern is about what a directory NAME may contain, and
+ * `confineCwd` is about where the resulting path may resolve to — two
+ * different questions that happen to agree here, and might not for a
+ * pattern chosen less conservatively later.
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { access, mkdir, rm, stat } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 import type { PluginImplementation, PluginMethod } from '../bridge/plugin-host.js';
 import { SENDER_SCOPED } from '../bridge/protocol.js';
@@ -58,6 +88,7 @@ import {
   type CliExecResult,
 } from '../bridge/cli-discovery.js';
 import { CLI_SPECS, spawnCliBinaryTurn, type CliId } from '../bridge/cli-specs.js';
+import { confineCwd } from '../bridge/cli-turns.js';
 import type { CliChildProcess, CliSpawnDeps, CliTurnExit, CliTurnHandle } from '../bridge/cli-turns.js';
 
 /** Everything one `Cli` plugin instance needs from its host, injected the same way `TunnelSocketPluginOptions` is. */
@@ -77,6 +108,21 @@ export interface CliPluginOptions {
   readonly discoveryDeps?: CliDiscoveryDeps;
   /** Defaults to the real `node:child_process`/`node:path` wiring this file builds. Overridable for the same reason as `discoveryDeps`. */
   readonly spawnDeps?: CliSpawnDeps;
+  /**
+   * Defaults to real `node:fs/promises` `mkdir`/`rm`. Overridable so a test
+   * can gate the scratch-cwd step the same way `discoveryDeps` lets it gate
+   * discovery -- `tests/desktop-cli-plugin.test.ts`'s orphan-race cases
+   * (#42, #115) need to land a `releaseRenderer`/`disposeAll` call exactly
+   * inside this `await`, which real `mkdir`'s own speed makes otherwise
+   * impractical to hit deterministically.
+   */
+  readonly fsOps?: CliPluginFsOps;
+}
+
+/** The two filesystem operations `startTurn`'s scratch cwd needs. */
+export interface CliPluginFsOps {
+  readonly mkdir: (path: string) => Promise<void>;
+  readonly rm: (path: string) => Promise<void>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -92,6 +138,24 @@ function requireString(record: Record<string, unknown>, key: string): string {
     throw new Error(`Cli: expected a non-empty string "${key}".`);
   }
   return value;
+}
+
+/**
+ * `requestId` becomes a directory NAME (`<turnRoot>/<requestId>`) before
+ * anything else happens to it, so it is validated as one here, at the IPC
+ * boundary, before `startTurn`/`cancelTurn` do anything with it -- not
+ * merely checked non-empty. `../outside-marker` (the measured escape) fails
+ * this on the `.` and `/` alone; `confineCwd` (below) is the second,
+ * independent check on the same value, not a substitute for this one.
+ */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+function requireRequestId(record: Record<string, unknown>): string {
+  const requestId = requireString(record, 'requestId');
+  if (!REQUEST_ID_PATTERN.test(requestId)) {
+    throw new Error(`Cli: "requestId" must match ${REQUEST_ID_PATTERN.source} (got "${requestId}").`);
+  }
+  return requestId;
 }
 
 function optionalString(record: Record<string, unknown>, key: string): string | undefined {
@@ -178,9 +242,27 @@ export type CliPluginImplementation = PluginImplementation & {
 /**
  * Build the main-process implementation `PluginHost.register(CLI_PLUGIN, …)` takes.
  */
+/**
+ * One tracked turn, from the moment `startTurn` accepts it. `handle` is
+ * `undefined` for exactly as long as the turn is PENDING -- recorded, but
+ * not yet spawned, because `discoverCli`/`mkdir` have not resolved. A
+ * pending turn has nothing a `cancel()` call could reach yet, so
+ * `cancelled` is where `releaseRenderer`/`disposeAll`/`cancelTurn` leave
+ * their mark instead: `startTurn` checks it after every `await` and aborts,
+ * cleanly, rather than spawning a process nothing is left to signal.
+ */
+interface TrackedTurn {
+  readonly ownerId: number;
+  handle?: CliTurnHandle;
+  cancelled: boolean;
+}
+
 export function createCliPlugin(options: CliPluginOptions): CliPluginImplementation {
   const parentEnv = options.parentEnv ?? process.env;
-  const turns = new Map<string, { readonly ownerId: number; readonly handle: CliTurnHandle }>();
+  const turns = new Map<string, TrackedTurn>();
+  // Set once, by `disposeAll`, and never cleared: the app is quitting, and
+  // there is no scenario where it un-quits and needs a new CLI turn.
+  let disposing = false;
 
   const discoveryDeps: CliDiscoveryDeps = options.discoveryDeps ?? {
     resolveBinary: resolveBinaryViaLoginShell,
@@ -202,14 +284,43 @@ export function createCliPlugin(options: CliPluginOptions): CliPluginImplementat
     },
   };
 
+  const fsOps: CliPluginFsOps = options.fsOps ?? {
+    mkdir: async (path) => {
+      await mkdir(path, { recursive: true });
+    },
+    rm: async (path) => {
+      await rm(path, { recursive: true, force: true });
+    },
+  };
+
   async function discover(raw: unknown): Promise<CliDiscoverResult> {
     const cliId = requireString(asRecord(raw), 'cliId');
     return discoverCli(specFor(cliId), discoveryDeps);
   }
 
+  /**
+   * Abort a PENDING turn cleanly: never spawned, its scratch directory (if
+   * one was already created) removed, and the caller's `startTurn` promise
+   * REJECTED -- chosen over a synthesised `cliExit` because no process ever
+   * existed for one to describe the end of. `cli-bridge.ts`'s renderer-side
+   * adapter already treats a rejected `startTurn` as the turn's one end
+   * (`.catch(() => exitListener?.({code: null, signal: null}))`), so the
+   * caller still gets exactly one terminal signal -- just not this plugin's
+   * own `cliExit` event, which would otherwise have no process behind it.
+   */
+  async function abortPending(requestId: string, cwdIfCreated: string | undefined): Promise<never> {
+    turns.delete(requestId);
+    if (cwdIfCreated !== undefined) {
+      await fsOps.rm(cwdIfCreated).catch(() => undefined);
+    }
+    throw new Error(`Cli: turn "${requestId}" was released before it finished starting.`);
+  }
+
   async function startTurn(ownerId: number, raw: unknown): Promise<{ readonly requestId: string }> {
+    if (disposing) throw new Error('Cli: refusing to start a new turn -- shutting down.');
+
     const record = asRecord(raw);
-    const requestId = requireString(record, 'requestId');
+    const requestId = requireRequestId(record);
     const cliId = requireString(record, 'cliId');
     const stdin = optionalString(record, 'stdin');
     const systemPrompt = optionalString(record, 'systemPrompt');
@@ -217,14 +328,28 @@ export function createCliPlugin(options: CliPluginOptions): CliPluginImplementat
     if (turns.has(requestId)) throw new Error(`Cli: a turn named "${requestId}" is already running.`);
     if (!isKnownCliId(cliId)) throw new Error(`Cli: "${cliId}" is not one of ${CLI_SPECS.map((s) => s.id).join(', ')}.`);
 
+    // Recorded SYNCHRONOUSLY, before the first `await` below -- this is the
+    // fix for the orphan race: `releaseRenderer`/`disposeAll`/`cancelTurn`
+    // running while this function is suspended at an `await` can find this
+    // entry and mark it `cancelled`, which the checks after each `await`
+    // below then act on.
+    const pending: TrackedTurn = { ownerId, cancelled: false };
+    turns.set(requestId, pending);
+
     // Discovery runs again here, deliberately -- see this file's header.
     const discovery = await discoverCli(specFor(cliId), discoveryDeps);
+    if (pending.cancelled || disposing) return abortPending(requestId, undefined);
     if (discovery.status !== 'found') {
+      turns.delete(requestId);
       throw new Error(`Cli: cannot start "${cliId}" -- discovery reported "${discovery.status}".`);
     }
 
-    const cwd = join(options.turnRoot, requestId);
-    await mkdir(cwd, { recursive: true });
+    // Confined the same way `spawnCliTurn` itself confines it (this is a
+    // SECOND, independent check -- `requireRequestId` above is the first)
+    // and computed before the one filesystem call that follows it.
+    const cwd = confineCwd(spawnDeps.path, options.turnRoot, requestId);
+    await fsOps.mkdir(cwd);
+    if (pending.cancelled || disposing) return abortPending(requestId, cwd);
 
     const handle = spawnCliBinaryTurn(
       cliId,
@@ -244,18 +369,18 @@ export function createCliPlugin(options: CliPluginOptions): CliPluginImplementat
           // awaited: nothing here is on a path anyone is waiting for, and a
           // scratch directory that fails to delete (a file still open a
           // beat longer on some platform) is not a reason to hold anything up.
-          void rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+          void fsOps.rm(cwd).catch(() => undefined);
         },
       },
       spawnDeps,
     );
 
-    turns.set(requestId, { ownerId, handle });
+    pending.handle = handle;
     return { requestId };
   }
 
   function cancelTurn(ownerId: number, raw: unknown): void {
-    const requestId = requireString(asRecord(raw), 'requestId');
+    const requestId = requireRequestId(asRecord(raw));
     const turn = turns.get(requestId);
     // Already ended (or never existed): cancelling it is a no-op, the same
     // contract `spawnCliTurn`'s own `cancel()` keeps.
@@ -263,13 +388,16 @@ export function createCliPlugin(options: CliPluginOptions): CliPluginImplementat
     if (turn.ownerId !== ownerId) {
       throw new Error('Cli: refusing to cancel a turn started by a different window.');
     }
-    turn.handle.cancel();
+    if (turn.handle !== undefined) turn.handle.cancel();
+    else turn.cancelled = true;
   }
 
-  /** Cancel every turn matching `predicate`. Shared by `releaseRenderer` and `disposeAll`. */
+  /** Cancel (or mark cancelled, if still pending) every turn matching `predicate`. Shared by `releaseRenderer` and `disposeAll`. */
   function cancelWhere(predicate: (ownerId: number) => boolean): void {
     for (const turn of turns.values()) {
-      if (predicate(turn.ownerId)) turn.handle.cancel();
+      if (!predicate(turn.ownerId)) continue;
+      if (turn.handle !== undefined) turn.handle.cancel();
+      else turn.cancelled = true;
     }
   }
 
@@ -278,6 +406,7 @@ export function createCliPlugin(options: CliPluginOptions): CliPluginImplementat
   }
 
   function disposeAll(): void {
+    disposing = true;
     cancelWhere(() => true);
   }
 

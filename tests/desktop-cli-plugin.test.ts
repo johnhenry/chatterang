@@ -1,13 +1,15 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdir as realMkdir, rm as realRm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { CLI_PLUGIN, PluginHost } from '@chatterang/desktop/bridge';
 import type { CliChildProcess, CliDiscoveryDeps, CliSpawnDeps } from '@chatterang/desktop/bridge';
 import { createCliPlugin } from '../apps/desktop/src/cli/cli-plugin.js';
+import type { CliPluginFsOps } from '../apps/desktop/src/cli/cli-plugin.js';
 
 /**
  * `Cli`, THROUGH A REAL `PluginHost` (#42, #115, #116, #118) — the same shape
@@ -70,7 +72,10 @@ const REAL_SPAWN_DEPS: CliSpawnDeps = {
 };
 
 /** One PluginHost, one Cli registration, and a tiny renderer-shaped driver over it -- mirrors `desktopSocket()` in tests/pairing-desktop-socket.test.ts. */
-function stand(scriptPath: string) {
+function stand(
+  scriptPath: string,
+  overrides: { discoveryDeps?: CliDiscoveryDeps; fsOps?: CliPluginFsOps } = {},
+) {
   const subscribers = new Map<string, (event: unknown) => void>();
   const host = new PluginHost((senderId, payload) => {
     const key = `${senderId}:${payload.subscriptionId}`;
@@ -79,11 +84,13 @@ function stand(scriptPath: string) {
     listener(structuredClone(payload.data));
     return true;
   });
+  const root = freshTurnRoot();
   const cliPlugin = createCliPlugin({
-    turnRoot: freshTurnRoot(),
+    turnRoot: root,
     notify: (eventName, data, ownerId) => host.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
-    discoveryDeps: fakeDiscoveryDeps(scriptPath),
+    discoveryDeps: overrides.discoveryDeps ?? fakeDiscoveryDeps(scriptPath),
     spawnDeps: REAL_SPAWN_DEPS,
+    ...(overrides.fsOps !== undefined ? { fsOps: overrides.fsOps } : {}),
   });
   host.register(CLI_PLUGIN, cliPlugin);
 
@@ -97,7 +104,7 @@ function stand(scriptPath: string) {
   // The two teardown methods `main.ts` calls DIRECTLY on the object
   // `createCliPlugin` returns -- never through `host.invoke`, since they are
   // not in `CLI_PLUGIN.methods` and a renderer has no way to reach them.
-  return { host, listen, cliPlugin };
+  return { host, listen, cliPlugin, root };
 }
 
 describe('discover, through PluginHost (#116: explicit add, never ambient)', () => {
@@ -377,4 +384,141 @@ describe('a turn cleans up its own scratch cwd (#120: LOW)', () => {
     }
     expect(existsSync(turnCwd)).toBe(false);
   }, 10000);
+});
+
+/** A `CliDiscoveryDeps` whose `resolveBinary` suspends until `release()` is called -- lets a test land a release exactly inside `startTurn`'s discovery `await`. */
+function gatedDiscoveryDeps(scriptPath: string): { deps: CliDiscoveryDeps; release: () => void } {
+  let releaseFn: (() => void) | undefined;
+  const gate = new Promise<void>((resolveGate) => {
+    releaseFn = resolveGate;
+  });
+  const deps: CliDiscoveryDeps = {
+    resolveBinary: async (command) => {
+      await gate;
+      return command === 'claude' ? scriptPath : undefined;
+    },
+    stat: async () => ({ executable: true }),
+    exec: async (_path, args) =>
+      args[0] === 'auth'
+        ? { stdout: '{"loggedIn":true}', stderr: '', code: 0 }
+        : { stdout: '2.1.263 (Claude Code)', stderr: '', code: 0 },
+  };
+  return { deps, release: () => releaseFn?.() };
+}
+
+/** A `CliPluginFsOps` whose `mkdir` suspends until `release()` is called -- lets a test land a release exactly inside `startTurn`'s `mkdir` `await`. */
+function gatedFsOps(): { fsOps: CliPluginFsOps; release: () => void } {
+  let releaseFn: (() => void) | undefined;
+  const gate = new Promise<void>((resolveGate) => {
+    releaseFn = resolveGate;
+  });
+  const fsOps: CliPluginFsOps = {
+    mkdir: async (path) => {
+      await gate;
+      await realMkdir(path, { recursive: true });
+    },
+    rm: async (path) => {
+      await realRm(path, { recursive: true, force: true });
+    },
+  };
+  return { fsOps, release: () => releaseFn?.() };
+}
+
+describe('the orphan race: releasing WHILE startTurn is still suspended at an await (#42, #115)', () => {
+  it('release during discovery -> never spawns', async () => {
+    const { deps, release } = gatedDiscoveryDeps(REPLAY_SCRIPT);
+    const stood = stand(REPLAY_SCRIPT, { discoveryDeps: deps });
+
+    const startPromise = stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+      { requestId: 'req-race-discovery', cliId: 'claude' },
+    ]);
+    // Give the event loop a turn so `startTurn` actually reaches and
+    // suspends at `await discoverCli(...)` before releasing the renderer.
+    await new Promise((r) => setTimeout(r, 10));
+    stood.cliPlugin.releaseRenderer(OWNER);
+    release(); // let discovery resolve now that the release has landed
+
+    await expect(startPromise).rejects.toThrow(/released before it finished starting/);
+    // No process was ever spawned -- no scratch cwd exists for this turn.
+    expect(existsSync(join(stood.root, 'req-race-discovery'))).toBe(false);
+  });
+
+  it('release during mkdir -> never spawns, and the scratch cwd it created is removed', async () => {
+    const { fsOps, release } = gatedFsOps();
+    const stood = stand(REPLAY_SCRIPT, { fsOps });
+
+    const startPromise = stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+      { requestId: 'req-race-mkdir', cliId: 'claude' },
+    ]);
+    await new Promise((r) => setTimeout(r, 10));
+    stood.cliPlugin.releaseRenderer(OWNER);
+    release(); // let mkdir actually run and resolve now
+
+    await expect(startPromise).rejects.toThrow(/released before it finished starting/);
+    // mkdir DID run (the directory was briefly real) but the abort path
+    // removed it -- eventually consistent, since the removal is itself async.
+    const deadline = Date.now() + 5000;
+    const cwd = join(stood.root, 'req-race-mkdir');
+    while (existsSync(cwd) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(existsSync(cwd)).toBe(false);
+  });
+
+  it('disposeAll during start -> never spawns, and every LATER startTurn is refused too', async () => {
+    const { deps, release } = gatedDiscoveryDeps(REPLAY_SCRIPT);
+    const stood = stand(REPLAY_SCRIPT, { discoveryDeps: deps });
+
+    const startPromise = stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+      { requestId: 'req-race-dispose', cliId: 'claude' },
+    ]);
+    await new Promise((r) => setTimeout(r, 10));
+    stood.cliPlugin.disposeAll();
+    release();
+
+    await expect(startPromise).rejects.toThrow(/released before it finished starting/);
+    expect(existsSync(join(stood.root, 'req-race-dispose'))).toBe(false);
+
+    // A later startTurn -- a brand new request, discovery not even gated
+    // this time -- is refused outright, because disposeAll's effect persists.
+    await expect(
+      stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-after-dispose', cliId: 'claude' }]),
+    ).rejects.toThrow(/shutting down/);
+  });
+});
+
+describe("requestId is validated BEFORE any filesystem call, not merely checked non-empty (#120, predates round 2)", () => {
+  it('rejects a traversal id and creates no directory anywhere, including outside turnRoot', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    const before = readdirSync(dirname(stood.root));
+
+    await expect(
+      stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+        { requestId: '../outside-marker', cliId: 'claude' },
+      ]),
+    ).rejects.toThrow(/requestId/);
+
+    // Nothing was created inside turnRoot...
+    expect(existsSync(join(stood.root, '..', 'outside-marker'))).toBe(false);
+    // ...and nothing new appeared in turnRoot's OWN parent directory either
+    // -- the traversal target this exact id was designed to escape to.
+    const after = readdirSync(dirname(stood.root));
+    expect(after.sort()).toEqual(before.sort());
+  });
+
+  it('rejects every other shape --help never intended a requestId to have', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    for (const badId of ['', 'has spaces', 'slash/inside', 'a'.repeat(129), '..', '.']) {
+      await expect(
+        stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: badId, cliId: 'claude' }]),
+      ).rejects.toThrow();
+    }
+  });
+
+  it('accepts the ordinary shape every other test in this file already relies on', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    await expect(
+      stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-ordinary-1', cliId: 'claude' }]),
+    ).resolves.toEqual({ requestId: 'req-ordinary-1' });
+  });
 });
