@@ -147,8 +147,19 @@ function requireString(record: Record<string, unknown>, key: string): string {
  * merely checked non-empty. `../outside-marker` (the measured escape) fails
  * this on the `.` and `/` alone; `confineCwd` (below) is the second,
  * independent check on the same value, not a substitute for this one.
+ *
+ * Lowercase only, on purpose (round 4): on a case-insensitive filesystem
+ * (macOS APFS default, Windows) `AAA` and `aaa` resolve to the SAME
+ * directory even though the `turns` map below is keyed by the raw string,
+ * so both would be treated as distinct turns sharing one cwd -- the first
+ * one to exit removes the directory out from under the other, which is
+ * still running. Rejecting uppercase here keeps the map key and the
+ * directory name in exact 1:1 correspondence on every filesystem, so two
+ * different-cased ids can never alias to one cwd. The one real caller,
+ * `freshRequestId` in `src/ai/backends/cli-bridge.ts`, only ever emits
+ * lowercase hex/base36, so this is not a behavior change for it.
  */
-const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const REQUEST_ID_PATTERN = /^[a-z0-9_-]{1,128}$/;
 
 function requireRequestId(record: Record<string, unknown>): string {
   const requestId = requireString(record, 'requestId');

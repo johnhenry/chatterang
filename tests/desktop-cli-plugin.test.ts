@@ -522,3 +522,40 @@ describe("requestId is validated BEFORE any filesystem call, not merely checked 
     ).resolves.toEqual({ requestId: 'req-ordinary-1' });
   });
 });
+
+describe('requestId is lowercase-only, so it can never alias across a case-insensitive filesystem (#115, round 4)', () => {
+  it('rejects an uppercase id and creates no directory', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    await expect(
+      stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'AAA', cliId: 'claude' }]),
+    ).rejects.toThrow(/requestId/);
+    expect(existsSync(join(stood.root, 'AAA'))).toBe(false);
+    // Case-insensitive filesystems (macOS APFS, Windows) resolve this to the
+    // SAME path as "AAA" -- confirming there is nothing here either is the
+    // whole point of the reproduction this fix closes.
+    expect(existsSync(join(stood.root, 'aaa'))).toBe(false);
+  });
+
+  it('still accepts the lowercase id', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    await expect(
+      stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'aaa', cliId: 'claude' }]),
+    ).resolves.toEqual({ requestId: 'aaa' });
+  });
+
+  it('two concurrent starts under the exact same id are still refused (the synchronous turns.has() duplicate check, unrelated to case)', async () => {
+    const stood = stand(REPLAY_SCRIPT);
+    const first = stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+      { requestId: 'req-dup-1', cliId: 'claude' },
+    ]);
+    // No await between these two calls: the second dispatch reaches
+    // startTurn while the first is still in flight, so this exercises the
+    // synchronous `turns.set` recorded before any await, not a race window.
+    const second = stood.host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+      { requestId: 'req-dup-1', cliId: 'claude' },
+    ]);
+
+    await expect(second).rejects.toThrow(/already running/);
+    await expect(first).resolves.toEqual({ requestId: 'req-dup-1' });
+  });
+});

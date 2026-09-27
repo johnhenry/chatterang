@@ -133,3 +133,49 @@ describe('createCliTurnBridge', () => {
     expect(receivedB).toEqual([new Uint8Array([2])]);
   });
 });
+
+describe('freshRequestId always produces an id the plugin side will accept (#115, round 4)', () => {
+  // apps/desktop/src/cli/cli-plugin.ts's IPC boundary now rejects any
+  // requestId outside /^[a-z0-9_-]{1,128}$/ (lowercase only, tightened in
+  // round 4 to close a case-insensitive-filesystem alias between "AAA" and
+  // "aaa"). freshRequestId is the ONE real caller, and it lives on this side
+  // of the bridge -- this file duplicates that exact pattern rather than
+  // importing the desktop-only module, matching cli-plugin.ts's own doc
+  // comment on REQUEST_ID_PATTERN verbatim.
+  const REQUEST_ID_PATTERN = /^[a-z0-9_-]{1,128}$/;
+
+  async function capturedRequestId(cliId: 'claude' | 'codex'): Promise<string> {
+    const fake = fakePlugin();
+    const bridge = createCliTurnBridge(fake.plugin);
+    bridge.start({ cliId, stdin: 'hi' });
+    await flushMicrotasks();
+    return (fake.startCalls[0] as { requestId: string }).requestId;
+  }
+
+  it('matches the plugin-side pattern across many real calls, for both known cliIds', async () => {
+    for (const cliId of ['claude', 'codex'] as const) {
+      for (let i = 0; i < 200; i += 1) {
+        expect(await capturedRequestId(cliId)).toMatch(REQUEST_ID_PATTERN);
+      }
+    }
+  });
+
+  it("Math.random().toString(36) never introduces an uppercase or otherwise-disallowed character, even at the numeric edges", async () => {
+    const originalRandom = Math.random;
+    // 0 and the largest double strictly less than 1 are the two edges of
+    // Math.random()'s range; toString(36) of both is checked directly,
+    // since a stray uppercase digit (radix-36 digits above 9 could in
+    // principle render as letters) would be exactly what slips past a
+    // case-sensitive equality check but not the pattern.
+    for (const edge of [0, 0.999999999999999, 0.1234567890123, 0.9999999999999999]) {
+      Math.random = () => edge;
+      try {
+        const id = await capturedRequestId('claude');
+        expect(id).toMatch(REQUEST_ID_PATTERN);
+        expect(id).toBe(id.toLowerCase());
+      } finally {
+        Math.random = originalRandom;
+      }
+    }
+  });
+});
