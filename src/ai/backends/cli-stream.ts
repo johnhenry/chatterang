@@ -239,9 +239,14 @@ export function createClaudeTranslator(requestId: string): CliStreamTranslator {
  * a coarser granularity — it is what the CLI actually sent — so one
  * `item.completed` with `item.type: "agent_message"` becomes one `content`
  * chunk carrying the full text as its `delta`. A tool-shaped item
- * (`command_execution`, etc.) is not translated: tools are disabled for this
- * source (#115), and a translator that rendered one as text would be
- * showing the user something the CLI was never asked to run.
+ * (`command_execution`, etc.) is not translated: this app never asked for
+ * one to run, and a translator that rendered one as text would be showing
+ * the user something outside that ask. This is NOT the same claim as "codex
+ * cannot run one" — `apps/desktop/src/bridge/cli-specs.ts`'s `CODEX_TURN_ARGV`
+ * doc says plainly that no flag `codex --help` documents removes its
+ * shell-command tool. If one ever appears in a real stream, this translator
+ * silently drops it rather than rendering it, which is a translator-level
+ * containment, not a guarantee that the CLI never ran it.
  *
  * Lines this translator acts on:
  *   - `{"type":"thread.started",...}` -> `start`

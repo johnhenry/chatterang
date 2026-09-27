@@ -14,8 +14,12 @@ import {
  *
  * The fixtures in `tests/fixtures/cli/` were captured from ONE real,
  * non-interactive run of each CLI with the trivial prompt "Reply with the
- * single word: pong" (tools disabled, an empty scratch directory), then
- * trimmed to the lines that matter and redacted: session ids, account
+ * single word: pong" (an empty scratch directory, claude's `--permission-mode
+ * plan` and codex's `-s read-only` at capture time — neither is the exact
+ * turn argv this app ships; see `apps/desktop/src/bridge/cli-specs.ts`'s
+ * `buildCliTurnArgv` for that, and its own doc for exactly what each CLI's
+ * flags do and do not close), then trimmed to the lines that matter and
+ * redacted: session ids, account
  * identifiers, absolute paths and this machine's own hooks/hooks/skills
  * output are all replaced with placeholders. The SHAPE and ORDER of the real
  * lines are preserved; nothing was invented.
@@ -173,7 +177,7 @@ describe('createCodexTranslator, replayed over the real fixture (#115)', () => {
     expect(result[0]).toMatchObject({ type: 'error', error: { message: 'sandbox denied the request' } });
   });
 
-  it('does not translate a tool-shaped item (tools are disabled for this source, #115)', () => {
+  it('does not translate a tool-shaped item, whether or not the CLI actually ran one (#115)', () => {
     const translator = createCodexTranslator('req_2');
     const result = translator.push(
       JSON.stringify({ item: { type: 'command_execution', command: 'ls' }, type: 'item.completed' }),
