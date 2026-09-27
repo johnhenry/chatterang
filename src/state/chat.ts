@@ -82,6 +82,7 @@ import {
   installMcpToolPruner,
   useApp,
 } from '@/state/app';
+import { useMcp } from '@/state/mcp';
 import { useModels } from '@/state/models';
 import { usePersonas } from '@/state/personas';
 
@@ -890,6 +891,16 @@ export const useChats = create<ChatState>((set, get) => ({
     const persona = personaId ? personas.byId[personaId] : undefined;
     const settings = useApp.getState().settings;
 
+    // Added-and-enabled servers only (#7): a server the user removed, or has
+    // switched off, is not in this list, so it cannot reach
+    // `narrowToolPolicy`'s `allowedMcpServerIds` no matter what a persona's
+    // `agentConfig.toolPolicy.mcpServerIds` names.
+    const allowedMcpServerIds = useMcp
+      .getState()
+      .servers.filter((server) => server.enabled)
+      .map((server) => server.id);
+    const narrowedTools = narrowToolPolicy(persona?.tools, persona?.agentConfig, allowedMcpServerIds);
+
     const chat: Chat = {
       id: newId('chat'),
       title: options.mode === 'task' ? 'Task' : 'New chat',
@@ -908,7 +919,10 @@ export const useChats = create<ChatState>((set, get) => ({
       // `agentConfig.toolPolicy`, when a persona carries one (#7), only
       // narrows this further — see `narrowToolPolicy` — so a persona written
       // before that field existed is unaffected.
-      tools: narrowToolPolicy(persona?.tools, persona?.agentConfig).toolIds,
+      tools: narrowedTools.toolIds,
+      // A candidate list only — every MCP tool is still `sensitive`, so this
+      // does not itself enable anything; see the field's own comment.
+      mcpServerIds: narrowedTools.mcpServerIds,
       showThinking: persona?.showThinking ?? settings.showThinking,
       createdAt: Date.now(),
       updatedAt: Date.now(),

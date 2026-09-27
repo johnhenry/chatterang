@@ -522,6 +522,16 @@ export interface Chat {
   /** Tool ids enabled for this chat. */
   tools: string[];
   /**
+   * MCP server ids a persona's `agentConfig.toolPolicy` pre-selected for this
+   * chat (#7), already narrowed to servers the user had added and enabled at
+   * the time the chat was created — see `narrowToolPolicy`. This is a
+   * candidate list only: every MCP tool is still `sensitive`, so nothing here
+   * pre-enables a tool by itself, and the picker (and later, the one-time
+   * consent for an imported remote-connection persona) still decides. Absent
+   * on chats from before this field existed, which reads as "none".
+   */
+  mcpServerIds?: string[];
+  /**
    * Destinations this conversation has agreed may receive tool output.
    *
    * Per conversation and per connection, because neither alone is the decision
