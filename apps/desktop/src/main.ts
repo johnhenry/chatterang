@@ -69,6 +69,7 @@ import type { MenuItemConstructorOptions, WebContents } from 'electron';
 
 import {
   BOOTSTRAP_CHANNEL,
+  CLI_PLUGIN,
   COMMAND_CHANNEL,
   DSH_PLUGIN,
   EVENT_CHANNEL,
@@ -111,6 +112,7 @@ import {
 import { createFilesystemPlugin } from './fs/filesystem.js';
 import { createMountPlugin } from './fs/mounts.js';
 import { createTunnelSocketPlugin } from './net/tunnel-socket.js';
+import { createCliPlugin } from './cli/cli-plugin.js';
 import { buildMenuTemplate } from './menu.js';
 import type { MenuTemplateItem } from './menu.js';
 
@@ -711,6 +713,24 @@ function start(): void {
     createTunnelSocketPlugin({
       notify: (eventName, data, ownerId) =>
         pluginHost.notifyListeners(TUNNEL_SOCKET_PLUGIN.name, eventName, data, ownerId),
+    }),
+  );
+
+  /*
+   * `Cli` — a local agent CLI (#42, #115, #116, #118). Every turn's scratch
+   * cwd is confined under `cacheRoot()`: ephemeral, regenerable, and already
+   * this app's answer to "where does something short-lived and disposable
+   * live" (`filesystemRoots()`'s own `CACHE` entry, above). Discovery and
+   * spawning use the real `node:child_process`/`node:path` wiring
+   * `cli/cli-plugin.ts` builds by default — `discoveryDeps`/`spawnDeps` are
+   * left unset here, unlike `tests/desktop-cli-plugin.test.ts`, which
+   * overrides both to stay off real CLIs.
+   */
+  pluginHost.register(
+    CLI_PLUGIN,
+    createCliPlugin({
+      turnRoot: join(cacheRoot(), 'cli-turns'),
+      notify: (eventName, data, ownerId) => pluginHost.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
     }),
   );
 

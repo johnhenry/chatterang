@@ -879,6 +879,21 @@ describe('main.ts wiring', () => {
       expect(source).toContain(setting);
     }
   });
+
+  it('#118: registers Cli with its own turn root, confined under cacheRoot(), not process.cwd() or the model root', () => {
+    // The registration this app's own local-agent-CLI feature depends on
+    // (#42, #115, #116) — commenting it out, or wiring it to a root this app
+    // does not already treat as ephemeral/disposable, would leave every test
+    // in tests/desktop-cli-plugin.test.ts green (they construct their own
+    // PluginHost and never load main.ts), which is exactly the blind spot
+    // this describe block exists to close for every other registration.
+    expect(code).toMatch(/pluginHost\.register\(\s*CLI_PLUGIN,\s*createCliPlugin\(/);
+    // And the turn root is `cacheRoot()`-derived, not a bare literal a future
+    // edit could point at the model directory or the app's own source tree.
+    const registration = code.slice(code.indexOf('createCliPlugin('), code.indexOf('createCliPlugin(') + 400);
+    expect(registration).toContain('cacheRoot()');
+    expect(registration).not.toContain('dataRoot()');
+  });
 });
 
 /* ── Model files ──────────────────────────────────────────────────────── */

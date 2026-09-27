@@ -1,0 +1,231 @@
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { CLI_PLUGIN, PluginHost } from '@chatterang/desktop/bridge';
+import type { CliChildProcess, CliDiscoveryDeps, CliSpawnDeps } from '@chatterang/desktop/bridge';
+import { createCliPlugin } from '../apps/desktop/src/cli/cli-plugin.js';
+
+/**
+ * `Cli`, THROUGH A REAL `PluginHost` (#42, #115, #116, #118) — the same shape
+ * `tests/pairing-desktop-socket.test.ts` drives `TunnelSocket` through: every
+ * method via `PluginHost.invoke` (so a call is stamped with its sender and
+ * checked for cloneability the same way a real renderer's would be), every
+ * event via `PluginHost.addListener`/`notifyListeners`, cloned on delivery.
+ *
+ * NEVER A REAL CLI. `createCliPlugin`'s `discoveryDeps`/`spawnDeps` are
+ * overridden to point at `tests/fixtures/cli/fake-cli-*.mjs` — the same fake
+ * scripts `tests/desktop-cli-turns.test.ts` already spawns directly. Here
+ * they are reached the long way: `discover`/`startTurn` -> `spawnCliBinaryTurn`
+ * -> the fake script, so the real `PluginHost` registration, sender-scoping
+ * and event delivery are what is being measured, not the spawn mechanics
+ * (already covered).
+ */
+
+const FIXTURES = resolve(process.cwd(), 'tests/fixtures/cli');
+const REPLAY_SCRIPT = join(FIXTURES, 'fake-cli-replay.mjs');
+const HANG_SCRIPT = join(FIXTURES, 'fake-cli-hang.mjs');
+
+const OWNER = 7;
+const OTHER_OWNER = 8;
+
+let turnRoot: string;
+afterEach(() => {
+  if (turnRoot) rmSync(turnRoot, { recursive: true, force: true });
+});
+
+function freshTurnRoot(): string {
+  turnRoot = mkdtempSync(join(tmpdir(), 'chatterang-cli-plugin-'));
+  return turnRoot;
+}
+
+/** Resolves 'claude' to a fake script; answers claude's real discovery checks with fixed, fake data. */
+function fakeDiscoveryDeps(scriptPath: string): CliDiscoveryDeps {
+  return {
+    resolveBinary: async (command) => (command === 'claude' ? scriptPath : undefined),
+    stat: async () => ({ executable: true }),
+    exec: async (_path, args) =>
+      args[0] === 'auth'
+        ? { stdout: '{"loggedIn":true}', stderr: '', code: 0 }
+        : { stdout: '2.1.263 (Claude Code)', stderr: '', code: 0 },
+  };
+}
+
+/** Real node:child_process, real node:path -- safe here because the target is always a fake script, never a real CLI. */
+const REAL_SPAWN_DEPS: CliSpawnDeps = {
+  path: { resolve, relative, isAbsolute },
+  spawn: (binaryPath, args, options) =>
+    spawn(binaryPath, args, {
+      cwd: options.cwd,
+      env: options.env,
+      detached: options.detached,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }) as unknown as CliChildProcess,
+  killProcessGroup: (pid, signal) => {
+    process.kill(-pid, signal as NodeJS.Signals);
+  },
+};
+
+/** One PluginHost, one Cli registration, and a tiny renderer-shaped driver over it -- mirrors `desktopSocket()` in tests/pairing-desktop-socket.test.ts. */
+function stand(scriptPath: string) {
+  const subscribers = new Map<string, (event: unknown) => void>();
+  const host = new PluginHost((senderId, payload) => {
+    const key = `${senderId}:${payload.subscriptionId}`;
+    const listener = subscribers.get(key);
+    if (listener === undefined) return false;
+    listener(structuredClone(payload.data));
+    return true;
+  });
+  host.register(
+    CLI_PLUGIN,
+    createCliPlugin({
+      turnRoot: freshTurnRoot(),
+      notify: (eventName, data, ownerId) => host.notifyListeners(CLI_PLUGIN.name, eventName, data, ownerId),
+      discoveryDeps: fakeDiscoveryDeps(scriptPath),
+      spawnDeps: REAL_SPAWN_DEPS,
+    }),
+  );
+
+  let nextSubscription = 0;
+  const listen = (ownerId: number, eventName: string, listener: (event: unknown) => void): void => {
+    nextSubscription += 1;
+    host.addListener(ownerId, CLI_PLUGIN.name, eventName, nextSubscription);
+    subscribers.set(`${ownerId}:${nextSubscription}`, listener);
+  };
+
+  return { host, listen };
+}
+
+describe('discover, through PluginHost (#116: explicit add, never ambient)', () => {
+  it('reports found for the fake script standing in for claude', async () => {
+    const { host } = stand(REPLAY_SCRIPT);
+    const result = await host.invoke(OWNER, CLI_PLUGIN.name, 'discover', [{ cliId: 'claude' }]);
+    expect(result).toEqual({ status: 'found', id: 'claude', path: REPLAY_SCRIPT, version: '2.1.263' });
+  });
+
+  it('reports not-found for a CLI discovery was not told to resolve', async () => {
+    const { host } = stand(REPLAY_SCRIPT);
+    const result = await host.invoke(OWNER, CLI_PLUGIN.name, 'discover', [{ cliId: 'codex' }]);
+    expect(result).toEqual({ status: 'not-found', id: 'codex' });
+  });
+});
+
+describe('startTurn streams a real turn through a real PluginHost, cliExit is the one terminal (#118, #120)', () => {
+  it('delivers cliData chunks and one cliExit to the owner that started the turn', async () => {
+    const { host, listen } = stand(REPLAY_SCRIPT);
+    const chunks: { readonly stream: string; readonly chunk: Uint8Array }[] = [];
+    const exits: unknown[] = [];
+
+    await new Promise<void>((resolveDone) => {
+      listen(OWNER, 'cliData', (event) => {
+        chunks.push(event as { readonly stream: string; readonly chunk: Uint8Array });
+      });
+      listen(OWNER, 'cliExit', (event) => {
+        exits.push(event);
+        resolveDone();
+      });
+      void host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [
+        { requestId: 'req-1', cliId: 'claude', stdin: '{"type":"user","message":{"role":"user","content":"hi"}}\n' },
+      ]);
+    });
+
+    expect(exits).toHaveLength(1);
+    expect(exits[0]).toMatchObject({ requestId: 'req-1', code: 0, signal: null });
+    const stdout = chunks.filter((c) => c.stream === 'stdout').map((c) => c.chunk);
+    const decoded = stdout.map((chunk) => new TextDecoder().decode(chunk)).join('');
+    expect(decoded.length).toBeGreaterThan(0);
+    expect(decoded).toContain('"type":"result"');
+  });
+
+  it('never delivers a cliData/cliExit event to a window that did not start the turn', async () => {
+    const { host, listen } = stand(REPLAY_SCRIPT);
+    const ownerEvents: string[] = [];
+    const otherEvents: string[] = [];
+
+    await new Promise<void>((resolveDone) => {
+      listen(OWNER, 'cliExit', () => {
+        ownerEvents.push('cliExit');
+        resolveDone();
+      });
+      listen(OTHER_OWNER, 'cliData', () => otherEvents.push('cliData'));
+      listen(OTHER_OWNER, 'cliExit', () => otherEvents.push('cliExit'));
+      void host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-2', cliId: 'claude' }]);
+    });
+
+    expect(ownerEvents).toEqual(['cliExit']);
+    expect(otherEvents).toEqual([]);
+  });
+});
+
+describe('cancelTurn, through PluginHost, kills the whole process group (#115, #118)', () => {
+  it('terminates the process and delivers exactly one cliExit with a SIGTERM signal', async () => {
+    const { host, listen } = stand(HANG_SCRIPT);
+    let pid: number | undefined;
+    let grandchildPid: number | undefined;
+    const exits: unknown[] = [];
+
+    await new Promise<void>((resolveStarted) => {
+      listen(OWNER, 'cliData', (event) => {
+        const { stream, chunk } = event as { readonly stream: string; readonly chunk: Uint8Array };
+        if (stream !== 'stderr') return;
+        const text = new TextDecoder().decode(chunk);
+        if (!text.includes('grandchildPid')) return;
+        const parsed = JSON.parse(text.trim()) as { pid: number; grandchildPid: number };
+        pid = parsed.pid;
+        grandchildPid = parsed.grandchildPid;
+        resolveStarted();
+      });
+      void host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-3', cliId: 'claude' }]);
+    });
+
+    listen(OWNER, 'cliExit', (event) => exits.push(event));
+    await host.invoke(OWNER, CLI_PLUGIN.name, 'cancelTurn', [{ requestId: 'req-3' }]);
+
+    const isAlive = (checkPid: number): boolean => {
+      try {
+        process.kill(checkPid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const deadline = Date.now() + 5000;
+    while ((isAlive(pid!) || isAlive(grandchildPid!)) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(isAlive(pid!)).toBe(false);
+    expect(isAlive(grandchildPid!)).toBe(false);
+    expect(exits).toHaveLength(1);
+    expect(exits[0]).toMatchObject({ requestId: 'req-3', signal: 'SIGTERM' });
+  }, 10000);
+
+  it('refuses to cancel a turn a different window started', async () => {
+    const { host, listen } = stand(HANG_SCRIPT);
+    await new Promise<void>((resolveStarted) => {
+      listen(OWNER, 'cliData', (event) => {
+        const { stream, chunk } = event as { readonly stream: string; readonly chunk: Uint8Array };
+        if (stream === 'stderr' && new TextDecoder().decode(chunk).includes('grandchildPid')) resolveStarted();
+      });
+      void host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-4', cliId: 'claude' }]);
+    });
+
+    await expect(host.invoke(OTHER_OWNER, CLI_PLUGIN.name, 'cancelTurn', [{ requestId: 'req-4' }])).rejects.toThrow(
+      /different window/,
+    );
+    // Clean up for real, as OWNER, so the test does not leak a hung process.
+    await host.invoke(OWNER, CLI_PLUGIN.name, 'cancelTurn', [{ requestId: 'req-4' }]);
+  });
+
+  it('is a no-op, not a throw, when the turn already ended', async () => {
+    const { host, listen } = stand(REPLAY_SCRIPT);
+    await new Promise<void>((resolveDone) => {
+      listen(OWNER, 'cliExit', () => resolveDone());
+      void host.invoke(OWNER, CLI_PLUGIN.name, 'startTurn', [{ requestId: 'req-5', cliId: 'claude' }]);
+    });
+    await expect(host.invoke(OWNER, CLI_PLUGIN.name, 'cancelTurn', [{ requestId: 'req-5' }])).resolves.toBeUndefined();
+  });
+});
