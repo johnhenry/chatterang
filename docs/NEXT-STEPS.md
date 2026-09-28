@@ -193,7 +193,7 @@ later rulings change the plan, and each has a comment on its issue.
 | After restart | The tunnel is off at every launch. | #158 |
 | Phone credential | The iOS Keychain (this device only) or Android Keystore (excluded from backups). The web layer holds only a reference. | #135 |
 | Stopped reply | A reply stopped before its first word is kept, marked "Stopped", and never sent to the model. | #7; built on `stopped-empty-reply`, not merged |
-| Fenced tool calls | A fenced JSON block runs as a call when its name is a tool the request offered; extra keys such as `"id"` are allowed. | Ruled on `stopped-empty-reply`, not merged. The branch reads "extra keys" as keys beside a name and its arguments; the owner has yet to confirm that (see "Decisions still needed"). |
+| Fenced tool calls | A fenced JSON block runs as a call when its name is a tool the request offered; extra keys such as `"id"` are allowed, arguments or none (owner ruling, 2026-09-27). | Ruled on `stopped-empty-reply`, not merged. |
 
 Three things the earlier plan assumed are now false:
 
@@ -524,7 +524,6 @@ question, only the open part is listed.
 | Does the paired chip show the served model as well as the machine name? Does the rail gain a paired state? | Chip and rail | Machine name in the chip, and the model in the model slot; add a "paired" rail state. |
 | Does the taint mark survive to a paired desktop? | Tunnel adapter | Keep stripping it in v1. |
 | How a chat pins a paired device's model. | Rail and registration | A structured field, not an overloaded `modelId`. |
-| A fenced call to a tool that takes no arguments, written with another key and no arguments key (`{"id": "call_0", "name": "get_datetime"}`): a call, or words? | Merging `stopped-empty-reply` | Words, as the branch has it, so that a record such as `{"name": "calculator", "version": "1.0.0"}` does not run. This reads the fenced-call ruling's "extra keys" as keys beside a name and its arguments. |
 | A `[tool name({…})]` call that repeats a call from earlier in the same turn, with the same name and arguments: a recount, or a retry? | Merging `stopped-empty-reply` | A recount, as the branch has it: stripped, not run and not recorded. A retry written that way after an error then does not run; the same call written with the tool's id in place of its name still does. |
 | A complete call in a local round that died before the cloud fallback finished the turn: record it as `reply-failed`? Recording it would count it as tool output when the cloud's calls are checked for taint. | Nothing; a low finding the branch leaves open | None yet. The branch strips the call from the words it now keeps and records nothing; main dropped that round's words, the call with them. |
 

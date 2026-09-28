@@ -24,7 +24,7 @@ import {
   nonChatRole,
   type Capability,
 } from '@/domain/manifest';
-import { deriveTitle, reachKind } from '@/domain/chat';
+import { deriveTitle, reachKind, showsStopped } from '@/domain/chat';
 import type { Reach, ToolInvocation } from '@/domain/chat';
 import { unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 
@@ -199,6 +199,8 @@ interface TranscriptGeneration {
   provenance?: { modelName: string; reach?: Reach };
   /** Only their receipts are printed: see `receiptLines`. */
   toolCalls?: readonly ToolInvocation[];
+  /** Whether a reply with no text was stopped: see `MessageVariant.stopped`. */
+  stopped?: boolean;
 }
 interface MessageRow extends TranscriptGeneration {
   role: string;
@@ -207,6 +209,8 @@ interface MessageRow extends TranscriptGeneration {
   variants?: readonly TranscriptGeneration[];
   variantIndex?: number;
   streaming?: boolean;
+  /** Set on a turn that failed; such a reply is never called stopped. */
+  error?: string;
 }
 interface PersonaRow {
   id: string;
@@ -993,7 +997,11 @@ export function renderTranscript(
     lines.push(
       `## ${escapeTranscriptBody(who)}${where}`,
       '',
-      escapeTranscriptBody(shown.content.trim()),
+      // A reply stopped before its first word says so, as the thread does,
+      // rather than printing a heading over nothing (owner ruling).
+      message.role === 'assistant' && !message.streaming && !message.error && showsStopped(shown)
+        ? '_Stopped before its first word._'
+        : escapeTranscriptBody(shown.content.trim()),
       '',
     );
 
@@ -1074,6 +1082,8 @@ function receiptClause(receipt: McpCallReceipt): string {
           return `${receipt.toolName} was not sent to ${where} at ${when} — the reply was stopped before it went`;
         case 'round-limit':
           return `${receipt.toolName} was not sent to ${where} at ${when} — the turn had already used every tool round it was allowed`;
+        case 'reply-failed':
+          return `${receipt.toolName} was not sent to ${where} at ${when} — the reply failed before it went`;
         default:
           return `${receipt.toolName} was not sent to ${where} at ${when} — ${unhandledWhy(receipt.why)}`;
       }

@@ -19,6 +19,7 @@ import { createRetryMiddleware } from '@johnhenry/aimatey-middleware/retry';
 import { ErrorCode } from '@johnhenry/aimatey-types';
 import type {
   BackendAdapter,
+  FinishReason,
   IRChatRequest,
   IRChatResponse,
   IRMessage,
@@ -33,12 +34,16 @@ import {
   type LlamaModelResolver,
 } from '@/ai/backends/llama-cpp';
 import {
+  callNames,
   createToolMiddleware,
+  cutUnfinishedCall,
   findToolCalls,
   runToolCalls,
+  shownCalls,
   stripToolSyntax,
   unlessStopped,
   type ExecutedTool,
+  type TextEnding,
   type ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
 import {
@@ -61,7 +66,7 @@ import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/pro
 import { CliBackendAdapter } from '@/ai/backends/cli';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
-import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
+import { REACH_DEVICE, REACH_REMOTE, closeReasoning, newId, type Reach } from '@/domain/chat';
 
 /**
  * Execute → tools → execute round trips permitted per turn.
@@ -197,9 +202,118 @@ function declaredTools(toolIds: readonly string[] | undefined): ChatterangTool[]
   });
 }
 
+/**
+ * A round's words as they join the finished reply: any call the round ended
+ * inside cut, when it could have written one (see `cutUnfinishedCall`), and its
+ * finished calls stripped.
+ *
+ * `offered` is the names a call can give, as `callNames` gives them; `ran` is
+ * whether a tool has run in the turn; `ended` is how the round's stream ended
+ * (see `TextEnding`). A round the model ended keeps words that run on from
+ * inside a call's value: they are a sentence that named its opening.
+ */
+function roundWords(
+  text: string,
+  { offered, ran, ended }: { readonly offered: readonly string[]; readonly ran: boolean; readonly ended: TextEnding },
+): string {
+  const cut = offered.length > 0 || ran ? cutUnfinishedCall(text, { ended, offered }) : text;
+  return stripToolSyntax(cut, { offered, ran });
+}
+
+/**
+ * The words of a round another round follows — one that called a tool, or one
+ * whose stream died before the turn diverted to the fallback — as they join the
+ * finished reply: see {@link roundWords}. And any reasoning it left open is
+ * closed where it ended, so the next round's words are answer, not reasoning:
+ * see `closeReasoning`.
+ */
+function endedRoundWords(
+  text: string,
+  reading: { readonly offered: readonly string[]; readonly ran: boolean; readonly ended: TextEnding },
+): string {
+  return closeReasoning(roundWords(text, reading));
+}
+
+/**
+ * The calls a round's text holds, READ ON THE SAME CONDITION ITS WORDS ARE
+ * STRIPPED — the request offered a tool, or one has already run in the turn.
+ *
+ * `offered` is the tools this round's request declared, `ran` whether a tool
+ * has run in the turn, `shown` the calls the round's history already shows
+ * (see `shownCalls`), and `ended` how its stream ended.
+ *
+ * THE TWO GATES DISAGREED, and the reader's was the narrower. A chat whose
+ * only tool is an MCP tool whose server is switched off, added or removed
+ * mid-turn starts its next round with nothing offered — `reconnect` in
+ * state/mcp.ts takes every MCP tool out of the registry — while `ran` is
+ * already true. A well-formed call that round wrote was stripped out of the
+ * words by `ran` and read by nobody: no batch, no tool result, no follow-up
+ * round, no #331 receipt. The stored reply said it had filed a note that never
+ * went and that the thread and the export said nothing about.
+ *
+ * NOTHING NEW CAN RUN FROM THIS. `runToolCalls` resolves every call through
+ * the chat's enabled ids in the LIVE registry, so a round that offered nothing
+ * runs nothing: what it gains is a record of the call the words lost.
+ */
+function roundCalls(
+  text: string,
+  {
+    offered,
+    ran,
+    shown,
+    ended,
+  }: {
+    readonly offered: readonly ChatterangTool[];
+    readonly ran: boolean;
+    readonly shown: readonly ToolUseContent[];
+    readonly ended: TextEnding;
+  },
+): ToolUseContent[] {
+  return offered.length > 0 || ran
+    ? findToolCalls({ role: 'assistant', content: text }, callNames(offered), shown, { ended })
+    : [];
+}
+
+/**
+ * How a round's stream ended, from the reason its last chunk gave and what the
+ * request asked for: `'model'` when the model ended it; `'cut'` when anything
+ * else did, or may have. See `TextEnding`.
+ *
+ * The model ended it only when the stream says `stop` or `tool_calls` and
+ * nothing says otherwise. A limit on tokens, a filter or an error cut it short.
+ * So did a limit on tokens the stream spent to the last token, whatever reason
+ * it gave: an adapter can say `stop` for every reply — aimatey's Ollama
+ * adapter does — and a reply cut off inside a call's arguments, read as one
+ * the model ended, kept them, stored and sent back. And a `stop` in a request
+ * with stop sequences of its own may be one of them, anywhere in a call.
+ */
+function endingOf(
+  reason: FinishReason,
+  {
+    completionTokens,
+    maxTokens,
+    stopSequences,
+  }: {
+    readonly completionTokens: number | undefined;
+    readonly maxTokens: number | undefined;
+    readonly stopSequences: readonly string[] | undefined;
+  },
+): TextEnding {
+  if (reason !== 'stop' && reason !== 'tool_calls') return 'cut';
+  if (completionTokens !== undefined && maxTokens !== undefined && completionTokens >= maxTokens) return 'cut';
+  if (reason === 'stop' && (stopSequences?.length ?? 0) > 0) return 'cut';
+  return 'model';
+}
+
 interface TurnResult {
   text: string;
   stats: GenerationStatsSnapshot;
+  /**
+   * How the round's stream ended: `'model'` when its last chunk said the model
+   * ended it and nothing said otherwise, `'cut'` for anything else — its limit
+   * on tokens, a filter, an error, or no last chunk at all. See `endingOf`.
+   */
+  ended: TextEnding;
   error?: string;
   /**
    * The IR error chunk's `code`, kept because the message alone is not enough
@@ -474,7 +588,17 @@ export interface GenerationRequest {
 export type GenerationEvent =
   | { readonly type: 'start'; readonly requestId: string }
   | { readonly type: 'delta'; readonly text: string }
-  | { readonly type: 'tool'; readonly tool: ExecutedTool }
+  | {
+      readonly type: 'tool';
+      readonly tool: ExecutedTool;
+      /**
+       * How the round that wrote the call ended (see `TextEnding`): `'model'`
+       * or `'cut'` as its stream said, `'stopped'` for a call Stop caught in a
+       * round it cut short. The round's words are read by it where it ends.
+       * Absent reads as `'cut'`.
+       */
+      readonly ended?: TextEnding;
+    }
   | { readonly type: 'fallback'; readonly event: FallbackEvent }
   /** A request carrying tool output met a non-local backend. The receipt. */
   | {
@@ -486,6 +610,10 @@ export type GenerationEvent =
     }
   | {
       readonly type: 'done';
+      /**
+       * Every round's words, each cut where a call it ended inside starts and
+       * its finished calls stripped, joined by a blank line.
+       */
       readonly text: string;
       readonly stats: GenerationStatsSnapshot;
       readonly provenance: ProvenanceSnapshot;
@@ -931,6 +1059,34 @@ export class ChatterangEngine {
     // ── Generate, then run any tools, then generate again ───────────────
     let messages: IRMessage[] = [...request.messages];
     let text = '';
+    /** How the round `text` holds ended, as its stream said: see `TurnResult.ended`. */
+    let ended: TextEnding = 'cut';
+    /**
+     * The words of each round that called a tool, its calls taken out.
+     *
+     * `text` is reset after a tool round, so the finished reply used to be only
+     * what the model wrote after its last tool ran: "Let me check your notes
+     * first." streamed, a tool ran, "They mention a passphrase." followed, and
+     * the stored reply was the second sentence alone.
+     */
+    const said: string[] = [];
+    /** The tools the latest request declared, as the registry held them when it was built. */
+    let offered: ChatterangTool[] = [];
+    /**
+     * EVERY tool this turn has declared, by id, as the registry held it when
+     * each round's request was built: `declared` on `runToolCalls` (#92).
+     * NEVER RUN — a call executes only from the live registry — and read only
+     * to name a call whose tool has left the registry since, so it is recorded
+     * as not sent to that server.
+     *
+     * The turn's, not the round's. Removing an MCP server, switching one off or
+     * adding one runs `reconnect` in state/mcp.ts, which takes every MCP tool
+     * out of the registry; a round that begins after that declares none, and a
+     * call it writes had no host to say it had not been sent to. So Stop caught
+     * a call to a server the turn had been talking to all along and wrote down
+     * nothing at all.
+     */
+    const everDeclared = new Map<string, ChatterangTool>();
     let stats: GenerationStatsSnapshot = {};
     const tools: ExecutedTool[] = [];
 
@@ -1053,7 +1209,8 @@ export class ChatterangEngine {
       }
 
       // Taken as the request is built, beside the tool list `#toIR` declares.
-      const offered = declaredTools(request.toolIds);
+      offered = declaredTools(request.toolIds);
+      for (const tool of offered) everDeclared.set(tool.id, tool);
       const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
 
       // STOPPED: no request goes to a backend, whether the turn was stopped
@@ -1077,7 +1234,7 @@ export class ChatterangEngine {
             : new Error(turn.error);
         }
       } catch (error) {
-        turn = { text: '', stats: {} };
+        turn = { text: '', stats: {}, ended: 'cut' };
         failure = error;
       }
 
@@ -1096,20 +1253,39 @@ export class ChatterangEngine {
            * turn's own (already aborted) signal — so `runToolCalls` records
            * each one as `stopped` and none of them run (owner ruling that
            * "not sent" covers every call that did not leave).
+           *
+           * Read with the names the request offered, as a finished turn's
+           * calls are and as `stripToolSyntax` reads a fenced block: a fenced
+           * JSON block is a call only when it names an offered tool. Read with
+           * none, a stopped turn's fenced call to an offered tool was neither
+           * recorded here nor kept in the words as an example — the stripper
+           * took it out as a call — so the reply lost it and no record said
+           * it had not gone.
+           *
+           * Read as STOPPED: reasoning the round had not closed when Stop
+           * landed is still reasoning, and a call it drafted is not one the
+           * model made. Read as a finished round, it was recorded as a call
+           * not sent. The stored words, read from the reply's answer alone,
+           * never held it.
            */
-          const strandedCalls = request.toolIds?.length
-            ? findToolCalls({ role: 'assistant', content: turn.text })
-            : [];
+          // Only in a round whose request offered a tool, or that follows one a
+          // tool ran in, exactly as its words are stripped: see `roundCalls`.
+          const strandedCalls = roundCalls(turn.text, {
+            offered,
+            ran: tools.length > 0,
+            shown: shownCalls(messages),
+            ended: 'stopped',
+          });
           if (strandedCalls.length > 0) {
             const batch = await runToolCalls(toolRegistry, strandedCalls, {
               enabledIds: request.toolIds ?? [],
               destinations: this.#mcpDestinations(request.mcpEgress),
-              declared: offered,
+              declared: [...everDeclared.values()],
               signal: request.signal,
               confirmEachCall: request.confirmEachCall,
             });
             tools.push(...batch.executed);
-            for (const tool of batch.executed) yield { type: 'tool', tool };
+            for (const tool of batch.executed) yield { type: 'tool', tool, ended: 'stopped' };
           }
           break;
         }
@@ -1120,6 +1296,30 @@ export class ChatterangEngine {
         // one request it acts on, `complete()`'s, can do neither.
         const fallback = runsOnThisDevice(target) ? this.#resolveFallback() : null;
         if (!fallback) {
+          // A CALL THE FAILED ROUND HAD WRITTEN IN FULL is recorded as not
+          // sent, as #331 records one Stop caught (#293). The failed row's words
+          // have their calls read out, as a finished reply's are — Try again
+          // keeps it as a version, and flipping back to it sent the call — and
+          // nothing else said the model had written a call to a server that
+          // never went. Its stream failed, so it ended wherever it was: read as
+          // `'cut'`, reasoning it left open is still reasoning. Nothing runs.
+          const unsent = roundCalls(turn.text, {
+            offered,
+            ran: tools.length > 0,
+            shown: shownCalls(messages),
+            ended: 'cut',
+          });
+          if (unsent.length > 0) {
+            const batch = await runToolCalls(toolRegistry, unsent, {
+              enabledIds: request.toolIds ?? [],
+              destinations: this.#mcpDestinations(request.mcpEgress),
+              declared: [...everDeclared.values()],
+              signal: request.signal,
+              replyFailed: true,
+            });
+            tools.push(...batch.executed);
+            for (const tool of batch.executed) yield { type: 'tool', tool, ended: 'cut' };
+          }
           const retryable = noBackendRetryable(failure);
           yield {
             type: 'error',
@@ -1132,6 +1332,45 @@ export class ChatterangEngine {
           };
           return;
         }
+
+        // THE DEAD ROUND'S WORDS STAY IN THE ANSWER, as a tool round's do, and
+        // the fallback's follow them. They were dropped here, so a turn the
+        // fallback finished was stored as the fallback's words alone: what the
+        // person had watched the local model write was gone, while a turn
+        // stopped or failed after the divert kept it. Its stream died, so it
+        // ended wherever it was: `'cut'`.
+        const deadWords = endedRoundWords(turn.text, {
+          offered: callNames(offered),
+          ran: tools.length > 0,
+          ended: 'cut',
+        });
+
+        // AND A CALL IT HAD WRITTEN IN FULL is recorded as not sent, exactly as
+        // the no-fallback path above records one. `endedRoundWords` has just
+        // taken that call's markup out of the words the person keeps, so with
+        // no record nothing at all was left of it: the reply says "Filing it
+        // now." above the cloud's answer, the server was never reached, and the
+        // thread and the export say nothing about a call that did not go.
+        // Read as `'cut'`, as those words were: its stream died wherever it was.
+        const unsent = roundCalls(turn.text, {
+          offered,
+          ran: tools.length > 0,
+          shown: shownCalls(messages),
+          ended: 'cut',
+        });
+        if (unsent.length > 0) {
+          const batch = await runToolCalls(toolRegistry, unsent, {
+            enabledIds: request.toolIds ?? [],
+            destinations: this.#mcpDestinations(request.mcpEgress),
+            declared: [...everDeclared.values()],
+            signal: request.signal,
+            replyFailed: true,
+          });
+          tools.push(...batch.executed);
+          for (const tool of batch.executed) yield { type: 'tool', tool, ended: 'cut' };
+        }
+
+        if (deadWords) said.push(deadWords);
 
         const { reason, detail } = classifyFailure(failure);
         const event: FallbackEvent = { reason, from: target.backendId, to: fallback.name, detail };
@@ -1150,6 +1389,7 @@ export class ChatterangEngine {
       }
 
       text = turn.text;
+      ended = turn.ended;
       stats = { ...stats, ...turn.stats };
 
       // Past the turn's limit on tool rounds, a call is still read — the
@@ -1159,9 +1399,31 @@ export class ChatterangEngine {
       // rather than let it vanish with only `stripToolSyntax` as a witness.
       const roundLimitReached = iteration >= effectiveMaxRounds;
       // Tool calls only become readable once the turn has finished.
-      const calls = request.toolIds?.length
-        ? findToolCalls({ role: 'assistant', content: turn.text })
-        : [];
+      // `messages` is the history this round was shown, which holds every call
+      // the turn's earlier rounds made: a copy of one in this app's history form
+      // is the model recounting it, not calling the tool again. See `shownCalls`.
+      //
+      // ONLY IN A ROUND WHOSE REQUEST OFFERED A TOOL, OR THAT FOLLOWS ONE A
+      // TOOL RAN IN — the condition its words are stripped on, and no other:
+      // see `roundCalls`. A chat keeps an MCP tool's id after its server is
+      // removed or disconnected, and its requests then offer none: nothing such
+      // a round writes is a call. Read because the chat still named a tool id,
+      // a reply showing Qwen's call format had its example dispatched, answered
+      // "No tool named", followed by a second request, and stripped from the
+      // words the person had watched arrive.
+      //
+      // READ AS THE ROUND ENDED. A round its limit on tokens cut short
+      // mid-reasoning was still thinking, as one Stop cut there was, and a call
+      // it drafted there is not one it made. Read as a round the model ended,
+      // it ran the call the model was only weighing — under a conversation's
+      // grant, the MCP server was sent its arguments — and asked for a
+      // follow-up, where Stop at the same character recorded nothing.
+      const calls = roundCalls(turn.text, {
+        offered,
+        ran: tools.length > 0,
+        shown: shownCalls(messages),
+        ended: turn.ended,
+      });
 
       if (calls.length === 0) break;
 
@@ -1175,13 +1437,13 @@ export class ChatterangEngine {
       const batch = await runToolCalls(toolRegistry, calls, {
         enabledIds: request.toolIds ?? [],
         destinations: this.#mcpDestinations(request.mcpEgress),
-        declared: offered,
+        declared: [...everDeclared.values()],
         signal: request.signal,
         roundLimitReached,
         confirmEachCall: request.confirmEachCall,
       });
       tools.push(...batch.executed);
-      for (const tool of batch.executed) yield { type: 'tool', tool };
+      for (const tool of batch.executed) yield { type: 'tool', tool, ended };
 
       // STOPPED. What Stop held back is recorded above, and nothing more is
       // asked or sent: the model is not run again over those refusals, which
@@ -1201,14 +1463,37 @@ export class ChatterangEngine {
         markTainted({ role: 'tool', content: batch.results }),
       ];
 
-      // The visible answer is whatever the model says after the tools ran.
+      // The round's words stay in the answer, and the next round's follow them.
+      // A fenced call is stripped as one only when it names an offered tool, as
+      // `findToolCalls` read it just above.
+      // Its reasoning ends with it: a tag it left open would take the next
+      // round's words into reasoning once the rounds are joined.
+      // So does a call it ended inside — a second call cut off in its arguments,
+      // or one with no closing tag — which has no end for `stripToolSyntax` to
+      // match. Cut here, where the round ends: joined to the next round's words,
+      // it was either cut with all of them or kept with its arguments. See
+      // `cutUnfinishedCall`. Read as its stream said it ended: a round the model
+      // ended keeps words that run on from inside a call's value.
+      const words = endedRoundWords(text, { offered: callNames(offered), ran: true, ended });
+      if (words) said.push(words);
       text = '';
     }
 
     const totalMs = Math.round(performance.now() - started);
     yield {
       type: 'done',
-      text: stripToolSyntax(text),
+      // Every tool round's words, then the last round's, each cut where a call
+      // it ended inside starts, where it ends, as its stream said it ended. The
+      // last round is cut here as the others are: cut by the store once the
+      // rounds were joined, an earlier round the model ended on a call's
+      // opening named in prose, its words kept, would be read on to the end of
+      // the reply and cut from it, every later round's words with it. A fenced
+      // JSON block is a call only when it names a tool the request offered;
+      // see `fencedCall`. A turn that offered no tool and ran none has nothing
+      // stripped or cut.
+      text: [...said, roundWords(text, { offered: callNames(offered), ran: tools.length > 0, ended })]
+        .filter((part) => part !== '')
+        .join('\n\n'),
       stats: {
         ...stats,
         totalMs,
@@ -1256,6 +1541,8 @@ export class ChatterangEngine {
   ): AsyncGenerator<GenerationEvent, TurnResult> {
     let text = '';
     let stats: GenerationStatsSnapshot = {};
+    /** How the stream ended, once its `done` says: see `TurnResult.ended`. */
+    let ended: TextEnding = 'cut';
 
     const stream = this.#bridge.chatStream(irRequest, {
       signal,
@@ -1314,12 +1601,19 @@ export class ChatterangEngine {
           if (mismatch) {
             this.#responseWarnings = mergeWarnings(this.#responseWarnings, [mismatch]);
           }
+          // Whether the model ended it, or its limit on tokens or a filter cut
+          // it short: a text the model ended ends outside any call it wrote.
+          ended = endingOf(chunk.finishReason, {
+            completionTokens: stats.completionTokens,
+            maxTokens: irRequest.parameters?.maxTokens,
+            stopSequences: irRequest.parameters?.stopSequences,
+          });
           sawTerminal = true;
           break;
         }
 
         case 'error':
-          return { text, stats, error: chunk.error.message, errorCode: chunk.error.code };
+          return { text, stats, ended: 'cut', error: chunk.error.message, errorCode: chunk.error.code };
 
         default:
           break;
@@ -1336,12 +1630,13 @@ export class ChatterangEngine {
       return {
         text,
         stats,
+        ended: 'cut',
         error: 'This reply ended before it was complete — the connection stopped part-way.',
         errorCode: 'EMPTY_RESPONSE',
       };
     }
 
-    return { text, stats };
+    return { text, stats, ended };
   }
 
   #resolveFallback(): { name: string; adapter: BackendAdapter; modelId?: string } | null {

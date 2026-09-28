@@ -13,10 +13,12 @@ import { onOtherWindows } from '@/lib/other-windows';
 import { db, deleteChat } from '@/db';
 import {
   applyVariant,
+  closeReasoning,
   currentVariant,
   deriveTitle,
   displaysUnrecorded,
   holdsGrant,
+  leftOutOfContext,
   newId,
   splitThinking,
   REACH_LOCAL_VIA_THIRD_PARTY,
@@ -57,8 +59,10 @@ import { markTainted } from '@/ai/taint';
 import type {
   DestinationRequest,
   ExecutedTool,
+  TextEnding,
   ToolDestinationPolicy,
 } from '@/ai/middleware/tools';
+import { callNames, closeReasoningOutsideCalls, cutUnfinishedCall, stripToolSyntax } from '@/ai/middleware/tools';
 import {
   mayHaveLeft,
   unhandledOutcome,
@@ -1412,6 +1416,34 @@ function carriesReceipt(variant: MessageVariant): boolean {
   return variant.toolCalls?.some((call) => call.receipt !== undefined) ?? false;
 }
 
+/**
+ * A reply's words with its finished tool calls read out of them, in a chat with
+ * tools. Handed the reply's text AFTER its reasoning is split off, and after
+ * any call a round ended inside was cut where that round ended: see `readRaw`
+ * in `runGeneration`, and the engine's `roundWords`.
+ *
+ * A finished call is stripped as the engine strips a finished reply's: a turn
+ * stopped at an MCP send sheet stored the model's call, arguments and all, as
+ * the words of its reply, and sent it back to the model as history.
+ *
+ * FINISHED CALLS ARE STRIPPED FROM THE WORDS OF EVERY TURN THAT OFFERED A TOOL
+ * OR RAN ONE (`ran`), a malformed one included: a reply that was only
+ * `<tool_call>{…,}}</tool_call>` ran no tool, and its call and arguments were
+ * still stored and sent back. A turn that offered none and ran none wrote no
+ * call, and one showing a model's call format keeps it.
+ *
+ * `offered` is the names a call could give in the request, as `callNames` gives
+ * them, which decides whether a fenced JSON block naming a tool is one. Only a
+ * block the engine would have run is stripped: a config file, a data record, or
+ * an example naming a tool the turn did not offer, is words. See `fencedCall`.
+ */
+function wordsWithoutCalls(
+  content: string,
+  { offered, ran }: { readonly offered: readonly string[]; readonly ran: boolean },
+): string {
+  return stripToolSyntax(content, { offered, ran });
+}
+
 /* ── Generation ─────────────────────────────────────────────────────── */
 
 interface RunOptions {
@@ -1643,6 +1675,20 @@ async function runGeneration(
     const turnToolPolicy = narrowToolPolicy(turnPersona?.tools, turnPersona?.agentConfig, turnAllowedMcpServerIds);
     const alwaysAsk = turnToolPolicy.confirmPolicy === 'always-ask';
 
+    // Whether this request offers the model a tool: the registry lookup the
+    // engine makes to declare them, as the request is built. A chat's tool ids
+    // are not that — an MCP tool's stays on the chat after its server is
+    // removed or disconnected, and the request then offers none.
+    //
+    // `offered` is the names a call can give among them, which decides whether
+    // a fenced JSON block naming a tool is one, as the engine's extractor does.
+    const offered = callNames(
+      chat.tools.flatMap((toolId) => {
+        const tool = toolRegistry.get(toolId);
+        return tool ? [tool] : [];
+      }),
+    );
+    const offersTools = offered.length > 0;
     const stream = engine.stream({
       messages: built.messages,
       target,
@@ -1655,6 +1701,93 @@ async function runGeneration(
       signal: controller.signal,
     });
 
+    // WHAT THE THREAD SHOWS, AND WHAT A TURN'S WORDS ARE READ FROM.
+    //
+    // `shown` is every delta, the turn's rounds back to back, as the thread
+    // shows it while the turn streams.
+    //
+    // `raw` is what the words of a turn that ends stopped, failed, or killed
+    // after a receipt are read from, and a finished one's when the engine
+    // hands back none: the same deltas, except that each round that has ended
+    // is cut where a call it ended inside starts, as it ends — when a tool it
+    // called runs, or when its local stream dies and the turn diverts to the
+    // fallback — and the round being written when the turn ends is cut as it
+    // ends, by `readRaw`. The cut used to run once over every round joined,
+    // anchored to the end of the last. A call a round ended inside was no
+    // longer at the end: one cut off in its arguments took every word after it,
+    // the follow-up's or the cloud's, because its string ran on into them; one
+    // whose JSON closed with no tag after it had those words after it and was
+    // kept, its arguments stored and sent back. So was a round the model ended
+    // on a call's opening named in prose, its words kept where it ended: read
+    // on to the end of the turn, it was cut from there, every later round's
+    // words with it. See `cutUnfinishedCall`.
+    let shown = '';
+    /** Where in `raw` the round being written starts. */
+    let roundStart = 0;
+    /**
+     * Whether the turn could have written a call: its request offered a tool,
+     * or one ran. A turn that did neither ends on an example, not a call, and
+     * a call's opening shape at its end is as likely a marker named in prose.
+     * A chat can name tools and offer none: an MCP tool's id stays on it after
+     * its server is removed or disconnected.
+     */
+    const readsCalls = (): boolean => offersTools || toolCalls.length > 0;
+    /**
+     * `round` with any call it ended inside cut where it starts, read as the
+     * round ended (see `TextEnding`): stopped or cut short, a call's opening
+     * the text ends inside is cut, whatever the words in its values; ended by
+     * the model, words that run on from inside a value are a sentence that
+     * named a call's opening, and are kept. An unfinished call in a fenced
+     * block is never cut: nothing tells it from the start of a JSON example.
+     */
+    const cutRound = (round: string, ended: TextEnding): string =>
+      readsCalls() ? cutUnfinishedCall(round, { ended, offered }) : round;
+    const endRound = (ended: TextEnding): void => {
+      raw = raw.slice(0, roundStart) + cutRound(raw.slice(roundStart), ended);
+      roundStart = raw.length;
+    };
+    /**
+     * A turn's words and reasoning from text whose rounds were each cut where
+     * they ended, with its finished calls read out (`wordsWithoutCalls`).
+     *
+     * No unfinished call is read over the deltas whole: read that way, a
+     * `<tool_call>` the model only mentioned while reasoning was taken for an
+     * unfinished call, the cut took the closing think tag and the whole answer
+     * with it, and the reply was stored as "Stopped before its first word". A
+     * round's cut reads it with its reasoning blanked (see `maskReasoning`), so
+     * a call named there takes none of the answer.
+     *
+     * Its FINISHED calls are read out before its reasoning is split off, as the
+     * engine reads a round's whole, and out of the words again after: a
+     * reasoning tag a call's string argument names — a note saying "reason
+     * inside <thinking> tags" — is the argument's words. Split first, the call
+     * was cut in two there, and the half left in the words, arguments and all,
+     * could not be found by the stripper: it was stored and sent back. A
+     * finished call named in reasoning is taken out of the stored reasoning
+     * too, as the engine's reading of a finished round takes it. See
+     * `closeRaw`.
+     */
+    const readRounds = (text: string): { content: string; thinking: string } => {
+      const reading = { offered, ran: toolCalls.length > 0 };
+      const split = splitThinking(readsCalls() ? wordsWithoutCalls(text, reading) : text);
+      return {
+        content: wordsWithoutCalls(split.content, reading),
+        thinking: split.thinking,
+      };
+    };
+    /**
+     * `raw` with any reasoning a round left open closed where it ended (see
+     * `closeReasoning`), read outside its finished calls: a reasoning tag a
+     * call's string argument names is not reasoning left open, and closing it
+     * put the call's closing half in the reasoning and left the rest in the
+     * words. See `closeReasoningOutsideCalls`.
+     */
+    const closeRaw = (text: string): string =>
+      readsCalls() ? closeReasoningOutsideCalls(text, offered) : closeReasoning(text);
+    /** The turn's words and reasoning read from `raw`, the round being written ending `ended`. */
+    const readRaw = (ended: TextEnding): { content: string; thinking: string } =>
+      readRounds(raw.slice(0, roundStart) + cutRound(raw.slice(roundStart), ended));
+
     for await (const event of stream) {
       switch (event.type) {
         case 'delta': {
@@ -1663,7 +1796,8 @@ async function runGeneration(
             app.setActivity(runsOnThisDevice(target) ? 'running' : 'remote');
           }
           raw += event.text;
-          const split = splitThinking(raw);
+          shown += event.text;
+          const split = splitThinking(shown);
           patch((message) => ({
             ...message,
             content: split.content,
@@ -1672,12 +1806,17 @@ async function runGeneration(
 
           const elapsed = performance.now() - started;
           if (elapsed > 400) {
-            app.setLiveRate(Number(((raw.length / 3.6 / elapsed) * 1000).toFixed(1)));
+            app.setLiveRate(Number(((shown.length / 3.6 / elapsed) * 1000).toFixed(1)));
           }
           break;
         }
 
         case 'tool': {
+          // The round that called it has ended, and any reasoning it left open
+          // with it: what the follow-up writes is its answer, on screen and in
+          // a turn stopped or killed from here on. See `closeReasoning`.
+          raw = closeRaw(raw);
+          shown = closeReasoning(shown);
           toolCalls = [
             ...toolCalls,
             {
@@ -1693,6 +1832,9 @@ async function runGeneration(
             },
           ];
           patch((message) => ({ ...message, toolCalls }));
+          // And so has any call it was writing beside the one that ran, read
+          // as the engine says the round ended.
+          endRound(event.ended ?? 'cut');
 
           // A receipt that says bytes may have left the device is written down
           // NOW. A withheld one waits for the turn to end like any other text.
@@ -1709,11 +1851,17 @@ async function runGeneration(
           // lookup found nothing and nothing was written. It is the row `patch`
           // keeps on screen, field for field.
           if (mayHaveLeft(event.tool.receipt)) {
-            const split = splitThinking(raw);
+            // With its calls read out as a finished reply's are. Every delta
+            // so far includes the call this receipt is for, and a turn killed
+            // from here on is recovered with these words: Try again kept them
+            // as a version, and flipping back to it sent the call, and the
+            // arguments that went to the server, to the model. Every round
+            // so far has ended, and was cut as it ended, just above.
+            const read = readRaw(event.ended ?? 'cut');
             await putMessage({
               ...placeholder,
-              content: split.content,
-              thinking: split.thinking || undefined,
+              content: read.content,
+              thinking: read.thinking || undefined,
               toolCalls,
               streaming: true,
             });
@@ -1727,6 +1875,18 @@ async function runGeneration(
         }
 
         case 'fallback':
+          // A local round whose stream died has ended where it died, and the
+          // fallback's words follow it: see `endRound`.
+          //
+          // And so has any reasoning it left open, as a round that called a
+          // tool: a local model that died mid-`<think>` left the tag open, and
+          // everything the cloud wrote after it was read as reasoning — shown
+          // as reasoning while it arrived, stored with no words and shown as
+          // "Stopped before its first word" when stopped, and kept as no words
+          // in a failed row. See `closeReasoning`.
+          raw = closeRaw(raw);
+          shown = closeReasoning(shown);
+          endRound('cut');
           app.setActivity('remote');
           break;
 
@@ -1745,12 +1905,46 @@ async function runGeneration(
             });
           }
 
-          const split = splitThinking(event.text || raw);
+          // `event.text` holds every round's words, each cut by the engine where
+          // a call it ended inside starts, as its stream said it ended, and its
+          // finished calls stripped. Its finished calls are read out of it
+          // again here, once its reasoning is split off.
+          //
+          // When it is empty the streamed deltas stand in for it, as they
+          // always have: the engine hands back no words only when every
+          // round's were calls, which read the same however a round ended, so
+          // the last round is read as cut short. A STOPPED turn is read from
+          // the deltas whatever it holds, the round Stop cut read as stopped:
+          // the engine never finished reading that round, so its text has the
+          // earlier rounds' words and none of that one's.
+          //
+          // Calls are read out of every turn that offered a tool or ran one:
+          // otherwise a call was stored as the reply's words and sent back to
+          // the model as history. A tool that ran left every round's deltas,
+          // the call included; a call cut off mid-arguments has no end for the
+          // engine's stripper; a stopped turn holds a call it was writing or
+          // waiting to send. OFFERED, NOT NAMED ON THE CHAT: a chat keeps an
+          // MCP tool's id after its server is gone, and its requests offer no
+          // tool, so nothing such a turn writes is a call, and reading it for
+          // one cut a JSON example, or a call marker named in prose, the person
+          // had watched arrive. See `readsCalls`.
+          const aborted = controller.signal.aborted;
+          const read = aborted ? readRaw('stopped') : event.text === '' ? readRaw('cut') : readRounds(event.text);
+          const content = read.content.trim();
+          // A REPLY WITH NO WORDS SAYS WHETHER IT WAS STOPPED.
+          //   true  — stopped before its first word (owner ruling): kept, shown
+          //           as stopped, and left out of every later request.
+          //   false — finished with no words, nobody stopped it: a reply spent
+          //           reasoning, say. Written so the display's reading of old
+          //           unmarked rows (`showsStopped`) never calls it stopped.
+          // A reply with words carries neither, stopped after some text or
+          // not, and keeps its text and its display.
+          const stopped = content.length > 0 ? undefined : aborted;
           // The generation is assembled as ONE value and then projected onto
           // the row, so the row cannot end up holding half of it.
           const own: MessageVariant = {
-            content: split.content.trim(),
-            thinking: split.thinking || undefined,
+            content,
+            thinking: read.thinking || undefined,
             toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             provenance: {
               backendId: event.provenance.backendId,
@@ -1791,6 +1985,7 @@ async function runGeneration(
                 : undefined,
             },
             stats: event.stats,
+            stopped,
           };
           // A first generation needs no list; a regenerated one appends itself
           // to the generations it was asked to replace.
@@ -1804,6 +1999,7 @@ async function runGeneration(
             toolCalls: own.toolCalls,
             provenance: own.provenance,
             stats: own.stats,
+            stopped: own.stopped,
             streaming: false,
             variants,
             variantIndex: variants ? variants.length - 1 : undefined,
@@ -1825,7 +2021,12 @@ async function runGeneration(
            * The `catch` below already preserved the row; only this branch
            * wiped it. They agree now.
            */
-          const partial = splitThinking(raw);
+          // With its calls read out as a finished reply's are, the round whose
+          // stream failed read as cut short. A failed row is left out of
+          // history, but Try again keeps it as a version, a version carries no
+          // error, and flipping back to it sent a call that ran, arguments and
+          // all, to the model.
+          const partial = readRaw('cut');
           const failed: Message = {
             ...placeholder,
             content: partial.content.trim(),
@@ -1876,7 +2077,10 @@ async function runGeneration(
       const last = get().messages.at(-1);
       await useChats.getState().updateChat(chat.id, (chatNow) => ({
         messageCount: chatNow.messageCount + 1,
-        preview: last?.content.slice(0, 120) ?? chatNow.preview,
+        // A reply with no words leaves the preview it had — the text just
+        // sent — rather than blanking the chat in the list and in the list's
+        // search. `??` took an empty reply for something to show.
+        preview: last?.content ? last.content.slice(0, 120) : chatNow.preview,
       }));
     }
   }
@@ -1988,6 +2192,7 @@ function originOf(tool: ExecutedTool): [name: string, origin: string] {
         case 'server-changed':
         case 'stopped':
         case 'round-limit':
+        case 'reply-failed':
           return [receipt.toolName, `was not sent to ${receipt.host}; this app wrote its reply`];
         default:
           // Not sent; whose words came back is not this build's to say.
@@ -2014,6 +2219,7 @@ function earlierSourceOf(receipt: McpCallReceipt, names: string): string {
         case 'server-changed':
         case 'stopped':
         case 'round-limit':
+        case 'reply-failed':
           return `${names}, which was not sent to ${receipt.host}`;
         default:
           return `${names}, which was not sent to ${receipt.host} (${unhandledWhy(receipt.why)})`;
@@ -2585,8 +2791,10 @@ export async function buildMessages(
   const models = useModels.getState();
   const persona = chat.personaId ? personas.byId[chat.personaId] : undefined;
 
+  // A reply with no text is left out, stopped or not: the bridge refuses the
+  // whole request over it, before any backend. See `leftOutOfContext`.
   const history = messages
-    .filter((message) => !message.streaming && !message.error)
+    .filter((message) => !message.streaming && !message.error && !leftOutOfContext(message))
     .slice(0, messages.length - dropTail)
     .slice(-HISTORY_TURNS);
 

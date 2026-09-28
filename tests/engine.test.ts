@@ -304,7 +304,11 @@ describe('ChatterangEngine.stream', () => {
       ),
     );
 
-    expect(done.text).toBe('Four.');
+    // The script repeats its last turn, so the model wrote "Four." before a
+    // call in each of rounds two to four, whose calls ran, and in a fifth past
+    // the tool cap, whose call did not. Every round's words are kept — the
+    // person watched each arrive — and none of the calls.
+    expect(done.text).toBe(['Four.', 'Four.', 'Four.', 'Four.'].join('\n\n'));
     expect(done.text).not.toContain('tool_call');
   });
 

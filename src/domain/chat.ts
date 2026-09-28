@@ -438,6 +438,32 @@ export interface MessageVariant {
    * that direction while it fails silent in the other.
    */
   readonly unrecorded?: true;
+  /**
+   * Whether a generation that finished with NO TEXT was stopped.
+   *
+   * `true` on a generation stopped before its first word: Stop landed while it
+   * had no text — waiting for the model, waiting at a send sheet, or waiting
+   * for the shared model slot (#7).
+   *
+   * Owner ruling: such a reply is KEPT, shown as stopped, and left out of what
+   * is sent to the model. Kept, because a stopped turn can carry MCP receipts,
+   * and a reply dropped would take the record of what did or did not leave with
+   * it. Left out, because an assistant message with no text is refused by the
+   * bridge before any backend — and with it every later request in the chat.
+   *
+   * `false` on a generation that finished with no text and was NOT stopped: a
+   * model that spent its whole reply reasoning, or wrote nothing after its
+   * tools ran. It is still left out of what is sent — the bridge refuses it
+   * just the same — but it is not called stopped. {@link showsStopped} reads an
+   * empty reply with no marker as stopped, for rows written before the marker
+   * existed, and without `false` every such reply this build finishes would be
+   * caught by that reading too.
+   *
+   * Absent on a reply with text, stopped after some text or not, which keeps
+   * its text and its display as it always did; and on rows written before this
+   * existed.
+   */
+  readonly stopped?: boolean;
 }
 
 export interface Message {
@@ -456,6 +482,8 @@ export interface Message {
   streaming?: boolean;
   /** Set when generation failed; content holds the user-facing explanation. */
   error?: string;
+  /** Whether a reply with no text was stopped. See {@link MessageVariant.stopped}. */
+  stopped?: boolean;
   /**
    * Every generation of this turn, oldest last-but-one, newest last —
    * INCLUDING the one currently projected onto the fields above.
@@ -599,6 +627,7 @@ export function currentVariant(message: Message): MessageVariant {
     toolCalls: message.toolCalls,
     provenance: message.provenance,
     stats: message.stats,
+    stopped: message.stopped,
   };
 }
 
@@ -621,6 +650,7 @@ export function applyVariant(message: Message, index: number): Message {
     toolCalls: variant.toolCalls,
     provenance: variant.provenance,
     stats: variant.stats,
+    stopped: variant.stopped,
     variantIndex: index,
   };
 }
@@ -635,6 +665,64 @@ export function displaysUnrecorded(message: Message): boolean {
   const index = message.variantIndex;
   if (index === undefined) return false;
   return message.variants?.[index]?.unrecorded === true;
+}
+
+/* ── A reply stopped before its first word ──────────────────────────── */
+
+/**
+ * Does the thread, and the export, show this generation as a reply stopped
+ * before its first word?
+ *
+ * An empty reply with a marker says which it is: `true` was stopped, `false`
+ * finished with no words and nobody stopped it. Every empty reply this build
+ * finishes carries one.
+ *
+ * An empty reply with NO marker was written before the marker existed. With no
+ * receipt it is shown as stopped, by owner ruling: that is what a turn stopped
+ * before its first token left on disk. WITH a receipt it is not called stopped
+ * — nothing recorded that it was, and a turn whose tool rounds ran out before
+ * it wrote anything leaves the same shape — and keeps the display it had.
+ *
+ * A reply with text is never shown as stopped, marker or not.
+ *
+ * Structural rather than `MessageVariant`, so the transcript's narrower row
+ * type can ask it too.
+ */
+export function showsStopped(generation: {
+  readonly content: string;
+  readonly stopped?: boolean;
+  readonly toolCalls?: readonly { readonly receipt?: unknown }[];
+}): boolean {
+  if (generation.content.trim().length > 0) return false;
+  if (generation.stopped !== undefined) return generation.stopped;
+  return !(generation.toolCalls?.some((call) => call.receipt !== undefined) ?? false);
+}
+
+/**
+ * Is this row left out of what is sent to the model?
+ *
+ * An assistant reply with no text, whatever made it so: stopped before its
+ * first word (marked, or written before the marker existed), a generation with
+ * no text flipped back to, a turn whose tool rounds ran out before it wrote a
+ * word. The bridge refuses an assistant message whose content is empty before
+ * any backend sees it, so there is nothing such a row adds to a request except
+ * that refusal — for this request and every later one in the chat.
+ *
+ * NOTHING ELSE OF IT WAS EVER SENT. History carries a row's `content`; its tool
+ * calls and their receipts are never sent as history, only the taint mark they
+ * imply, and a row with no text has nothing to mark. Leaving it out sends no
+ * less of them than before.
+ */
+export function leftOutOfContext(message: {
+  readonly role: MessageRole;
+  readonly content: string;
+  readonly attachments?: readonly unknown[];
+}): boolean {
+  return (
+    message.role === 'assistant' &&
+    message.content.trim().length === 0 &&
+    (message.attachments?.length ?? 0) === 0
+  );
 }
 
 export function newId(prefix: string): string {
@@ -652,6 +740,66 @@ export function deriveTitle(text: string): string {
   return cleaned.length > 42 ? `${cleaned.slice(0, 41).trimEnd()}…` : cleaned;
 }
 
+/** Where a reasoning block opens and where it closes, as {@link splitThinking} and {@link maskReasoning} both read them. */
+const REASONING_OPEN = /<(think|thinking|reasoning)>/i;
+const REASONING_CLOSE = /<\/(think|thinking|reasoning)>/i;
+
+/**
+ * A generation's text with each reasoning block, its tags included, blanked to
+ * spaces, read as {@link splitThinking} reads them: a block still open runs to
+ * the end. Every other character stays where it was.
+ *
+ * FOR FINDING WHERE SOMETHING STANDS IN A GENERATION'S WORDS. A tool round is
+ * cut where a call it ended inside starts (`cutUnfinishedCall` in
+ * ai/middleware/tools.ts), and a round is read with its reasoning still in it.
+ * Reasoning that names a call it never finishes — `<think>A call opens
+ * [TOOL_CALLS] leaky({"path": "</think>` — was taken for that call, and the cut
+ * took the round's answer with it.
+ *
+ * `spans` are the blocks to blank, when the caller read them some other way
+ * than {@link reasoningSpans} reads `raw` alone: see `reasoningOutsideCalls` in
+ * ai/middleware/tools.ts.
+ */
+export function maskReasoning(raw: string, spans: readonly (readonly [number, number])[] = reasoningSpans(raw)): string {
+  let masked = '';
+  let at = 0;
+  for (const [start, end] of spans) {
+    masked += raw.slice(at, start) + ' '.repeat(end - start);
+    at = end;
+  }
+  return masked + raw.slice(at);
+}
+
+/**
+ * Where each reasoning block in a generation's text starts and ends, its tags
+ * included, as {@link splitThinking} reads them: `[start, end)`.
+ *
+ * A block still open at the end runs to the end, unless `unclosed` is false,
+ * when it is left out. A finished round whose reasoning was never closed can
+ * have written its call inside it, and did — a model that calls before it
+ * closes its reasoning — while a round Stop cut there was still reasoning.
+ */
+export function reasoningSpans(
+  raw: string,
+  { unclosed = true }: { readonly unclosed?: boolean } = {},
+): [number, number][] {
+  const spans: [number, number][] = [];
+  let at = 0;
+  for (;;) {
+    const open = REASONING_OPEN.exec(raw.slice(at));
+    if (!open) return spans;
+    const start = at + open.index;
+    const inside = start + open[0].length;
+    const close = REASONING_CLOSE.exec(raw.slice(inside));
+    if (!close) {
+      if (unclosed) spans.push([start, raw.length]);
+      return spans;
+    }
+    at = inside + close.index + close[0].length;
+    spans.push([start, at]);
+  }
+}
+
 /**
  * Split a raw model response into visible answer and reasoning trace.
  * Handles the `<think>` convention used by reasoning-tuned open models, and
@@ -659,16 +807,13 @@ export function deriveTitle(text: string): string {
  * the trace live (PRD §3.4 — Thinking Mode).
  */
 export function splitThinking(raw: string): { content: string; thinking: string; open: boolean } {
-  const OPEN = /<(think|thinking|reasoning)>/i;
-  const CLOSE = /<\/(think|thinking|reasoning)>/i;
-
-  const openMatch = OPEN.exec(raw);
+  const openMatch = REASONING_OPEN.exec(raw);
   if (!openMatch) return { content: raw, thinking: '', open: false };
 
   const before = raw.slice(0, openMatch.index);
   const rest = raw.slice(openMatch.index + openMatch[0].length);
 
-  const closeMatch = CLOSE.exec(rest);
+  const closeMatch = REASONING_CLOSE.exec(rest);
   if (!closeMatch) {
     // Block still open — everything after the tag is reasoning so far.
     return { content: before, thinking: rest, open: true };
@@ -682,4 +827,24 @@ export function splitThinking(raw: string): { content: string; thinking: string;
     thinking: (thinking + (tail.thinking ? `\n${tail.thinking}` : '')).trim(),
     open: tail.open,
   };
+}
+
+/**
+ * One generation's text with any reasoning block it left open closed where the
+ * generation ended.
+ *
+ * FOR A TOOL ROUND, whose text is followed by the next round's. A model can
+ * write its call before it closes its reasoning — `<think>I should read the
+ * notes first.` then the call — or name `<think>` in its words, and the round
+ * ends there. Joined to what the follow-up wrote, the open tag made
+ * {@link splitThinking} file the follow-up's whole answer as reasoning: the
+ * reply was stored with no words and left out of every later request.
+ *
+ * `readAs` is the text whose reasoning is read, when that is not `text` itself:
+ * `text` with its finished tool calls blanked, so a reasoning tag a call's
+ * string argument names is not reasoning left open. See
+ * `closeReasoningOutsideCalls` in ai/middleware/tools.ts.
+ */
+export function closeReasoning(text: string, readAs: string = text): string {
+  return splitThinking(readAs).open ? `${text}</think>` : text;
 }

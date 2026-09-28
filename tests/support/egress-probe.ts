@@ -14,7 +14,7 @@
 
 import { vi } from 'vitest';
 
-import type { BackendAdapter, IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
+import type { BackendAdapter, FinishReason, IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
 import { FunctionBackendAdapter } from '@johnhenry/aimatey-backend-browser';
 
 import type { GenerationEvent } from '@/ai/engine';
@@ -113,31 +113,59 @@ export const cloudTarget = {
   reach: REACH_REMOTE,
 };
 
+/**
+ * A reply as a script for {@link recordingBackend} writes one when its stream
+ * ends for a reason of its own, or says how many tokens it spent: a plain
+ * string ends as the model ending it, `finishReason: 'stop'`, and says nothing
+ * of its tokens.
+ */
+export interface EndedReply {
+  readonly text: string;
+  readonly finishReason: FinishReason;
+  readonly completionTokens?: number;
+}
+
+/** `text` as a reply the backend cut off at its limit on tokens, `finishReason: 'length'`. */
+export function cutOff(text: string): EndedReply {
+  return { text, finishReason: 'length' };
+}
+
 /** A backend that records every request it is handed, then replies to script. */
-export function recordingBackend(turns: string[]): {
+export function recordingBackend(turns: readonly (string | EndedReply)[]): {
   adapter: BackendAdapter;
   seen: IRChatRequest[];
 } {
   const seen: IRChatRequest[] = [];
   let turn = 0;
-  const next = (request: IRChatRequest): string => {
+  const next = (request: IRChatRequest): EndedReply => {
     seen.push(structuredClone(request));
-    return turns[Math.min(turn++, turns.length - 1)] ?? '';
+    const scripted = turns[Math.min(turn++, turns.length - 1)] ?? '';
+    return typeof scripted === 'string' ? { text: scripted, finishReason: 'stop' } : scripted;
   };
 
   return {
     seen,
     adapter: new FunctionBackendAdapter({
-      execute: async (request) => ({
-        message: { role: 'assistant', content: next(request) },
-        finishReason: 'stop',
-        metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
-      }),
+      execute: async (request) => {
+        const { text, finishReason } = next(request);
+        return {
+          message: { role: 'assistant', content: text },
+          finishReason,
+          metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
+        };
+      },
       executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
-        const text = next(request);
+        const { text, finishReason, completionTokens } = next(request);
         yield { type: 'start', sequence: 0, metadata: request.metadata };
         yield { type: 'content', sequence: 1, delta: text };
-        yield { type: 'done', sequence: 2, finishReason: 'stop' };
+        yield {
+          type: 'done',
+          sequence: 2,
+          finishReason,
+          ...(completionTokens === undefined
+            ? {}
+            : { usage: { promptTokens: 1, completionTokens, totalTokens: completionTokens + 1 } }),
+        };
       },
     }),
   };

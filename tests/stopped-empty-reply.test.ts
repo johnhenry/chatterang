@@ -1,0 +1,6764 @@
+import { createElement } from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { IRChatRequest, IRStreamChunk } from '@johnhenry/aimatey-types';
+
+/**
+ * A REPLY STOPPED BEFORE ITS FIRST WORD STAYS, MARKED STOPPED, AND IS NEVER SENT.
+ *
+ * The `done` handler wrote a turn stopped before any token as an assistant row
+ * with `content: ''`. The next request in that chat was then refused by the
+ * bridge's validation before any backend saw it — "Invalid message at index 3:
+ * Message content cannot be empty string" — and every later one too, so the
+ * conversation could not be continued. The #7 work broker makes that routine: a
+ * turn stopped while it waits for the shared model slot has no tokens at all.
+ *
+ * Owner ruling: keep the reply, marked stopped. It stays in the thread as a
+ * visible "Stopped" reply with no text — which keeps any MCP receipts from that
+ * turn on screen — and it is left out of what is sent to the model.
+ *
+ * Everything below runs the real engine and the real bridge, so the refusal is
+ * the one aimatey's validation raises, and every assertion about a request is
+ * about the bytes a backend adapter was handed. The database is held in memory
+ * at the table boundary, as in stop-every-turn.test.ts.
+ */
+
+type Row = { id: string; chatId?: string; createdAt?: number };
+
+const fake = vi.hoisted(() => {
+  const chats = new Map<string, Row>();
+  const messages = new Map<string, Row>();
+  const clone = <T>(value: T): T => structuredClone(value);
+  const threadOf = (chatId: string): Row[] =>
+    [...messages.values()]
+      .filter((row) => row.chatId === chatId)
+      .map(clone)
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+
+  const db = {
+    chats: {
+      put: vi.fn(async (chat: Row) => {
+        chats.set(chat.id, clone(chat));
+      }),
+      delete: vi.fn(async (id: string) => {
+        chats.delete(id);
+      }),
+      orderBy: () => ({ reverse: () => ({ toArray: async () => [...chats.values()].map(clone) }) }),
+    },
+    messages: {
+      put: vi.fn(async (message: Row) => {
+        messages.set(message.id, clone(message));
+      }),
+      delete: vi.fn(async (id: string) => {
+        messages.delete(id);
+      }),
+      where: () => ({
+        equals: (chatId: string) => ({
+          sortBy: async () => threadOf(chatId),
+          toArray: async () => threadOf(chatId),
+        }),
+      }),
+    },
+    blobs: { get: async () => undefined, bulkDelete: vi.fn(async () => {}) },
+    models: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+    settings: { get: vi.fn(async () => undefined), put: vi.fn(async () => {}) },
+    connections: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
+  };
+
+  const deleteChat = vi.fn(async (chatId: string) => {
+    for (const row of [...messages.values()]) if (row.chatId === chatId) messages.delete(row.id);
+    chats.delete(chatId);
+  });
+
+  return {
+    db,
+    deleteChat,
+    chats,
+    messages,
+    reset: (): void => {
+      chats.clear();
+      messages.clear();
+    },
+  };
+});
+
+vi.mock('@/db', () => ({
+  db: fake.db,
+  deleteChat: fake.deleteChat,
+  readSetting: async (_key: string, fallback: unknown) => fallback,
+  writeSetting: vi.fn(async () => {}),
+}));
+
+const { act } = await import('react');
+const { createRoot } = await import('react-dom/client');
+const { FunctionBackendAdapter } = await import('@johnhenry/aimatey-backend-browser');
+
+const { useChats } = await import('@/state/chat');
+const { useModels } = await import('@/state/models');
+const { useApp } = await import('@/state/app');
+const { usePersonas } = await import('@/state/personas');
+const { catalogEntry } = await import('@/data/catalog');
+const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
+const { REACH_DEVICE } = await import('@/domain/chat');
+const { ChatterangEngine } = await import('@/ai/engine');
+const { toolRegistry } = await import('@/ai/tools/registry');
+const { MessageView } = await import('@/features/chat/MessageView');
+const { renderTranscript } = await import('@/shell/commands');
+const { MCP_CALL, MCP_CALL_CLEAN, PROBE_SERVER, cutOff, mcpProbe, probeResolver, recordingBackend } = await import(
+  './support/egress-probe'
+);
+
+type Chat = import('@/domain/chat').Chat;
+type Message = import('@/domain/chat').Message;
+type ToolInvocation = import('@/domain/chat').ToolInvocation;
+type Persona = import('@/domain/persona').Persona;
+
+const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
+
+const ON_DEVICE = {
+  backendId: 'llama-cpp',
+  engine: 'llama-cpp' as const,
+  modelId: QWEN.id,
+  modelName: 'Qwen3 4B Instruct',
+  reach: REACH_DEVICE,
+};
+
+/** What the thread and the export say beside a reply stopped before its first word. */
+const STOPPED_NOTE = 'Stopped before its first word';
+
+/* ── The rig ────────────────────────────────────────────────────────── */
+
+function chat(id: string, extra: Partial<Chat> = {}): Chat {
+  return {
+    id,
+    title: id,
+    mode: 'chat',
+    personaId: null,
+    modelId: QWEN.id,
+    sampler: null,
+    tools: [],
+    showThinking: false,
+    createdAt: 1,
+    updatedAt: 1,
+    messageCount: 0,
+    preview: '',
+    ...extra,
+  };
+}
+
+function user(chatId: string, n: number, content: string): Message {
+  return { id: `${chatId}_u${n}`, chatId, role: 'user', content, createdAt: n };
+}
+
+function reply(chatId: string, n: number, content: string, extra: Partial<Message> = {}): Message {
+  return {
+    id: `${chatId}_a${n}`,
+    chatId,
+    role: 'assistant',
+    content,
+    provenance: ON_DEVICE,
+    createdAt: n,
+    ...extra,
+  };
+}
+
+/** A chat in the store and the table, with its thread on disk and on screen. */
+function given(entry: Chat, thread: Message[]): void {
+  fake.chats.set(entry.id, structuredClone(entry));
+  for (const row of thread) fake.messages.set(row.id, structuredClone(row));
+  useChats.setState({
+    loaded: true,
+    chats: [entry],
+    activeChatId: entry.id,
+    messages: thread,
+    generating: false,
+    controller: null,
+    context: null,
+  });
+}
+
+type Step =
+  | { readonly reply: string }
+  | { readonly cutOff: string }
+  | { readonly stall: Promise<void> }
+  | { readonly partial: string; readonly stall: Promise<void> }
+  | { readonly fail: string };
+
+/**
+ * A backend that records every request it is handed, then follows its script:
+ * reply, as the model ending it (`finishReason: 'stop'`) or cut off at its limit
+ * on tokens (`'length'`); fail; or hold the stream open without a token until
+ * the test lets it go — which the test does only after Stop, so the turn ends
+ * stopped.
+ */
+function scriptedBackend(steps: Step[]) {
+  const seen: IRChatRequest[] = [];
+  let at = 0;
+  const adapter = new FunctionBackendAdapter({
+    execute: async () => {
+      throw new Error('this rig only streams');
+    },
+    executeStream: async function* (request: IRChatRequest): AsyncGenerator<IRStreamChunk> {
+      seen.push(structuredClone(request));
+      const step = steps[at++];
+      if (!step) throw new Error('the script ran out of turns');
+      if ('fail' in step) throw new Error(step.fail);
+      yield { type: 'start', sequence: 0, metadata: request.metadata };
+      if ('partial' in step) {
+        yield { type: 'content', sequence: 1, delta: step.partial };
+        await step.stall;
+        throw new Error('the stream was cut when the turn stopped');
+      }
+      if ('stall' in step) {
+        await step.stall;
+        throw new Error('the stream was cut when the turn stopped');
+      }
+      if ('cutOff' in step) {
+        yield { type: 'content', sequence: 1, delta: step.cutOff };
+        yield { type: 'done', sequence: 2, finishReason: 'length' };
+        return;
+      }
+      yield { type: 'content', sequence: 1, delta: step.reply };
+      yield { type: 'done', sequence: 2, finishReason: 'stop' };
+    },
+  });
+  return { adapter, seen };
+}
+
+/** The real engine, with the local model served by `local` and an optional cloud fallback. */
+function engineWith(local: { adapter: unknown }, cloud?: { id: string; adapter: unknown }) {
+  const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: cloud?.id ?? null });
+  engine.router.replace(QWEN.engine, local.adapter as never);
+  if (cloud) engine.router.register(cloud.id, cloud.adapter as never);
+  useApp.setState({ engine: engine as never });
+  return engine;
+}
+
+/** Indices of messages in a request whose content is empty. */
+function emptyAt(request: IRChatRequest | undefined): number[] {
+  expect(request, 'a request reached the backend').toBeDefined();
+  return request!.messages.flatMap((message, index) =>
+    (typeof message.content === 'string' ? message.content.trim() === '' : message.content.length === 0)
+      ? [index]
+      : [],
+  );
+}
+
+/** A request's messages as role and text, for reading. */
+function spoken(request: IRChatRequest | undefined): [string, string][] {
+  return (request?.messages ?? []).map((message) => [
+    message.role,
+    typeof message.content === 'string' ? message.content : '[blocks]',
+  ]);
+}
+
+/** What the person was told went wrong. */
+const refusals = (): string[] =>
+  useApp
+    .getState()
+    .toasts.filter((toast) => toast.tone === 'crit')
+    .map((toast) => toast.message);
+
+const rowsFor = (chatId: string): Message[] =>
+  ([...fake.messages.values()] as Message[])
+    .filter((row) => row.chatId === chatId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+const assistantRows = (chatId: string): Message[] => rowsFor(chatId).filter((row) => row.role === 'assistant');
+
+const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function until(condition: () => boolean): Promise<void> {
+  for (let tries = 0; tries < 400; tries += 1) {
+    if (condition()) return;
+    await macrotask();
+  }
+  throw new Error('the condition never held');
+}
+
+function held(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+/** Send, and press Stop while the backend holds the stream open with no token. */
+async function stopBeforeTheFirstToken(
+  text: string,
+  seen: () => number,
+  release: () => void,
+): Promise<void> {
+  const before = seen();
+  const sending = useChats.getState().send(text);
+  await until(() => seen() === before + 1);
+  useChats.getState().stop();
+  // Only once Stop has landed does the backend let the stream go. Released any
+  // earlier, the stream ends as an ordinary failure of a turn nobody stopped:
+  // an error row, and for a local turn a divert to the fallback.
+  release();
+  await sending;
+}
+
+/** Answer whatever sheets are still up with no, until `promise` settles. */
+async function drainSheets(promise: Promise<unknown>): Promise<void> {
+  let settled = false;
+  void promise.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  for (let rounds = 0; rounds < 50 && !settled; rounds += 1) {
+    for (const approval of useApp.getState().approvals) useApp.getState().answerApproval(approval.id, false);
+    await macrotask();
+  }
+  await promise;
+}
+
+/* ── Rendering ──────────────────────────────────────────────────────── */
+
+async function mounted(message: Message, body: () => Promise<void> | void): Promise<void> {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const host = document.createElement('div');
+  document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => {
+      root.render(
+        createElement(MessageView, { message, showThinking: true, onRegenerate: () => {}, onEdit: () => {} }),
+      );
+    });
+    await body();
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+}
+
+const stoppedNote = (): string | null => document.querySelector('.msg__stopped')?.textContent ?? null;
+const stoppedLabel = (): string | null =>
+  document.querySelector('.msg__stopped .label')?.textContent ?? null;
+const receipts = (): string[] =>
+  [...document.querySelectorAll('.tool__receipt')].map((node) => node.textContent ?? '');
+const control = (label: string): Element | null => document.querySelector(`[aria-label="${label}"]`);
+const bodyText = (): string => document.querySelector('.msg__body')?.textContent?.trim() ?? '';
+
+/* ── Setup ──────────────────────────────────────────────────────────── */
+
+beforeEach(() => {
+  fake.reset();
+  vi.clearAllMocks();
+  useModels.setState({
+    loaded: true,
+    activeModelId: QWEN.id,
+    progress: {},
+    storage: { used: 0, quota: 0 },
+    installed: {
+      [QWEN.id]: {
+        id: QWEN.id,
+        manifest: QWEN,
+        state: 'installed',
+        downloadedBytes: QWEN.sizeBytes,
+        paths: { model: `/dev/${QWEN.id}` },
+        sampler: { ...DEFAULT_SAMPLER },
+        systemPrompt: '',
+        installedAt: 1,
+        lastUsedAt: null,
+        useCount: 0,
+      },
+    },
+  });
+  useApp.setState({
+    toasts: [],
+    approvals: [],
+    connections: [],
+    settings: { ...useApp.getState().settings, renderMarkdown: false },
+  });
+});
+
+/* ── The reproduced sequence ────────────────────────────────────────── */
+
+describe('a reply stopped before its first token', () => {
+  it('stays in the thread marked stopped, and the next send succeeds carrying no empty message', async () => {
+    const id = 'repro';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopBeforeTheFirstToken('second', () => local.seen.length, gate.release);
+
+    await useChats.getState().send('third');
+
+    expect(refusals(), 'what the person was told').toEqual([]);
+    expect(local.seen, 'requests that reached the backend').toHaveLength(2);
+    expect(emptyAt(local.seen[1]), 'empty messages in the next request').toEqual([]);
+    expect(spoken(local.seen[1])).toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['user', 'third'],
+    ]);
+
+    const [, stopped, answered] = assistantRows(id);
+    expect(stopped, 'the stopped reply, on disk').toMatchObject({ content: '', stopped: true });
+    expect(stopped?.error, 'a stopped reply is not a failed one').toBeUndefined();
+    expect(
+      useChats.getState().messages.map((message) => message.id),
+      'and on screen, where it was',
+    ).toContain(stopped?.id);
+    expect(answered?.content).toBe('Fine.');
+  });
+
+  it('shows its MCP receipts beside "Stopped", and the next send still carries nothing empty', async () => {
+    const id = 'receipts';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([MCP_CALL, 'Fine.']);
+    engineWith(local);
+
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      toolRegistry.register(probe.tool);
+      sending = useChats.getState().send('file a note');
+      await until(() => useApp.getState().approvals.length === 1);
+      useChats.getState().stop();
+      await drainSheets(sending);
+
+      const stopped = assistantRows(id).at(-1)!;
+      expect(stopped).toMatchObject({ content: '', stopped: true });
+      expect(stopped.toolCalls?.[0]?.receipt).toMatchObject({ outcome: 'withheld', why: 'stopped' });
+
+      await mounted(stopped, () => {
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the reply was stopped before it went.']);
+        expect(stoppedLabel(), 'the visible label').toBe('Stopped');
+        expect(stoppedNote(), 'what a screen reader reads').toBe(STOPPED_NOTE);
+        expect(control('Read aloud'), 'nothing to read aloud').toBeNull();
+        expect(control('Regenerate')).not.toBeNull();
+      });
+
+      await useChats.getState().send('try again');
+    } finally {
+      await drainSheets(sending);
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(refusals()).toEqual([]);
+    expect(local.seen, 'requests that reached the backend').toHaveLength(2);
+    expect(emptyAt(local.seen[1])).toEqual([]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the receipt’s record, sent to the model').not.toContain(
+      'not sent',
+    );
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+  });
+
+  it('keeps its text and today’s display when it was stopped after some text', async () => {
+    const id = 'partial';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: 'Half an answer', stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    const sending = useChats.getState().send('second');
+    await until(() => useChats.getState().messages.some((message) => message.content === 'Half an answer'));
+    useChats.getState().stop();
+    gate.release();
+    await sending;
+
+    const partial = assistantRows(id).at(-1)!;
+    expect(partial.content).toBe('Half an answer');
+    expect(partial.stopped, 'no stopped marker on a reply that has text').toBeUndefined();
+    expect(partial.error).toBeUndefined();
+
+    await mounted(partial, () => {
+      expect(bodyText()).toBe('Half an answer');
+      expect(stoppedNote()).toBeNull();
+      expect(control('Read aloud')).not.toBeNull();
+    });
+
+    await useChats.getState().send('third');
+    expect(spoken(local.seen[1])).toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', 'Half an answer'],
+      ['user', 'third'],
+    ]);
+  });
+
+  it('is not written back into a chat deleted while it was stopped', async () => {
+    const id = 'removed';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }]);
+    engineWith(local);
+
+    const sending = useChats.getState().send('second');
+    await until(() => local.seen.length === 1);
+    const removing = useChats.getState().removeChat(id);
+    gate.release();
+    await Promise.all([sending, removing]);
+
+    expect(fake.chats.has(id), 'the chat, on disk').toBe(false);
+    expect(rowsFor(id), 'its rows, on disk').toEqual([]);
+    expect(useChats.getState().chats.some((entry) => entry.id === id)).toBe(false);
+  });
+});
+
+/* ── Every path that builds a request ───────────────────────────────── */
+
+describe('a stopped empty reply is left out of', () => {
+  it('a regeneration that replaces it, as today', async () => {
+    const id = 'regen_it';
+    given(chat(id), [
+      user(id, 1, 'hello'),
+      reply(id, 2, 'Hi.'),
+      user(id, 3, 'second'),
+      reply(id, 4, '', { stopped: true }),
+    ]);
+    const local = scriptedBackend([{ reply: 'Again.' }]);
+    engineWith(local);
+
+    await useChats.getState().regenerate(`${id}_a4`);
+
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[0])).toEqual([]);
+    const replies = assistantRows(id);
+    expect(replies.map((row) => row.content)).toEqual(['Hi.', 'Again.']);
+    // As today: `generationsSoFar` drops an empty generation with no receipt,
+    // so the list the new generation is appended to is empty.
+    expect(
+      replies[1]?.variants?.map((variant) => variant.content),
+      'an empty generation with no receipt is not kept',
+    ).toEqual(['Again.']);
+    expect(replies[1]?.stopped).toBeUndefined();
+    expect(replies[1]?.variants?.[0]?.stopped).toBeUndefined();
+  });
+
+  it('a regeneration over it that kept its receipts, flipped back to and sent after', async () => {
+    const id = 'regen_receipts';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([MCP_CALL, 'Again.', 'Fine.']);
+    engineWith(local);
+
+    let sending: Promise<void> = Promise.resolve();
+    try {
+      toolRegistry.register(probe.tool);
+      sending = useChats.getState().send('file a note');
+      await until(() => useApp.getState().approvals.length === 1);
+      useChats.getState().stop();
+      await drainSheets(sending);
+
+      const stopped = assistantRows(id).at(-1)!;
+      await useChats.getState().regenerate(stopped.id);
+
+      const regenerated = useChats.getState().messages.at(-1)!;
+      expect(regenerated.content).toBe('Again.');
+      expect(regenerated.variants?.map((variant) => [variant.content, variant.stopped])).toEqual([
+        ['', true],
+        ['Again.', undefined],
+      ]);
+
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      const flipped = useChats.getState().messages.at(-1)!;
+      expect(flipped.stopped, 'the row projects the generation on display').toBe(true);
+      await mounted(flipped, () => {
+        expect(stoppedNote()).toBe(STOPPED_NOTE);
+        expect(receipts()).toEqual(['Not sent to notes.example (notes) — the reply was stopped before it went.']);
+      });
+
+      await useChats.getState().send('next');
+
+      // Flipped forward again, the row carries no marker left over from the
+      // stopped generation it was showing.
+      await useChats.getState().cycleVariant(regenerated.id, 1);
+      const forward = useChats.getState().messages.find((message) => message.id === regenerated.id)!;
+      expect(forward.content).toBe('Again.');
+      expect(forward.stopped, 'no stale marker on the row').toBeUndefined();
+    } finally {
+      await drainSheets(sending);
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(refusals()).toEqual([]);
+    expect(local.seen, 'requests that reached the backend').toHaveLength(3);
+    expect(emptyAt(local.seen[2])).toEqual([]);
+    expect(spoken(local.seen[2]).map(([role]) => role)).toEqual(['user', 'assistant', 'user', 'user']);
+  });
+
+  it('a regeneration of a later reply', async () => {
+    const id = 'regen_later';
+    given(chat(id), [
+      user(id, 1, 'hello'),
+      reply(id, 2, '', { stopped: true }),
+      user(id, 3, 'second'),
+      reply(id, 4, 'Later.'),
+    ]);
+    const local = scriptedBackend([{ reply: 'Again.' }]);
+    engineWith(local);
+
+    await useChats.getState().regenerate(`${id}_a4`);
+
+    expect(refusals()).toEqual([]);
+    expect(local.seen).toHaveLength(1);
+    expect(emptyAt(local.seen[0])).toEqual([]);
+    expect(spoken(local.seen[0])).toEqual([
+      ['user', 'hello'],
+      ['user', 'second'],
+    ]);
+  });
+
+  it('an edit that resends', async () => {
+    const id = 'edit';
+    given(chat(id), [
+      user(id, 1, 'hello'),
+      reply(id, 2, 'Hi.'),
+      user(id, 3, 'second'),
+      reply(id, 4, '', { stopped: true }),
+      user(id, 5, 'third'),
+      reply(id, 6, 'Y.'),
+    ]);
+    const local = scriptedBackend([{ reply: 'Edited.' }]);
+    engineWith(local);
+
+    await useChats.getState().editMessage(`${id}_u5`, 'third, edited');
+
+    expect(refusals()).toEqual([]);
+    expect(local.seen).toHaveLength(1);
+    expect(emptyAt(local.seen[0])).toEqual([]);
+    expect(spoken(local.seen[0]).at(-1)).toEqual(['user', 'third, edited']);
+  });
+
+  it('the tool loop’s follow-up request', async () => {
+    const id = 'tool_loop';
+    const probe = mcpProbe();
+    given(
+      chat(id, {
+        tools: [probe.tool.id],
+        egressGrants: [{ kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 }],
+      }),
+      [user(id, 1, 'hello'), reply(id, 2, 'Hi.')],
+    );
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }, { reply: MCP_CALL_CLEAN }, { reply: 'Filed.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopBeforeTheFirstToken('second', () => local.seen.length, gate.release);
+
+      await useChats.getState().send('file a shopping list');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(refusals()).toEqual([]);
+    expect(probe.call, 'the granted call ran').toHaveBeenCalledTimes(1);
+    expect(local.seen, 'the stopped request, the call, the follow-up').toHaveLength(3);
+    expect(emptyAt(local.seen[1]), 'the request the model called the tool from').toEqual([]);
+    expect(emptyAt(local.seen[2]), 'the follow-up after the tool ran').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content).toBe('Filed.');
+  });
+
+  it('the request a failed local turn diverts to the cloud fallback', async () => {
+    const id = 'fallback';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }, { fail: 'not enough memory' }]);
+    const cloud = recordingBackend(['From the cloud.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    await stopBeforeTheFirstToken('second', () => local.seen.length, gate.release);
+    expect(cloud.seen, 'a stopped turn does not divert').toHaveLength(0);
+
+    await useChats.getState().send('third');
+
+    expect(refusals()).toEqual([]);
+    expect(local.seen, 'the local backend was asked, and failed').toHaveLength(2);
+    expect(emptyAt(local.seen[1])).toEqual([]);
+    expect(cloud.seen, 'the diverted request').toHaveLength(1);
+    expect(emptyAt(cloud.seen[0])).toEqual([]);
+    expect(spoken(cloud.seen[0])).toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['user', 'third'],
+    ]);
+    expect(assistantRows(id).at(-1)).toMatchObject({
+      content: 'From the cloud.',
+      provenance: { fallbackFrom: QWEN.engine },
+    });
+  });
+});
+
+/* ── Rows already on disk ───────────────────────────────────────────── */
+
+describe('an empty reply written before the marker existed', () => {
+  it('shows as stopped and is left out of the next request, and the row is not rewritten', async () => {
+    const id = 'old_row';
+    const old = reply(id, 4, '');
+    fake.chats.set(id, chat(id));
+    for (const row of [user(id, 1, 'hello'), reply(id, 2, 'Hi.'), user(id, 3, 'second'), old]) {
+      fake.messages.set(row.id, structuredClone(row));
+    }
+    useChats.setState({ loaded: true, chats: [chat(id)], activeChatId: null, messages: [] });
+    const local = scriptedBackend([{ reply: 'Fine.' }]);
+    engineWith(local);
+
+    await useChats.getState().openChat(id);
+    const opened = useChats.getState().messages.find((message) => message.id === old.id)!;
+    await mounted(opened, () => {
+      expect(stoppedNote()).toBe(STOPPED_NOTE);
+    });
+
+    await useChats.getState().send('third');
+
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[0])).toEqual([]);
+    expect(spoken(local.seen[0]).map(([role]) => role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(fake.messages.get(old.id), 'the old row, on disk').toEqual(old);
+  });
+
+  it('keeps today’s display when it carries receipts, and is still left out of the next request', async () => {
+    const id = 'old_receipts';
+    const call: ToolInvocation = {
+      id: 'call_old',
+      name: 'notes.note',
+      input: { text: 'a note' },
+      output: 'filed',
+      receipt: {
+        outcome: 'sent',
+        serverId: PROBE_SERVER.serverId,
+        serverName: 'notes',
+        host: 'notes.example',
+        toolName: 'notes.note',
+        bytes: 17,
+        at: Date.UTC(2026, 8, 1),
+      },
+    };
+    const old = reply(id, 4, '', { toolCalls: [call] });
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.'), user(id, 3, 'second'), old]);
+    const local = scriptedBackend([{ reply: 'Fine.' }]);
+    engineWith(local);
+
+    await mounted(old, () => {
+      expect(receipts()).toHaveLength(1);
+      expect(stoppedNote(), 'not called stopped: nothing says it was').toBeNull();
+    });
+
+    await useChats.getState().send('third');
+
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[0])).toEqual([]);
+    expect(spoken(local.seen[0]).map(([role]) => role)).toEqual(['user', 'assistant', 'user', 'user']);
+  });
+});
+
+/* ── The export ─────────────────────────────────────────────────────── */
+
+describe('the transcript', () => {
+  it('says a reply was stopped before its first word, and nothing about one that has text', () => {
+    const id = 'transcript';
+    const markdown = renderTranscript({ title: 'Stops', updatedAt: Date.UTC(2026, 8, 14) }, [
+      user(id, 1, 'hello'),
+      reply(id, 2, '', { stopped: true }),
+      user(id, 3, 'again'),
+      reply(id, 4, ''),
+      user(id, 5, 'once more'),
+      reply(id, 6, 'Half an answer'),
+      user(id, 7, 'and again'),
+      // A failed reply with no text is a failure, never "stopped".
+      reply(id, 8, '', { error: 'The model could not be loaded.' }),
+    ]);
+
+    expect(markdown.split(`_${STOPPED_NOTE}._`)).toHaveLength(3);
+    expect(markdown).toContain('Half an answer');
+    expect(markdown.slice(markdown.indexOf('Half an answer'))).not.toContain(STOPPED_NOTE);
+  });
+});
+
+/* ── The words a stopped turn streamed ──────────────────────────────── */
+
+const { CALL, leakyTool } = await import('./support/egress-probe');
+
+/** Send, let the backend stream some text, press Stop once `marker` is on screen, then let the stream go. */
+async function stopAfterSome(text: string, marker: string, release: () => void): Promise<void> {
+  const sending = useChats.getState().send(text);
+  await until(() => useChats.getState().messages.some((message) => message.content.includes(marker)));
+  useChats.getState().stop();
+  release();
+  await sending;
+}
+
+describe('a reply stopped after some text, in a chat with no tools', () => {
+  // Names a "function" inside a fenced JSON block: the shape the engine's
+  // tool-syntax stripping removes, and not a tool call in a chat with no tools.
+  const EXAMPLE = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+
+  it('keeps a JSON example it was writing, word for word', async () => {
+    const id = 'partial_json';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is the shape:\n\n${EXAMPLE}\n\nEach entry`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'Each entry', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.content, 'the words the person watched arrive').toBe(partial);
+    expect(stopped.stopped, 'a reply with text carries no marker').toBeUndefined();
+  });
+
+  it('is not called stopped, nor left out, when such an example was all it wrote', async () => {
+    const id = 'partial_json_only';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: EXAMPLE, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'get_weather', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: EXAMPLE,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      expect(control('Read aloud')).not.toBeNull();
+    });
+
+    await useChats.getState().send('third');
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', EXAMPLE],
+      ['user', 'third'],
+    ]);
+  });
+});
+
+describe('a turn stopped while the model was still writing its tool call', () => {
+  it('keeps the words before the call, and sends none of the call back to the model', async () => {
+    const id = 'partial_call';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = 'Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(stopped.content, 'the stopped reply, on disk').toBe('Filing it now.');
+    expect(stopped.stopped).toBeUndefined();
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', 'Filing it now.'],
+      ['user', 'third'],
+    ]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('is a reply stopped before its first word when the unfinished call was all it wrote', async () => {
+    const id = 'partial_call_only';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+
+      const stopped = assistantRows(id).at(-1)!;
+      expect(stopped, 'the stopped reply, on disk').toMatchObject({ content: '', stopped: true });
+      await mounted(stopped, () => {
+        expect(stoppedNote()).toBe(STOPPED_NOTE);
+      });
+
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[1])).toEqual([]);
+    expect(spoken(local.seen[1]).map(([role]) => role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── A reply nobody stopped ─────────────────────────────────────────── */
+
+describe('an empty reply nobody stopped', () => {
+  it('that spent itself reasoning is recorded as not stopped, and neither shown nor exported as stopped', async () => {
+    const id = 'thinking_only';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<think>Let me weigh the options carefully</think>', 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('which one?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.error, 'not a failure').toBeUndefined();
+    expect(last.thinking).toContain('weigh the options');
+    expect(last, 'finished with no words, and recorded as not stopped').toMatchObject({
+      content: '',
+      stopped: false,
+    });
+    await mounted(last, () => {
+      expect(stoppedNote(), 'the thread').toBeNull();
+    });
+    expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').not.toContain(STOPPED_NOTE);
+
+    await useChats.getState().send('and?');
+    expect(refusals()).toEqual([]);
+    expect(emptyAt(local.seen[1]), 'still left out of the next request').toEqual([]);
+  });
+
+  it('whose local tool ran and whose follow-up wrote nothing stores no words, and regenerates like any empty reply with no receipt', async () => {
+    const id = 'local_tool_empty';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([CALL, '', 'Again.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+
+      const last = assistantRows(id).at(-1)!;
+      expect(last.error, 'not a failure').toBeUndefined();
+      expect(last.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(last.content, 'the call it made is not stored as its words').toBe('');
+      expect(last.stopped, 'nothing stopped it').toBe(false);
+      expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').not.toContain(
+        STOPPED_NOTE,
+      );
+      await mounted(last, () => {
+        expect(stoppedNote(), 'the thread').toBeNull();
+      });
+
+      await useChats.getState().regenerate(last.id);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const regenerated = assistantRows(id).at(-1)!;
+    expect(regenerated.content).toBe('Again.');
+    // A local tool's call carries no receipt, and an empty generation with no
+    // receipt is not a version anyone can flip back to (#92's rule, pinned in
+    // variant-provenance.test.ts). It was kept only while the call's markup was
+    // stored as its words.
+    expect(
+      regenerated.variants?.map((variant) => variant.content),
+      'the empty generation is dropped, as any empty one with no receipt',
+    ).toEqual(['Again.']);
+  });
+});
+
+/* ── The chat list ──────────────────────────────────────────────────── */
+
+describe('the chat list, after a reply stopped before its first word', () => {
+  it('keeps the preview it had rather than blanking it', async () => {
+    const id = 'preview';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ stall: gate.promise }]);
+    engineWith(local);
+
+    await stopBeforeTheFirstToken('second', () => local.seen.length, gate.release);
+
+    expect(assistantRows(id).at(-1)).toMatchObject({ content: '', stopped: true });
+    expect(useChats.getState().chats.find((entry) => entry.id === id)?.preview, 'the sidebar').toBe('second');
+    expect((fake.chats.get(id) as Chat | undefined)?.preview, 'on disk').toBe('second');
+  });
+});
+
+/* ── Tool-call syntax in a chat with tools ──────────────────────────── */
+
+/** Run `body` with the MCP probe registered, in a chat that enables it. */
+async function inToolsChat(id: string, body: () => Promise<void>): Promise<ReturnType<typeof mcpProbe>> {
+  const probe = mcpProbe();
+  given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+  try {
+    toolRegistry.register(probe.tool);
+    await body();
+  } finally {
+    toolRegistry.unregister(probe.tool.id);
+  }
+  return probe;
+}
+
+describe('a reply stopped after some text, in a chat with tools', () => {
+  it('keeps its answer when its reasoning mentioned <tool_call>, and is not called stopped', async () => {
+    const id = 'think_mentions_call';
+    // Named twice in the reasoning: as a word, and in the shape a call opens with.
+    const reasoning = 'A plain fact. No need to emit a <tool_call> for this, nor <tool_call>{"name": "notes.note"} at all.';
+    const partial = `<think>${reasoning}</think>The capital of Australia is Canberra, which`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'Canberra, which', gate.release);
+      const stopped = assistantRows(id).at(-1)!;
+      expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+        content: 'The capital of Australia is Canberra, which',
+        stopped: undefined,
+      });
+      expect(stopped.thinking, 'its reasoning, as the model wrote it').toBe(reasoning);
+      await mounted(stopped, () => {
+        expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      });
+      await useChats.getState().send('third');
+    });
+
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', 'The capital of Australia is Canberra, which'],
+      ['user', 'third'],
+    ]);
+  });
+
+  it('still cuts an unfinished call written after its reasoning', async () => {
+    const id = 'think_then_call';
+    const partial =
+      '<think>File it.</think>Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    const probe = await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    const stopped = assistantRows(id)[1]!;
+    expect({ content: stopped.content, thinking: stopped.thinking }).toEqual({
+      content: 'Filing it now.',
+      thinking: 'File it.',
+    });
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words after a literal `<tool_call>` in prose', async () => {
+    const id = 'prose_call_tag';
+    const partial = 'Qwen wraps each call in a `<tool_call>` tag. Inside it is JSON naming the tool, and the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps a TOML example with a [tool_calls] table', async () => {
+    const id = 'toml_tool_calls';
+    const partial =
+      'Add this to your config:\n\n```toml\n[tool_calls]\nenabled = true\nmax_rounds = 4\n```\n\nThen restart the';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'restart the', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('cuts an unfinished [TOOL_CALLS] call and sends none of it back', async () => {
+    const id = 'mistral_call';
+    const partial = 'Reading it.\n[TOOL_CALLS] leaky({"path": "canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Reading it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a finished reply in a chat with tools', () => {
+  it('whose tool ran and whose follow-up wrote nothing sends no tool-call markup back to the model', async () => {
+    const id = 'tool_ran_follow_up_empty';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([CALL, '', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id)[1]!;
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(refusals()).toEqual([]);
+    expect(local.seen, 'the call, the follow-up, the next send').toHaveLength(3);
+    expect(emptyAt(local.seen[2])).toEqual([]);
+    expect(spoken(local.seen[2]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'read my notes'],
+      ['user', 'and then?'],
+    ]);
+  });
+
+  it('cut off in the middle of a call stores and sends none of the call', async () => {
+    const id = 'cut_off_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    // Cut off at its limit on tokens: a reply the model ended ends outside
+    // any call, and one that runs on from inside a value is prose.
+    const local = recordingBackend([
+      cutOff('Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a'),
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content).toBe('Checking.');
+    expect(refusals()).toEqual([]);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('that was only a JSON example naming a "function" keeps it, as it did', async () => {
+    const id = 'tools_json_only';
+    const example = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([example, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('show me the shape');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content).toBe(example);
+  });
+});
+
+/* ── A call's opening shape the reply goes on past ──────────────────── */
+
+/** A reply that documents Qwen's call format: a call's opening shape, with no closing tag, and prose after it. */
+const DOC =
+  'Every Qwen call opens like this:\n\n```\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```\n\n' +
+  'and the model then writes the closing tag. The app reads the JSON, runs the tool, and hands its result back as the next turn.';
+
+describe('a reply that writes a call’s opening shape and goes on past it, in a chat with tools', () => {
+  it('keeps every word when it finished, and sends them back', async () => {
+    const id = 'doc_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([DOC, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does qwen format a call?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(DOC);
+    expect(refusals()).toEqual([]);
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'how does qwen format a call?'],
+      ['assistant', DOC],
+      ['user', 'thanks'],
+    ]);
+  });
+
+  it('keeps every word when it was stopped after the example', async () => {
+    const id = 'doc_stopped';
+    const partial = DOC.slice(0, DOC.indexOf('runs the tool, and ') + 'runs the tool, and'.length);
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'runs the tool, and', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('is not called stopped before its first word when its words began with the example', async () => {
+    const id = 'doc_first';
+    const partial = '<tool_call>{"name": "get_weather"} is how every Qwen call opens, and the app then reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the app then reads', gate.release);
+    });
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: partial,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+  });
+
+  it('still cuts a call whose arguments closed when Stop landed before its closing tag', async () => {
+    const id = 'call_before_close';
+    const partial = 'Filing it.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    const probe = await inToolsChat(id, async () => {
+      await stopAfterSome('second', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Filing it.');
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('still cuts a call whose opening marker and name were all Stop let it write', async () => {
+    const id = 'call_marker_at_end';
+    const partial = 'Reading it.\n[TOOL_CALLS] leaky(';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'leaky(', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Reading it.');
+  });
+
+  it('still cuts an unfinished call whose arguments hold a closing brace in a string', async () => {
+    const id = 'call_brace_in_string';
+    const partial = 'Filing it.\n<tool_call>{"name":"notes.note","arguments":{"text":"a } b } canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Filing it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words after a [TOOL_CALLS] name({…} whose arguments closed and prose followed', async () => {
+    const id = 'mistral_doc';
+    const partial = 'Mistral writes [TOOL_CALLS] get_weather({"city": "Paris"} and then the paren, which the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'which the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
+
+/* ── A chat whose tools were not offered ────────────────────────────── */
+
+describe('a reply in a chat whose tool ids name nothing connected', () => {
+  // An MCP tool id kept after its server was removed: the request offers no tools.
+  const GONE = 'mcp:gone-server:note';
+  const EXAMPLE = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+
+  it('keeps a JSON example it was writing when it was stopped', async () => {
+    const id = 'gone_stopped_json';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is the shape:\n\n${EXAMPLE}\n\nEach entry`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'Each entry', gate.release);
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps a finished reply’s last word when it names a call marker', async () => {
+    const id = 'gone_finished_marker';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = 'Mistral models put every call after the special token [TOOL_CALLS]';
+    const local = recordingBackend([text]);
+    engineWith(local);
+
+    await useChats.getState().send('how does mistral mark a call?');
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+  });
+
+  it('does not run a complete <tool_call> example, and keeps it in a finished reply and the next request', async () => {
+    // The request offered no tool, so nothing the turn wrote is a call. The
+    // engine read it for calls anyway, because the chat still named a tool id:
+    // the example was dispatched, answered "No tool named", followed by a
+    // second request, and stripped from the reply the person watched arrive.
+    const id = 'gone_finished_tag_example';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'Qwen writes a call as <tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call> and then waits.';
+    const local = recordingBackend([text, 'Follow-up.']);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen call a tool?');
+    const requests = local.seen.length;
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(
+      { requests, content: stored.content, tools: stored.toolCalls?.map((call) => call.output) },
+      'the finished reply',
+    ).toEqual({ requests: 1, content: text, tools: undefined });
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+  });
+});
+
+/* ── Words that name, show or explain a call, in a chat with tools ──── */
+
+/**
+ * The engine's call patterns were lazy and did not know about strings, and the
+ * reply's words were read with them: a JSON example, prose naming a call's
+ * tags, or a call whose arguments held a ")" lost words, or kept a fragment of
+ * the call. What is taken out of a reply now is what the engine reads as a call.
+ */
+
+/** A tool DEFINITION, as OpenAI's function-calling docs show one. Not a call. */
+const SCHEMA_EXAMPLE = '```json\n{\n  "type": "function",\n  "function": {\n    "name": "get_weather"\n  }\n}\n```';
+
+describe('a reply stopped after some text, in a chat offering tools, keeps words that are not a call', () => {
+  it('keeps a whole JSON function-schema example that was all it wrote, and is not called stopped', async () => {
+    const id = 'r1_schema_only';
+    const gate = held();
+    const local = scriptedBackend([{ partial: SCHEMA_EXAMPLE, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'get_weather', gate.release);
+      const stopped = assistantRows(id).at(-1)!;
+      expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+        content: SCHEMA_EXAMPLE,
+        stopped: undefined,
+      });
+      await mounted(stopped, () => {
+        expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      });
+      await useChats.getState().send('third');
+    });
+
+    expect(spoken(local.seen[1]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'second'],
+      ['assistant', SCHEMA_EXAMPLE],
+      ['user', 'third'],
+    ]);
+  });
+
+  it('keeps a JSON example with prose around it', async () => {
+    const id = 'r1_schema_prose';
+    const partial = `Here is the shape:\n\n${SCHEMA_EXAMPLE}\n\nEach entry`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'Each entry', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps two code blocks and the prose between them when a quoted "tool" sits there', async () => {
+    const id = 'r1_two_blocks';
+    const partial =
+      'Start from this:\n\n```json\n{"model": "qwen3"}\n```\n\nThen set the "tool" key in the second file:\n\n' +
+      '```json\n{"enabled": true}\n```\n\nAfter that, restart';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'After that, restart', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps the words between a `<tool_call>` and a `</tool_call>` named in prose', async () => {
+    const id = 'r1_prose_tags';
+    const partial = 'Qwen wraps each call in a `<tool_call>` tag and ends it with `</tool_call>`, and between them the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('keeps the words after a [TOOL_CALLS] named in prose before a parenthetical aside', async () => {
+    const id = 'r1_prose_mistral';
+    const partial = 'Mistral emits [TOOL_CALLS] before (not after) the function name, and the parser then reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'the parser then reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
+
+describe('a finished reply keeps words that are not a call', () => {
+  it('keeps the words between a `<tool_call>` and a `</tool_call>` named in prose, in any chat', async () => {
+    const id = 'r1_finished_prose_tags';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'Qwen wraps each call in a `<tool_call>` tag and ends it with `</tool_call>`, and between them the app reads JSON.';
+    const local = recordingBackend([text]);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen mark a call?');
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+  });
+
+  it('keeps a fenced block naming a tool in a chat that enables none', async () => {
+    const id = 'r1_no_tools_fenced';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'Configure the agent like this:\n\n```json\n{"tool": "search", "arguments": {"query": "weather"}}\n```\n\nThen restart it.';
+    const local = recordingBackend([text]);
+    engineWith(local);
+
+    await useChats.getState().send('what goes in the config?');
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+  });
+
+  it('keeps its answer when its reasoning names <tool_call> and its answer names </tool_call>', async () => {
+    const id = 'r1_finished_think_tags';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const answer = 'Qwen closes every call with </tool_call>, and the app reads the JSON inside.';
+    const local = recordingBackend([`<think>They ask about the <tool_call> tag.</think>${answer}`]);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen close a call?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect({ content: last.content, thinking: last.thinking, stopped: last.stopped }).toEqual({
+      content: answer,
+      thinking: 'They ask about the <tool_call> tag.',
+      stopped: undefined,
+    });
+  });
+
+  it('whose tool ran and whose follow-up was only a JSON function-schema example keeps the example', async () => {
+    const id = 'r1_tool_ran_schema';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([CALL, SCHEMA_EXAMPLE, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('show me a tool definition');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
+      content: SCHEMA_EXAMPLE,
+      stopped: undefined,
+    });
+    expect(spoken(local.seen[2]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'show me a tool definition'],
+      ['assistant', SCHEMA_EXAMPLE],
+      ['user', 'thanks'],
+    ]);
+  });
+});
+
+describe('a call whose string arguments hold a ")"', () => {
+  const MEGAPIXELS = '[TOOL_CALLS] calculate({"expression": "(1920 * 1080) / 1000000"})';
+
+  it('leaves none of the call in a finished reply whose follow-up wrote nothing, nor in the next request', async () => {
+    const id = 'r1_paren_finished';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([MEGAPIXELS, '', 'Next.']);
+    engineWith(local);
+
+    await useChats.getState().send('how many megapixels is 1080p?');
+    await useChats.getState().send('and 4k?');
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['(1920 * 1080) / 1000000 = 2.0736']);
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({ content: '', stopped: false });
+    expect(spoken(local.seen[2]), 'the next request').toEqual([
+      ['user', 'hello'],
+      ['assistant', 'Hi.'],
+      ['user', 'how many megapixels is 1080p?'],
+      ['user', 'and 4k?'],
+    ]);
+  });
+
+  it('keeps only the words before it when the turn was stopped mid-arguments', async () => {
+    const id = 'r1_paren_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = 'Working it out.\n[TOOL_CALLS] calculate({"expression": "(1920 * 1080) / canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('second', 'canary-7f3a', gate.release);
+    await useChats.getState().send('third');
+
+    expect(assistantRows(id)[1]?.content, 'the stopped reply, on disk').toBe('Working it out.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a finished reply in a chat offering tools, ending on a call marker', () => {
+  for (const text of [
+    'Mistral models put every call after the special token [TOOL_CALLS]',
+    'Qwen and Hermes open every call with <tool_call>',
+    'Before the name, Mistral writes its special [TOOL_CALLS] token',
+  ]) {
+    it(`keeps its last word: ${JSON.stringify(text.slice(-24))}`, async () => {
+      const id = `r1_marker_${text.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('how is a call marked?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(local.seen[0]?.tools?.map((tool) => tool.name), 'the tools the request offered').toEqual(['leaky']);
+      expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(text);
+    });
+  }
+
+  for (const text of ['Checking.\n<tool_call>{', 'Checking.\n[TOOL_CALLS] leaky(']) {
+    it(`still stores none of a call cut off as it opened: ${JSON.stringify(text.slice(10))}`, async () => {
+      const id = `r1_opened_${text.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id).at(-1)?.content).toBe('Checking.');
+    });
+  }
+});
+
+describe('a turn stopped mid-arguments of a [TOOL_CALLS] call whose name is on the next line', () => {
+  it('keeps the words before it and sends none of it back', async () => {
+    const id = 'r1_mistral_newline';
+    const partial = 'Reading it.\n[TOOL_CALLS]\nleaky({"path": "canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content).toBe('Reading it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the call’s arguments, sent back').not.toContain('canary-7f3a');
+  });
+
+  it('keeps the words before it when Stop landed on the name and its paren', async () => {
+    const id = 'r1_mistral_newline_paren';
+    const partial = 'Reading it.\n[TOOL_CALLS]\nleaky(';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('second', 'leaky(', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Reading it.');
+  });
+});
+
+describe('a finished reply cut off as a [TOOL_CALLS] call opened with its name on the next line', () => {
+  it('stores none of the call', async () => {
+    const id = 'r1_mistral_newline_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['Checking.\n[TOOL_CALLS]\nleaky(']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content).toBe('Checking.');
+  });
+});
+
+describe('words a model writes before a tool call that runs', () => {
+  it('stay in the stored reply once the follow-up answers', async () => {
+    const id = 'r1_words_before_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me check your notes first.\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.content).toBe('Let me check your notes first.\n\nThey mention a passphrase.');
+  });
+});
+
+describe('words a model writes before a tool call that runs, when the follow-up is stopped', () => {
+  it('stay in the stored reply beside the follow-up’s words', async () => {
+    const id = 'r1_words_before_call_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me check your notes first.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'Let me check your notes first.\nThey mention a pass',
+      stopped: undefined,
+    });
+  });
+});
+
+describe('a finished reply that is only a malformed <tool_call>', () => {
+  // Read past its trailing comma, it is the call it names, and it runs: the
+  // stripper took it out of the words, and a call the words lose is a call.
+  it('runs it, and stores and sends back none of its markup or arguments', async () => {
+    const id = 'r1_malformed_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const malformed = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a",}}</tool_call>';
+    const local = recordingBackend([malformed, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = assistantRows(id)[1]!;
+    expect(last.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect({ content: last.content, stopped: last.stopped }, 'the stored reply').toEqual({
+      content: 'Next.',
+      stopped: undefined,
+    });
+    expect(refusals()).toEqual([]);
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a failed tool turn, tried again and flipped back to', () => {
+  it('stores none of the call as its words and sends none of it', async () => {
+    const id = 'r1_failed_tool_turn';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}</tool_call>' },
+      { fail: 'the model crashed' },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+
+      const failed = assistantRows(id).at(-1)!;
+      expect(failed.error, 'the turn failed').toBe('the model crashed');
+      expect(failed.content, 'the failed row’s words').toBe('Checking.');
+
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      expect(regenerated.variants?.map((variant) => variant.content)).toEqual(['Checking.', 'Again.']);
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Checking.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain('canary-7f3a');
+  });
+});
+
+
+const { SECRET } = await import('./support/egress-probe');
+
+describe('a turn killed after an MCP call left', () => {
+  it('recovers with none of the call as its words, and regenerating and flipping back sends none of it', async () => {
+    const id = 'r1_killed_after_call';
+    const probe = mcpProbe();
+    given(
+      chat(id, {
+        tools: [probe.tool.id],
+        egressGrants: [{ kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 }],
+      }),
+      [user(id, 1, 'hello'), reply(id, 2, 'Hi.')],
+    );
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Filing it.\n${MCP_CALL}` },
+      { stall: gate.promise },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+      const midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true)!);
+      expect(midTurn.content, 'the row written mid-turn').toBe('Filing it.');
+
+      // The app is killed during the follow-up: what is on disk is the row
+      // written mid-turn. The turn is ended here only so the test can go on.
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      fake.messages.set(midTurn.id, structuredClone(midTurn));
+      useChats.setState({ activeChatId: null, messages: [] });
+
+      await useChats.getState().openChat(id);
+      const recovered = useChats.getState().messages.find((message) => message.id === midTurn.id)!;
+      expect(recovered.error).toBe('This reply was interrupted before it finished.');
+      expect(recovered.content, 'the recovered row’s words').toBe('Filing it.');
+
+      await useChats.getState().regenerate(recovered.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      expect(regenerated.variants?.map((variant) => variant.content)).toEqual(['Filing it.', 'Again.']);
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'the call went once').toHaveBeenCalledTimes(1);
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Filing it.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain(SECRET);
+  });
+});
+
+/* ── Round 2: a JSON record is not a call ───────────────────────────── */
+
+/** A data record whose most common key happens to be one a fenced call names its tool with. */
+const RECORD = '```json\n{"name": "Alice Chen", "email": "alice@example.com", "age": 34}\n```';
+
+describe('a JSON record with a "name" key, in a chat with a tool on', () => {
+  it('stays whole in a reply stopped after it, with the prose around it, and is sent back', async () => {
+    const id = 'r2_record_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Here is a sample user record:\n\n${RECORD}\n\nYou can add more fields such as`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await stopAfterSome('a sample user record as JSON, please', 'more fields such as', gate.release);
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(partial);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', partial]);
+  });
+
+  it('is kept, and the reply not called stopped, when the record was all a stopped reply wrote', async () => {
+    const id = 'r2_record_only_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: RECORD, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('a sample user record as JSON, please', '"age": 34', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: RECORD,
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+  });
+
+  it('is not run as a call to a tool named after its value, and stays in a finished reply', async () => {
+    const id = 'r2_record_finished';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Here is a sample user record:\n\n${RECORD}\n\nYou can add more fields.`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('a sample user record as JSON, please');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(local.seen, 'no follow-up request').toHaveLength(1);
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+
+  it('a flat tool definition naming an offered tool is read as a call to it, run, and stripped from a finished reply', async () => {
+    // A CALL, by the owner's ruling: a fenced block runs when its name is a tool
+    // the request offered, whatever keys beside it. Its `parameters` are read as
+    // the arguments, as the extractor reads them. A nested definition, whose
+    // `function` is an object, names no tool and is words: see tools.test.ts.
+    const id = 'r2_offered_definition';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text =
+      'My calculator is declared like this:\n\n```json\n{"name": "calculate", "description": "Evaluate arithmetic", ' +
+      '"parameters": {"type": "object", "properties": {"expression": {"type": "string"}}}}\n```';
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('what tools do you have?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls?.map((call) => call.name), 'the call ran').toEqual(['calculate']);
+    expect(last.content, 'the stored reply').toBe('My calculator is declared like this:\n\nAnything else?');
+  });
+});
+
+/* ── Round 5: a fenced call to an offered tool may carry more keys ─────── */
+
+describe('a fenced call to an offered tool that carries an "id" key', () => {
+  const ID_CANARY = 'call_canary_5e1d';
+  const FENCED_WITH_ID = `\`\`\`json\n{"id": "${ID_CANARY}", "name": "calculate", "arguments": {"expression": "6*7"}}\n\`\`\``;
+
+  it('runs, and none of it is stored in a finished reply or sent in the next request', async () => {
+    const id = 'r5_fenced_id_finished';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me work it out.\n\n${FENCED_WITH_ID}`, 'It is 42.', 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+    expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
+      content: 'Let me work it out.\n\nIt is 42.',
+      stopped: undefined,
+    });
+    expect(local.seen, 'the follow-up and the next turn').toHaveLength(3);
+    expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain(ID_CANARY);
+    expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('```');
+  });
+
+  it('runs, and none of it is stored when the follow-up is stopped', async () => {
+    const id = 'r5_fenced_id_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me work it out.\n\n${FENCED_WITH_ID}` },
+      { partial: 'It is fort', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    await stopAfterSome('what is six times seven?', 'It is fort', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+    expect(stopped.stopped, 'called stopped before its first word').not.toBe(true);
+    expect(stopped.content, 'the stored reply').not.toContain(ID_CANARY);
+    expect(stopped.content, 'the stored reply').not.toContain('```');
+    expect(stopped.content, 'the words the person watched arrive').toMatch(/^Let me work it out\.\s+It is fort$/);
+  });
+});
+
+/* ── Round 2: a fenced block names a tool the turn offered, or is words ─ */
+
+describe('a fenced call example in a chat whose tool ids name nothing connected', () => {
+  const GONE = 'mcp:gone-server:note';
+  const EXAMPLE_CALL = '```json\n{"tool": "search", "arguments": {"query": "weather"}}\n```';
+
+  it('stays in a reply stopped after it', async () => {
+    const id = 'r2_gone_fenced_stopped';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('what goes in the config?', 'Then restart', gate.release);
+
+    expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('stays in a reply whose stream failed after it', async () => {
+    const id = 'r2_gone_fenced_failed';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what goes in the config?');
+    await until(() => useChats.getState().messages.some((message) => message.content.includes('Then restart')));
+    // Released with nobody pressing Stop: the stream fails.
+    gate.release();
+    await sending;
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect(failed.content, 'the words the person watched arrive').toBe(partial);
+  });
+
+  it('is not run, and stays in a finished reply', async () => {
+    const id = 'r2_gone_fenced_finished';
+    given(chat(id, { tools: [GONE] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Configure the agent like this:\n\n${EXAMPLE_CALL}\n\nThen restart it.`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('what goes in the config?');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+});
+
+describe('a fenced block naming a tool the chat does not offer, in a chat with a tool on', () => {
+  it('is not run, and stays in a finished reply', async () => {
+    const id = 'r2_unoffered_fenced';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = 'Here is a person:\n\n```json\n{"name": "Alice Chen"}\n```\n\nAdd more fields as you need them.';
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('a minimal person record, please');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls, 'no tool ran').toBeUndefined();
+    expect(last.content, 'the words the person watched arrive').toBe(text);
+  });
+});
+
+/* ── Round 2: in a turn that offered no tool, a call's format is words ─ */
+
+describe('a reply that shows a model’s tool-call format, in a chat with no tools', () => {
+  const EXAMPLES = [
+    'Qwen formats a call like this:\n\n```\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>\n```\n\nThe app reads the JSON between the tags.',
+    'The chat template says:\n\n```\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>\n```\n\nand fills in both.',
+    'Mistral writes a call as `[TOOL_CALLS] get_weather({"city": "Paris"})`, and the app reads the JSON inside the parentheses.',
+  ];
+
+  for (const [index, text] of EXAMPLES.entries()) {
+    it(`keeps the example in a finished reply, and sends it back: ${JSON.stringify(text.slice(0, 24))}`, async () => {
+      const id = `r2_no_tools_format_${index}`;
+      given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('how does a model format a tool call?');
+      await useChats.getState().send('thanks');
+
+      expect(local.seen[0]?.tools ?? [], 'the tools the request offered').toEqual([]);
+      expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(text);
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+    });
+  }
+
+  it('keeps the example in a reply stopped after it', async () => {
+    const id = 'r2_no_tools_format_stopped';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const partial = `${EXAMPLES[0]!} Each call`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('how does a model format a tool call?', 'Each call', gate.release);
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
+
+/* ── Round 2: a tool round's reasoning ends with the round ──────────── */
+
+describe('a tool round whose reasoning was left open', () => {
+  it('keeps the follow-up’s answer as the finished reply’s words, and sends it back', async () => {
+    const id = 'r2_open_think_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`<think>I should read the notes first.\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: ran.content, thinking: ran.thinking, stopped: ran.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      thinking: 'I should read the notes first.',
+      stopped: undefined,
+    });
+    expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', 'They mention a passphrase.']);
+  });
+
+  it('keeps the follow-up’s answer when the calling round named <think> in its words', async () => {
+    const id = 'r2_named_think_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Qwen reasons inside a <think> block. Let me check.\n${CALL}`, 'They mention a passphrase.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toContain('They mention a passphrase.');
+  });
+
+  it('keeps the words a stopped follow-up wrote, and is not called stopped', async () => {
+    const id = 'r2_open_think_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `<think>I should read the notes first.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      const sending = useChats.getState().send('read my notes');
+      await until(() => {
+        const live = useChats.getState().messages.at(-1);
+        return `${live?.content ?? ''}${live?.thinking ?? ''}`.includes('They mention a pass');
+      });
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a pass',
+      stopped: undefined,
+    });
+    expect(stopped.thinking, 'the reasoning').toContain('I should read the notes first.');
+  });
+});
+
+/* ── Round 2: a call with one closing bracket too many ──────────────── */
+
+describe('a call written with one closing brace too many', () => {
+  const CASES = [
+    ['a <tool_call>', 'Let me look.\n<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}}}</tool_call>'],
+    ['a [TOOL_CALLS] call', 'Let me look. [TOOL_CALLS] leaky({"path": "canary-7f3a"}})'],
+  ] as const;
+
+  // Each is the call it names, and runs: see "a call in a shape the stripper
+  // took out and the reader did not read".
+  for (const [form, text] of CASES) {
+    it(`in ${form} after words: a finished reply runs it, and stores and sends back none of it`, async () => {
+      const id = `r2_extra_brace_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+      expect(stored.content, 'the stored reply').toBe('Let me look.\n\nNext.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('that was all a finished reply wrote: runs it, and stores and sends back none of it', async () => {
+    const id = 'r2_extra_brace_only';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}}}</tool_call>', 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((call) => call.name), 'the call that ran').toEqual(['leaky']);
+    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: 'Next.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped before its closing tag: keeps only the words before it', async () => {
+    const id = 'r2_extra_brace_stopped';
+    const partial = 'Let me look.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}}</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me look.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Round 2: a <tool_call> whose body is Qwen3-Coder's XML ─────────── */
+
+describe('a Qwen3-Coder <tool_call> with an XML body', () => {
+  const XML_CALL = '<tool_call>\n<function=leaky>\n<parameter=path>\ncanary-7f3a\n</parameter>\n</function>\n</tool_call>';
+
+  it('after words: a finished reply runs it, and stores and sends back none of it', async () => {
+    const id = 'r2_xml_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me check.\n${XML_CALL}`, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect(stored.content, 'the stored reply').toBe('Let me check.\n\nNext.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped inside a parameter: keeps only the words before it', async () => {
+    const id = 'r2_xml_stopped';
+    const partial = 'Let me check.\n<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me check.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('keeps prose that names the XML form’s tags, stopped or finished', async () => {
+    const id = 'r2_xml_prose';
+    const partial =
+      'Qwen3-Coder opens a call with `<tool_call><function=name>` and closes it with `</function></tool_call>`, and the app reads';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('how does qwen3-coder mark a call?', 'the app reads', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
+
+/* ── Round 2: a fenced call wrapped in <tool_call> tags ─────────────── */
+
+describe('a tool call written as a fenced block inside <tool_call> tags', () => {
+  const WRAPPED =
+    'Checking.\n<tool_call>\n```json\n{"name":"leaky","arguments":{"path":"canary-7f3a"}}\n```\n</tool_call>';
+
+  it('leaves none of its tags in a failed follow-up’s words, tried again and flipped back to', async () => {
+    const id = 'r2_wrapped_failed';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: WRAPPED },
+      { fail: 'the model crashed' },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      const failed = assistantRows(id).at(-1)!;
+      expect(failed.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(failed.error, 'the turn failed').toBe('the model crashed');
+      expect(failed.content, 'the failed row’s words').toBe('Checking.');
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Checking.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+    expect(last, 'the request after flipping back').not.toContain('canary-7f3a');
+  });
+
+  it('leaves none of its tags in a stopped follow-up’s words, nor in the next request', async () => {
+    const id = 'r2_wrapped_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ reply: WRAPPED }, { partial: 'Found your', stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'Found your', gate.release);
+      const stopped = assistantRows(id).at(-1)!;
+      expect(stopped.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+      expect(stopped.content, 'the stored reply').toBe('Checking.\nFound your');
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('is cut from a finished reply cut off as its JSON opened', async () => {
+    const id = 'r2_wrapped_finished_opened';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['Checking.\n<tool_call>\n```json\n{']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+  });
+
+  it('is cut from a turn stopped as its fence opened', async () => {
+    const id = 'r2_wrapped_fence_opened';
+    const partial = 'Checking.\n<tool_call>\n```json\n';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '```json', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+  });
+
+  it('is cut from a turn stopped inside it', async () => {
+    const id = 'r2_wrapped_unfinished';
+    const partial = 'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a fenced call wrapped in <tool_call> tags, stopped before its closing tag', () => {
+  it('keeps only the words before it, and sends none of it back', async () => {
+    const id = 'r2_wrapped_closing_tag';
+    const partial =
+      'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n```\n</tool_';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '</tool_', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a fenced call wrapped in <tool_call> tags, stopped on its closing fence', () => {
+  it('keeps only the words before it, and sends none of it back', async () => {
+    const id = 'r2_wrapped_closing_fence';
+    const partial = 'Checking.\n<tool_call>\n```json\n{"name":"notes.note","arguments":{"text":"canary-7f3a"}}\n``';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('file a note', '}}\n``', gate.release);
+      await useChats.getState().send('third');
+    });
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Round 3: a call with a closing brace too few ───────────────────── */
+
+/**
+ * A call with one closing brace too few, ended by its closing tag. Its JSON never
+ * closes, so it was read as a call still being written, and everything after it
+ * was cut. Read with the missing brace, it is the call it names, and runs.
+ */
+const SHORT_BRACE = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a"}</tool_call>';
+
+describe('a call written with a closing brace too few', () => {
+  it('between words: a finished reply runs it, keeps the words after it, and stores and sends none of the call', async () => {
+    const id = 'r3_short_brace_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`Let me look.\n${SHORT_BRACE}\nI have asked for your notes; one moment.`, 'Next.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('and then?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((call) => call.input), 'the call that ran').toEqual([{ path: 'canary-7f3a' }]);
+    expect(stored.content, 'the stored reply').toBe('Let me look.\n\nI have asked for your notes; one moment.\n\nNext.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  for (const [before, expected] of [
+    ['Let me look.\n', 'Let me look.\n\nThey mention a passphrase.'],
+    ['', 'They mention a passphrase.'],
+  ] as const) {
+    it(`beside a call that ran${before ? ', after words' : ''}: a finished turn keeps the follow-up’s answer, and sends it back`, async () => {
+      const id = `r3_short_brace_ran_${before.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`${before}${SHORT_BRACE}\n${CALL}`, 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const ran = assistantRows(id)[1]!;
+      expect(ran.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
+      expect({ content: ran.content, stopped: ran.stopped }, 'the stored reply').toEqual({
+        content: expected,
+        stopped: undefined,
+      });
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', expected]);
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('beside a call that ran: a stopped follow-up keeps its words, is not called stopped, and sends none of the call', async () => {
+    const id = 'r3_short_brace_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `${SHORT_BRACE}\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(stopped?.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a pass',
+      stopped: undefined,
+    });
+    await mounted(stopped!, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Round 3: a tool round that ends inside a call ──────────────────── */
+
+/** A second call cut off in its arguments, as a round that hit its token limit leaves one. */
+const HALF_CALL = '<tool_call>{"name": "leaky", "arguments": {"path": "canary-7f3a';
+
+/** A second call whose JSON closed with no closing tag after it. */
+const UNTAGGED_CALL = '<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}';
+
+/** A tool turn's calling round: words, a call that runs, then `tail`, where the round ends. */
+const roundEndingIn = (tail: string): string => `Reading both.\n${CALL}\n${tail}`;
+
+describe('a finished tool turn whose calling round ended inside a second call', () => {
+  // A round ends inside a call's arguments only when it is cut off, at its
+  // limit on tokens: a round the model ended that runs on from inside a value
+  // is prose. One whose call's JSON closed with no tag after it is a call
+  // however the round ended, and the model that ended the round there ended
+  // the call: it runs, beside the first.
+  for (const [form, tail, cutShort, ran] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true, ['leaky']],
+    ['with no closing tag', UNTAGGED_CALL, false, ['leaky', 'leaky']],
+  ] as const) {
+    it(`${form}: keeps the follow-up’s answer, and stores and sends none of the call`, async () => {
+      const id = `r3_round_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const round = roundEndingIn(tail);
+      const local = recordingBackend([cutShort ? cutOff(round) : round, 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(ran);
+      expect(stored.content, 'the stored reply').toBe('Reading both.\n\nThey mention a passphrase.');
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual([
+        'assistant',
+        'Reading both.\n\nThey mention a passphrase.',
+      ]);
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen[2]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps the calling round’s words written after a call with a closing brace too few', async () => {
+    const id = 'r3_round_short_brace_words';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `Let me look.\n${SHORT_BRACE}\nI have asked for your notes.\n${CALL}`,
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'both calls ran').toEqual(['leaky', 'leaky']);
+    expect(ran.content, 'the stored reply').toBe(
+      'Let me look.\n\nI have asked for your notes.\n\nThey mention a passphrase.',
+    );
+  });
+
+  it('keeps the calling round’s words when its reasoning named a call it did not finish', async () => {
+    const id = 'r3_round_reasoning_names_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `<think>A call opens [TOOL_CALLS] leaky({"path": "</think>Let me look.\n${CALL}`,
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the tool ran').toEqual(['leaky']);
+    expect(ran.content, 'the stored reply').toBe('Let me look.\n\nThey mention a passphrase.');
+    expect(ran.thinking, 'the reasoning').toContain('A call opens');
+  });
+});
+
+/* ── Round 3: a stopped or failed turn read round by round ──────────── */
+
+describe('a stopped follow-up after a calling round that ended inside a second call', () => {
+  // As above: half-written, the calling round was cut off at its limit on
+  // tokens; with no closing tag, the model ended it, and both calls ran.
+  for (const [form, tail, cutShort, ran] of [
+    ['half-written, cut off at its limit on tokens', HALF_CALL, true, ['leaky']],
+    ['with no closing tag', UNTAGGED_CALL, false, ['leaky', 'leaky']],
+  ] as const) {
+    it(`${form}: keeps both rounds’ words, and stores and sends none of the call`, async () => {
+      const id = `r3_round_stopped_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const round = roundEndingIn(tail);
+      const local = scriptedBackend([
+        cutShort ? { cutOff: round } : { reply: round },
+        { partial: 'They mention a pass', stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      engineWith(local);
+
+      let stopped: Message | undefined;
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(stopped?.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(ran);
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Reading both.\n\nThey mention a pass',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps the calling round’s words written after a call with a closing brace too few', async () => {
+    const id = 'r3_round_stopped_short_brace_words';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Let me look.\n${SHORT_BRACE}\nI have asked for your notes.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(
+      'Let me look.\n\nI have asked for your notes.\nThey mention a pass',
+    );
+  });
+
+  it('keeps the calling round’s words when its reasoning named a call it did not finish', async () => {
+    const id = 'r3_round_stopped_reasoning_names_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `<think>A call opens [TOOL_CALLS] leaky({"path": "</think>Let me look.\n${CALL}` },
+      { partial: 'They mention a pass', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'They mention a pass', gate.release);
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect({ content: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      content: 'Let me look.\nThey mention a pass',
+      stopped: undefined,
+    });
+    expect(stopped.thinking, 'the reasoning').toContain('A call opens');
+  });
+});
+
+describe('a local turn whose stream died inside a call, diverted to the cloud fallback', () => {
+  const LOCAL_PARTIAL = 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a';
+
+  /**
+   * Send; once the local model has written its partial call, let its stream die;
+   * wait for the cloud's words. The send is handed back in an object: returned
+   * bare from an async function, it would be awaited here, before Stop.
+   */
+  async function divertedUntil(cloudWords: string, dies: () => void): Promise<{ sending: Promise<void> }> {
+    const sending = useChats.getState().send('read my notes');
+    await until(() => useChats.getState().messages.some((message) => message.content.includes('canary-7f3a')));
+    dies();
+    await until(() => useChats.getState().messages.some((message) => message.content.includes(cloudWords)));
+    return { sending };
+  }
+
+  it('stopped: keeps the cloud’s words, and stores and sends none of the call', async () => {
+    const id = 'r3_fallback_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const gate = held();
+    const local = scriptedBackend([{ partial: LOCAL_PARTIAL, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: 'From the cloud: your notes mention', stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      const { sending } = await divertedUntil('your notes mention', dies.release);
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(cloud.seen, 'the diverted request, then the next send').toHaveLength(2);
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Checking.\nFrom the cloud: your notes mention',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('failed in the cloud too: the failed row keeps the cloud’s words and none of the call', async () => {
+    const id = 'r3_fallback_failed';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const cloudDies = held();
+    const local = scriptedBackend([{ partial: LOCAL_PARTIAL, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: 'From the cloud: your notes mention', stall: cloudDies.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      const { sending } = await divertedUntil('your notes mention', dies.release);
+      cloudDies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect(failed.content, 'the failed row’s words').toBe('Checking.\nFrom the cloud: your notes mention');
+  });
+});
+
+/* ── Round 4: a call's opening named in words that go on past it ───── */
+
+describe('a finished reply in a chat offering a tool, naming a call’s opening it does not finish', () => {
+  for (const [form, words] of [
+    [
+      'the Mistral opening',
+      'To parse it, look for the prefix `[TOOL_CALLS] get_weather({` in the output and read the JSON until its brackets balance. Everything after that is the arguments object.',
+    ],
+    [
+      'the Qwen opening',
+      'Qwen starts each call with `<tool_call>{"name": "` and the tool name follows, then the arguments object and the closing tag.',
+    ],
+  ] as const) {
+    it(`${form}: keeps every word, and sends them back`, async () => {
+      const id = `r4_named_opening_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([words, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('how do I parse a tool call?');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls, 'no tool ran').toBeUndefined();
+      expect(stored.content, 'the stored reply').toBe(words);
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+    });
+  }
+
+  it('stopped after the words that follow it: keeps every word', async () => {
+    const id = 'r4_named_opening_stopped';
+    const partial = 'Look for the prefix `[TOOL_CALLS] get_weather({` in the output, then read the JSON until';
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    engineWith(local);
+
+    await inToolsChat(id, async () => {
+      await stopAfterSome('how do I parse a tool call?', 'read the JSON until', gate.release);
+    });
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(partial);
+  });
+
+  // Cut off at its limit on tokens inside a call's arguments; or, however it
+  // ended, inside its structure — the tool's name.
+  for (const [form, tail] of [
+    ['a tag call', '<tool_call>{"name": "leaky", "arguments": {"path": "my notes canary-7f3a'],
+    ['a Mistral call', '[TOOL_CALLS] leaky({"path": "my notes canary-7f3a'],
+    ['a tag call cut off in its name', '<tool_call>{"name": "lea'],
+  ] as const) {
+    it(`still stores none of ${form} it ended inside`, async () => {
+      const id = `r4_ended_inside_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const inName = form.endsWith('its name');
+      const local = recordingBackend([inName ? `Checking.\n${tail}` : cutOff(`Checking.\n${tail}`)]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe('Checking.');
+    });
+  }
+});
+
+describe('a local turn whose stream died mid-reasoning, diverted to the cloud fallback', () => {
+  const REASONING = 'The user wants a summary of';
+  const CLOUD_WORDS = 'Your notes mention a passphrase and';
+
+  /**
+   * Send; once the local model's reasoning is on screen, let its stream die; wait
+   * for the cloud's words, as answer or as reasoning. The send is handed back in
+   * an object, so it is not awaited here.
+   */
+  async function divertedUntilCloudWrites(dies: () => void): Promise<{ sending: Promise<void> }> {
+    const sending = useChats.getState().send('summarise my notes');
+    await until(() => useChats.getState().messages.some((message) => (message.thinking ?? '').includes(REASONING)));
+    dies();
+    await until(() =>
+      useChats
+        .getState()
+        .messages.some((message) => `${message.content}${message.thinking ?? ''}`.includes(CLOUD_WORDS)),
+    );
+    return { sending };
+  }
+
+  it('stopped while the cloud wrote: shows and keeps the cloud’s words as the answer, and is not called stopped', async () => {
+    const id = 'r4_fallback_reasoning_stopped';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>${REASONING}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: CLOUD_WORDS, stall: gate.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    const { sending } = await divertedUntilCloudWrites(dies.release);
+    const onScreen = useChats.getState().messages.at(-1)?.content;
+    useChats.getState().stop();
+    gate.release();
+    await sending;
+
+    expect(onScreen, 'the answer on screen while the cloud wrote').toBe(CLOUD_WORDS);
+    const stopped = assistantRows(id).at(-1)!;
+    expect(
+      { content: stopped.content, thinking: stopped.thinking, stopped: stopped.stopped },
+      'the stored reply',
+    ).toEqual({ content: CLOUD_WORDS, thinking: REASONING, stopped: undefined });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'called stopped before its first word').toBeNull();
+      expect(bodyText(), 'the body').toContain(CLOUD_WORDS);
+    });
+  });
+
+  it('failed in the cloud too: the failed row keeps the cloud’s words as its answer', async () => {
+    const id = 'r4_fallback_reasoning_failed';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const cloudDies = held();
+    const local = scriptedBackend([{ partial: `<think>${REASONING}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ partial: CLOUD_WORDS, stall: cloudDies.promise }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    const { sending } = await divertedUntilCloudWrites(dies.release);
+    cloudDies.release();
+    await sending;
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(failed.error, 'the turn failed').toBeDefined();
+    expect({ content: failed.content, thinking: failed.thinking }, 'the failed row').toEqual({
+      content: CLOUD_WORDS,
+      thinking: REASONING,
+    });
+  });
+});
+
+describe('a <tool_call> whose body is calls, but not one JSON object', () => {
+  for (const [form, call, inputs] of [
+    [
+      'two call objects',
+      '<tool_call>\n{"name":"leaky","arguments":{"path":"a.md"}}\n{"name":"leaky","arguments":{"path":"canary-7f3a"}}\n</tool_call>',
+      [{ path: 'a.md' }, { path: 'canary-7f3a' }],
+    ],
+    ['a name and its arguments in parens', '<tool_call>leaky({"path":"canary-7f3a"})</tool_call>', [{ path: 'canary-7f3a' }]],
+    ['a name on its own line and its JSON', '<tool_call>\nleaky\n{"path": "canary-7f3a"}\n</tool_call>', [{ path: 'canary-7f3a' }]],
+  ] as const) {
+    it(`${form}: a finished reply runs each call, and stores and sends back none of it`, async () => {
+      const id = `r4_tag_body_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Reading it.\n${call}`, 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+        await useChats.getState().send('and then?');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.input), 'the calls that ran').toEqual(inputs);
+      expect(stored.content, 'the stored reply').toBe('Reading it.\n\nNext.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  for (const [form, partial] of [
+    [
+      'inside its second call object',
+      'Reading both.\n<tool_call>\n{"name":"leaky","arguments":{"path":"a.md"}}\n{"name":"leaky","arguments":{"path":"canary-7f3a',
+    ],
+    ['inside a name’s parens', 'Reading both.\n<tool_call>leaky({"path":"canary-7f3a'],
+  ] as const) {
+    it(`stopped ${form}: keeps only the words before it, and sends none of it back`, async () => {
+      const id = `r4_tag_body_stopped_${form.length}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', 'canary-7f3a', gate.release);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Reading both.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('keeps prose that names both tags with words between them, finished', async () => {
+    const id = 'r4_tag_body_prose';
+    const words = 'Qwen puts <tool_call> first, then a name such as leaky, then {"path": "notes.md"}, and </tool_call> last.';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([words]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does qwen format a call?');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id).at(-1)?.content, 'the stored reply').toBe(words);
+  });
+});
+
+const { messageText } = await import('@/ai/prompt');
+
+describe('a follow-up that writes a call as the app writes the call that ran in its history, [tool name({…})]', () => {
+  it('finished: the call runs, and the stored reply keeps none of it and sends none of it back', async () => {
+    const id = 'r4_app_call_finished';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      `Reading your notes.\n${CALL}`,
+      'One more file.\n[tool leaky({"path":"canary-7f3a"})]\nReading it now.',
+      'Both read.',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(local.seen[1]!.messages.map(messageText).join('\n'), 'how the follow-up’s history shows the call').toContain(
+      '[tool leaky({})]',
+    );
+    const ran = assistantRows(id)[1]!;
+    expect(ran.toolCalls?.map((call) => call.input), 'the calls that ran').toEqual([{}, { path: 'canary-7f3a' }]);
+    expect(ran.content, 'the stored reply').toBe('Reading your notes.\n\nOne more file.\n\nReading it now.\n\nBoth read.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('stopped mid-arguments: keeps the words before it, and sends none of it back', async () => {
+    const id = 'r4_app_call_stopped';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Reading your notes.\n${CALL}` },
+      { partial: 'One more file.\n[tool leaky({"path":"canary-7f3a', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', 'canary-7f3a', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Reading your notes.\nOne more file.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Round 6: a stopped turn's fenced call, #331's record and the words ─ */
+
+describe('a fenced call Stop caught complete, in a turn offering its tool (refs #293)', () => {
+  // #331 reads the text a stopped stream left for calls it can record as not
+  // sent. A fenced block is a call only when it names an offered tool, and the
+  // stripper reads it with the names the request offered, so the stranded-call
+  // reading must too: read with none, the call below was stripped from the
+  // words as a call and never recorded as one. A block naming no offered tool
+  // is neither.
+  const FENCED_CALL = '```json\n{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}\n```';
+  const FENCED_EXAMPLE = '```json\n{"name": "search", "arguments": {"query": "canary-7f3a"}}\n```';
+
+  it('is recorded as not sent, stopped, and none of it is stored or sent back', async () => {
+    const id = 'r6_stranded_fenced';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `Filing it.\n\n${FENCED_CALL}\n\nThen I will`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Then I will', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      stopped?.toolCalls?.map((call) => ({ name: call.name, receipt: call.receipt })),
+      'the call Stop caught, as #331 records it',
+    ).toEqual([
+      {
+        name: 'notes.note',
+        receipt: expect.objectContaining({ outcome: 'withheld', why: 'stopped', host: 'notes.example' }),
+      },
+    ]);
+    expect(stopped?.stopped, 'a reply with words carries no marker').toBeUndefined();
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it\.\s+Then I will$/);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('naming no offered tool, is neither recorded nor stripped', async () => {
+    const id = 'r6_stranded_example';
+    const partial = `Configure it like this:\n\n${FENCED_EXAMPLE}\n\nThen restart`;
+    const gate = held();
+    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('what goes in the config?', 'Then restart', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'nothing recorded').toBeUndefined();
+    expect(stopped?.content, 'the words the person watched arrive').toBe(partial);
+  });
+});
+
+/* ── Round 6 → owner ruling of 2026-09-27: this record now runs ───────── */
+
+describe('a JSON record whose "name" is an offered tool’s id, carrying no arguments, in a chat with that tool on', () => {
+  // The calculator's id is "calculator". A package.json for a project of that
+  // name used to be read as words: a call carries its arguments, or is
+  // nothing but its name, and a record with other keys and no arguments key
+  // was neither. The owner's ruling of 2026-09-27 reverses that: a fenced
+  // block naming an offered tool runs whatever other keys it holds, arguments
+  // or none, so this record now runs — with no arguments — and the calculator
+  // tool reports the failure the way it reports any bad expression, honestly
+  // and without throwing.
+  const PACKAGE = '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```';
+  const NO_EXPRESSION = 'That does not look like an arithmetic expression.';
+
+  it('runs with no arguments, is stripped from a finished reply, and its receipt reports the tool’s own validation failure', async () => {
+    const id = 'r6_record_named_by_id';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Here is a package.json:\n\n${PACKAGE}\n\nThen run npm install.`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    await useChats.getState().send('a package.json for my calculator app, please');
+
+    const last = assistantRows(id).at(-1)!;
+    expect(
+      last.toolCalls?.map((call) => ({ name: call.name, input: call.input, isError: call.isError })),
+      'the call ran, with no arguments',
+    ).toEqual([{ name: 'calculator', input: {}, isError: true }]);
+    expect(last.toolCalls?.[0]?.output, 'the tool’s own message, not a crash').toBe(NO_EXPRESSION);
+    expect(last.content, 'the stripped words, both rounds').toBe(
+      'Here is a package.json:\n\n\n\nThen run npm install.\n\nAnything else?',
+    );
+    expect(JSON.stringify(local.seen[1]?.messages), 'the follow-up request').not.toContain('```');
+  });
+
+  it('runs, and none of it is stored when the follow-up is stopped', async () => {
+    const id = 'r6_record_named_by_id_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `Here is a package.json:\n\n${PACKAGE}\n\nThen run npm install.` },
+      { partial: 'Anything el', stall: gate.promise },
+    ]);
+    engineWith(local);
+
+    await stopAfterSome('a package.json for my calculator app, please', 'Anything el', gate.release);
+
+    const stopped = assistantRows(id).at(-1)!;
+    expect(
+      stopped.toolCalls?.map((call) => ({ name: call.name, isError: call.isError })),
+      'the call ran',
+    ).toEqual([{ name: 'calculator', isError: true }]);
+    expect(stopped.content, 'the stored reply').not.toContain('```');
+    expect(stopped.content, 'the words the person watched arrive').toMatch(
+      /^Here is a package\.json:\s+Then run npm install\.Anything el$/,
+    );
+  });
+});
+
+/* ── Round 10 coverage gap: a persona's always-ask still gates ruling 1 ── */
+
+describe('confirmPolicy: always-ask gates a ruling-1 fenced call exactly as it gates any other (refs #293, refs #23)', () => {
+  // A persona with `agentConfig.toolPolicy.confirmPolicy: 'always-ask'` makes
+  // `send` pass `confirmEachToolCall` as the request's `confirmEachCall`
+  // (state/chat.ts). `runToolCalls` (ai/middleware/tools.ts) asks it for any
+  // call with no destination — datetime is a local, non-sensitive tool, never
+  // an MCP one, so it is asked about and never gets a destination-grant sheet
+  // of its own. The ruling-1 shape — a fenced block naming an offered tool,
+  // no `arguments` key, with another key beside its name — has to reach that
+  // same gate: it is read as a call before confirmEachCall ever sees it, and
+  // this is the one path that was not covered when ruling 1 landed.
+  const RECORD = '```json\n{"id": "call_0", "name": "get_datetime"}\n```';
+
+  function alwaysAskPersona(): void {
+    usePersonas.setState(
+      {
+        byId: {
+          p_confirm: {
+            id: 'p_confirm',
+            kind: 'assistant',
+            name: 'Careful',
+            tagline: '',
+            avatarSeed: 'careful',
+            description: 'A careful assistant that confirms every tool call.',
+            tags: [],
+            version: 1,
+            createdAt: 0,
+            updatedAt: 0,
+            origin: 'authored',
+            agentConfig: { toolPolicy: { confirmPolicy: 'always-ask' } },
+          } satisfies Persona,
+        },
+        order: ['p_confirm'],
+      } as never,
+    );
+  }
+
+  it('declined: the tool is not run, and the app’s own "Declined" message is what is recorded — no destination, so no receipt', async () => {
+    const id = 'r_confirm_ruling1_declined';
+    alwaysAskPersona();
+    given(chat(id, { personaId: 'p_confirm', tools: ['datetime'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Such a block reads:\n${RECORD}`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what time is it?');
+    await until(() => useApp.getState().approvals.length === 1);
+    const approval = useApp.getState().approvals[0]!;
+    expect(approval.action, 'the sheet names the call it is asking about').toBe('run get_datetime');
+    useApp.getState().answerApproval(approval.id, false);
+    await sending;
+
+    const last = assistantRows(id).at(-1)!;
+    expect(
+      last.toolCalls?.map((call) => ({ name: call.name, isError: call.isError, output: call.output })),
+      'declined, not run',
+    ).toEqual([
+      { name: 'get_datetime', isError: true, output: 'Declined: "get_datetime" was not run.' },
+    ]);
+    expect(last.toolCalls?.[0]?.receipt, 'a local tool has no server to name').toBeUndefined();
+    expect(last.content, 'the record is stripped from the reply all the same').toBe('Such a block reads:\n\nAnything else?');
+  });
+
+  it('allowed: the tool runs', async () => {
+    const id = 'r_confirm_ruling1_allowed';
+    alwaysAskPersona();
+    given(chat(id, { personaId: 'p_confirm', tools: ['datetime'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Such a block reads:\n${RECORD}`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what time is it?');
+    await until(() => useApp.getState().approvals.length === 1);
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    await sending;
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls?.map((call) => call.name), 'allowed, ran').toEqual(['get_datetime']);
+    expect(last.toolCalls?.[0]?.isError, 'the datetime tool needs no arguments').toBeFalsy();
+    expect(last.toolCalls?.[0]?.output, 'the tool’s own answer, not a declined message').not.toContain('Declined');
+  });
+});
+
+/* ── Round 6: a real call after words naming its tag ────────────────── */
+
+describe('a real <tool_call> after words that name the tag, in a chat with its tool on', () => {
+  // The extractor read a tag call as everything from the FIRST `<tool_call>` to
+  // the first `</tool_call>`: reasoning or prose naming the tag began a body
+  // that never parsed, and swallowed the real call after it. The stripper,
+  // which reads a call by its JSON, took it out of the reply: the call the
+  // model made neither ran nor showed.
+  const CALC = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>';
+
+  for (const [where, before] of [
+    ['reasoning', '<think>I will answer with a <tool_call> for this.</think>\n'],
+    ['prose', 'Qwen wraps each call in a <tool_call> tag, so here is mine.\n'],
+  ] as const) {
+    it(`runs when ${where} named the tag first`, async () => {
+      const id = `r6_tag_after_${where}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`${before}${CALC}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const ran = assistantRows(id).at(-1)!;
+      expect(ran.toolCalls?.map((call) => call.output), 'the calculator ran').toEqual(['6*7 = 42']);
+      expect(local.seen, 'the follow-up').toHaveLength(2);
+      expect(ran.content, 'the stored reply').toMatch(/It is 42\.$/);
+      expect(ran.content, 'the stored reply').not.toContain('6*7');
+    });
+  }
+});
+
+/* ── Round 6: a stopped tag call whose body is not strict JSON ──────── */
+
+describe('a turn stopped inside a tag call whose body is not strict JSON', () => {
+  // A small model's call is often single-quoted, leaves its keys unquoted, or
+  // wraps its calls in an array. The cut read a tag call's body only when it
+  // opened `{"`, so a stopped turn kept every such call, its arguments stored
+  // and sent back to the model.
+  for (const [form, body] of [
+    ['single-quoted', "{'name': 'notes.note', 'arguments': {'text': 'canary-7f3a"],
+    ['unquoted keys', '{name: "notes.note", arguments: {text: "canary-7f3a'],
+    ['an array', '[{"name": "notes.note", "arguments": {"text": "canary-7f3a'],
+  ] as const) {
+    it(`${form}: keeps the words before it, and sends none of it back`, async () => {
+      const id = `r6_loose_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n<tool_call>${body}`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+});
+
+/* ── Round 6: a follow-up recounting the call its history shows ─────── */
+
+const { sanitiseMessages } = await import('@/ai/prompt');
+const { GRANTED_PROBE, drainEvents } = await import('./support/egress-probe');
+
+type GenerationEvent = import('@/ai/engine').GenerationEvent;
+
+/** A call as a text template's history shows it: `messageText` over `sanitiseMessages`. */
+function asHistoryShows(name: string, input: Record<string, unknown>): string {
+  const [message] = sanitiseMessages([{ role: 'assistant', content: [{ type: 'tool_use', id: 'call_0', name, input }] }]);
+  return messageText(message!);
+}
+
+describe('a follow-up that recounts the call its history shows, as the history shows it', () => {
+  it('does not run the tool a second time, and stores and sends none of the recount', async () => {
+    const id = 'r6_recount_local';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const recount = asHistoryShows('leaky', {});
+    const local = recordingBackend([
+      `Reading your notes.\n${CALL}`,
+      `I read them with ${recount} and they mention a passphrase.`,
+      'Should not be asked for.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(local.seen[1]!.messages.map(messageText).join('\n'), 'the follow-up’s history').toContain(recount);
+    const ran = assistantRows(id).at(-1)!;
+    expect(ran.toolCalls?.map((call) => call.name), 'the calls that ran').toEqual(['leaky']);
+    expect(local.seen, 'no follow-up after the recount').toHaveLength(2);
+    expect(ran.content, 'the stored reply').not.toContain('[tool');
+  });
+
+  it('does not send an MCP call a second time, recounted as its encoded history shows it or as the model first wrote it', async () => {
+    const input = { text: 'call Ana at 10:30' };
+    const shown = asHistoryShows('notes.note', input);
+    // The history encodes a tool block's strings: the colon is not the one the model wrote.
+    expect(shown).not.toContain('10:30');
+    for (const recount of [shown, `[tool notes.note(${JSON.stringify(input)})]`]) {
+      const probe = mcpProbe();
+      toolRegistry.register(probe.tool);
+      try {
+        const local = recordingBackend([
+          `<tool_call>${JSON.stringify({ name: 'notes.note', arguments: input })}</tool_call>`,
+          `Filed: ${recount}. Anything else?`,
+          'Should not be asked for.',
+        ]);
+        const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+        engine.router.replace(QWEN.engine, local.adapter as never);
+        const events = await drainEvents(
+          engine.stream({
+            messages: [{ role: 'user', content: 'note that I should call Ana at 10:30' }],
+            target: ON_DEVICE,
+            toolIds: [probe.tool.id],
+            mcpEgress: GRANTED_PROBE,
+          }),
+        );
+
+        expect(sanitiseMessages(local.seen[1]!.messages).map(messageText).join('\n'), recount).toContain(shown);
+        expect(probe.call, `sent to the server, recounted as ${recount}`).toHaveBeenCalledTimes(1);
+        expect(local.seen, recount).toHaveLength(2);
+        const done = events.find((event) => event.type === 'done');
+        expect(done?.type === 'done' && done.text, recount).toBe('Filed: . Anything else?');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+    }
+  });
+
+  it('stopped after the recount: records no second call as not sent (refs #293)', async () => {
+    // #331 records a complete call in the text Stop caught. A recount is not a
+    // call, so it is not recorded as one that did not go: the one call went.
+    const input = { text: 'call Ana at 10:30' };
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const controller = new AbortController();
+      const gate = held();
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      let turn = 0;
+      engine.router.replace(
+        QWEN.engine,
+        new FunctionBackendAdapter({
+          execute: async () => {
+            throw new Error('this rig only streams');
+          },
+          executeStream: async function* (request: IRChatRequest): AsyncGenerator<IRStreamChunk> {
+            yield { type: 'start', sequence: 0, metadata: request.metadata };
+            if (turn++ === 0) {
+              yield {
+                type: 'content',
+                sequence: 1,
+                delta: `<tool_call>${JSON.stringify({ name: 'notes.note', arguments: input })}</tool_call>`,
+              };
+            } else {
+              yield { type: 'content', sequence: 1, delta: `Filed: ${asHistoryShows('notes.note', input)}. And` };
+              await gate.promise;
+            }
+            yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          },
+        }) as never,
+      );
+
+      const events: GenerationEvent[] = [];
+      for await (const event of engine.stream({
+        messages: [{ role: 'user', content: 'note that I should call Ana at 10:30' }],
+        target: ON_DEVICE,
+        toolIds: [probe.tool.id],
+        mcpEgress: GRANTED_PROBE,
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        if (event.type === 'delta' && event.text.includes('. And')) {
+          controller.abort();
+          gate.release();
+        }
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(
+        events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt?.outcome] : [])),
+        'the calls recorded',
+      ).toEqual(['sent']);
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+});
+
+/* ── A local round that died, the turn finished by the cloud fallback ── */
+
+describe('a local turn whose stream died after some words, finished by the cloud fallback', () => {
+  // The engine dropped the dead round's text when it diverted, so the finished
+  // reply was the cloud's round alone: the words the person had watched the
+  // local model write were gone from it, while a turn stopped or failed on the
+  // same path kept them.
+  async function divertedAndFinished(onScreen: () => boolean, dies: () => void): Promise<void> {
+    const sending = useChats.getState().send('what do my notes say?');
+    await until(onScreen);
+    dies();
+    await sending;
+  }
+
+  it('keeps the local words beside the cloud’s, and sends both back', async () => {
+    const id = 'rv6_fallback_finished_words';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: 'Checking your notes first.', stall: dies.promise }]);
+    const cloud = recordingBackend(['From the cloud: they mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    await divertedAndFinished(
+      () => useChats.getState().messages.some((message) => message.content.includes('first.')),
+      dies.release,
+    );
+    const finished = assistantRows(id).at(-1)!;
+    await useChats.getState().send('thanks');
+
+    const words = 'Checking your notes first.\n\nFrom the cloud: they mention a passphrase.';
+    expect(
+      { error: finished.error, content: finished.content, stopped: finished.stopped },
+      'the finished reply',
+    ).toEqual({ error: undefined, content: words, stopped: undefined });
+    expect(spoken(cloud.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+  });
+
+  it('keeps the reasoning the local model wrote before it died', async () => {
+    const id = 'rv6_fallback_finished_reasoning';
+    given(chat(id), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: '<think>The user wants a summary of', stall: dies.promise }]);
+    const cloud = recordingBackend(['Your notes mention a passphrase.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    await divertedAndFinished(
+      () => useChats.getState().messages.some((message) => (message.thinking ?? '').includes('summary of')),
+      dies.release,
+    );
+
+    const finished = assistantRows(id).at(-1)!;
+    expect({ content: finished.content, thinking: finished.thinking }, 'the finished reply').toEqual({
+      content: 'Your notes mention a passphrase.',
+      thinking: 'The user wants a summary of',
+    });
+  });
+
+  it('in a chat with a tool on, keeps the words and none of a call the local round died inside', async () => {
+    const id = 'rv6_fallback_finished_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([
+      { partial: 'Checking.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a', stall: dies.promise },
+    ]);
+    const cloud = recordingBackend(['From the cloud: your notes mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      await divertedAndFinished(
+        () => useChats.getState().messages.some((message) => message.content.includes('canary-7f3a')),
+        dies.release,
+      );
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const finished = assistantRows(id)[1]!;
+    expect(finished.content, 'the finished reply').toBe('Checking.\n\nFrom the cloud: your notes mention a passphrase.');
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── A call named in reasoning is not a call ────────────────────────── */
+
+describe('a call named in reasoning', () => {
+  // Reasoning is the model thinking, not calling: its words are never the
+  // reply's, and a call it names is not one the round made. The extractor read
+  // the round with its reasoning in it, so a call only mentioned there ran and
+  // sent a follow-up, a call drafted there and then made ran twice, and Stop
+  // landing mid-reasoning recorded a call the model never made as not sent.
+  const calc = (expression: string): string =>
+    `<tool_call>{"name": "calculate", "arguments": {"expression": "${expression}"}}</tool_call>`;
+
+  it('is not run when the answer makes no call', async () => {
+    const id = 'rv6_reasoning_names_call';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([`<think>I could call ${calc('6*7')} but I know it.</think>\nIt is 42.`, 'Second answer.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(
+      { tools: stored.toolCalls?.length ?? 0, requests: local.seen.length, content: stored.content },
+      'the finished reply',
+    ).toEqual({ tools: 0, requests: 1, content: 'It is 42.' });
+  });
+
+  for (const [form, call] of [
+    ['a <tool_call>', calc('6*7')],
+    ['a fenced block', '```json\n{"name": "calculate", "arguments": {"expression": "6*7"}}\n```'],
+    ['this app’s history form', '[tool calculate({"expression": "6*7"})]'],
+  ] as const) {
+    it(`runs once when the reasoning drafts it as ${form} and the answer makes it`, async () => {
+      const id = `rv6_reasoning_drafts_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`<think>First ${call}, then the answer.</think>\n${call}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42']);
+      expect(local.seen, 'one follow-up').toHaveLength(2);
+      expect(stored.content, 'the stored reply').toBe('It is 42.');
+    });
+  }
+
+  it('stopped mid-reasoning after drafting a call to an MCP tool: records nothing as not sent', async () => {
+    const id = 'rv6_reasoning_stopped';
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>I will file it with ${MCP_CALL_CLEAN}, and then`, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file a note');
+      await until(() => (useChats.getState().messages.at(-1)?.thinking ?? '').includes('and then'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(stopped?.thinking, 'the reasoning').toContain('I will file it with');
+  });
+});
+
+/* ── A call written twice in one reply, once in this app's history form ─ */
+
+describe('a call a reply writes twice, once as this app’s history writes a call', () => {
+  // A copy of a call in the `[tool NAME({…})]` form that the history shows the
+  // model is a recount, but it was compared with the history alone: announced
+  // in that form and then made in the model's own markup, or made and then
+  // recounted in the same reply, one call ran twice — a second note filed on
+  // the server — and Stop after it recorded two calls not sent for the one.
+  const CALC = '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>';
+  const APP_CALC = '[tool calculate({"expression": "6*7"})]';
+
+  it('sends an MCP call once when a follow-up announces it in that form and then makes it', async () => {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const local = recordingBackend([
+        '<tool_call>{"name": "notes.note", "arguments": {"text": "first"}}</tool_call>',
+        'Filed the first. Next, [tool notes.note({"text": "second"})]:\n<tool_call>{"name": "notes.note", "arguments": {"text": "second"}}</tool_call>',
+        'Both filed.',
+      ]);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.replace(QWEN.engine, local.adapter as never);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file two notes' }],
+          target: ON_DEVICE,
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+
+      expect(probe.call.mock.calls.map((call) => call[2]), 'notes sent to the server').toEqual([
+        { text: 'first' },
+        { text: 'second' },
+      ]);
+      const done = events.find((event) => event.type === 'done');
+      expect(done?.type === 'done' && done.text, 'the finished words').toBe('Filed the first. Next, :\n\nBoth filed.');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+
+  for (const [how, text] of [
+    ['announced in that form, then made', `I will work it out with ${APP_CALC}:\n${CALC}`],
+    ['made, then recounted in that form', `${CALC}\nThat was ${APP_CALC}.`],
+    ['written in that form twice', `Working it out: ${APP_CALC}\n${APP_CALC}`],
+  ] as const) {
+    it(`runs once when ${how}`, async () => {
+      const id = `rv6_twice_${how.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([text, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').not.toMatch(/\[tool|tool_call/);
+    });
+  }
+
+  it('stopped after it: records the one call as not sent, once (refs #293)', async () => {
+    const id = 'rv6_twice_stopped';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Next, [tool notes.note({"text": "canary-7f3a"})]:\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>\nAnd`,
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', '\nAnd', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((call) => call.receipt), 'the calls recorded').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped' }),
+    ]);
+  });
+});
+
+/* ── A stopped single-quoted tag call holding Python's literals ──────── */
+
+describe('a turn stopped inside a single-quoted tag call that holds Python’s True, False or None', () => {
+  // A small model that writes its call as Python writes a dict writes Python's
+  // literals too. The cut read a bare word in a call's JSON only as JSON's own
+  // `true`, `false` or `null`, or as an unquoted key, so a call holding `True`
+  // was read as prose and kept, its arguments stored and sent back.
+  for (const literal of ['True', 'False', 'None'] as const) {
+    it(`${literal}: keeps the words before it, and sends none of it back`, async () => {
+      const id = `rv6_python_literal_${literal}`;
+      const gate = held();
+      const local = scriptedBackend([
+        {
+          partial: `Filing it now.\n<tool_call>{'name': 'notes.note', 'arguments': {'pinned': ${literal}, 'text': 'canary-7f3a`,
+          stall: gate.promise,
+        },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+});
+
+/* ── What the stripper takes out as a call is read as one ───────────── */
+
+describe('a call in a shape the stripper took out and the reader did not read', () => {
+  // The stripper takes a call out of the words in more shapes than the reader
+  // read: a <tool_call> holding several calls, an array of them, Qwen3-Coder's
+  // XML, a name before its JSON, and a body with a trailing comma or a closing
+  // brace too many or too few. The reader read a tag's body only as one strict
+  // JSON object followed by its closing tag. So such a call, stopped, vanished
+  // from the words with no record that it had not gone — #331 writes that
+  // record for the calls the reader reads — and finished, it was stripped and
+  // never ran: the call the model made neither ran, nor showed, nor was
+  // recorded.
+  const note = (text: string): string => `{"name": "notes.note", "arguments": {"text": "${text}"}}`;
+  const STRANDED = [
+    ['two calls in one tag', `<tool_call>\n${note('canary-1')}\n${note('canary-2')}\n</tool_call>`, 2],
+    ['an array body', `<tool_call>[${note('canary-7f3a')}]</tool_call>`, 1],
+    [
+      'an XML body',
+      '<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-7f3a\n</parameter>\n</function>\n</tool_call>',
+      1,
+    ],
+    ['a name before its JSON', '<tool_call>notes.note({"text": "canary-7f3a"})</tool_call>', 1],
+    ['a trailing comma', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"},}</tool_call>', 1],
+    ['a closing brace too many', `<tool_call>${note('canary-7f3a')}}</tool_call>`, 1],
+    ['a closing brace too few', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}</tool_call>', 1],
+  ] as const;
+
+  for (const [shape, call, count] of STRANDED) {
+    it(`${shape}, Stop caught complete: is recorded as not sent, and none of it is stored or sent back (refs #293)`, async () => {
+      const id = `rv6_stranded_${shape.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n${call}\nWaiting`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'Waiting', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual(
+        Array.from({ length: count }, () =>
+          expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+        ),
+      );
+      expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary');
+    });
+  }
+
+  const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+  for (const [shape, call, outputs] of [
+    ['two calls in one tag', `<tool_call>\n${calc('6*7')}\n${calc('6*8')}\n</tool_call>`, ['6*7 = 42', '6*8 = 48']],
+    ['an array body', `<tool_call>[${calc('6*7')}, ${calc('6*8')}]</tool_call>`, ['6*7 = 42', '6*8 = 48']],
+    [
+      'an XML body',
+      '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7\n</parameter>\n</function>\n</tool_call>',
+      ['6*7 = 42'],
+    ],
+    ['a name before its JSON', '<tool_call>calculate({"expression": "6*7"})</tool_call>', ['6*7 = 42']],
+    ['a trailing comma', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"},}</tool_call>', ['6*7 = 42']],
+    ['single quotes', "<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7'}}</tool_call>", ['6*7 = 42']],
+    ['a closing brace too many', `<tool_call>${calc('6*7')}}</tool_call>`, ['6*7 = 42']],
+    ['a closing brace too few', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}</tool_call>', ['6*7 = 42']],
+    ['a [TOOL_CALLS] call with a closing brace too many', '[TOOL_CALLS] calculate({"expression": "6*7"}})', ['6*7 = 42']],
+  ] as const) {
+    it(`${shape}, finished: runs, and the reply keeps none of it`, async () => {
+      const id = `rv6_finished_${shape.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+
+      const stored = assistantRows(id).at(-1)!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(outputs);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nIt is 42.');
+    });
+  }
+
+  it('two calls in one tag, past the round limit: each is recorded as not sent (refs #293)', async () => {
+    const probe = mcpProbe();
+    toolRegistry.register(probe.tool);
+    try {
+      const local = recordingBackend([`<tool_call>\n${note('a')}\n${note('b')}\n</tool_call>`]);
+      const engine = new ChatterangEngine({ resolver: probeResolver, fallbackBackendId: null });
+      engine.router.replace(QWEN.engine, local.adapter as never);
+      const events = await drainEvents(
+        engine.stream({
+          messages: [{ role: 'user', content: 'file notes until I say stop' }],
+          target: ON_DEVICE,
+          toolIds: [probe.tool.id],
+          mcpEgress: GRANTED_PROBE,
+        }),
+      );
+
+      const receipts = events.flatMap((event) => (event.type === 'tool' ? [event.tool.receipt] : []));
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(8);
+      expect(receipts.slice(8), 'the last round’s calls').toEqual([
+        expect.objectContaining({ outcome: 'withheld', why: 'round-limit' }),
+        expect.objectContaining({ outcome: 'withheld', why: 'round-limit' }),
+      ]);
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+});
+
+/* ── A call whose body is not JSON: Python's keyword arguments ────────── */
+
+describe('a call written as Python writes one, name(key=value, …), in a tag or after [TOOL_CALLS]', () => {
+  // The stripper read only a JSON body, so a finished reply kept such a call,
+  // arguments and all, and sent it back in every later request. Main's lazy
+  // strips had removed it. A tag body holding Python's None, or two calls one
+  // of which holds True, was kept the same way until a8e19ea.
+  const FINISHED = [
+    ['a tag call', '<tool_call>calculate(expression="6*7", note="canary-7f3a")</tool_call>'],
+    ['a [TOOL_CALLS] call', '[TOOL_CALLS] calculate(expression="6*7", note="canary-7f3a")'],
+    ['single quotes and Python’s literals', "<tool_call>calculate(expression='6*7', exact=True, note='canary-7f3a', unit=None)</tool_call>"],
+    ['a name before a dict holding None', "<tool_call>calculate({'expression': '6*7', 'note': 'canary-7f3a', 'unit': None})</tool_call>"],
+  ] as const;
+
+  for (const [form, call] of FINISHED) {
+    it(`${form}, finished: runs, and none of it is stored or sent back`, async () => {
+      const id = `rv6_python_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}\nOne moment.`, 'It is 42.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nOne moment.\n\nIt is 42.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('two calls in a tag, one holding True, finished: both run, and none of them is stored or sent back', async () => {
+    const id = 'rv6_python_two_calls';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const call =
+      '<tool_call>\n{"name": "calculate", "arguments": {"expression": "6*7", "exact": True, "note": "canary-7f3a"}}\n{"name": "calculate", "arguments": {"expression": "6*8"}}\n</tool_call>';
+    const local = recordingBackend([`Working it out.\n${call}`, 'Done.']);
+    engineWith(local);
+
+    await useChats.getState().send('six times seven, and six times eight?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42', '6*8 = 48']);
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  for (const [form, partial] of [
+    ['a tag call', 'Filing it now.\n<tool_call>notes.note(text="canary-7f3a'],
+    ['a [TOOL_CALLS] call', 'Filing it now.\n[TOOL_CALLS] note(pinned=True, text="canary-7f3a'],
+  ] as const) {
+    it(`${form}, stopped inside its arguments: keeps the words before it, and sends none of it back`, async () => {
+      const id = `rv6_python_stopped_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'canary-7f3a', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a tag call Stop caught complete: is recorded as not sent, and none of it is stored (refs #293)', async () => {
+    const id = 'rv6_python_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n<tool_call>notes.note(text="canary-7f3a")</tool_call>\nWaiting', stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+  });
+});
+
+/* ── Review round 7: an MCP tool's name in the [TOOL_CALLS] forms ───── */
+
+describe('a [TOOL_CALLS] call to an MCP tool, whose name and id hold a dot and a colon', () => {
+  // Every MCP tool is named `server.tool`, with the id `mcp:server.tool`, and
+  // each `[TOOL_CALLS]` form read a call's name as a word alone. So a call to
+  // one was never read: finished, the server was never called, and the call,
+  // arguments and all, was stored and sent back in every later request;
+  // stopped inside it, nothing was cut; and Stop catching it complete wrote no
+  // record that it had not gone.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, call] of [
+    ['by its name, with JSON', '[TOOL_CALLS] notes.note({"text": "canary-7f3a"})'],
+    ['by its id, with JSON', '[TOOL_CALLS] mcp:notes.note({"text": "canary-7f3a"})'],
+    ['by its name, with Python’s keyword arguments', '[TOOL_CALLS] notes.note(text="canary-7f3a")'],
+  ] as const) {
+    it(`${form}, finished: is sent once, and none of it is stored or sent back`, async () => {
+      const id = `rv7_mcp_name_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Filing it.\n${call}`, 'Filed.', 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-7f3a' });
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing it.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  for (const [form, partial, marker] of [
+    ['inside its JSON', 'Filing it.\n[TOOL_CALLS] notes.note({"text": "canary-7f3a', 'canary-7f3a'],
+    ['inside its keyword arguments', 'Filing it.\n[TOOL_CALLS] mcp:notes.note(text="canary-7f3a', 'canary-7f3a'],
+    ['on its name', 'Filing it.\n[TOOL_CALLS] notes.no', 'notes.no'],
+  ] as const) {
+    it(`stopped ${form}: keeps the words before it, and sends none of it back`, async () => {
+      const id = `rv7_mcp_name_stopped_${form.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', marker, gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+        content: 'Filing it.',
+        stopped: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('notes.no');
+    });
+  }
+
+  it('Stop caught complete: is recorded as not sent, and none of it is stored (refs #293)', async () => {
+    const id = 'rv7_mcp_name_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it.\n[TOOL_CALLS] notes.note({"text": "canary-7f3a"})\nWaiting', stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it\.\s+Waiting$/);
+  });
+});
+
+/* ── Review round 7: a single-quoted call's strings ─────────────────── */
+
+describe('a single-quoted call whose strings hold a bracket or a double quote', () => {
+  // A call's end was found by scanners that knew only JSON's double quote, and
+  // its body read by one that knows both. A `}` or `]` in a single-quoted
+  // string closed the call's JSON early: the stripper took the call out and
+  // the reader read nothing from what was left, so it never ran, and stopped,
+  // no record said it had not gone. A `"` in one opened a string that never
+  // closed: the call was neither read nor stripped, and its arguments were
+  // stored and sent back, where main's lazy strip had removed them.
+  const calc = (note: string): string =>
+    `{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': '${note}'}}`;
+
+  for (const [shape, call] of [
+    ['a closing brace in a string', `<tool_call>${calc('canary-7f3a :-}')}</tool_call>`],
+    ['a closing bracket in a string', `<tool_call>${calc('canary-7f3a, item 3]')}</tool_call>`],
+    ['a double quote in a string', `<tool_call>${calc('canary-7f3a, a 5" board')}</tool_call>`],
+    ['an opening brace in a string', `<tool_call>${calc('canary-7f3a, a { brace')}</tool_call>`],
+    ['a double quote in a [TOOL_CALLS] call', `[TOOL_CALLS] calculate({'expression': '6*7', 'note': 'canary-7f3a, a 5" board'})`],
+    [
+      'a double quote in a call with a closing brace too few',
+      `<tool_call>{'name': 'calculate', 'arguments': {'expression': '6*7', 'note': 'canary-7f3a, a 5" board'}</tool_call>`,
+    ],
+  ] as const) {
+    it(`${shape}, finished: runs, and none of it is stored or sent back`, async () => {
+      const id = `rv7_quoted_${shape.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Working it out.\n${call}\nOne moment.`, 'It is 42.', 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe('Working it out.\n\nOne moment.\n\nIt is 42.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a malformed call holding an apostrophe in a word, finished: none of it is stored or sent back', async () => {
+    // A single quote inside a word is an apostrophe, not a string's opening:
+    // read as one, it opened a string that never closed, and the malformed
+    // call, arguments and all, was kept where it had been stripped.
+    const id = 'rv7_quoted_apostrophe';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      "Working it out.\n<tool_call>{name: calculate, arguments: {note: canary-7f3a it's}}</tool_call>\nOne moment.",
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Working it out.\n\nOne moment.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  const note = (text: string): string => `<tool_call>{'name': 'notes.note', 'arguments': {'text': '${text}'}}</tool_call>`;
+  for (const [shape, call] of [
+    ['a closing brace in a string', note('canary-7f3a :-}')],
+    ['a closing bracket in a string', note('canary-7f3a, item 3]')],
+    ['a double quote in a string', note('canary-7f3a, a 5" board')],
+  ] as const) {
+    it(`${shape}, Stop caught complete: is recorded as not sent, and none of it is stored or sent back (refs #293)`, async () => {
+      const id = `rv7_quoted_stranded_${shape.replace(/\W+/g, '_')}`;
+      const gate = held();
+      const local = scriptedBackend([
+        { partial: `Filing it now.\n${call}\nWaiting`, stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      let stopped: Message | undefined;
+      const probe = await inToolsChat(id, async () => {
+        engineWith(local);
+        await stopAfterSome('file a note', 'Waiting', gate.release);
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      });
+
+      expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+      expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+        expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+      ]);
+      expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+Waiting$/);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('a closing brace in a string, stopped before the paren that ends it: keeps the words before it, and sends none of it back', async () => {
+    const id = 'rv7_quoted_before_paren';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: "Filing it now.\n[TOOL_CALLS] notes.note({'text': 'canary-7f3a :-}'}", stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', ":-}'}", gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ content: stopped?.content, stopped: stopped?.stopped }, 'the stored reply').toEqual({
+      content: 'Filing it now.',
+      stopped: undefined,
+    });
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+/* ── Review round 7: a call's opening named in a reply the model ended ─ */
+
+describe('a reply the model ended that names a call’s opening, its value running on as prose', () => {
+  // A value's words — a string, or a Qwen3-Coder parameter's value — can be
+  // anything, so a call's opening named in prose, with no closing quote or
+  // closing tag after it, reads as a call still being written to the end of
+  // the text. A finished reply was cut from that opening on: every word after
+  // it, which the person had watched arrive, was gone from the stored reply and
+  // every later request, and a reply that began with one was stored with no
+  // words at all. Only a reply cut short can end inside a call: the model
+  // ends its reply outside one.
+  const PROSE = [
+    [
+      'a Qwen3-Coder opening in a code block',
+      'Qwen3-Coder opens a call like this:\n\n```\n<tool_call>\n<function=get_weather>\n<parameter=city>\n```\n\nThe city goes on the next line, and each tag is closed in turn.',
+    ],
+    [
+      'a Qwen3-Coder opening it begins with',
+      '<tool_call>\n<function=search>\n<parameter=query>\nis how Qwen3-Coder begins a call; the value follows, then the closing tags.',
+    ],
+    ['a keyword opening in a tag', 'A Python-style call looks like <tool_call>search(query=" and then the words to look for, a closing quote and a paren.'],
+    ['a keyword opening after [TOOL_CALLS]', "Mistral's would be [TOOL_CALLS] search(query=' and then the words, a closing quote and a paren."],
+    ['a JSON opening', 'Qwen writes <tool_call>{"name": "search", "arguments": {"query": " and then the words to look for.'],
+    [
+      'a JSON opening before its first key',
+      'Its arguments are an object, <tool_call>{"name": "search", "arguments": {" and then each key, its value, and a closing brace.',
+    ],
+  ] as const;
+
+  for (const [form, words] of PROSE) {
+    it(`${form}, finished: keeps every word, and sends them back`, async () => {
+      const id = `rv7_prose_opening_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([words, 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('how does a model write a call?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(
+        { content: stored.content, stopped: stored.stopped, toolCalls: stored.toolCalls },
+        'the stored reply',
+      ).toEqual({ content: words, stopped: undefined, toolCalls: undefined });
+      expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+    });
+  }
+
+  const ROUND =
+    'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>\nA Python-style call would be <tool_call>calculate(expression=" and then the sum.';
+  const ROUND_WORDS = 'Working it out.\n\nA Python-style call would be <tool_call>calculate(expression=" and then the sum.';
+
+  for (const finishReason of ['stop', 'tool_calls'] as const) {
+    it(`at the end of a round whose call ran, ended as ${finishReason}: keeps the round’s words and the follow-up’s`, async () => {
+      const id = `rv7_prose_opening_tool_round_${finishReason}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([{ text: ROUND, finishReason }, 'It is 42.', 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+      expect(stored.content, 'the stored reply').toBe(`${ROUND_WORDS}\n\nIt is 42.`);
+      expect(spoken(local.seen[2]).at(-2), 'the next request').toEqual(['assistant', `${ROUND_WORDS}\n\nIt is 42.`]);
+    });
+  }
+
+  it('at the end of a round whose call ran, the follow-up stopped: keeps the round’s words and the follow-up’s', async () => {
+    const id = 'rv7_prose_opening_tool_round_stopped';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ reply: ROUND }, { partial: 'It is 42', stall: gate.promise }]);
+    engineWith(local);
+
+    await stopAfterSome('what is six times seven?', 'It is 42', gate.release);
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe(`${ROUND_WORDS}It is 42`);
+  });
+
+  for (const [form, tail] of [
+    ['inside a keyword argument', '<tool_call>calculate(expression="6*7, canary-7f3a'],
+    ['inside a Qwen3-Coder parameter', '<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7 canary-7f3a'],
+    ['inside a JSON string', '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7 canary-7f3a'],
+  ] as const) {
+    it(`cut off at its limit on tokens ${form}: stores and sends none of the call`, async () => {
+      const id = `rv7_cut_off_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(`Checking.\n${tail}`), 'Fine.']);
+      engineWith(local);
+
+      await useChats.getState().send('what is six times seven?');
+      await useChats.getState().send('thanks');
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  // A stream can say `stop` without the model having ended it: aimatey's Ollama
+  // adapter says it for every reply, a reply cut off at its limit included, and
+  // a stop sequence of the request's own ends a reply wherever it matches.
+  const CUT_CALL = 'Checking.\n<tool_call>calculate(expression="6*7, canary-7f3a';
+
+  it('a reply whose stream says stop but spent its request’s whole limit on tokens: stores and sends none of the call', async () => {
+    const id = 'rv7_spent_limit';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const limit = DEFAULT_SAMPLER.maxTokens;
+    const local = recordingBackend([{ text: CUT_CALL, finishReason: 'stop', completionTokens: limit }, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(local.seen[0]?.parameters?.maxTokens, 'the request’s limit on tokens').toBe(limit);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('a reply whose stream says stop, in a request with stop sequences of its own: stores and sends none of the call', async () => {
+    const id = 'rv7_stop_sequences';
+    given(chat(id, { tools: ['calculator'], sampler: { stopSequences: ['###'] } }), [
+      user(id, 1, 'hello'),
+      reply(id, 2, 'Hi.'),
+    ]);
+    const local = recordingBackend([CUT_CALL, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(local.seen[0]?.parameters?.stopSequences, 'the request’s stop sequences').toEqual(['###']);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('a reply the model ended inside the tag that closes a Qwen3-Coder parameter: stores and sends none of the call', async () => {
+    // Its value is written, and the text ends in the call's structure, as a
+    // JSON call's whose arguments closed with its tag half written.
+    const id = 'rv7_xml_closing_tag';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      'Checking.\n<tool_call>\n<function=calculate>\n<parameter=expression>\n6*7, canary-7f3a\n</param',
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Checking.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('a reply the model ended that spent fewer tokens than its limit: keeps every word', async () => {
+    const id = 'rv7_under_limit';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = PROSE[2][1];
+    const local = recordingBackend([{ text: words, finishReason: 'stop', completionTokens: 40 }, 'Fine.']);
+    engineWith(local);
+
+    await useChats.getState().send('how does a model write a call?');
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe(words);
+  });
+
+  it('a round Stop caught a complete call in, ending on a bare opening: records the call, and keeps none of the opening', async () => {
+    // The round's words are read as Stop left them, as every stopped round's
+    // are, though the call Stop caught complete in them has ended the round.
+    const id = 'rv7_stranded_then_marker';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing it now.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>\nAnd <tool_call>',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'And <tool_call>', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing it now\.\s+And$/);
+  });
+
+  it('a round cut off at its limit inside a second call, its first call run: keeps its words and none of the second', async () => {
+    const id = 'rv7_cut_off_tool_round';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>\n<tool_call>calculate(expression="6*8, canary-7f3a',
+      ),
+      'It is 42.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe('Working it out.\n\nIt is 42.');
+  });
+});
+
+/* ── Review round 8 ─────────────────────────────────────────────────── */
+
+const ROUND8_GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+describe('a round its token limit cut short while its reasoning was still open', () => {
+  // A round cut off at its limit is read at its end as a stopped one is: the
+  // model was still thinking, and a call it drafted there is not one it made.
+  // Read as a round the model ended, the drafted call ran, an MCP server was
+  // sent its arguments under a conversation's grant, and a follow-up was asked
+  // for, where Stop landing at the same character recorded nothing.
+  const DRAFT =
+    '<think>The notes might say. I could call <tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}</tool_call> but the question is only arithmetic, so I do not need';
+  for (const [how, ended] of [
+    ['cut off at its limit', cutOff(DRAFT)],
+    [
+      'said stop, having spent its whole limit',
+      { text: DRAFT, finishReason: 'stop' as const, completionTokens: DEFAULT_SAMPLER.maxTokens },
+    ],
+  ] as const) {
+    it(`${how}: does not run a call drafted there, nor ask for a follow-up`, async () => {
+      const id = `rv8_cut_open_reasoning_${how.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([ended, 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('what is six times seven?');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((call) => call.name) ?? [], 'tools that ran').toEqual([]);
+      expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+      expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+        content: '',
+        stopped: false,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('under a conversation’s grant: sends the MCP server nothing it only drafted', async () => {
+    const id = 'rv8_cut_open_reasoning_mcp';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        '<think>I could file it with <tool_call>{"name":"notes.note","arguments":{"text":"canary-7f3a"}}</tool_call> but the person only asked what the note would say, so I should not file anything. The note would',
+      ),
+      'Fine.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('what would the note say?');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'sent to the MCP server').not.toHaveBeenCalled();
+    expect(assistantRows(id).at(-1)?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(local.seen, 'no follow-up').toHaveLength(1);
+  });
+});
+
+describe('a call the model made inside reasoning it closed, with nothing after it', () => {
+  // A reasoning model can write its call inside its think block and close the
+  // block with nothing after it. Read as a call only named in reasoning, it
+  // never ran: no follow-up was sent, nothing said why, and the reply was
+  // stored with no words while the person waited for an answer. A call named
+  // in reasoning and then answered, or drafted there and then made, has words
+  // or a call outside the reasoning; this has neither.
+  const MADE = '<think>I need their notes first.\n<tool_call>{"name":"leaky","arguments":{"path":"notes.md"}}</tool_call>\n</think>';
+  for (const finishReason of ['stop', 'tool_calls'] as const) {
+    it(`ended ${finishReason}: runs it once, and the follow-up’s answer is the reply`, async () => {
+      const id = `rv8_call_in_closed_reasoning_${finishReason}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([{ text: MADE, finishReason }, 'They mention a passphrase.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await useChats.getState().send('read my notes');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(
+        {
+          ran: stored.toolCalls?.map((call) => call.name) ?? [],
+          content: stored.content,
+          thinking: stored.thinking,
+          stopped: stored.stopped,
+          requests: local.seen.length,
+        },
+        'the stored reply',
+      ).toEqual({
+        ran: ['leaky'],
+        content: 'They mention a passphrase.',
+        thinking: 'I need their notes first.',
+        stopped: undefined,
+        requests: 2,
+      });
+    });
+  }
+
+  it('stopped just after it closed that reasoning: records nothing as not sent', async () => {
+    // Stop landed before the model said whether an answer followed.
+    const id = 'rv8_call_in_closed_reasoning_stopped';
+    const gate = held();
+    const local = scriptedBackend([{ partial: `<think>I will file it.\n${MCP_CALL_CLEAN}\n</think>`, stall: gate.promise }]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file a note');
+      await until(() => (useChats.getState().messages.at(-1)?.thinking ?? '').includes('I will file it.'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+  });
+});
+
+describe('two calls, the first written without its closing tag or paren', () => {
+  // A small Hermes/Qwen-format model can leave out the first call's closing
+  // tag. Only the second ran, and the first, arguments and all, was stored as
+  // the reply's words and sent back in every later request; main's lazy strip
+  // took both out. The next call's opening ends the first.
+  const calc = (expression: string): string => `{"name": "calculate", "arguments": {"expression": "${expression}"}}`;
+  for (const [form, calls] of [
+    ['tags', `<tool_call>\n${calc('6*7')}\n<tool_call>\n${calc('6*8')}\n</tool_call>`],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] calculate({"expression": "6*7"}\n[TOOL_CALLS] calculate({"expression": "6*8"})'],
+  ] as const) {
+    it(`${form}, finished: both run, and none of either is stored or sent back`, async () => {
+      const id = `rv8_first_unclosed_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Let me work both out.\n${calls}`, 'Both are done.', 'Next.']);
+      engineWith(local);
+
+      await useChats.getState().send('six times seven and six times eight?');
+      await useChats.getState().send('thanks');
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.toolCalls?.map((ran) => ran.output), 'the calls that ran').toEqual(['6*7 = 42', '6*8 = 48']);
+      expect(stored.content, 'the stored reply').toBe('Let me work both out.\n\nBoth are done.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('6*7');
+    });
+  }
+
+  it('tags, Stop caught both complete: each is recorded as not sent, and none of either is stored (refs #293)', async () => {
+    const id = 'rv8_first_unclosed_stopped';
+    const gate = held();
+    const note = (text: string): string => `{"name": "notes.note", "arguments": {"text": "${text}"}}`;
+    const local = scriptedBackend([
+      { partial: `Filing both.\n<tool_call>\n${note('canary-1')}\n<tool_call>\n${note('canary-2')}\n</tool_call>\nWaiting`, stall: gate.promise },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', 'Waiting', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing both\.\s+Waiting$/);
+  });
+
+  it('tags, stopped inside the second: records the first as not sent, and stores neither (refs #293)', async () => {
+    const id = 'rv8_first_unclosed_stopped_in_second';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial:
+          'Filing both.\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-1"}}\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-2',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', 'canary-2', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'stopped', toolName: 'notes.note' }),
+    ]);
+    expect(stopped?.content, 'the stored reply').toBe('Filing both.');
+  });
+
+  it('tags, stopped partway into the second’s opening: records nothing, and stores none of the first', async () => {
+    // The first has no close yet: nothing has ended it, so it is a call still
+    // being written, cut and not recorded, as one Stop caught before its
+    // closing tag is.
+    const id = 'rv8_first_unclosed_stopped_in_opening';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing both.\n<tool_call>\n{"name": "notes.note", "arguments": {"text": "canary-1"}}\n<tool_c',
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file two notes', '<tool_c', gate.release);
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls, 'no call recorded').toBeUndefined();
+    expect(stopped?.content, 'the stored reply').toBe('Filing both.');
+  });
+});
+
+describe('a call whose string argument names a reasoning tag', () => {
+  // A `<thinking>` inside a finished call's string is the argument's words.
+  // Read as reasoning left open, the round that wrote the call had `</think>`
+  // appended where it ended, and every reading of the streamed text split the
+  // call in two there: half of it, arguments and all, in the stored words, where
+  // the stripper could not find it. The row written as an MCP receipt came in,
+  // a stopped or failed follow-up, and a finished turn with no words of its own
+  // all stored it and sent it back — past the round limit, beside a record that
+  // said the call was withheld.
+  const TIP = 'Prompt tip: reason inside <thinking> tags. canary-7f3a';
+  const NOTE_CALL = `<tool_call>{"name": "notes.note", "arguments": {"text": "${TIP}"}}</tool_call>`;
+
+  for (const [where, after, midTurnWords, stoppedWords] of [
+    ['ending its round', '', 'Filing it.', /^Filing it\.\s+Filed it$/],
+    ['with words after it in its round', '\nOne moment.', 'Filing it.\n\nOne moment.', /^Filing it\.\s+One moment\.\s*Filed it$/],
+  ] as const) {
+    it(`${where}, sent under a grant, the follow-up stopped: the row written mid-turn and the stopped reply keep none of it`, async () => {
+      const id = `rv8_reasoning_tag_in_argument_mcp_${where.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([
+        { reply: `Filing it.\n${NOTE_CALL}${after}` },
+        { partial: 'Filed it', stall: gate.promise },
+        { reply: 'Fine.' },
+      ]);
+      engineWith(local);
+
+      let midTurn: Message | undefined;
+      let stopped: Message | undefined;
+      try {
+        toolRegistry.register(probe.tool);
+        const sending = useChats.getState().send('save that prompt tip to my notes');
+        await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+        midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true));
+        await until(() => (useChats.getState().messages.at(-1)?.content ?? '').includes('Filed it'));
+        useChats.getState().stop();
+        gate.release();
+        await sending;
+        stopped = assistantRows(id).at(-1);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect({ content: midTurn?.content, thinking: midTurn?.thinking }, 'the row written mid-turn').toEqual({
+        content: midTurnWords,
+        thinking: undefined,
+      });
+      expect(stopped?.content, 'the stopped reply').toMatch(stoppedWords);
+      expect(stopped?.thinking, 'the stopped reply’s reasoning').toBeUndefined();
+      const next = JSON.stringify(local.seen.at(-1)?.messages);
+      expect(next, 'the next request').not.toContain('tool_call');
+      expect(next, 'the next request').not.toContain('canary-7f3a');
+    });
+  }
+
+  it('Stop caught it complete with a call after it: records both as not sent, and stores neither (refs #293)', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_stranded';
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Filing both.\n${NOTE_CALL}\n<tool_call>{"name": "notes.note", "arguments": {"text": "second, canary-2"}}</tool_call>\nWaiting`,
+        stall: gate.promise,
+      },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      const sending = useChats.getState().send('file two notes');
+      // The thread shows the streaming text split as it arrives, the tag in the
+      // argument included: 'Waiting' may be on screen as reasoning.
+      await until(() => {
+        const live = useChats.getState().messages.at(-1);
+        return `${live?.content ?? ''}${live?.thinking ?? ''}`.includes('Waiting');
+      });
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.toolCalls?.map((recorded) => recorded.input['text']), 'recorded as not sent').toEqual([
+      TIP,
+      'second, canary-2',
+    ]);
+    expect(stopped?.content, 'the stored reply').toMatch(/^Filing both\.\s+Waiting$/);
+  });
+
+  it('a local tool that ran, its follow-up writing nothing: stores no words and sends none of the call', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_local';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where I reason, canary-7f3a"}}</tool_call>',
+      '',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect({ content: stored.content, thinking: stored.thinking, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: '',
+      thinking: undefined,
+      stopped: false,
+    });
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('a call every round to the round limit: stores none of the calls beside the one recorded as withheld (refs #293)', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_round_limit';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [ROUND8_GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([NOTE_CALL]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file notes until I say stop');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls?.map((call) => call.receipt?.outcome), 'the records').toEqual([
+      'sent',
+      'sent',
+      'sent',
+      'sent',
+      'withheld',
+    ]);
+    expect(stored.content, 'the stored reply').toBe('');
+    expect(stored.thinking, 'the stored reply’s reasoning').toBeUndefined();
+  });
+
+  it('in a round cut off at its limit after words that follow it: keeps those words', async () => {
+    const id = 'rv8_reasoning_tag_in_argument_cut';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      cutOff(
+        'Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7", "note": "<think> is where I reason"}}</tool_call>\nThe sum is on its way and',
+      ),
+      'It is 42.',
+    ]);
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.output), 'the call that ran').toEqual(['6*7 = 42']);
+    expect(stored.content, 'the stored reply').toBe('Working it out.\n\nThe sum is on its way and\n\nIt is 42.');
+  });
+});
+
+describe('a complete call in a round whose stream then failed', () => {
+  // The failed row's words have their calls read out, as a finished reply's
+  // are: a failed row is kept as a version by Try again, and flipping back to
+  // it sent the call. But nothing recorded a call read out that way, so the
+  // failed row said nothing of a call the model wrote to a server that was
+  // never sent — where main kept its text on screen. It is recorded as not
+  // sent, as #331 records a call Stop caught or the round limit held back.
+  const FAILS_AFTER = `Filing it.\n<tool_call>{"name": "notes.note", "arguments": {"text": "canary-7f3a"}}</tool_call>`;
+  function streamsThenFails(text: string) {
+    const seen: IRChatRequest[] = [];
+    const adapter = new FunctionBackendAdapter({
+      execute: async () => {
+        throw new Error('this rig only streams');
+      },
+      executeStream: async function* (request: IRChatRequest): AsyncGenerator<IRStreamChunk> {
+        seen.push(structuredClone(request));
+        if (seen.length > 1) {
+          yield { type: 'start', sequence: 0, metadata: request.metadata };
+          yield { type: 'content', sequence: 1, delta: 'Fine.' };
+          yield { type: 'done', sequence: 2, finishReason: 'stop' };
+          return;
+        }
+        yield { type: 'start', sequence: 0, metadata: request.metadata };
+        yield { type: 'content', sequence: 1, delta: text };
+        throw new Error('not enough memory');
+      },
+    });
+    return { adapter, seen };
+  }
+
+  it('is recorded as not sent, and none of it is stored or sent back (refs #293)', async () => {
+    const id = 'rv8_failed_round_call';
+    const local = streamsThenFails(FAILS_AFTER);
+    let failed: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await useChats.getState().send('file a note');
+      failed = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ content: failed?.content, error: failed?.error }, 'the failed row').toEqual({
+      content: 'Filing it.',
+      error: 'not enough memory',
+    });
+    expect(failed?.toolCalls?.map((recorded) => recorded.receipt), 'recorded as not sent').toEqual([
+      expect.objectContaining({
+        outcome: 'withheld',
+        why: 'reply-failed',
+        toolName: 'notes.note',
+        host: 'notes.example',
+      }),
+    ]);
+    await mounted(failed!, () => {
+      expect(receipts(), 'the thread').toEqual(['Not sent to notes.example (notes) — the reply failed before it went.']);
+    });
+    expect(renderTranscript({ title: 't', updatedAt: 1 }, rowsFor(id)), 'the export').toMatch(
+      /notes\.note was not sent to notes\.example \(notes\) at .+ — the reply failed before it went/,
+    );
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('canary-7f3a');
+    expect(next, 'the next request').not.toContain('the reply failed');
+  });
+
+  it('drafted in reasoning the stream failed inside: records nothing', async () => {
+    const id = 'rv8_failed_round_reasoning';
+    const local = streamsThenFails(`<think>I could file it with ${MCP_CALL_CLEAN} but the person only asked`);
+    let failed: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await useChats.getState().send('what would the note say?');
+      failed = assistantRows(id).at(-1);
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ error: failed?.error, toolCalls: failed?.toolCalls }, 'the failed row').toEqual({
+      error: 'not enough memory',
+      toolCalls: undefined,
+    });
+  });
+
+  it('with no destination, as a local tool’s: records nothing, and none of it is stored', async () => {
+    const id = 'rv8_failed_round_local_call';
+    given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = streamsThenFails('Working it out.\n<tool_call>{"name": "calculate", "arguments": {"expression": "6*7"}}</tool_call>');
+    engineWith(local);
+
+    await useChats.getState().send('what is six times seven?');
+
+    const failed = assistantRows(id).at(-1)!;
+    expect(
+      { content: failed.content, error: failed.error, toolCalls: failed.toolCalls },
+      'the failed row',
+    ).toEqual({ content: 'Working it out.', error: 'not enough memory', toolCalls: undefined });
+  });
+});
+
+/* ── Review round 9 ─────────────────────────────────────────────────── */
+
+describe('a round cut short on a bare call opening', () => {
+  // A round cut short ended wherever it was, as one Stop landed in did, and a
+  // bare opening at its end may be a call begun. Read as a round the model
+  // ended, it kept the opening: at its limit on tokens, in a failed row Try
+  // again kept as a version, and in a dead local round the cloud fallback
+  // finished, the stored reply ended on `<tool_call>` and the next request
+  // carried it. Stop at the same character cut it.
+  const OPENED = 'Let me read your notes.\n<tool_call>';
+
+  it('cut off at its limit on tokens: stores and sends none of the opening', async () => {
+    const id = 'rv9_cut_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([cutOff(OPENED), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', 'Let me read your notes.']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('failed, tried again and flipped back to: the failed version stores and sends none of the opening', async () => {
+    const id = 'rv9_failed_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { partial: OPENED, stall: Promise.resolve() },
+      { reply: 'Again.' },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      const failed = assistantRows(id).at(-1)!;
+      expect({ content: failed.content, failed: failed.error !== undefined }, 'the failed row').toEqual({
+        content: 'Let me read your notes.',
+        failed: true,
+      });
+
+      await useChats.getState().regenerate(failed.id);
+      const regenerated = useChats.getState().messages.at(-1)!;
+      await useChats.getState().cycleVariant(regenerated.id, -1);
+      await useChats.getState().send('next');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const last = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(last, 'the request after flipping back').toContain('Let me read your notes.');
+    expect(last, 'the request after flipping back').not.toContain('tool_call');
+  });
+
+  it('a dead local round the cloud fallback finished: stores and sends none of the opening', async () => {
+    const id = 'rv9_fallback_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: OPENED, stall: dies.promise }]);
+    const cloud = recordingBackend(['From the cloud: they mention a passphrase.', 'Fine.']);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(leakyTool);
+      const sending = useChats.getState().send('read my notes');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('<tool_call>')));
+      dies.release();
+      await sending;
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const words = 'Let me read your notes.\n\nFrom the cloud: they mention a passphrase.';
+    expect(assistantRows(id)[1]?.content, 'the finished reply').toBe(words);
+    expect(spoken(cloud.seen.at(-1)).at(-2), 'the next request').toEqual(['assistant', words]);
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('stopped on it, as a guard: stores and sends none of the opening', async () => {
+    const id = 'rv9_stopped_bare_opening';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: OPENED, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await stopAfterSome('read my notes', '<tool_call>', gate.release);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+});
+
+describe('a call with a closing brace too few, stopped or cut short partway into its close', () => {
+  // Its JSON never closes and its close is not whole, so it was neither cut
+  // nor stripped: its arguments were stored and sent back, where the same
+  // call with its brace was cut at the same character. A small model's
+  // `</tool_call>` can arrive in pieces, and a fence and a line break come
+  // before it whatever the tokenizer makes of the tag.
+  const SHORT = '{"name": "leaky", "arguments": {"path": "canary-7f3a"}';
+  for (const [form, partial, marker] of [
+    ['in its closing tag', `Let me read your notes.\n<tool_call>${SHORT}</tool_`, '</tool_'],
+    ['after its closing fence', `Let me read your notes.\n<tool_call>\n\`\`\`json\n${SHORT}\n\`\`\`\n`, '"}\n```'],
+    ['with its brace, as a guard', `Let me read your notes.\n<tool_call>\n\`\`\`json\n${SHORT}}\n\`\`\`\n`, '"}}\n```'],
+    [
+      'in its closing tag, after a call written without its close',
+      `Let me read your notes.\n<tool_call>{"name": "leaky", "arguments": {"path": "canary-first"}}\n<tool_call>${SHORT}</tool_`,
+      '</tool_',
+    ],
+  ] as const) {
+    it(`stopped ${form}: keeps only the words before it, and sends none of it back`, async () => {
+      const id = `rv9_short_close_stopped_${form.replace(/\W+/g, '_')}`;
+      given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const gate = held();
+      const local = scriptedBackend([{ partial, stall: gate.promise }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(leakyTool);
+        await stopAfterSome('read my notes', marker, gate.release);
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(leakyTool.id);
+      }
+
+      const stopped = assistantRows(id)[1]!;
+      expect({ content: stopped.content, toolCalls: stopped.toolCalls }, 'the stored reply').toEqual({
+        content: 'Let me read your notes.',
+        toolCalls: undefined,
+      });
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary');
+    });
+  }
+
+  it('cut off at its limit on tokens in its closing tag: stores and sends none of it', async () => {
+    const id = 'rv9_short_close_cut';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([cutOff(`Let me read your notes.\n<tool_call>${SHORT}</tool_`), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Let me read your notes.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+
+  it('in this app’s history form, stopped before its `]`: keeps only the words before it, and sends none of it back', async () => {
+    const id = 'rv9_short_close_app_form';
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Let me file it.\n[tool notes.note({"text":"canary-7f3a")', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    let stopped: Message | undefined;
+    const probe = await inToolsChat(id, async () => {
+      engineWith(local);
+      await stopAfterSome('file a note', 'canary-7f3a")', gate.release);
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    });
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped?.content, 'the stored reply').toBe('Let me file it.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-7f3a');
+  });
+});
+
+describe('a call the model ended its reply on, written without its close', () => {
+  // A model that ends its reply has ended any call it wrote, as the next
+  // call's opening ends one written without its close. Read as a call still
+  // being written, it was cut from the reply and never ran: the server was
+  // never called, nothing recorded it, no follow-up was asked for, and the
+  // stored reply said "Filing it now." of a note that never went.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const NOTE = '{"name":"notes.note","arguments":{"text":"canary-r9"}}';
+
+  for (const [form, call] of [
+    ['a tag', `<tool_call>${NOTE}`],
+    ['a tag, a line break after it', `<tool_call>\n${NOTE}\n`],
+    ['a tag, partway into its closing tag', `<tool_call>${NOTE}</tool_`],
+    ['a tag, a closing brace too few', '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r9"}'],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] notes.note({"text":"canary-r9"}'],
+    ['[TOOL_CALLS], Python’s keyword arguments', '[TOOL_CALLS] notes.note(text="canary-r9"'],
+    ['a name and its JSON in a tag', '<tool_call>notes.note({"text":"canary-r9"})'],
+    ['this app’s history form', '[tool notes.note({"text":"canary-r9"})'],
+    ['Qwen3-Coder’s XML', '<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-r9\n</parameter>\n</function>\n'],
+  ] as const) {
+    it(`${form}: is sent once, recorded, and none of it is stored or sent back`, async () => {
+      const id = `rv9_model_ended_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Filing it now. ${call}`, 'Filed.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-r9' });
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(local.seen, 'the turn, its follow-up, and the next send').toHaveLength(3);
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r9');
+    });
+  }
+
+  it('two calls, each written without its close: both are sent, and none of either is stored', async () => {
+    const id = 'rv9_model_ended_two';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      'Filing both.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-1"}}\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-2"}}',
+      'Filed both.',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call.mock.calls.map((sent) => sent[2]), 'sent to the server').toEqual([
+      { text: 'canary-1' },
+      { text: 'canary-2' },
+    ]);
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing both.\n\nFiled both.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary');
+  });
+
+  it('that was all the reply wrote: runs, and the follow-up’s answer is the reply', async () => {
+    const id = 'rv9_model_ended_only_call';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend(['<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}', 'They mention a passphrase.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stored.content, stopped: stored.stopped }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      stopped: undefined,
+    });
+  });
+
+  it('its string naming a reasoning tag, sent under a grant, the follow-up stopped: the row written mid-turn and the stopped reply keep none of it', async () => {
+    // The store closed the "reasoning" the tag opened where the round ended,
+    // and the call, split there, was never cut: its markup and arguments were
+    // the row's words.
+    const id = 'rv9_model_ended_reasoning_tag';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: 'Filing it.\n<tool_call>{"name": "notes.note", "arguments": {"text": "Reason inside <thinking> tags. canary-r9"}}' },
+      { partial: 'Filed it', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    let midTurn: Message | undefined;
+    let stopped: Message | undefined;
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('save that prompt tip to my notes');
+      await until(() => assistantRows(id).some((row) => row.streaming === true && (row.toolCalls?.length ?? 0) > 0));
+      midTurn = structuredClone(assistantRows(id).find((row) => row.streaming === true));
+      await until(() => (useChats.getState().messages.at(-1)?.content ?? '').includes('Filed it'));
+      useChats.getState().stop();
+      gate.release();
+      await sending;
+      stopped = assistantRows(id).at(-1);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+    expect({ content: midTurn?.content, thinking: midTurn?.thinking }, 'the row written mid-turn').toEqual({
+      content: 'Filing it.',
+      thinking: undefined,
+    });
+    expect(stopped?.content, 'the stopped reply').toMatch(/^Filing it\.\s+Filed it$/);
+    expect(stopped?.thinking, 'the stopped reply’s reasoning').toBeUndefined();
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('tool_call');
+    expect(next, 'the next request').not.toContain('canary-r9');
+  });
+
+  it('in reasoning it left open: runs, and none of it is stored in the reply’s reasoning', async () => {
+    const id = 'rv9_model_ended_open_reasoning';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<think>I need their notes first.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7f3a"}}',
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stored.content, thinking: stored.thinking }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      thinking: 'I need their notes first.',
+    });
+  });
+
+  it('an example the reply ends on, naming no tool the request offered: is not run, and stays in the reply and the next request', async () => {
+    const id = 'rv9_model_ended_example';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'Qwen’s format looks like this:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}';
+    const local = recordingBackend([words, 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does Qwen call a tool?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+      content: words,
+      toolCalls: undefined,
+    });
+    expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+  });
+
+  for (const [how, step] of [
+    ['stopped there', 'stopped'],
+    ['cut off at its limit on tokens there', 'cut'],
+  ] as const) {
+    it(`${how}, as a guard: is not sent nor recorded, and none of it is stored`, async () => {
+      const id = `rv9_model_ended_guard_${step}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const text = `Filing it now. <tool_call>${NOTE}`;
+      const gate = held();
+      const local =
+        step === 'stopped'
+          ? scriptedBackend([{ partial: text, stall: gate.promise }, { reply: 'Fine.' }])
+          : scriptedBackend([{ cutOff: text }, { reply: 'Fine.' }]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        if (step === 'stopped') await stopAfterSome('file a note', 'canary-r9"}}', gate.release);
+        else await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+      expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+        content: 'Filing it now.',
+        toolCalls: undefined,
+      });
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r9');
+    });
+  }
+});
+
+/* ── Round 10: a call written without its close, the reply going on ─── */
+
+describe('a call to an offered tool written without its close, with words after it', () => {
+  // A model that writes a call, forgets its close and goes on writing has made
+  // that call, as one that ends its reply there has: the words below it are the
+  // reply going on, as the next call's opening is. Read by a close that had to
+  // follow the arguments, the call was found by no reading at all — not read,
+  // not run, not recorded, not stripped and not cut — so the reply said it was
+  // filing a note that never went, and the whole markup, arguments and all,
+  // stayed in the stored row's words and rode in every later request.
+  //
+  // What decides it is what decides the call a model ended its reply on: the
+  // markup calls only tools the request offered (`callsOnlyTo`), and it ends
+  // the line it stands on, so a call's shape named inside a sentence that goes
+  // on is that sentence's words.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const NOTE = '{"name":"notes.note","arguments":{"text":"canary-r10"}}';
+
+  for (const [form, call] of [
+    ['a tag', `<tool_call>${NOTE}`],
+    ['a tag, a line break after it', `<tool_call>\n${NOTE}`],
+    ['a tag, a closing brace too many', '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r10"}}}'],
+    ['[TOOL_CALLS]', '[TOOL_CALLS] notes.note({"text":"canary-r10"}'],
+    ['[TOOL_CALLS], Python’s keyword arguments', '[TOOL_CALLS] notes.note(text="canary-r10"'],
+    ['a name and its JSON in a tag', '<tool_call>notes.note({"text":"canary-r10"})'],
+    ['this app’s history form', '[tool notes.note({"text":"canary-r10"})'],
+    [
+      'Qwen3-Coder’s XML',
+      '<tool_call>\n<function=notes.note>\n<parameter=text>\ncanary-r10\n</parameter>\n</function>',
+    ],
+    ['a tag around a fence', `<tool_call>\x60\x60\x60json\n${NOTE}\n\x60\x60\x60`],
+  ] as const) {
+    it(`${form}: is sent once, recorded, and none of it is stored or sent back`, async () => {
+      const id = `r10_after_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([`Filing it now.\n${call}\nAll done.`, 'Filed.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-r10' });
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the words the person watched arrive, and none of the markup').toBe(
+        'Filing it now.\n\nAll done.\n\nFiled.',
+      );
+      expect(local.seen, 'the turn, its follow-up, and the next send').toHaveLength(3);
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r10');
+    });
+  }
+
+  it('two of them with a sentence between: both are sent, and neither is stored', async () => {
+    const id = 'r10_after_two';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<tool_call>{"name":"notes.note","arguments":{"text":"canary-one"}}\nAnd one more.\n\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-two"}}</tool_call>\nFiled.',
+      'Both filed.',
+      'Next.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-one' },
+      { text: 'canary-two' },
+    ]);
+    expect(stored.content, 'the stored reply holds neither call').not.toContain('canary-');
+    expect(stored.content, 'the sentence between them').toContain('And one more.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-');
+  });
+
+  it('inside reasoning the model closed, with nothing after it: runs, and the reply is not stored empty', async () => {
+    const id = 'r10_after_closed_reasoning';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = recordingBackend([
+      '<think>I should read the notes.\n<tool_call>{"name":"leaky","arguments":{"path":"canary-7e2f"}}\n</think>',
+      'They mention a passphrase.',
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('read my notes');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(stored.toolCalls?.map((ran) => ran.name), 'the tool ran').toEqual(['leaky']);
+    expect({ content: stored.content, thinking: stored.thinking }, 'the stored reply').toEqual({
+      content: 'They mention a passphrase.',
+      thinking: 'I should read the notes.',
+    });
+  });
+
+  it('naming no tool the request offered: is not run, and stays in the reply and the next request', async () => {
+    const id = 'r10_after_example';
+    given(chat(id, { tools: [leakyTool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words =
+      'Qwen’s format looks like this:\n<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}\nand the closing tag ends it.';
+    const local = recordingBackend([words, 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(leakyTool);
+      await useChats.getState().send('how does Qwen call a tool?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(leakyTool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+      content: words,
+      toolCalls: undefined,
+    });
+    expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', words]);
+  });
+
+  it('named inside a sentence that goes on on the same line: stays in the reply, whatever it names', async () => {
+    const id = 'r10_after_inline';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = `Write <tool_call>${NOTE} and then another <tool_call> tag after it.`;
+    const local = recordingBackend([words, 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('how do I write a call?');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
+      content: words,
+      toolCalls: undefined,
+    });
+    expect(local.seen, 'the turn, then the next send: no follow-up').toHaveLength(2);
+  });
+
+  it('stopped later in the reply: is not sent, is recorded as not sent, and none of it is stored', async () => {
+    const id = 'r10_after_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `Filing it now.\n<tool_call>${NOTE}\nAll done, and then`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'All done, and then', gate.release);
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'the call it caught').toEqual(['notes.note']);
+    expect(stored.toolCalls?.[0]?.receipt, 'the record that it did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+    });
+    expect(stored.content, 'the stored reply holds no call markup').not.toContain('canary-r10');
+    expect(stored.content, 'the words the person watched arrive').toContain('All done, and then');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r10');
+  });
+
+  it('cut off at its limit on tokens later in the reply: is sent once, as the same call with its close is', async () => {
+    const id = 'r10_after_cut';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { cutOff: `Filing it now.\n<tool_call>${NOTE}\nAll done, and then` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the stored reply holds no call markup').not.toContain('canary-r10');
+    expect(stored.content, 'the words the person watched arrive').toContain('All done, and then');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r10');
+  });
+});
+
+/* ── Round 10: the dead local round's call, on the fallback divert ──── */
+
+describe('a call a dead local round had written in full, on a turn that diverts to the cloud fallback', () => {
+  // The dead round's words stay in the answer, and `stripToolSyntax` takes the
+  // call's markup out of them. Nothing else read that call on this one path, so
+  // the MCP server was never reached and no receipt said so: the thread and the
+  // export held a reply saying "Filing it now." of a note nothing recorded as
+  // not sent. The sibling path — the same failure with no fallback configured —
+  // already writes that record.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const DEAD_CALL = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r10f"}}</tool_call>';
+
+  it('is recorded as not sent, and the kept words say nothing of it', async () => {
+    const id = 'r10_fallback_dead_call';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([{ partial: `Filing it now.\n${DEAD_CALL}`, stall: dies.promise }]);
+    const cloud = scriptedBackend([{ reply: 'The cloud finished it.' }, { reply: 'Next.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('Filing it now.')));
+      dies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect(stored.content, 'the dead round’s words and the cloud’s').toBe('Filing it now.\n\nThe cloud finished it.');
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'the call the dead round wrote').toEqual([
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'reply-failed',
+    });
+    expect(JSON.stringify(cloud.seen.at(-1)?.messages), 'the request that diverted').not.toContain('canary-r10f');
+  });
+
+  it('written without its close, with words after it: is recorded too', async () => {
+    const id = 'r10_fallback_dead_unclosed';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const dies = held();
+    const local = scriptedBackend([
+      {
+        partial: 'Filing it now.\n<tool_call>{"name":"notes.note","arguments":{"text":"canary-r10f"}}\nAll done.',
+        stall: dies.promise,
+      },
+    ]);
+    const cloud = scriptedBackend([{ reply: 'The cloud finished it.' }]);
+    engineWith(local, { id: 'conn_cloud', adapter: cloud.adapter });
+
+    try {
+      toolRegistry.register(probe.tool);
+      const sending = useChats.getState().send('file a note');
+      await until(() => useChats.getState().messages.some((message) => message.content.includes('All done.')));
+      dies.release();
+      await sending;
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server').not.toHaveBeenCalled();
+    expect(stored.content, 'the dead round’s words and the cloud’s').toBe(
+      'Filing it now.\n\nAll done.\n\nThe cloud finished it.',
+    );
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'the call the dead round wrote').toEqual([
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'reply-failed',
+    });
+  });
+});
+
+/* ── Round 11: a fenced tag holding an ARRAY of calls ───────────────── */
+
+describe('a fenced <tool_call> whose body is an array of calls', () => {
+  // `CALL_SHAPES` reads a fenced tag's JSON opening on `{` or `[`; the cut's
+  // own opening read `{` alone. So this one shape was markup to the stripper
+  // and the reader and invisible to the cut: its whole block, name and
+  // arguments, stayed in the stored row's words and rode in every later
+  // request — after the arguments had reached the server, and with no record
+  // at all when Stop or a limit on tokens landed inside it.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const OPENED = 'Filing it now.\n<tool_call>```json\n[{"name":"notes.note","arguments":{"text":"canary-r11';
+
+  it('whose call ran and whose follow-up wrote nothing leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_ran';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ reply: `${OPENED}a"}}]\n\`\`\`` }, { reply: '' }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'the arguments left for the server').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11a');
+  });
+
+  it('stopped inside its arguments leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${OPENED}b`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-r11b', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11b');
+  });
+
+  it('cut off at its limit on tokens inside its arguments leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_cut';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ cutOff: `${OPENED}c` }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11c');
+  });
+
+  it('stopped with its calls whole, before its closing tag, leaves none of it stored or sent back', async () => {
+    const id = 'r11_fenced_array_whole';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${OPENED}d"}}]`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'canary-r11d', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11d');
+  });
+});
+
+/* ── Round 11: a call a bracket short, written without its close ────── */
+
+describe('a call with a closing brace too few, written without its close, the reply going on below it', () => {
+  // Read by nothing at all: `shortCall` needs the form's close token and
+  // `endOfJson` needs the JSON to balance, and this call has neither. So the
+  // tool never ran, no #331 receipt said it had not gone, and the whole
+  // markup, arguments and all, was stored as the reply's words and sent back
+  // in every later request while the reply said it had filed the note.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r11e"}';
+
+  it('runs, is recorded once, and leaves none of itself stored or sent back', async () => {
+    const id = 'r11_short_no_close';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it now.\n${SHORT}\nAll done.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it now.\n\nAll done.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11e');
+  });
+
+  it('is recorded as not sent, and leaves none of itself, when Stop caught the turn after it', async () => {
+    const id = 'r11_short_no_close_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `Filing it now.\n${SHORT}\nAll done, and then`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'All done, and then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nAll done, and then');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11e');
+  });
+});
+
+/* ── Round 11: the calls in one tag, separated by a comma ───────────── */
+
+describe('a call in a tag with a trailing comma after its JSON', () => {
+  // Read as neither a next call nor the tag's close, the whole
+  // `<tool_call>…</tool_call>` was markup to no reader at all: the tool never
+  // ran, no follow-up was asked for, no #331 receipt said it had not gone, and
+  // the model's arguments were stored as the reply's words and sent back in
+  // every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const note = (text: string): string => `{"name":"notes.note","arguments":{"text":"${text}"}}`;
+
+  it('runs once, is recorded, and leaves none of itself stored or sent back', async () => {
+    const id = 'r11_trailing_comma';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it.\n<tool_call>\n${note('canary-r11f')},\n</tool_call>` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person keeps').toBe('Filing it.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11f');
+  });
+
+  it('sends both of two calls a comma separates, and stores neither’s arguments', async () => {
+    const id = 'r11_comma_separated';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both.\n<tool_call>${note('canary-r11g')}, ${note('canary-r11h')}</tool_call>` },
+      { reply: 'Both filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([
+      { text: 'canary-r11g' },
+      { text: 'canary-r11h' },
+    ]);
+    expect(stored.content, 'the words the person keeps').toBe('Filing both.\n\nBoth filed.');
+    const next = JSON.stringify(local.seen.at(-1)?.messages);
+    expect(next, 'the next request').not.toContain('canary-r11g');
+    expect(next, 'the next request').not.toContain('canary-r11h');
+  });
+
+  it('is recorded as not sent when Stop caught the turn after it', async () => {
+    const id = 'r11_trailing_comma_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      {
+        partial: `Filing it.\n<tool_call>\n${note('canary-r11i')},\n</tool_call>\nAnd then`,
+        stall: gate.promise,
+      },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'And then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.toolCalls?.[0]?.receipt, 'the record that the call did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'stopped',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it.\n\nAnd then');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r11i');
+  });
+
+  it('leaves no closing tag behind when the reply went on between the call and it', async () => {
+    const id = 'r11_orphan_close';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Ok.\n<tool_call>\n${note('canary-r11j')}\n\nFiled it.\n</tool_call>` },
+      { reply: 'Done.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(stored.content, 'the words the person keeps, with no markup left in them').toBe(
+      'Ok.\n\n\nFiled it.\n\nDone.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('tool_call');
+  });
+});
+
+/* ── Round 11: every tool leaves the registry mid-turn ──────────────── */
+
+describe('a call a round writes after every tool has left the registry', () => {
+  // Switching an MCP server off, adding one or removing one runs `reconnect`
+  // in state/mcp.ts, which takes every MCP tool out of the registry before it
+  // puts the enabled servers' back. A turn whose round-1 call runs meanwhile
+  // starts round 2 with nothing offered — and `ran` is already true, so the
+  // stripper took the round's markup out of the words while the reader's
+  // narrower gate never looked at it: no batch, no tool result, no follow-up
+  // round, no #331 receipt. The stored reply said it had filed a note the
+  // thread and the export said nothing about.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const note = (text: string): string =>
+    `<tool_call>{"name":"notes.note","arguments":{"text":"${text}"}}</tool_call>`;
+
+  /** The MCP probe, taking its own tool out of the registry the first time it runs. */
+  function departingProbe(): ReturnType<typeof mcpProbe> {
+    const probe = mcpProbe();
+    probe.call.mockImplementation(async () => {
+      toolRegistry.unregister(probe.tool.id);
+      return { content: [{ type: 'text', text: 'filed' }] };
+    });
+    return probe;
+  }
+
+  it('is recorded as not sent, and its markup is stored and sent back by neither', async () => {
+    const id = 'r11_departed_finished';
+    const probe = departingProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `First one.\n${note('canary-r11k')}` },
+      { reply: `Filing the second.\n${note('canary-r11l')}\n\nBoth filed.` },
+      { reply: 'Done.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([{ text: 'canary-r11k' }]);
+    expect(stored.toolCalls?.map((recorded) => recorded.name), 'both calls the turn wrote').toEqual([
+      'notes.note',
+      'notes.note',
+    ]);
+    expect(stored.toolCalls?.[1]?.receipt, 'the record that the second did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+    });
+    expect(stored.content, 'the words the person keeps').toContain('Both filed.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11l');
+  });
+
+  it('is recorded as not sent when Stop caught the turn after it', async () => {
+    const id = 'r11_departed_stopped';
+    const probe = departingProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { reply: `First.\n${note('canary-r11m')}` },
+      { partial: `Filing the second.\n${note('canary-r11n')}\n\nAnd then`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'And then', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((call) => call[2]), 'the notes that went').toEqual([{ text: 'canary-r11m' }]);
+    expect(stopped.toolCalls?.[1]?.receipt, 'the record that the second did not go').toMatchObject({
+      outcome: 'withheld',
+      why: 'server-changed',
+    });
+    expect(stopped.content, 'the words the person watched arrive').toContain('And then');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r11n');
+  });
+
+  it('still reads nothing in a turn where no tool was offered and none ran', async () => {
+    // The gate that keeps a reply documenting Qwen's call format from having
+    // its example dispatched: a chat whose tool ids name nothing connected
+    // offers none, and nothing it writes is a call.
+    const id = 'r11_departed_none_ran';
+    const example = note('canary-r11o');
+    given(chat(id, { tools: ['mcp:notes.note'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([{ reply: `Qwen writes:\n${example}` }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    await useChats.getState().send('how does qwen format a call?');
+    await useChats.getState().send('thanks');
+
+    const stored = assistantRows(id)[1]!;
+    expect(stored.toolCalls ?? [], 'the calls the turn recorded').toEqual([]);
+    expect(stored.content, 'the words the person watched arrive').toBe(`Qwen writes:\n${example}`);
+  });
+});
+
+/* ── Round 12: a call a bracket short that swallowed the next one ───── */
+
+describe('a call a bracket short and unclosed, with a second call below it', () => {
+  // The two malformations this file's own reader calls a small model's
+  // commonest: a closing brace too few with no closing tag, and a brace too
+  // many with its tag. `endOfJson` ran past the sentence between them and
+  // closed on the second call's spare brace, and the second call's own tag
+  // closed the span: one markup covered both calls and the words between
+  // them, read no call at all, and was stripped whole. So neither call was
+  // sent, neither was recorded, no follow-up round ran, and the sentence the
+  // person watched arrive was gone from the stored reply — which said it had
+  // filed two notes that never went.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12a"}';
+  const LONG = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12b"}}}</tool_call>';
+
+  it('sends both, records both, and keeps the sentence the reply wrote between them', async () => {
+    const id = 'r12_swallow';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both.\n${SHORT}\nAnd the second:\n${LONG}\nBoth queued.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r12a' },
+      { text: 'canary-r12b' },
+    ]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'their records').toEqual(['sent', 'sent']);
+    expect(stored.content, 'every word the person watched arrive, and none of the markup').toBe(
+      'Filing both.\n\nAnd the second:\n\nBoth queued.\n\nFiled.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12');
+  });
+
+  it('stopped after the pair: keeps the sentence between them, and is not called stopped', async () => {
+    const id = 'r12_swallow_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: `${SHORT}\nHere is what I found.\n${LONG}`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'Here is what I found.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      { words: stopped.content, stopped: stopped.stopped },
+      'the sentence stays, and the reply is not called stopped before its first word',
+    ).toEqual({ words: 'Here is what I found.', stopped: undefined });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'shown as stopped before its first word').toBeNull();
+      expect(bodyText(), 'what the person reads').toBe('Here is what I found.');
+    });
+    expect(
+      renderTranscript(chat(id), [stopped]),
+      'and the export says the same',
+    ).not.toContain(STOPPED_NOTE);
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'both calls recorded as not sent',
+    ).toEqual(['withheld', 'withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r12');
+  });
+});
+
+/* ── Round 12: the closing marker a reply shows as content ──────────── */
+
+describe('a reply that makes a call and then shows the closing marker in its answer', () => {
+  // The pass that takes out a closing tag the reply left behind asked only
+  // that the nearest `<tool_call>` before it had been read as markup — which
+  // the call the reply had just made was. So the marker the reply wrote as
+  // content, on a line of its own, went with it: the code block the person had
+  // asked for was stored empty, and the sentence lost its example. Only an
+  // opening LEFT UNCLOSED leaves a close behind.
+  const CALL = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r12c"}}</tool_call>';
+
+  for (const [shape, after] of [
+    ['in a code block', '\x60\x60\x60\n</tool_call>\n\x60\x60\x60\n\nThat is the whole format.'],
+    ['in a sentence', 'You close it like this:\n\n</tool_call>\n\nand that is the whole format.'],
+  ] as const) {
+    it(`${shape}: keeps the marker the person watched arrive`, async () => {
+      const id = `r12_shown_${shape.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it.\n${CALL}\nAnd the closing marker is:\n\n${after}` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await drainSheets(useChats.getState().send('file a note, then show me the format'));
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(stored.content, 'the answer the person asked for').toContain(after);
+      expect(stored.content, 'and none of the call').not.toContain('canary-r12c');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12c');
+    });
+  }
+});
+
+/* ── Round 12: a keyword argument's bracket left open ───────────────── */
+
+describe('a call whose list or dict argument is a closing bracket short', () => {
+  // `valueEnd` opened depth on the `[`, never saw a `]` and ran off the end of
+  // the text, which the doc calls the call's structure — where nothing but the
+  // call can stand — so the call was one still being written whatever the
+  // reply's ending, the round was cut at its opening, and every word below it
+  // was lost. At the start of a reply that took the whole visible answer with
+  // it: the row was stored with `content: ''` and left out of every later
+  // request. Nothing was read as a call either, so no tool ran and no receipt
+  // said one had not gone.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '[TOOL_CALLS] notes.note(text="canary-r12d", tags=["errand")';
+
+  it('sends it once, records it, and keeps the sentence the reply wrote below it', async () => {
+    const id = 'r12_short_value';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `I’ll file that.\n${SHORT}\nDone — filed under errand.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+    expect(probe.call.mock.calls[0]?.[2], 'its arguments, the missing bracket supplied').toEqual({
+      text: 'canary-r12d',
+      tags: ['errand'],
+    });
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the words the person watched arrive, and the follow-up’s').toBe(
+      'I’ll file that.\n\nDone — filed under errand.\n\nFiled.',
+    );
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12d');
+  });
+
+  it('at the start of a reply: the answer the person read is kept, and not called stopped', async () => {
+    const id = 'r12_short_value_first';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const answer = 'I could not file that — the tool refused the tag list.';
+    const local = scriptedBackend([{ reply: `${SHORT}\n${answer}` }, { reply: 'Filed.' }, { reply: 'Next.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await drainSheets(useChats.getState().send('file a note'));
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(
+      { starts: stored.content.startsWith(answer), stopped: stored.stopped, markup: stored.content.includes('[TOOL') },
+      'the reply the person watched arrive, kept and not called stopped',
+    ).toEqual({ starts: true, stopped: undefined, markup: false });
+    expect(stored.content, 'and none of the call’s arguments').not.toContain('canary-r12d');
+    expect(spoken(local.seen.at(-1)).some(([, said]) => said.includes(answer)), 'sent back in the next request').toBe(
+      true,
+    );
+  });
+});
+
+/* ── Round 12: a round that ended inside the tool's name ────────────── */
+
+describe('a round cut short or stopped while the tool’s name was streaming', () => {
+  // `CALL_OPENING` needs the `(` or `{` that has not arrived, and the bare
+  // marker the cut already reads does not cover a name after `<tool_call>` or
+  // after this app's own `[tool `. So the marker and the name were stored as
+  // the reply's words and rode in every later request. The window is the
+  // several tokens of a server-qualified MCP name — `notes.note` here.
+  for (const [form, opening, kept] of [
+    ['a tag', 'Filing it now.\n<tool_call>notes.note', 'Filing it now.'],
+    ['a tag, the name on its own line', 'Filing it now.\n<tool_call>\nnotes.note', 'Filing it now.'],
+    ['a tag around a fence, its language half written', 'Filing it now.\n<tool_call>\x60\x60\x60js', 'Filing it now.'],
+    ['this app’s history form', 'I filed it: [tool notes.note', 'I filed it:'],
+  ] as const) {
+    it(`${form}: cut off at its limit on tokens, stores and sends none of it`, async () => {
+      const id = `r12_naming_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(opening), 'Fine.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      expect(assistantRows(id)[1]?.content, 'the stored reply').toBe(kept);
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('notes.note');
+      expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('[tool');
+    });
+  }
+
+  it('stopped while the name was streaming: stores and sends none of it', async () => {
+    const id = 'r12_naming_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n<tool_call>notes.note', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('second', 'Filing it now.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the stored reply').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('tool_call');
+  });
+
+  it('keeps a word no offered tool’s name begins, after the same tag', async () => {
+    const id = 'r12_naming_word';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'The tag is <tool_call>weather';
+    const local = recordingBackend([cutOff(words), 'Fine.']);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('how does a call open?');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    expect(assistantRows(id)[1]?.content, 'the words the person watched arrive').toBe(words);
+  });
+});
+
+/* ── Round 12: a fenced call a small model malformed ────────────────── */
+
+describe('a fenced call to an offered tool with a small model’s commonest JSON malformation', () => {
+  // The fenced block was read with `JSON.parse` where every tag form's body is
+  // read as a small model writes JSON. So a block that unmistakably named an
+  // offered tool and carried its arguments was a call to neither the reader
+  // nor the stripper: the reply said it had filed the note, no tool ran, no
+  // #331 receipt said the call had not gone, and the model's own arguments sat
+  // in the stored row's words and rode in every later request — where the same
+  // body inside `<tool_call>` ran and was stripped.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [malformation, body] of [
+    ['a trailing comma', '{"name": "notes.note", "arguments": {"text": "canary-r12e",}}'],
+    ['single-quoted strings', "{'name': 'notes.note', 'arguments': {'text': 'canary-r12e'}}"],
+    ['unquoted keys', '{name: "notes.note", arguments: {text: "canary-r12e"}}'],
+  ] as const) {
+    it(`${malformation}: is sent once, recorded, and stored nowhere`, async () => {
+      const id = `r12_fenced_${malformation.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n\x60\x60\x60json\n${body}\n\x60\x60\x60\nDone.` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call, 'sent to the server once').toHaveBeenCalledTimes(1);
+      expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({ text: 'canary-r12e' });
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply holds none of the call').not.toContain('canary-r12e');
+      expect(stored.content, 'and every word the person watched arrive').toBe('Filing it now.\n\nDone.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r12e');
+    });
+  }
+
+  it('the ruling reversed (2026-09-27): an extra key and no arguments key now runs, malformed or not', async () => {
+    const id = 'r12_fenced_ruling';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const words = 'Such a block reads:\n\x60\x60\x60json\n{\'id\': \'call_0\', \'name\': \'notes.note\'}\n\x60\x60\x60';
+    const local = scriptedBackend([{ reply: words }, { reply: 'Filed.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('how does a no-argument call look?');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server once, with no arguments').toHaveBeenCalledTimes(1);
+    expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({});
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the stored reply holds none of the call').toBe('Such a block reads:\n\nFiled.');
+  });
+});
+
+/* ── Round 13: a call a bracket short and unclosed, the cut and the words ─ */
+
+describe('a call a bracket short, written without its close, with one line below it', () => {
+  // The cut and `callMarkup` read the same call by different scanners, and
+  // where they disagreed the cut won. `shortCallWithoutClose` ends this call at
+  // the last line its own JSON reaches and runs it; `writesJson` reads it as
+  // JSON still being written to the end of the text, because it accepts the
+  // bare word a text ends in. So the one word the reply wrote below its call
+  // was cut out of the stored reply and out of every later request — and, when
+  // Stop landed after that word had arrived on screen, the row was stored with
+  // no words at all and shown as stopped before its first word.
+  //
+  // With a WHOLE call below it instead, the cut landed on that call's opening,
+  // which left the first call at the end of the cut text: `wordsAfterCall`
+  // refuses a call a text ends on, so its whole markup, arguments and all, was
+  // stored as the reply's words and sent back in every later request, while
+  // both calls really ran.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const SHORT = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13a"}';
+  const WHOLE = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13b"}}</tool_call>';
+
+  it('sends it once, records it, and keeps the word the person watched arrive', async () => {
+    const id = 'r13_short_then_word';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing it now.\n${SHORT}\nDone.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([{ text: 'canary-r13a' }]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'every word the person watched arrive').toBe('Filing it now.\n\nDone.\n\nFiled.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13a');
+  });
+
+  it('stopped once that word is on screen: it stays, and the reply is not called stopped', async () => {
+    const id = 'r13_short_then_word_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([{ partial: `${SHORT}\nDone.`, stall: gate.promise }, { reply: 'Fine.' }]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'Done.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect({ words: stopped.content, stopped: stopped.stopped }, 'the stored reply').toEqual({
+      words: 'Done.',
+      stopped: undefined,
+    });
+    await mounted(stopped, () => {
+      expect(stoppedNote(), 'shown as stopped before its first word').toBeNull();
+      expect(bodyText(), 'what the person reads').toBe('Done.');
+    });
+    expect(renderTranscript(chat(id), [stopped]), 'and the export says the same').not.toContain(STOPPED_NOTE);
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13a');
+  });
+
+  it('with a whole call below it whose follow-up writes nothing: neither is stored or sent back', async () => {
+    // The follow-up round writes no words, so the joined text still ends on the
+    // markup: a second strip cannot save it, and the stranded call is what the
+    // row keeps and what every later request carries.
+    const id = 'r13_short_then_whole';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const local = scriptedBackend([
+      { reply: `Filing both now.\n${SHORT}\n${WHOLE}` },
+      { reply: '' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r13a' },
+      { text: 'canary-r13b' },
+    ]);
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'their records').toEqual(['sent', 'sent']);
+    expect(stored.content, 'the stored reply').toBe('Filing both now.');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13');
+  });
+});
+
+/* ── Round 13: a paren form with a trailing separator ───────────────── */
+
+describe('a call in the paren forms with a comma after its last argument and no closing paren', () => {
+  // b6c345c took the separator a call leaves on its own line into the TAG
+  // form's markup, so `wordsAfterCall` would not read the comma as the start of
+  // a close. The forms that write their arguments in parens still ended at
+  // their last value, before the comma: the call to an offered tool never ran,
+  // no #331 receipt said it had not gone, and its whole markup with the model's
+  // arguments was stored as the reply's words and rode in every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, call] of [
+    ['[TOOL_CALLS], keyword arguments', '[TOOL_CALLS] notes.note(text="canary-r13c",'],
+    ['a tag, keyword arguments', '<tool_call>notes.note(text="canary-r13c",'],
+    ['[TOOL_CALLS], a name and its JSON', '[TOOL_CALLS] notes.note({"text": "canary-r13c"},'],
+  ] as const) {
+    it(`${form}: goes once, is recorded, and is stored nowhere`, async () => {
+      const id = `r13_sep_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n${call}\nAll set.` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+        { text: 'canary-r13c' },
+      ]);
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'every word the person watched arrive').toBe('Filing it now.\n\nAll set.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13c');
+    });
+  }
+
+  it('stopped with the comma written and nothing after it: the call is recorded as not sent', async () => {
+    const id = 'r13_sep_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n[TOOL_CALLS] notes.note(text="canary-r13c",\nAll set.', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'All set.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nAll set.');
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13c');
+  });
+});
+
+/* ── Round 13: the closing marker a reply shows, in two more shapes ─── */
+
+describe('a reply that shows the closing marker after a tag that held two calls, or in a code block', () => {
+  // 22b5210 narrowed the orphan-close pass to an opening LEFT UNCLOSED, asking
+  // the reading it found first. One opening can be read twice: a tag holding
+  // two calls is read loosely at its first call and whole, past its closing
+  // tag, by `readTaggedCalls`, and the loose reading wrote no `</tool_call>` —
+  // so the marker the reply showed as content was deleted again, and the code
+  // block the person asked for was stored empty. And a marker standing inside a
+  // code BLOCK is the block's content whatever the call above it did: a model
+  // closing the tag it left open does not fence the close.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+  const BLOCK = '\x60\x60\x60\n</tool_call>\n\x60\x60\x60';
+
+  it('after a tag holding two calls: both go, and the marker the person asked for stays', async () => {
+    const id = 'r13_shown_after_pair';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const pair =
+      '<tool_call>\n{"name":"notes.note","arguments":{"text":"canary-r13d"}}\n{"name":"notes.note","arguments":{"text":"canary-r13e"}}\n</tool_call>';
+    const local = scriptedBackend([
+      { reply: `Filing both.\n${pair}\nA call ends with:\n${BLOCK}\nThat is all.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file two notes, then show me the format');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+      { text: 'canary-r13d' },
+      { text: 'canary-r13e' },
+    ]);
+    expect(stored.content, 'the block the person asked for').toContain(BLOCK);
+    expect(stored.content, 'and none of the calls').not.toContain('canary-r13');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13d');
+  });
+
+  it('in a code block below a call written without its close: the block stays', async () => {
+    const id = 'r13_shown_in_block';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const unclosed = '<tool_call>{"name":"notes.note","arguments":{"text":"canary-r13f"}}';
+    const local = scriptedBackend([
+      { reply: `Working.\n${unclosed}\nEvery call ends with this marker:\n${BLOCK}\nThat is all.` },
+      { reply: 'Filed.' },
+      { reply: 'Next.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await useChats.getState().send('file a note, then show me the end marker');
+      await useChats.getState().send('thanks');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stored = assistantRows(id)[1]!;
+    expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([{ text: 'canary-r13f' }]);
+    expect(stored.content, 'the block the person asked for').toContain(BLOCK);
+    expect(stored.content, 'and none of the call').not.toContain('canary-r13f');
+    expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13f');
+  });
+});
+
+/* ── Round 13: Mistral’s own [TOOL_CALLS] and its JSON ──────────────── */
+
+describe('a local Mistral writing its canonical call: the marker and then its JSON', () => {
+  // This file's own docs call `[TOOL_CALLS]` Mistral-style, and Mistral's real
+  // output is the special token followed DIRECTLY by a JSON list of calls. Every
+  // reader of the marker wanted a name and a `(` after it, so the canonical form
+  // was markup to none of them: the tool never ran, no follow-up round was asked
+  // for, `runToolCalls` was never handed the call so no #331 receipt said it had
+  // not gone, and the whole markup with the model's arguments was stored as the
+  // reply's words and rode in every later request.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [form, body] of [
+    ['a list of calls', '[{"name": "notes.note", "arguments": {"text": "canary-r13g"}}]'],
+    ['one object', ' {"name": "notes.note", "arguments": {"text": "canary-r13g"}}'],
+    ['single-quoted', "[{'name': 'notes.note', 'arguments': {'text': 'canary-r13g'}}]"],
+  ] as const) {
+    it(`${form}: goes once, is recorded, and is stored nowhere`, async () => {
+      const id = `r13_mistral_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n[TOOL_CALLS]${body}` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'sent to the server').toEqual([
+        { text: 'canary-r13g' },
+      ]);
+      expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13g');
+    });
+  }
+
+  it('stopped inside its arguments: none of it is stored, and none is sent back', async () => {
+    const id = 'r13_mistral_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const local = scriptedBackend([
+      { partial: 'Filing it now.\n[TOOL_CALLS][{"name": "notes.note", "arguments": {"text": "canary-r13g', stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'canary-r13g', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(stopped.content, 'the stored reply').toBe('Filing it now.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13g');
+  });
+
+  it('cut short at its limit on tokens with the call whole: the tag form’s turn, exactly', async () => {
+    // Whatever a round cut off at its limit does with a whole call, the two
+    // forms must do the same: one reading, whichever marker the model wrote.
+    const outcomes: { words: string; sent: unknown[]; records: (string | undefined)[]; leaked: boolean }[] = [];
+    for (const [form, call] of [
+      ['Mistral’s marker and its JSON', '[TOOL_CALLS][{"name": "notes.note", "arguments": {"text": "canary-r13h"}}]'],
+      ['a tag', '<tool_call>{"name": "notes.note", "arguments": {"text": "canary-r13h"}}</tool_call>'],
+    ] as const) {
+      const id = `r13_mistral_cut_${form.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = recordingBackend([cutOff(`Filing it now.\n${call}`), 'Filed.', 'Next.']);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      outcomes.push({
+        words: stored.content,
+        sent: probe.call.mock.calls.map((went) => went[2]),
+        records: stored.toolCalls?.map((recorded) => recorded.receipt?.outcome) ?? [],
+        leaked: JSON.stringify(local.seen.at(-1)?.messages).includes('canary-r13h'),
+      });
+    }
+
+    expect(outcomes[0], 'Mistral’s form and the tag form').toEqual(outcomes[1]);
+    expect(outcomes[0]?.words, 'the stored reply holds none of the markup').not.toContain('TOOL_CALLS');
+    expect(outcomes[0]?.leaked, 'the call’s arguments, sent back').toBe(false);
+  });
+});
+
+/* ── Round 13: OpenAI’s own wire shapes inside a tag ────────────────── */
+
+describe('a call written in OpenAI’s wire shapes: a nested function object, and string arguments', () => {
+  // A call whose `function` is an OBJECT was read by nothing, and the tag round
+  // it was stripped all the same — a tag is markup whatever its body holds — so
+  // the words lost a call that nothing ran and no #331 receipt recorded. And a
+  // call whose `arguments` were OpenAI's JSON-encoded STRING ran with `{}`: the
+  // empty object was what left the device, and the receipt beside it said the
+  // call had carried two bytes.
+  const GRANT = { kind: 'mcp', serverId: PROBE_SERVER.serverId, url: PROBE_SERVER.url, grantedAt: 1 } as const;
+
+  for (const [shape, body] of [
+    [
+      'a nested function object',
+      '{"type": "function", "function": {"name": "notes.note", "arguments": {"text": "canary-r13i"}}}',
+    ],
+    ['arguments as a JSON string', '{"name": "notes.note", "arguments": "{\\"text\\": \\"canary-r13i\\"}"}'],
+    [
+      'both at once',
+      '{"id": "call_0", "type": "function", "function": {"name": "notes.note", "arguments": "{\\"text\\": \\"canary-r13i\\"}"}}',
+    ],
+  ] as const) {
+    it(`${shape}: carries what the model wrote, and the receipt says so`, async () => {
+      const id = `r13_openai_${shape.replace(/\W+/g, '_')}`;
+      const probe = mcpProbe();
+      given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+      const local = scriptedBackend([
+        { reply: `Filing it now.\n<tool_call>${body}</tool_call>` },
+        { reply: 'Filed.' },
+        { reply: 'Next.' },
+      ]);
+      engineWith(local);
+
+      try {
+        toolRegistry.register(probe.tool);
+        await useChats.getState().send('file a note');
+        await useChats.getState().send('thanks');
+      } finally {
+        toolRegistry.unregister(probe.tool.id);
+      }
+
+      const stored = assistantRows(id)[1]!;
+      expect(probe.call.mock.calls.map((went) => went[2]), 'what left the device').toEqual([
+        { text: 'canary-r13i' },
+      ]);
+      expect(
+        stored.toolCalls?.map((recorded) => ({
+          outcome: recorded.receipt?.outcome,
+          bytes: recorded.receipt?.bytes,
+          input: recorded.input,
+        })),
+        'the record beside it',
+      ).toEqual([{ outcome: 'sent', bytes: JSON.stringify({ text: 'canary-r13i' }).length, input: { text: 'canary-r13i' } }]);
+      expect(stored.content, 'the stored reply').toBe('Filing it now.\n\nFiled.');
+      expect(JSON.stringify(local.seen.at(-1)?.messages), 'the next request').not.toContain('canary-r13i');
+    });
+  }
+
+  it('stopped before a nested-function call went: it is recorded as not sent, not silently stripped', async () => {
+    const id = 'r13_openai_stopped';
+    const probe = mcpProbe();
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const gate = held();
+    const call = '{"type": "function", "function": {"name": "notes.note", "arguments": {"text": "canary-r13j"}}}';
+    const local = scriptedBackend([
+      { partial: `Filing it now.\n<tool_call>${call}</tool_call>\nDone — it is filed.`, stall: gate.promise },
+      { reply: 'Fine.' },
+    ]);
+    engineWith(local);
+
+    try {
+      toolRegistry.register(probe.tool);
+      await stopAfterSome('file a note', 'Done — it is filed.', gate.release);
+      await useChats.getState().send('third');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+
+    const stopped = assistantRows(id)[1]!;
+    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
+    expect(
+      stopped.toolCalls?.map((recorded) => recorded.receipt?.outcome),
+      'the call recorded as not sent',
+    ).toEqual(['withheld']);
+    expect(stopped.content, 'the words the person watched arrive').toBe('Filing it now.\n\nDone — it is filed.');
+    expect(JSON.stringify(local.seen[1]?.messages), 'the next request').not.toContain('canary-r13j');
+  });
+});

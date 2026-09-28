@@ -21,8 +21,10 @@ Consequence for the inbound privacy copy (#221): it must say a phone's turn can 
 - **The branch keeps iterating** review-and-fix rounds until a round finds nothing medium or higher.
 
 ## Tool-call shapes (ruled 2026-09-19, confirming what the branch does)
-- **A fenced JSON block with an extra key and no `arguments` key is words, not a call.** "Extra keys are allowed" means keys beside a name AND its arguments, so `{"id": "call_0", "name": "get_datetime"}` does not run, and neither does `{"name": "calculator", "version": "1.0.0"}` when `calculator` is an offered tool. A real no-argument call carries an arguments key.
 - **A `[tool name({…})]` repeated in one turn with the same name and arguments is a recount, not a retry.** It is stripped, not run and not recorded, so a model narrating its own call in the app's history form never runs the tool twice. A deliberate retry written that exact way after an error does not run; the same call written with the tool's id still does.
+
+## Tool-call shapes (ruled 2026-09-27, reversing the 2026-09-19 ruling above)
+- **A fenced JSON block naming a tool the request offered, with no `arguments` key, written with other keys, IS a call.** `{"id": "call_0", "name": "get_datetime"}` now runs, and so does `{"name": "calculator", "version": "1.0.0"}` when `calculator` is an offered tool — with whatever the tool does with empty or missing arguments, validated and refused honestly through the normal path, never by crashing. This reverses the 2026-09-19 ruling that kept such a record as words. It does not relax the offered-name check itself: a name that is not an offered tool (by id or by name) stays words whatever other keys it holds, and a tool's id sitting in some OTHER field of the record (its own `"id"` key, say) is not read as if it were the record's name.
 
 ## Earlier today
 - A desktop turn holds the work broker's shared slot for the whole turn, tool calls included (#7).

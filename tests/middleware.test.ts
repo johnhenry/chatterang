@@ -236,6 +236,35 @@ describe('tool middleware', () => {
     // the text of an error path rather than of the answer.
     expect((result.metadata.custom?.toolCalls as ExecutedTool[])[0]?.output).toBe('42');
   });
+
+  it('does not run a call again when the follow-up recounts it as a text template’s history shows it', async () => {
+    // `messageText` in ai/prompt.ts writes the call that ran into the
+    // follow-up's history as `[tool multiply({"a":6,"b":7})]`.
+    const middleware = createToolMiddleware({ registry });
+    const backend = {
+      execute: vi
+        .fn()
+        .mockResolvedValueOnce(response('I ran [tool multiply({"a":6,"b":7})] and it is 42.'))
+        .mockResolvedValue(response('Should not be asked for.')),
+    } as unknown as BackendAdapter;
+    const next = vi.fn(async () =>
+      response('<tool_call>{"name":"multiply","arguments":{"a":6,"b":7}}</tool_call>'),
+    );
+
+    const result = await middleware(
+      context({
+        request: request({
+          tools: [{ name: 'multiply', description: 'x', parameters: { type: 'object' } }],
+        }),
+        backend,
+      }),
+      next,
+    );
+
+    expect(result.metadata.custom?.toolCalls as ExecutedTool[], 'the calls that ran').toHaveLength(1);
+    expect(backend.execute, 'follow-ups').toHaveBeenCalledTimes(1);
+    expect(result.message.content).toBe('I ran  and it is 42.');
+  });
 });
 
 /* ── Resilience middleware ──────────────────────────────────────────── */
@@ -706,6 +735,44 @@ describe('tool enablement is enforced', () => {
     );
     // The model still reads a `tool_result` saying so, the same as any other
     // refusal — it is a refusal, not a call silently dropped.
+    expect(results).toHaveLength(1);
+  });
+
+  it('records a call from a reply that failed as not sent, runs nothing, and asks nobody about it (refs #293)', async () => {
+    // The failed reply's words have their calls read out, as a finished
+    // reply's are, so this record is what says the model wrote a call that did
+    // not go. As past the round limit: nothing runs, nobody is asked, and only
+    // a call with a destination is recorded.
+    const destination = {
+      kind: 'mcp' as const,
+      serverId: 'mcp_notes',
+      serverName: 'notes',
+      host: 'notes.example',
+      url: 'https://notes.example/mcp',
+    };
+    const spy = spyTool('mcp:notes.note', 'notes.note');
+    const tool: ChatterangTool = { ...spy.tool, destination };
+    const local = spyTool('calculator');
+    const isGranted = vi.fn(() => true);
+    const request = vi.fn(async (): Promise<'calls'> => 'calls');
+
+    const { results, executed } = await runToolCalls(
+      new ToolRegistry([tool, local.tool]),
+      [
+        { type: 'tool_use' as const, id: 'c0', name: 'notes.note', input: { text: 'x' } },
+        { type: 'tool_use' as const, id: 'c1', name: 'calculator', input: {} },
+      ],
+      { enabledIds: [tool.id, local.tool.id], destinations: { isGranted, request }, replyFailed: true },
+    );
+
+    expect(spy.execute, 'nothing runs after the reply failed').not.toHaveBeenCalled();
+    expect(local.execute, 'not a local tool either').not.toHaveBeenCalled();
+    expect(isGranted, 'nobody is asked whether the destination is already granted').not.toHaveBeenCalled();
+    expect(request, 'nobody is asked').not.toHaveBeenCalled();
+    expect(executed.map((record) => record.receipt)).toEqual([
+      expect.objectContaining({ outcome: 'withheld', why: 'reply-failed', host: 'notes.example', toolName: 'notes.note' }),
+    ]);
+    expect(executed[0]?.output).toBe('This call’s arguments were not sent to notes.example: the reply failed before it went.');
     expect(results).toHaveLength(1);
   });
 
