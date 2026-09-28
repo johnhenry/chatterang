@@ -191,6 +191,22 @@ export interface PlatformCapabilities {
    * whose camera request is refused.
    */
   readonly cameraScan: boolean;
+  /**
+   * Can a person here add a local agent CLI (`claude`, `codex`) as a chat
+   * provider (#42, #115)?
+   *
+   * TRUE ONLY WHERE THE `Cli` PLUGIN HAS A REAL IMPLEMENTATION.
+   * `apps/desktop/src/cli/cli-plugin.ts` is the one and only implementation,
+   * registered by `apps/desktop/src/main.ts` — no other shell registers it,
+   * so `src/plugins/cli/web.ts`'s fallback (used by web, ios, android, and
+   * server alike, since none of them seeds a native `Cli` header) refuses
+   * every call honestly rather than pretending a binary was found. This is a
+   * table row, not a plugin probe, for the same reason `folderGrants` is:
+   * a live probe would have to spawn a subprocess to find out, and the
+   * whole point of #116's "explicit add, never ambient" ruling is that
+   * nothing probes for a CLI before the user asks Settings to look.
+   */
+  readonly cliAgents: boolean;
 }
 
 /**
@@ -203,6 +219,7 @@ export interface PlatformCapabilities {
  *   purchases    false            true             false             false
  *   folderGrants false            false            true              false
  *   cameraScan   true             true             false             false
+ *   cliAgents    false            false            true              false
  */
 const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.freeze({
   web: {
@@ -215,6 +232,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // A browser on a phone can scan. `getUserMedia` needs a secure origin,
     // which a served PWA has.
     cameraScan: true,
+    cliAgents: false,
   },
   ios: {
     id: 'ios',
@@ -226,6 +244,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // Only because `patch-native.mjs` adds NSCameraUsageDescription — without
     // it WKWebView exposes no `navigator.mediaDevices` at all (#128).
     cameraScan: true,
+    cliAgents: false,
   },
   android: {
     id: 'android',
@@ -237,6 +256,7 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // `patch-native.mjs` declares CAMERA with the hardware optional, so a
     // camera-less tablet still installs and falls back to Type.
     cameraScan: true,
+    cliAgents: false,
   },
   electron: {
     id: 'electron',
@@ -251,6 +271,9 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // The desktop DRAWS pairing codes; it does not scan them. Its permission
     // handler also denies `media` — see the field's doc.
     cameraScan: false,
+    // The one true row here too: `apps/desktop/src/main.ts` is the only
+    // shell that registers a real `Cli` implementation.
+    cliAgents: true,
   },
   /*
    * A9: the bundle served by `apps/server`, running in an ordinary browser
@@ -316,6 +339,10 @@ const PLATFORMS: Readonly<Record<PlatformId, PlatformCapabilities>> = Object.fre
     // A served deployment draws the code for a phone to scan. The browser
     // viewing it is not the device that pairs.
     cameraScan: false,
+    // Spawning a CLI binary on the OPERATOR's machine on behalf of someone
+    // sitting elsewhere is exactly the `folderGrants` server problem again:
+    // nobody at the other end to consent, so no grant.
+    cliAgents: false,
   },
 });
 
@@ -342,6 +369,8 @@ function unknownPlatform(id: string): PlatformCapabilities {
     folderGrants: false,
     // No claims on an unknown shell's behalf. The typed route still works.
     cameraScan: false,
+    // No claims on an unknown shell's behalf either.
+    cliAgents: false,
   };
 }
 

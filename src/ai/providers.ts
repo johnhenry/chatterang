@@ -288,6 +288,56 @@ export const PROVIDERS: readonly ProviderDescriptor[] = [
       });
     },
   },
+  /**
+   * The two local agent CLIs this build has a stream translator for (#42,
+   * #115, #119) — `gemini` stays out, per the owner's deferral (its Google
+   * login is refused for the account that tried it; `src/ai/backends/cli.ts`'s
+   * `SUPPORTED_CLI_IDS` is the same list, kept in sync by
+   * `tests/cli-providers-catalog.test.ts`).
+   *
+   * `load()` ignores `config` entirely — the `ApiKeyBackendAdapterConfig`
+   * shape (`apiKey`, `baseURL`, ...) is an HTTP shape, and a CLI connection's
+   * `apiKey`/`baseUrl` are always empty strings (see `needsKey`/`needsBaseUrl`
+   * below). What it builds instead is exactly what `src/ai/backends/cli.ts`'s
+   * own doc says a caller should: a `CliBackendAdapter` over
+   * `createCliTurnBridge` over the real registered `Cli` Capacitor plugin —
+   * the same plugin `ProvidersPanel`'s "Find" button calls `discover` on.
+   */
+  {
+    id: 'cli-claude',
+    label: 'Claude Code',
+    kind: 'local-cli',
+    note: 'Messages go to Anthropic, sent by the claude binary using your own Claude Code login. Chatterang never sees or stores a key for it (#113).',
+    needsKey: false,
+    needsBaseUrl: false,
+    async load() {
+      const [{ CliBackendAdapter }, { createCliTurnBridge }, { Cli }] = await Promise.all([
+        import('./backends/cli'),
+        import('./backends/cli-bridge'),
+        import('@/plugins/cli'),
+      ]);
+      return new CliBackendAdapter('claude', createCliTurnBridge(Cli));
+    },
+  },
+  {
+    id: 'cli-codex',
+    label: 'Codex',
+    kind: 'local-cli',
+    // The residual, worded exactly as `apps/desktop/src/bridge/cli-specs.ts`
+    // requires of anyone who surfaces this CLI in product copy: never
+    // "sandboxed" (reads as "safe"), always the measured shape.
+    note: 'Messages go to OpenAI, sent by the codex binary using your own Codex login. Chatterang never sees or stores a key for it (#113). Codex can run shell commands confined to this turn’s folder, with network denied.',
+    needsKey: false,
+    needsBaseUrl: false,
+    async load() {
+      const [{ CliBackendAdapter }, { createCliTurnBridge }, { Cli }] = await Promise.all([
+        import('./backends/cli'),
+        import('./backends/cli-bridge'),
+        import('@/plugins/cli'),
+      ]);
+      return new CliBackendAdapter('codex', createCliTurnBridge(Cli));
+    },
+  },
 ];
 
 /**

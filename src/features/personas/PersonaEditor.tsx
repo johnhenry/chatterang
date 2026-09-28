@@ -21,6 +21,7 @@ import { useApp } from '@/state/app';
 import { useMcp } from '@/state/mcp';
 import { useProviderConsent } from '@/state/provider-consent';
 import { narrowToolPolicy, providerDestinationLabel } from '@/state/chat';
+import { getProvider } from '@/ai/providers';
 import { TOOL_ITERATIONS } from '@/ai/engine';
 import { toolRegistry } from '@/ai/tools/registry';
 import { Avatar } from '@/features/personas/Avatar';
@@ -108,6 +109,14 @@ export function PersonaEditor({
       : models.filter((model) => requiredCaps.every((cap) => model.manifest.capabilities.includes(cap)));
 
   const connections = useApp(useShallow((state) => state.connections));
+  // #23/#122's 'cli-agent' kind can now name one of the user's OWN local-cli
+  // connections (#42, #115) -- restricted to `kind: 'local-cli'` here so a
+  // persona cannot end up naming an ordinary remote connection under the
+  // wrong kind; `resolvePersonaProvider` (`src/state/chat.ts`) applies the
+  // identical restriction on the read side.
+  const cliConnections = connections.filter(
+    (connection) => getProvider(connection.providerId)?.kind === 'local-cli',
+  );
   const mcpServers = useMcp(useShallow((state) => state.servers));
   const allowedMcpServerIds = mcpServers.filter((server) => server.enabled).map((server) => server.id);
 
@@ -329,24 +338,28 @@ export function PersonaEditor({
                 One of your connections
               </button>
               {/*
-                Recognised by the domain type and round-tripped by
-                sanitizeAgentConfig (#23, #122), but nothing resolves it to a
-                backend yet — another track owns that target kind. Disabled
-                here rather than hidden, so the persona editor's shape is
-                already the one this will slot into.
+                #42, #115: no longer a placeholder. `resolvePersonaProvider`
+                (`src/state/chat.ts`) now resolves this to a real
+                `CliBackendAdapter` connection the same way `remote-connection`
+                resolves to any other one -- disabled only when the user has
+                not added a local-cli connection yet, exactly like the
+                `remote-connection` chip above is disabled with none at all.
               */}
               <button
                 type="button"
                 className="chip chip--button"
-                aria-pressed={false}
-                disabled
-                title="Coming soon — the command-line agent track hasn't landed yet"
+                aria-pressed={providerKind === 'cli-agent'}
+                disabled={cliConnections.length === 0}
+                title={cliConnections.length === 0 ? 'Add a local CLI in Settings first' : undefined}
+                onClick={() =>
+                  setProvider({ kind: 'cli-agent', connectionId: cliConnections[0]?.id })
+                }
               >
-                CLI agent (coming soon)
+                CLI agent
               </button>
             </div>
 
-            {providerKind === 'remote-connection' ? (
+            {providerKind === 'remote-connection' || providerKind === 'cli-agent' ? (
               <div className="field">
                 <label className="field__label" htmlFor="persona-connection">
                   Connection
@@ -356,11 +369,11 @@ export function PersonaEditor({
                   className="select"
                   value={agentConfig?.provider?.connectionId ?? ''}
                   onChange={(event) =>
-                    setProvider({ kind: 'remote-connection', connectionId: event.target.value || undefined })
+                    setProvider({ kind: providerKind, connectionId: event.target.value || undefined })
                   }
                 >
                   <option value="">Choose a connection</option>
-                  {connections.map((connection) => (
+                  {(providerKind === 'cli-agent' ? cliConnections : connections).map((connection) => (
                     <option key={connection.id} value={connection.id}>
                       {connection.label}
                     </option>

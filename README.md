@@ -106,15 +106,22 @@ What can leave the device, each only when you turn it on:
 
 1. **Model search and downloads**, to Hugging Face — both what you type into
    the search box and the files you fetch.
-2. **Messages to a remote provider**, if you connect one. Each provider states
-   plainly what connecting it means, self-hosted endpoints are grouped
-   separately from cloud ones, and every remote reply is marked in the thread.
-   A persona you wrote yourself can prefer a connection you have set up
-   without asking again — you already decided. A persona imported from a file
-   or acquired from the marketplace asks once, naming the destination, before
-   its first message goes there; declining sends nothing to it and the chat
-   falls back the same way it would with no preference at all, and the
-   allowance can be revoked from the persona's own editor at any time.
+2. **Messages to a remote provider**, if you connect one — off until you add
+   one, the same as every route below. Each provider states plainly what
+   connecting it means, self-hosted endpoints are grouped separately from
+   cloud ones, and every remote reply is marked in the thread. A local agent
+   CLI (Claude Code, Codex — desktop only) counts too, in its own group: it
+   runs as a subprocess on this device but reaches its own vendor there under
+   your own login, Chatterang never sees or stores a key for it, and its
+   reply says so in the thread — it ran through the local CLI and reached its
+   vendor, never merely "on device." A persona you wrote yourself can prefer a
+   connection you have set up without asking again — you already decided. A
+   persona imported from a file or acquired from the marketplace asks once,
+   naming the destination, before its first message goes there — the same
+   rule for a local CLI as for any other connection; declining sends nothing
+   to it and the chat falls back the same way it would with no preference at
+   all, and the allowance can be revoked from the persona's own editor at any
+   time.
 3. **Tool output, and anything derived from it**, when a tool runs in a chat a
    remote model is serving — for `bash` that is this app's own data. The app
    asks first and withholds it if you decline. "Derived" is meant literally: a

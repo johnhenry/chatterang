@@ -88,6 +88,7 @@ describe('the capability table', () => {
       // it landed". A handle cannot answer the resolve half.
       folderGrants: false,
       cameraScan: true,
+      cliAgents: false,
     });
   });
 
@@ -107,6 +108,7 @@ describe('the capability table', () => {
         // NSCameraUsageDescription; without it `navigator.mediaDevices` is
         // undefined in WKWebView (dev/probe-128).
         cameraScan: true,
+        cliAgents: false,
       });
     });
   }
@@ -135,6 +137,9 @@ describe('the capability table', () => {
       // The desktop draws codes rather than scanning them, and its Electron
       // permission handler (apps/desktop/src/permissions.ts) denies `media`.
       cameraScan: false,
+      // #42/#115's one true row too: `apps/desktop/src/main.ts` registers
+      // the one real `Cli` plugin implementation.
+      cliAgents: true,
     });
   });
 
@@ -186,6 +191,7 @@ describe('the capability table', () => {
       purchases: false,
       folderGrants: false,
       cameraScan: false,
+      cliAgents: false,
     });
 
     /*
@@ -225,6 +231,8 @@ describe('the capability table', () => {
     expect(unknown.folderGrants).toBe(false);
     // Nor a camera: an unknown shell's permission model is unknown too.
     expect(unknown.cameraScan).toBe(false);
+    // Nor a CLI agent: an unknown shell registers no `Cli` plugin either.
+    expect(unknown.cliAgents).toBe(false);
     // It reports its own id rather than claiming to be one of the four.
     expect(unknown.id).toBe('some-future-shell');
   });

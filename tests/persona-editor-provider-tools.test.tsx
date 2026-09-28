@@ -92,6 +92,19 @@ const ANTHROPIC: ProviderConnection = {
   createdAt: 0,
 };
 
+/** A local-cli connection (#42, #115) -- absent from every other test's fixture list on purpose. */
+const CLAUDE_CLI: ProviderConnection = {
+  id: 'conn_cli_claude',
+  providerId: 'cli-claude',
+  label: 'Claude Code',
+  apiKey: '',
+  baseUrl: '',
+  defaultModel: '',
+  enabled: true,
+  models: [],
+  createdAt: 1,
+};
+
 function persona(overrides: Partial<Persona> = {}): Persona {
   return {
     id: 'p1',
@@ -290,10 +303,45 @@ describe('Model & provider', () => {
     });
   });
 
-  it('the CLI agent option is present but disabled', async () => {
+  it('the CLI agent option is present but disabled when no local-cli connection has been added', async () => {
     await render(createElement(PersonaEditor, { persona: persona(), onClose: () => {} }));
     const cli = chipFor('CLI agent');
     expect(cli?.disabled).toBe(true);
+  });
+
+  it('choosing a local-cli connection sets agentConfig.provider kind cli-agent (#42, #115)', async () => {
+    useApp.setState({ connections: [ANTHROPIC, CLAUDE_CLI] });
+    await render(createElement(PersonaEditor, { persona: persona(), onClose: () => {} }));
+
+    const cli = chipFor('CLI agent');
+    expect(cli?.disabled).toBe(false);
+    await act(async () => {
+      cli?.click();
+    });
+
+    const select = document.querySelector<HTMLSelectElement>('#persona-connection');
+    expect(select).not.toBeNull();
+    // Only the CLI connection is offered, never the ordinary remote one.
+    const options = [...(select?.options ?? [])].map((option) => option.textContent);
+    expect(options).toContain('Claude Code');
+    expect(options).not.toContain('Anthropic');
+
+    await act(async () => {
+      if (select) {
+        select.value = 'conn_cli_claude';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+
+    expect(document.body.textContent).toContain('Claude Code (local CLI)');
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('.btn--primary')?.click();
+    });
+    expect(usePersonas.getState().byId['p1']?.agentConfig?.provider).toEqual({
+      kind: 'cli-agent',
+      connectionId: 'conn_cli_claude',
+    });
   });
 });
 

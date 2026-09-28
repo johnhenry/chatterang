@@ -5,7 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { CopyButton } from '@/ui/primitives';
 import { frameDocument } from '@/ui/frame';
 import type { Message, MessageVariant, ToolInvocation } from '@/domain/chat';
-import { currentVariant, ranOnDevice } from '@/domain/chat';
+import { currentVariant, ranOnDevice, ranThroughLocalCli } from '@/domain/chat';
 import { mayHaveLeft, unhandledOutcome, unhandledWhy, type McpCallReceipt } from '@/domain/mcp';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
@@ -179,10 +179,25 @@ export function MessageView({
             three), and the chip that tells a paired desktop apart from a
             provider is #210–#219, which owns the copy. */}
         {provenance ? (
-          <span className={`chip ${ranOnDevice(provenance) ? 'chip--local' : 'chip--remote'}`}>
-            <Icon name={ranOnDevice(provenance) ? 'flame' : 'cloud'} size={10} />
-            {ranOnDevice(provenance) ? 'On device' : 'Remote'}
-          </span>
+          ranThroughLocalCli(provenance) ? (
+            // #42, #112: a local agent CLI ran HERE and still reached a
+            // third party under the user's own CLI login -- checked BEFORE
+            // `ranOnDevice` below, which would otherwise say "On device" for
+            // this exact shape (`reach.host.kind` really is `'device'`) and
+            // hide the vendor it actually reached.
+            <span
+              className="chip chip--remote"
+              title={`Ran through the local CLI, and reached ${provenance.modelName} there -- never only on this device.`}
+            >
+              <Icon name="cloud" size={10} />
+              Local CLI, reached its vendor
+            </span>
+          ) : (
+            <span className={`chip ${ranOnDevice(provenance) ? 'chip--local' : 'chip--remote'}`}>
+              <Icon name={ranOnDevice(provenance) ? 'flame' : 'cloud'} size={10} />
+              {ranOnDevice(provenance) ? 'On device' : 'Remote'}
+            </span>
+          )
         ) : null}
         {/* The chip says where the reply was made. This says what went with
             the request — a remote turn that carried the contents of your

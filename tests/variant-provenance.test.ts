@@ -110,16 +110,17 @@ const ON_DEVICE: Provenance = {
 /**
  * The snapshot the real engine would emit for a stored record.
  *
- * The ENGINE still reports a boolean — `ProvenanceSnapshot.local`, which #188
- * owns — and `state/chat.ts` is where it becomes a `Reach`. The fixtures below
- * are written as the record the app STORES, so this converts one back into the
- * shape the engine hands over, `reach` and all removed. Passing the record
- * through unchanged would let a store that simply copied `event.provenance`
- * pass a test about deriving it.
+ * The engine reports BOTH a boolean (`ProvenanceSnapshot.local`, pinned by
+ * `tests/engine.test.ts`) and the real `reach` itself (#42, #112 — added
+ * because `local` alone cannot tell `REACH_DEVICE` apart from
+ * `REACH_LOCAL_VIA_THIRD_PARTY`; both run "here"). The fixtures below are
+ * written as the record the app STORES, so this converts one back into the
+ * shape the engine hands over — recomputing `local` rather than trusting the
+ * fixture's, so a store that simply copied `event.provenance` still has
+ * something of its own to derive.
  */
 function snapshotOf(provenance: Provenance): Record<string, unknown> {
-  const { reach: _derived, ...rest } = provenance;
-  return { ...rest, local: ranOnDevice(provenance) };
+  return { ...provenance, local: ranOnDevice(provenance) };
 }
 
 interface Turn {

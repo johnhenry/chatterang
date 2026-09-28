@@ -24,7 +24,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ProviderConnection } from '@/ai/providers';
 import type { Persona } from '@/domain/persona';
-import { REACH_REMOTE } from '@/domain/chat';
+import { REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE } from '@/domain/chat';
 
 const tables = vi.hoisted(() => ({
   chats: { put: vi.fn(async () => {}), delete: vi.fn(async () => {}), toArray: async () => [] },
@@ -50,6 +50,7 @@ const { useChats } = await import('@/state/chat');
 const { useApp } = await import('@/state/app');
 const { useModels } = await import('@/state/models');
 const { usePersonas } = await import('@/state/personas');
+const { useProviderConsent } = await import('@/state/provider-consent');
 
 const OPENAI: ProviderConnection = {
   id: 'conn_openai',
@@ -111,6 +112,14 @@ async function dispatchFrom(connections: readonly ProviderConnection[]): Promise
   useApp.setState({
     toasts: [],
     connections: [...connections],
+    // #42, #115: an ungranted imported/marketplace persona's `send` awaits
+    // `requestApproval` before `resolveTarget` (see
+    // `tests/persona-provider-consent.test.ts`'s own doc on this exact stub)
+    // -- every other test in this file uses an 'authored' persona, which
+    // routes silently and never reaches it, but the cli-agent consent test
+    // below uses 'imported' and would otherwise hang the way that file
+    // warns about.
+    requestApproval: async () => false,
     engine: {
       async *stream({ target }: { target: Record<string, unknown> }) {
         seen = { ...target };
@@ -269,7 +278,61 @@ describe('agentConfig.provider — remote-connection', () => {
   });
 });
 
-describe('agentConfig.provider — cli-agent (placeholder, resolved by nothing yet)', () => {
+describe('agentConfig.provider — remote-connection, naming a local-cli connection (#42, #115)', () => {
+  const CLAUDE_CLI: ProviderConnection = {
+    id: 'conn_cli_claude',
+    providerId: 'cli-claude',
+    label: 'Claude Code',
+    apiKey: '',
+    baseUrl: '',
+    defaultModel: '',
+    enabled: true,
+    models: [],
+    createdAt: 3,
+  };
+
+  beforeEach(() => {
+    useModels.setState({ activeModelId: null, installed: {} });
+  });
+
+  it('produces REACH_LOCAL_VIA_THIRD_PARTY, never REACH_REMOTE, for the CLI connection', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'remote-connection', connectionId: 'conn_cli_claude' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, CLAUDE_CLI]);
+
+    expect(sent.target).toEqual({
+      backendId: CLAUDE_CLI.id,
+      engine: 'remote',
+      modelId: '',
+      modelName: CLAUDE_CLI.label,
+      reach: REACH_LOCAL_VIA_THIRD_PARTY,
+    });
+  });
+
+  it('falls back to the ordinary first-enabled connection exactly as before when the CLI one is disabled', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'remote-connection', connectionId: 'conn_cli_claude' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, { ...CLAUDE_CLI, enabled: false }]);
+    expect((sent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+    expect((sent.target as { reach?: unknown } | null)?.reach).toEqual(REACH_REMOTE);
+  });
+});
+
+describe('agentConfig.provider — cli-agent naming a connection that is NOT local-cli', () => {
   it('falls back to ordinary resolution, exactly as if no provider were set', async () => {
     useModels.setState({ activeModelId: null, installed: {} });
     usePersonas.setState({
@@ -278,11 +341,14 @@ describe('agentConfig.provider — cli-agent (placeholder, resolved by nothing y
     } as never);
 
     const sent = await dispatchFrom([OPENAI]);
-    // Not sent to a "cli-agent" backend — there is no such target kind yet —
-    // but to the ordinary first-enabled-connection fallback. `chat.modelId`
-    // itself is untouched (no local model, no preference) — it is
-    // `resolveTarget`'s OWN pre-existing fallback that picks a connection at
-    // send time, exactly as it would with no `agentConfig` at all.
+    // #42, #115: `cli-agent` now resolves to a real connection, but only one
+    // whose descriptor is `kind: 'local-cli'` -- `conn_openai` is an
+    // ordinary remote connection, so this is the SAME "no match" fallback a
+    // missing or removed connection gets, not a new special case.
+    // `chat.modelId` itself is untouched (no local model, no preference) —
+    // it is `resolveTarget`'s OWN pre-existing fallback that picks a
+    // connection at send time, exactly as it would with no `agentConfig` at
+    // all.
     expect(sent.chatModelId).toBeNull();
     expect(sent.target).toEqual({
       backendId: OPENAI.id,
@@ -291,5 +357,80 @@ describe('agentConfig.provider — cli-agent (placeholder, resolved by nothing y
       modelName: `${OPENAI.label} · ${OPENAI.defaultModel}`,
       reach: REACH_REMOTE,
     });
+  });
+});
+
+describe('agentConfig.provider — cli-agent naming a real local-cli connection (#42, #115)', () => {
+  const CODEX_CLI: ProviderConnection = {
+    id: 'conn_cli_codex',
+    providerId: 'cli-codex',
+    label: 'Codex',
+    apiKey: '',
+    baseUrl: '',
+    defaultModel: '',
+    enabled: true,
+    models: [],
+    createdAt: 4,
+  };
+
+  beforeEach(() => {
+    useModels.setState({ activeModelId: null, installed: {} });
+  });
+
+  it('sends to the named CLI connection, with REACH_LOCAL_VIA_THIRD_PARTY', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'cli-agent', connectionId: 'conn_cli_codex' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, CODEX_CLI]);
+
+    expect(sent.target).toEqual({
+      backendId: CODEX_CLI.id,
+      engine: 'remote',
+      modelId: '',
+      modelName: CODEX_CLI.label,
+      reach: REACH_LOCAL_VIA_THIRD_PARTY,
+    });
+  });
+
+  it('falls back to the ordinary first-enabled connection when the named CLI one is disabled', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          agentConfig: { provider: { kind: 'cli-agent', connectionId: 'conn_cli_codex' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    const sent = await dispatchFrom([OPENAI, { ...CODEX_CLI, enabled: false }]);
+    expect((sent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+    expect((sent.target as { reach?: unknown } | null)?.reach).toEqual(REACH_REMOTE);
+  });
+
+  it('is consent-gated exactly like remote-connection for an imported persona, granted by the CLI connection id', async () => {
+    usePersonas.setState({
+      byId: {
+        p1: persona({
+          origin: 'imported',
+          agentConfig: { provider: { kind: 'cli-agent', connectionId: 'conn_cli_codex' } },
+        }),
+      },
+      order: ['p1'],
+    } as never);
+
+    // Ungranted: falls back, exactly like an ungranted remote-connection would.
+    const beforeConsent = await dispatchFrom([OPENAI, CODEX_CLI]);
+    expect((beforeConsent.target as { backendId?: string } | null)?.backendId).toBe(OPENAI.id);
+
+    await useProviderConsent.getState().grant('p1', 'conn_cli_codex');
+    const afterConsent = await dispatchFrom([OPENAI, CODEX_CLI]);
+    expect((afterConsent.target as { backendId?: string } | null)?.backendId).toBe(CODEX_CLI.id);
+    expect((afterConsent.target as { reach?: unknown } | null)?.reach).toEqual(REACH_LOCAL_VIA_THIRD_PARTY);
   });
 });

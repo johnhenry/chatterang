@@ -318,6 +318,23 @@ export function ranOnDevice(provenance: { readonly reach?: Reach } | undefined):
 }
 
 /**
+ * Did this turn run on this device but reach a local agent CLI's vendor
+ * (#42, #112)?
+ *
+ * `ranOnDevice` alone would answer TRUE for this shape too — `host.kind`
+ * really is `'device'`, the process ran here — and the chip that reads only
+ * that predicate would say "On device", which is true about the machine and
+ * false about where the words ended up. This is the narrower question the
+ * reader is actually owed an answer to: `reached === 'third-party'` on top of
+ * `ranOnDevice`, matching {@link REACH_LOCAL_VIA_THIRD_PARTY} exactly. A
+ * message with this true must never ALSO render "On device" — the chip this
+ * feeds is the one place that ordering is enforced.
+ */
+export function ranThroughLocalCli(provenance: { readonly reach?: Reach } | undefined): boolean {
+  return provenance?.reach?.host.kind === 'device' && provenance?.reach?.reached === 'third-party';
+}
+
+/**
  * Did the bytes leave this device?
  *
  * True for `paired` as well as `remote` — a tunnelled turn crossed the network

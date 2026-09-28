@@ -31,9 +31,9 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { REACH_DEVICE, REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE, leftThisDevice, pairedDevice, ranOnDevice, reachKind, reachPaired, reachedThirdParty, type Provenance } from '@/domain/chat';
+import { REACH_DEVICE, REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE, leftThisDevice, pairedDevice, ranOnDevice, ranThroughLocalCli, reachKind, reachPaired, reachedThirdParty, type Provenance } from '@/domain/chat';
 import { db, upgradeMessageReachAxes, upgradeReach, upgradeReachValue } from '@/db';
-import { reachOf } from '@/ui/target';
+import { chatTarget, reachOf } from '@/ui/target';
 import { renderTranscript } from '@/shell/commands';
 
 /* ── Fixtures ───────────────────────────────────────────────────────── */
@@ -816,5 +816,46 @@ describe('what a chat target will produce', () => {
     expect(reachKind({ reach: cli })).toBe('remote');
     expect(reachKind({ reach: REACH_DEVICE })).toBe('device');
     expect(reachKind({ reach: REACH_REMOTE })).toBe('remote');
+  });
+
+  it('ranThroughLocalCli is true only for the CLI shape, never for device or remote (#42, #112)', () => {
+    // The exact predicate `ranOnDevice` alone cannot answer: both device and
+    // this shape have `host.kind === 'device'`, and only this one also
+    // reaches a third party. The chip that would misread this shape as
+    // "On device" reads this predicate FIRST.
+    expect(ranThroughLocalCli({ reach: REACH_LOCAL_VIA_THIRD_PARTY })).toBe(true);
+    expect(ranThroughLocalCli({ reach: REACH_DEVICE })).toBe(false);
+    expect(ranThroughLocalCli({ reach: REACH_REMOTE })).toBe(false);
+    expect(ranThroughLocalCli(undefined)).toBe(false);
+  });
+});
+
+describe('chatTarget routes a local-cli connection to its own kind, not remote (#42, #115)', () => {
+  const installed = {};
+
+  it('produces {kind: "cli"} for an enabled connection whose descriptor is local-cli', () => {
+    const target = chatTarget(null, installed, [
+      { id: 'conn_cli_claude', label: 'Claude Code', enabled: true, cli: true },
+    ]);
+    expect(target).toEqual({ kind: 'cli', cli: { id: 'conn_cli_claude', label: 'Claude Code' } });
+    expect(reachOf(target)).toEqual(REACH_LOCAL_VIA_THIRD_PARTY);
+  });
+
+  it('still produces {kind: "remote"} for a connection with no cli marker -- the unchanged path', () => {
+    const target = chatTarget(null, installed, [
+      { id: 'conn_openai', label: 'OpenAI', enabled: true },
+    ]);
+    expect(target).toEqual({
+      kind: 'remote',
+      provider: { id: 'conn_openai', label: 'OpenAI', enabled: true },
+    });
+  });
+
+  it('picks the first ENABLED connection regardless of cli marker order, unchanged from before', () => {
+    const target = chatTarget(null, installed, [
+      { id: 'conn_off', label: 'Off', enabled: false, cli: true },
+      { id: 'conn_openai', label: 'OpenAI', enabled: true },
+    ]);
+    expect(target.kind).toBe('remote');
   });
 });

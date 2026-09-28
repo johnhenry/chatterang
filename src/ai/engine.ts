@@ -58,6 +58,7 @@ import {
 import { toolRegistry, type ChatterangTool } from '@/ai/tools/registry';
 import { fallbackWarning, mergeWarnings, warningsOf, type TurnWarning } from '@/ai/warnings';
 import { connectionConfig, getProvider, type ProviderConnection } from '@/ai/providers';
+import { CliBackendAdapter } from '@/ai/backends/cli';
 import type { EngineId } from '@/domain/manifest';
 import { isLocalEngine } from '@/domain/manifest';
 import { REACH_DEVICE, REACH_REMOTE, newId, type Reach } from '@/domain/chat';
@@ -510,6 +511,18 @@ export interface ProvenanceSnapshot {
   modelId: string;
   modelName: string;
   local: boolean;
+  /**
+   * The full three-valued reach, alongside `local` rather than instead of it
+   * (#42, #112). `local` is `runsOnThisDevice(target)` — true for BOTH
+   * `REACH_DEVICE` and `REACH_LOCAL_VIA_THIRD_PARTY`, since a local agent CLI
+   * genuinely does run here — so a reader that reconstructed `Reach` from
+   * `local` alone (as `state/chat.ts` used to) could never tell those two
+   * apart: exactly `src/domain/chat.ts`'s `ranThroughLocalCli` needing more
+   * than `ranOnDevice` to answer the question a reader is actually owed.
+   * `local` stays for the callers pinned on it as a boolean (`tests/engine.test.ts`);
+   * this field is what a caller that needs the real shape reads instead.
+   */
+  reach: Reach;
   fallbackFrom?: string;
   fallbackReason?: FallbackReason;
   /**
@@ -552,6 +565,18 @@ export class ChatterangEngine {
   #remotes = new Map<string, BackendAdapter>();
   /** Default model per registered backend, used when a fallback retargets. */
   #fallbackModels = new Map<string, string>();
+  /**
+   * Connection ids whose descriptor is `kind: 'local-cli'` (#42, #115).
+   *
+   * A CLI backend runs on THIS device but reaches its own vendor over a
+   * login this app never sees — a divert to it would be the honest opposite
+   * of what a cloud-pressure fallback is for. `setFallbackBackend` below is
+   * the one place `#options.fallbackBackendId` is ever assigned, so refusing
+   * a CLI connection id there is sufficient to keep `#resolveFallback` (the
+   * one place that id is ever read back) from ever handing a divert to one —
+   * there is no second path that sets this option.
+   */
+  #cliConnectionIds = new Set<string>();
   #pendingTools: ExecutedTool[] = [];
   #lastFallback: FallbackEvent | null = null;
   /** `metadata.warnings` from the response this turn produced (#149). */
@@ -647,6 +672,19 @@ export class ChatterangEngine {
 
     const adapter = await descriptor.load(connectionConfig(connection));
     this.#remotes.set(connection.id, adapter);
+    if (descriptor.kind === 'local-cli') {
+      this.#cliConnectionIds.add(connection.id);
+      // Round 6: `#resolveFallback` already refuses this id regardless, but
+      // clearing the STORED value here too means `fallbackBackendId` (the
+      // getter `app.ts` reads back to decide whether to correct the
+      // persisted setting) stops lying the moment this connection's real
+      // kind is known — not just at the one call site that reads it.
+      if (this.#options.fallbackBackendId === connection.id) {
+        this.#options = { ...this.#options, fallbackBackendId: null };
+      }
+    } else {
+      this.#cliConnectionIds.delete(connection.id);
+    }
 
     // Reconnecting an existing provider — the user rotated their API key, or
     // changed the endpoint — swaps the adapter in place. `register` would
@@ -665,6 +703,7 @@ export class ChatterangEngine {
   disconnectProvider(connectionId: string): void {
     this.#remotes.delete(connectionId);
     this.#fallbackModels.delete(connectionId);
+    this.#cliConnectionIds.delete(connectionId);
 
     // Unregistering an absent backend still throws, so a double-disconnect
     // must not be able to take the settings screen down with it.
@@ -685,6 +724,14 @@ export class ChatterangEngine {
   }
 
   setFallbackBackend(backendId: string | null): void {
+    // #42/#115: a local agent CLI is never fallback-eligible. Refusing here,
+    // the one place `fallbackBackendId` is ever assigned, is what makes it
+    // true regardless of what any future UI offers — see `#cliConnectionIds`.
+    if (backendId !== null && this.#cliConnectionIds.has(backendId)) {
+      throw new Error(
+        `"${backendId}" is a local agent CLI connection and can never be the cloud-pressure fallback.`,
+      );
+    }
     this.#options = { ...this.#options, fallbackBackendId: backendId };
   }
 
@@ -1302,6 +1349,22 @@ export class ChatterangEngine {
     if (!id) return null;
     const adapter = this.router.get(id);
     if (!adapter) return null;
+    /*
+     * #42/#115, round 6: `setFallbackBackend` refuses to ASSIGN a CLI
+     * connection id, but the constructor assigns `options.fallbackBackendId`
+     * unchecked (`src/state/app.ts`'s `initialize()` passes the persisted
+     * setting in before `connectProvider` has even run, so at construction
+     * time nothing yet knows this id names a CLI). This is the actual point
+     * of use, and it checks the resolved ADAPTER's real kind directly --
+     * `instanceof CliBackendAdapter` -- rather than `#cliConnectionIds.has(id)`
+     * alone. The set is still maintained (`connectProvider`,
+     * `disconnectProvider`) and still guards the setter, but a set is
+     * bookkeeping that could fall out of sync with what is actually
+     * registered; the adapter under `id` on the router right now cannot.
+     * Whatever path put a `CliBackendAdapter` here -- `connectProvider`
+     * today, a future caller tomorrow -- this refuses it the same way.
+     */
+    if (adapter instanceof CliBackendAdapter) return null;
     return { name: id, adapter, modelId: this.#fallbackModels.get(id) };
   }
 
@@ -1411,6 +1474,7 @@ export class ChatterangEngine {
       modelId: target.modelId,
       modelName: target.modelName,
       local: fallback ? false : runsOnThisDevice(target),
+      reach: fallback ? REACH_REMOTE : target.reach,
       fallbackFrom: fallback?.from,
       fallbackReason: fallback?.reason,
       // Omitted rather than empty: a chip that renders `warnings` should not

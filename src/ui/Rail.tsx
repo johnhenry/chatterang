@@ -19,6 +19,7 @@ import { useApp } from '@/state/app';
 import { useModels } from '@/state/models';
 import { useChats } from '@/state/chat';
 import { usageTone } from '@/ai/context';
+import { getProvider } from '@/ai/providers';
 
 /** 12400 -> "12.4k". Keeps the readout to a fixed width as it grows. */
 function compact(value: number): string {
@@ -74,7 +75,15 @@ export function Rail({ title, actions }: RailProps): ReactNode {
    * `chatTarget` answers both, and answers them the way `resolveTarget` will
    * when the turn is actually sent.
    */
-  const target = chatTarget(chat?.modelId ?? activeModelId, installed, connections);
+  // `Providerish.cli` (#42, #115) is what lets `chatTarget` tell a local-cli
+  // connection apart from an ordinary remote one, so this raw store selector
+  // is not enough on its own -- computed fresh here, the same way
+  // `ChatScreen.tsx` computes it, rather than stored on the connection.
+  const connectionsForTarget = connections.map((connection) => ({
+    ...connection,
+    cli: getProvider(connection.providerId)?.kind === 'local-cli',
+  }));
+  const target = chatTarget(chat?.modelId ?? activeModelId, installed, connectionsForTarget);
   /**
    * The model that would really answer here.
    *

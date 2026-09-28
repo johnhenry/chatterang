@@ -5,6 +5,7 @@ import { Icon } from '@/ui/Icon';
 import { Rail } from '@/ui/Rail';
 import { chatTarget, type ChatTarget, type Providerish } from '@/ui/target';
 import { Confirm, Empty, Sheet } from '@/ui/primitives';
+import { getProvider } from '@/ai/providers';
 import { useApp } from '@/state/app';
 import { useChats } from '@/state/chat';
 import { useModels, chatModels, installedModels } from '@/state/models';
@@ -101,14 +102,25 @@ export function ChatScreen(): ReactNode {
   // globally active one. Anything else and the composer disables itself while
   // the engine would happily have generated.
   const effectiveModelId = chat?.modelId ?? activeModelId;
-  const target = chatTarget(effectiveModelId, installed, connections);
+  // `chatTarget` needs to tell a local-cli connection apart from an ordinary
+  // remote one (#42, #115) -- `Providerish.cli` carries that, computed here
+  // from the catalog rather than stored on `ProviderConnection` itself.
+  const connectionsForTarget = useMemo(
+    () =>
+      connections.map((connection) => ({
+        ...connection,
+        cli: getProvider(connection.providerId)?.kind === 'local-cli',
+      })),
+    [connections],
+  );
+  const target = chatTarget(effectiveModelId, installed, connectionsForTarget);
   // The same selector the picker uses, so the two sentences a whisper-only
   // user meets — this screen's and the sheet's — name their models in one
   // order rather than two.
   const nonChat = useModels(useShallow(nonChatInstalled));
   const acceptsImages =
     target.kind === 'local' && target.model.manifest.capabilities.includes('vision');
-  const hasTarget = target.kind === 'local' || target.kind === 'remote';
+  const hasTarget = target.kind === 'local' || target.kind === 'remote' || target.kind === 'cli';
 
   const send = useCallback((text: string, attachments: Attachment[]) => {
     pinnedToBottom.current = true;
@@ -404,6 +416,16 @@ export function startProse(target: ChatTarget): { heading: string; body: string 
         'every reply that comes back from a provider is marked Remote in the thread.',
     };
   }
+  if (target.kind === 'cli') {
+    return {
+      heading: 'This chat runs through a local CLI, and still leaves the device.',
+      body:
+        `${target.cli.label} runs as a subprocess on this device, but it reaches its own ` +
+        'vendor under your own login there — not this device alone, and never this app’s key. ' +
+        'From now on, every reply that comes back is marked Local CLI, reached its vendor, in ' +
+        'the thread.',
+    };
+  }
   return null;
 }
 
@@ -592,7 +614,7 @@ function StartState({
     <div className="screen__scroll">
       <div className="screen__pad" style={{ paddingTop: 'var(--s-7)' }}>
         <div style={{ color: 'var(--ember)' }}>
-          <Icon name={target.kind === 'remote' ? 'cloud' : 'flame'} size={30} />
+          <Icon name={target.kind === 'remote' || target.kind === 'cli' ? 'cloud' : 'flame'} size={30} />
         </div>
         <div className="stack" style={{ gap: 'var(--s-2)' }}>
           <h2 style={{ fontSize: 'var(--t-xl)', fontVariationSettings: "'wdth' 112" }}>
@@ -770,9 +792,24 @@ function ChatSettingsSheet({
   // name a value that list has dropped.
   const pinned = useModels((state) => (chat?.modelId ? state.installed[chat.modelId] : undefined));
   const connections = useApp((state) => state.connections);
+  const installedAll = useModels((state) => state.installed);
   const update = useChats((state) => state.updateChat);
   const toast = useApp((state) => state.toast);
   const [exporting, setExporting] = useState(false);
+
+  // #42: whether THIS chat currently targets a local-cli connection --
+  // needed only for the honest "tools will not be sent" note below, so
+  // computed the same way `chatTarget`'s other two callers do rather than
+  // adding a third field to `Providerish` for one reader.
+  const cliTarget = useMemo(() => {
+    if (!chat) return null;
+    const connectionsForTarget = connections.map((connection) => ({
+      ...connection,
+      cli: getProvider(connection.providerId)?.kind === 'local-cli',
+    }));
+    const target = chatTarget(chat.modelId, installedAll, connectionsForTarget);
+    return target.kind === 'cli' ? target : null;
+  }, [chat, connections, installedAll]);
 
   // Declared before the early return so the hook order is stable; `chat` is
   // re-checked inside.
@@ -895,6 +932,17 @@ function ChatSettingsSheet({
           model, and off this device with it when the model is remote — that one the app asks
           about, every turn until you answer for the whole conversation.
         </p>
+        {cliTarget ? (
+          // #42: a local agent CLI has no tool support yet
+          // (`CliBackendAdapter.metadata.capabilities.tools` is false) —
+          // the engine never hands it a tool to call, so any chip turned on
+          // below is truthfully described as inert for this chat rather
+          // than left to look like it works and silently not firing.
+          <p className="section__hint" style={{ color: 'var(--warn)' }}>
+            This chat currently runs through {cliTarget.cli.label}, which has no tool support
+            yet — any tool turned on below will not be sent to it.
+          </p>
+        ) : null}
         <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
           {toolRegistry.list().map((tool) => {
             const enabled = chat.tools.includes(tool.id);

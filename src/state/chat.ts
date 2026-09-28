@@ -19,7 +19,7 @@ import {
   holdsGrant,
   newId,
   splitThinking,
-  REACH_DEVICE,
+  REACH_LOCAL_VIA_THIRD_PARTY,
   REACH_REMOTE,
   type Attachment,
   type Chat,
@@ -1757,15 +1757,15 @@ async function runGeneration(
               engine: event.provenance.engine,
               modelId: event.provenance.modelId,
               modelName: event.provenance.modelName,
-              // The engine still reports a boolean: `EngineTarget.local` gates
-              // the fallback and the egress sheet, and widening it is #188's
-              // and #144's, not this record's. So this is the one place the
-              // boolean becomes a `Reach`, and today it can only produce two
-              // of the three — nothing registers a paired target yet. When one
-              // does, the snapshot gains the device and this line reads it;
-              // until then the third value exists in the type and in the
-              // migration, and no runtime path reaches it.
-              reach: event.provenance.local ? REACH_DEVICE : REACH_REMOTE,
+              // #42, #112: the engine's `ProvenanceSnapshot` now carries the
+              // real three-valued `reach` alongside its pinned `local`
+              // boolean, which this used to reconstruct FROM (`local ?
+              // REACH_DEVICE : REACH_REMOTE`) — lossy the moment a local
+              // agent CLI's `REACH_LOCAL_VIA_THIRD_PARTY` existed, since
+              // `local` is true for that reach too. Reading the field
+              // directly is what lets `ranThroughLocalCli`
+              // (`src/domain/chat.ts`) tell the two apart downstream.
+              reach: event.provenance.reach,
               fallbackFrom: event.provenance.fallbackFrom,
               fallbackReason: event.provenance.fallbackReason,
               toolEgress: event.provenance.toolEgress,
@@ -2323,8 +2323,13 @@ export function providerDestinationLabel(
     const kind = descriptor?.kind === 'self-hosted' ? 'self-hosted' : 'cloud';
     return `${connection.label} (${kind})`;
   }
-  // 'cli-agent': no connection of its own in this app yet (#23, #122).
-  return 'a command-line agent';
+  // 'cli-agent' (#42, #115): a real local-cli connection, once one is named
+  // and actually added -- "a command-line agent" stays the fallback for a
+  // preference that names none yet, or names one since removed.
+  const connection = connections.find(
+    (entry) => entry.id === provider.connectionId && getProvider(entry.providerId)?.kind === 'local-cli',
+  );
+  return connection ? `${connection.label} (local CLI)` : 'a command-line agent';
 }
 
 /**
@@ -2346,11 +2351,13 @@ export function providerDestinationLabel(
  *    exactly this same `{}`, so a UI never has to tell "no connection" apart
  *    from "not consented yet" by reading anything other than the pending
  *    query below.
- *  - `'cli-agent'` is a placeholder (#23, #122): it round-trips through
- *    `agentConfig` and is validated by `sanitizeAgentConfig`, and IS
- *    consent-gated below (the ruling names it explicitly), but nothing
- *    resolves it to a backend in this pass either way — another track owns
- *    that target kind — so it resolves to `{}` regardless of consent.
+ *  - `'cli-agent'` (#42, #115) resolves exactly like `'remote-connection'`
+ *    now, restricted to a connection whose descriptor is `kind: 'local-cli'`
+ *    — a persona preference naming an ordinary remote connection under this
+ *    kind resolves to `{}`, the same as naming one that was removed. Consent
+ *    is checked the same way and at the same point as `'remote-connection'`
+ *    (the ruling named `cli-agent` explicitly, before either kind actually
+ *    resolved to anything).
  */
 function resolvePersonaProvider(
   persona: PersonaProviderContext | undefined,
@@ -2381,8 +2388,19 @@ function resolvePersonaProvider(
     return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
   }
 
-  // 'cli-agent': recognised, consent-gated above, resolved to nothing here.
-  return {};
+  // 'cli-agent' (#42, #115): the same resolution as 'remote-connection',
+  // restricted to a connection whose descriptor is actually `local-cli` --
+  // never a plain remote one a persona card mislabelled.
+  const connection = provider.connectionId
+    ? connections.find(
+        (entry) =>
+          entry.id === provider.connectionId &&
+          entry.enabled &&
+          getProvider(entry.providerId)?.kind === 'local-cli',
+      )
+    : undefined;
+  if (!connection) return {};
+  return { modelId: provider.modelId || connection.defaultModel, preferredConnectionId: connection.id };
 }
 
 /**
@@ -2408,7 +2426,16 @@ export function providerConsentPending(
     // nothing concrete for the user to be saying yes to yet.
     return connections.some((entry) => entry.id === provider.connectionId && entry.enabled);
   }
-  return true; // 'cli-agent'
+  // 'cli-agent' (#42, #115): matches `resolvePersonaProvider`'s own
+  // restricted lookup exactly -- an enabled connection whose descriptor is
+  // actually `local-cli`, same reasoning as the `remote-connection` branch
+  // above: nothing concrete to consent to otherwise.
+  return connections.some(
+    (entry) =>
+      entry.id === provider.connectionId &&
+      entry.enabled &&
+      getProvider(entry.providerId)?.kind === 'local-cli',
+  );
 }
 
 /** Decide which backend and model serve this chat. */
@@ -2475,14 +2502,24 @@ function resolveTarget(chat: Chat, overrideModelId?: string): TargetChoice {
     // uses the connection's own default, exactly as before this field
     // existed.
     const remoteModelId = preferred ? resolved.modelId ?? connection.defaultModel : connection.defaultModel;
+    // #42, #115: a local-cli connection runs a subprocess HERE but reaches
+    // its own vendor there — REACH_LOCAL_VIA_THIRD_PARTY, never REACH_REMOTE,
+    // is what keeps `runsOnThisDevice`/`leavesThisDevice`/`keepsTaintMark`
+    // (`src/ai/engine.ts`) and the thread chip (`ranThroughLocalCli`,
+    // `src/domain/chat.ts`) telling this apart from an ordinary provider. The
+    // engine's own `setFallbackBackend` guard is the second, independent
+    // reason a CLI connection is never diverted to; this is the first —
+    // there being nothing to divert FROM in the first place, since
+    // `runsOnThisDevice` is still true for this reach.
+    const cli = getProvider(connection.providerId)?.kind === 'local-cli';
     return {
       kind: 'target',
       target: {
         backendId: connection.id,
         engine: 'remote',
         modelId: remoteModelId,
-        modelName: `${connection.label} · ${remoteModelId}`,
-        reach: REACH_REMOTE,
+        modelName: cli ? connection.label : `${connection.label} · ${remoteModelId}`,
+        reach: cli ? REACH_LOCAL_VIA_THIRD_PARTY : REACH_REMOTE,
       },
     };
   }
