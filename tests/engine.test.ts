@@ -15,7 +15,10 @@ import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { toolRegistry } from '@/ai/tools/registry';
 import type { FallbackReason } from '@/ai/middleware/resilience';
-import { REACH_REMOTE } from '@/domain/chat';
+import { REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE } from '@/domain/chat';
+import type { CliBridgeExit, CliBridgeHandle, CliTurnBridge } from '@/ai/backends/cli';
+import { stripToolSyntax } from '@/ai/middleware/tools';
+import { GRANTED_PROBE, mcpProbe } from './support/egress-probe';
 
 /**
  * Dexie, stubbed at the table boundary.
@@ -1360,5 +1363,309 @@ describe('a local-cli connection is never fallback-eligible (#42, #115)', () => 
     }
 
     expect(bridgeStarted).toBe(false);
+  });
+});
+
+describe('a CLI reply is never read for a textual tool call (#42, #114, #360)', () => {
+  /**
+   * A fake `CliTurnBridge` whose `start()` streams one CLAUDE-shaped
+   * stream-json reply carrying `text` verbatim, then a `result` terminal --
+   * the minimum `createClaudeTranslator` (`src/ai/backends/cli-stream.ts`)
+   * needs to hand the engine back exactly `text`, unstripped, as `turn.text`.
+   * `startCalls` lets a test assert there was no SECOND round.
+   */
+  function cliFakeBridge(text: string): { bridge: CliTurnBridge; startCalls: () => number } {
+    let startCalls = 0;
+    const lines = [
+      JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: {} } }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      }),
+      JSON.stringify({ type: 'result', is_error: false, result: text }),
+    ];
+    const bytes = new TextEncoder().encode(lines.join('\n') + '\n');
+
+    const bridge: CliTurnBridge = {
+      start() {
+        startCalls += 1;
+        let dataListener: ((chunk: Uint8Array, stream: 'stdout' | 'stderr') => void) | undefined;
+        let exitListener: ((exit: CliBridgeExit) => void) | undefined;
+        const handle: CliBridgeHandle = {
+          onData(listener) {
+            dataListener = listener;
+          },
+          onExit(listener) {
+            exitListener = listener;
+          },
+          cancel() {
+            // Never cancelled by anything this test does.
+          },
+        };
+        queueMicrotask(() => {
+          dataListener?.(bytes, 'stdout');
+          exitListener?.({ code: 0, signal: null });
+        });
+        return handle;
+      },
+    };
+
+    return { bridge, startCalls: () => startCalls };
+  }
+
+  it('leaves call-shaped text in a CLI reply as words: no receipt, no tool event, no second round', async () => {
+    const { CliBackendAdapter } = await import('@/ai/backends/cli');
+    const replyText = 'Sure, one sec.<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>';
+    const state = cliFakeBridge(replyText);
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register('conn_cli', new CliBackendAdapter('claude', state.bridge));
+
+    const cliTarget = targetFor('remote', 'claude-x', 'Claude Code', 'conn_cli', REACH_LOCAL_VIA_THIRD_PARTY);
+    const events = await drain(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is 1 + 1?' }],
+        target: cliTarget,
+        toolIds: ['calculator'],
+      }),
+    );
+
+    expect(events.filter((event) => event.type === 'tool')).toHaveLength(0);
+    const done = doneEvent(events);
+    // `stripToolSyntax` still runs on the FINAL text either way (the same
+    // cosmetic pass the "does not run tools when the chat has none enabled"
+    // case above already gets) -- what this proves is the call was never
+    // EXECUTED: no tool event, no receipt, no second round below. With
+    // nothing offered (`offered.length === 0`) and no tool having run
+    // (`ran === false`), `stripToolSyntax` takes its own early exit and only
+    // trims -- the call-shaped markup stays, verbatim, as words.
+    expect(done.text).toBe(stripToolSyntax(replyText, { offered: [], ran: false }));
+    expect(done.text).toBe(replyText.trim());
+    expect(done.tools ?? []).toHaveLength(0);
+    // No second round: the bridge's `start()` (one subprocess turn) ran
+    // exactly once.
+    expect(state.startCalls()).toBe(1);
+  });
+
+  it('paired control: the SAME call-shaped text still runs on a normal local target', async () => {
+    // Proves the assertions above are specific to the CLI destination, not
+    // an accident of the tool-call syntax used or a global regression.
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    const replyText = 'Sure, one sec.<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>';
+    engine.router.register('scripted', scriptedBackend([replyText, 'It is 2.']));
+
+    const events = await drain(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is 1 + 1?' }],
+        target: targetFor('llama-cpp', manifest.id, manifest.name, 'scripted'),
+        toolIds: ['calculator'],
+      }),
+    );
+
+    const toolEvents = events.filter(
+      (event): event is Extract<GenerationEvent, { type: 'tool' }> => event.type === 'tool',
+    );
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0]?.tool.name).toBe('calculate');
+  });
+
+  /**
+   * A fake bridge that streams one partial delta and then never sends a
+   * clean `result` terminal on its own -- only `cancel()` ends it, exactly
+   * as a killed subprocess would. `createClaudeTranslator`'s `finish()`
+   * synthesizes an `error` terminal for exactly this case (`cli_exit`),
+   * which is what lets the engine's own "stopped mid-stream" branch
+   * (`request.signal?.aborted` alongside a failed turn, engine.ts's
+   * `#toolsCapable`-gated `strandedCalls`) run at all.
+   */
+  function cliStallingBridge(text: string): { bridge: CliTurnBridge; cancelCalls: () => number } {
+    let cancelCalls = 0;
+    const lines = [
+      JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: {} } }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      }),
+    ];
+    const bytes = new TextEncoder().encode(lines.join('\n') + '\n');
+
+    const bridge: CliTurnBridge = {
+      start() {
+        let dataListener: ((chunk: Uint8Array, stream: 'stdout' | 'stderr') => void) | undefined;
+        let exitListener: ((exit: CliBridgeExit) => void) | undefined;
+        const handle: CliBridgeHandle = {
+          onData(listener) {
+            dataListener = listener;
+          },
+          onExit(listener) {
+            exitListener = listener;
+          },
+          cancel() {
+            cancelCalls += 1;
+            // A killed subprocess: no clean `result` line, ever.
+            exitListener?.({ code: null, signal: 'SIGTERM' });
+          },
+        };
+        queueMicrotask(() => {
+          dataListener?.(bytes, 'stdout');
+        });
+        return handle;
+      },
+    };
+
+    return { bridge, cancelCalls: () => cancelCalls };
+  }
+
+  it('a CLI turn Stop catches mid-call records no receipt -- unlike the same call on a normal target', async () => {
+    /**
+     * DECISION: `cutUnfinishedCall` is not special-cased for a CLI target,
+     * and nothing new is added for the "stopped" branch beyond the same
+     * `#toolsCapable` gate the ordinary round already gets.
+     *
+     * `roundCalls`'s stranded-calls read (engine.ts, the
+     * `request.signal?.aborted` branch) and `roundWords`'s call to
+     * `cutUnfinishedCall` both gate on the SAME condition:
+     * `offered.length > 0 || ran`. `offered` is already `[]` for the whole
+     * life of a CLI turn (`#toolsCapable`), and `ran` never becomes true for
+     * one either, since nothing is ever offered to run in the first place.
+     * So there is no separate flag to add here: the gate that keeps a CLI's
+     * FINISHED reply from being read as a call also keeps a STOPPED one from
+     * being read as one, or cut as an unfinished one -- consistent with the
+     * issue's own wording, "the reply's call-shaped text stays words",
+     * taken literally rather than "stays words unless it merely looks like
+     * an in-progress call".
+     *
+     * The paired control below is `tests/stopped-empty-reply.test.ts`'s "a
+     * turn stopped while the model was still writing its tool call" block,
+     * which already proves a normal target's unfinished call IS cut and
+     * sends nothing back; this test proves a CLI target does not even reach
+     * that machinery -- no receipt at all, where the control gets one marked
+     * `stopped`.
+     */
+    const { CliBackendAdapter } = await import('@/ai/backends/cli');
+    const probe = mcpProbe();
+    // A complete, offered-by-name call -- as the doc comment above the
+    // stranded-calls read says, "a call already complete in the text that
+    // had streamed (#293)" is exactly the case that matters here; an
+    // unfinished one fails to parse and is read as nothing, for any target.
+    const replyText = `Filing it now.${'<tool_call>{"name":"notes.note","arguments":{"text":"a shopping list"}}</tool_call>'}`;
+    const { bridge, cancelCalls } = cliStallingBridge(replyText);
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register('conn_cli', new CliBackendAdapter('claude', bridge));
+
+    const cliTarget = targetFor('remote', 'claude-x', 'Claude Code', 'conn_cli', REACH_LOCAL_VIA_THIRD_PARTY);
+    const controller = new AbortController();
+
+    try {
+      toolRegistry.register(probe.tool);
+      const iterator = engine.stream({
+        messages: [{ role: 'user', content: 'file a note' }],
+        target: cliTarget,
+        toolIds: [probe.tool.id],
+        signal: controller.signal,
+        mcpEgress: GRANTED_PROBE,
+      });
+
+      // Pull events until the partial delta has arrived, mirroring what a
+      // real Stop click lands on: text has streamed, nothing has finished.
+      const events: GenerationEvent[] = [];
+      let sawDelta = false;
+      while (!sawDelta) {
+        const step = await iterator.next();
+        if (step.done) break;
+        events.push(step.value);
+        if (step.value.type === 'delta') sawDelta = true;
+      }
+      expect(sawDelta, 'the partial delta arrived before Stop').toBe(true);
+
+      controller.abort();
+
+      for (;;) {
+        const step = await iterator.next();
+        if (step.done) break;
+        events.push(step.value);
+      }
+
+      // The subprocess was told to stop, and nothing about the call it was
+      // mid-writing was read: no receipt at all, where the paired control in
+      // tests/stopped-empty-reply.test.ts ("a turn stopped while the model
+      // was still writing its tool call") gets one marked `stopped` for the
+      // same shape of call on a normal target.
+      expect(cancelCalls(), 'the subprocess was cancelled exactly once').toBe(1);
+      expect(events.filter((event) => event.type === 'tool')).toHaveLength(0);
+      expect(probe.call, 'the MCP server').not.toHaveBeenCalled();
+      expect(events.at(-1)?.type).toBe('done');
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
+  });
+
+  it('paired control: the SAME complete call, caught by Stop, gets a receipt marked stopped on a normal target', async () => {
+    // Proves the CLI test above is measuring something real: the identical
+    // call shape, read by the identical stranded-calls path, DOES get a
+    // receipt -- withheld, marked `stopped` -- when the destination is not a
+    // CLI. `runToolCalls`'s own `stopped()` check only writes a receipt for a
+    // call with a destination (an MCP tool, unlike a local one such as
+    // `calculator`), which is why the probe is used here too.
+    const probe = mcpProbe();
+    const replyText = 'Filing it now.<tool_call>{"name":"notes.note","arguments":{"text":"a shopping list"}}</tool_call>';
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register(
+      'scripted',
+      new FunctionBackendAdapter({
+        execute: async (request) => ({
+          message: { role: 'assistant', content: replyText },
+          finishReason: 'stop',
+          metadata: { requestId: request.metadata.requestId, timestamp: Date.now() },
+        }),
+        executeStream: async function* (request): AsyncGenerator<IRStreamChunk> {
+          yield { type: 'start', sequence: 0, metadata: request.metadata };
+          // The WHOLE reply in one delta, as the CLI bridge above streams it
+          // -- what matters here is a call already complete in `turn.text`
+          // when Stop lands, not the chunking.
+          yield { type: 'content', sequence: 1, delta: replyText };
+          // No `done` -- as with the CLI bridge above, only Stop ends this
+          // turn, and nothing here reports a clean finish on its own.
+        },
+      }),
+    );
+    const controller = new AbortController();
+
+    try {
+      toolRegistry.register(probe.tool);
+      const iterator = engine.stream({
+        messages: [{ role: 'user', content: 'file a note' }],
+        target: targetFor('llama-cpp', manifest.id, manifest.name, 'scripted'),
+        toolIds: [probe.tool.id],
+        signal: controller.signal,
+        mcpEgress: GRANTED_PROBE,
+      });
+
+      const events: GenerationEvent[] = [];
+      let sawDelta = false;
+      while (!sawDelta) {
+        const step = await iterator.next();
+        if (step.done) break;
+        events.push(step.value);
+        if (step.value.type === 'delta') sawDelta = true;
+      }
+      expect(sawDelta, 'the partial delta arrived before Stop').toBe(true);
+
+      controller.abort();
+
+      for (;;) {
+        const step = await iterator.next();
+        if (step.done) break;
+        events.push(step.value);
+      }
+
+      const toolEvents = events.filter(
+        (event): event is Extract<GenerationEvent, { type: 'tool' }> => event.type === 'tool',
+      );
+      expect(toolEvents).toHaveLength(1);
+      expect(toolEvents[0]?.ended).toBe('stopped');
+      expect(probe.call, 'the MCP server').not.toHaveBeenCalled();
+    } finally {
+      toolRegistry.unregister(probe.tool.id);
+    }
   });
 });
