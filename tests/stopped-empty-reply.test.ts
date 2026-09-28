@@ -96,6 +96,7 @@ const { FunctionBackendAdapter } = await import('@johnhenry/aimatey-backend-brow
 const { useChats } = await import('@/state/chat');
 const { useModels } = await import('@/state/models');
 const { useApp } = await import('@/state/app');
+const { usePersonas } = await import('@/state/personas');
 const { catalogEntry } = await import('@/data/catalog');
 const { DEFAULT_SAMPLER } = await import('@/domain/manifest');
 const { REACH_DEVICE } = await import('@/domain/chat');
@@ -110,6 +111,7 @@ const { MCP_CALL, MCP_CALL_CLEAN, PROBE_SERVER, cutOff, mcpProbe, probeResolver,
 type Chat = import('@/domain/chat').Chat;
 type Message = import('@/domain/chat').Message;
 type ToolInvocation = import('@/domain/chat').ToolInvocation;
+type Persona = import('@/domain/persona').Persona;
 
 const QWEN = catalogEntry('qwen3-4b-instruct-q4km')!;
 
@@ -3178,6 +3180,90 @@ describe('a JSON record whose "name" is an offered tool’s id, carrying no argu
     expect(stopped.content, 'the words the person watched arrive').toMatch(
       /^Here is a package\.json:\s+Then run npm install\.Anything el$/,
     );
+  });
+});
+
+/* ── Round 10 coverage gap: a persona's always-ask still gates ruling 1 ── */
+
+describe('confirmPolicy: always-ask gates a ruling-1 fenced call exactly as it gates any other (refs #293, refs #23)', () => {
+  // A persona with `agentConfig.toolPolicy.confirmPolicy: 'always-ask'` makes
+  // `send` pass `confirmEachToolCall` as the request's `confirmEachCall`
+  // (state/chat.ts). `runToolCalls` (ai/middleware/tools.ts) asks it for any
+  // call with no destination — datetime is a local, non-sensitive tool, never
+  // an MCP one, so it is asked about and never gets a destination-grant sheet
+  // of its own. The ruling-1 shape — a fenced block naming an offered tool,
+  // no `arguments` key, with another key beside its name — has to reach that
+  // same gate: it is read as a call before confirmEachCall ever sees it, and
+  // this is the one path that was not covered when ruling 1 landed.
+  const RECORD = '```json\n{"id": "call_0", "name": "get_datetime"}\n```';
+
+  function alwaysAskPersona(): void {
+    usePersonas.setState(
+      {
+        byId: {
+          p_confirm: {
+            id: 'p_confirm',
+            kind: 'assistant',
+            name: 'Careful',
+            tagline: '',
+            avatarSeed: 'careful',
+            description: 'A careful assistant that confirms every tool call.',
+            tags: [],
+            version: 1,
+            createdAt: 0,
+            updatedAt: 0,
+            origin: 'authored',
+            agentConfig: { toolPolicy: { confirmPolicy: 'always-ask' } },
+          } satisfies Persona,
+        },
+        order: ['p_confirm'],
+      } as never,
+    );
+  }
+
+  it('declined: the tool is not run, and the app’s own "Declined" message is what is recorded — no destination, so no receipt', async () => {
+    const id = 'r_confirm_ruling1_declined';
+    alwaysAskPersona();
+    given(chat(id, { personaId: 'p_confirm', tools: ['datetime'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Such a block reads:\n${RECORD}`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what time is it?');
+    await until(() => useApp.getState().approvals.length === 1);
+    const approval = useApp.getState().approvals[0]!;
+    expect(approval.action, 'the sheet names the call it is asking about').toBe('run get_datetime');
+    useApp.getState().answerApproval(approval.id, false);
+    await sending;
+
+    const last = assistantRows(id).at(-1)!;
+    expect(
+      last.toolCalls?.map((call) => ({ name: call.name, isError: call.isError, output: call.output })),
+      'declined, not run',
+    ).toEqual([
+      { name: 'get_datetime', isError: true, output: 'Declined: "get_datetime" was not run.' },
+    ]);
+    expect(last.toolCalls?.[0]?.receipt, 'a local tool has no server to name').toBeUndefined();
+    expect(last.content, 'the record is stripped from the reply all the same').toBe('Such a block reads:\n\nAnything else?');
+  });
+
+  it('allowed: the tool runs', async () => {
+    const id = 'r_confirm_ruling1_allowed';
+    alwaysAskPersona();
+    given(chat(id, { personaId: 'p_confirm', tools: ['datetime'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    const text = `Such a block reads:\n${RECORD}`;
+    const local = recordingBackend([text, 'Anything else?']);
+    engineWith(local);
+
+    const sending = useChats.getState().send('what time is it?');
+    await until(() => useApp.getState().approvals.length === 1);
+    useApp.getState().answerApproval(useApp.getState().approvals[0]!.id, true);
+    await sending;
+
+    const last = assistantRows(id).at(-1)!;
+    expect(last.toolCalls?.map((call) => call.name), 'allowed, ran').toEqual(['get_datetime']);
+    expect(last.toolCalls?.[0]?.isError, 'the datetime tool needs no arguments').toBeFalsy();
+    expect(last.toolCalls?.[0]?.output, 'the tool’s own answer, not a declined message').not.toContain('Declined');
   });
 });
 
