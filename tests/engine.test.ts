@@ -15,7 +15,9 @@ import { DEFAULT_SAMPLER } from '@/domain/manifest';
 import { catalogEntry } from '@/data/catalog';
 import { toolRegistry } from '@/ai/tools/registry';
 import type { FallbackReason } from '@/ai/middleware/resilience';
-import { REACH_REMOTE } from '@/domain/chat';
+import { REACH_LOCAL_VIA_THIRD_PARTY, REACH_REMOTE } from '@/domain/chat';
+import type { CliBridgeExit, CliBridgeHandle, CliTurnBridge } from '@/ai/backends/cli';
+import { stripToolSyntax } from '@/ai/middleware/tools';
 
 /**
  * Dexie, stubbed at the table boundary.
@@ -1360,5 +1362,108 @@ describe('a local-cli connection is never fallback-eligible (#42, #115)', () => 
     }
 
     expect(bridgeStarted).toBe(false);
+  });
+});
+
+describe('a CLI reply is never read for a textual tool call (#42, #114, #360)', () => {
+  /**
+   * A fake `CliTurnBridge` whose `start()` streams one CLAUDE-shaped
+   * stream-json reply carrying `text` verbatim, then a `result` terminal --
+   * the minimum `createClaudeTranslator` (`src/ai/backends/cli-stream.ts`)
+   * needs to hand the engine back exactly `text`, unstripped, as `turn.text`.
+   * `startCalls` lets a test assert there was no SECOND round.
+   */
+  function cliFakeBridge(text: string): { bridge: CliTurnBridge; startCalls: () => number } {
+    let startCalls = 0;
+    const lines = [
+      JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: {} } }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      }),
+      JSON.stringify({ type: 'result', is_error: false, result: text }),
+    ];
+    const bytes = new TextEncoder().encode(lines.join('\n') + '\n');
+
+    const bridge: CliTurnBridge = {
+      start() {
+        startCalls += 1;
+        let dataListener: ((chunk: Uint8Array, stream: 'stdout' | 'stderr') => void) | undefined;
+        let exitListener: ((exit: CliBridgeExit) => void) | undefined;
+        const handle: CliBridgeHandle = {
+          onData(listener) {
+            dataListener = listener;
+          },
+          onExit(listener) {
+            exitListener = listener;
+          },
+          cancel() {
+            // Never cancelled by anything this test does.
+          },
+        };
+        queueMicrotask(() => {
+          dataListener?.(bytes, 'stdout');
+          exitListener?.({ code: 0, signal: null });
+        });
+        return handle;
+      },
+    };
+
+    return { bridge, startCalls: () => startCalls };
+  }
+
+  it('leaves call-shaped text in a CLI reply as words: no receipt, no tool event, no second round', async () => {
+    const { CliBackendAdapter } = await import('@/ai/backends/cli');
+    const replyText = 'Sure, one sec.<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>';
+    const state = cliFakeBridge(replyText);
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    engine.router.register('conn_cli', new CliBackendAdapter('claude', state.bridge));
+
+    const cliTarget = targetFor('remote', 'claude-x', 'Claude Code', 'conn_cli', REACH_LOCAL_VIA_THIRD_PARTY);
+    const events = await drain(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is 1 + 1?' }],
+        target: cliTarget,
+        toolIds: ['calculator'],
+      }),
+    );
+
+    expect(events.filter((event) => event.type === 'tool')).toHaveLength(0);
+    const done = doneEvent(events);
+    // `stripToolSyntax` still runs on the FINAL text either way (the same
+    // cosmetic pass the "does not run tools when the chat has none enabled"
+    // case above already gets) -- what this proves is the call was never
+    // EXECUTED: no tool event, no receipt, no second round below. With
+    // nothing offered (`offered.length === 0`) and no tool having run
+    // (`ran === false`), `stripToolSyntax` takes its own early exit and only
+    // trims -- the call-shaped markup stays, verbatim, as words.
+    expect(done.text).toBe(stripToolSyntax(replyText, { offered: [], ran: false }));
+    expect(done.text).toBe(replyText.trim());
+    expect(done.tools ?? []).toHaveLength(0);
+    // No second round: the bridge's `start()` (one subprocess turn) ran
+    // exactly once.
+    expect(state.startCalls()).toBe(1);
+  });
+
+  it('paired control: the SAME call-shaped text still runs on a normal local target', async () => {
+    // Proves the assertions above are specific to the CLI destination, not
+    // an accident of the tool-call syntax used or a global regression.
+    const engine = new ChatterangEngine({ resolver, fallbackBackendId: null });
+    const replyText = 'Sure, one sec.<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>';
+    engine.router.register('scripted', scriptedBackend([replyText, 'It is 2.']));
+
+    const events = await drain(
+      engine.stream({
+        messages: [{ role: 'user', content: 'what is 1 + 1?' }],
+        target: targetFor('llama-cpp', manifest.id, manifest.name, 'scripted'),
+        toolIds: ['calculator'],
+      }),
+    );
+
+    const toolEvents = events.filter(
+      (event): event is Extract<GenerationEvent, { type: 'tool' }> => event.type === 'tool',
+    );
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0]?.tool.name).toBe('calculate');
   });
 });

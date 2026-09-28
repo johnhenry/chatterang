@@ -1208,8 +1208,18 @@ export class ChatterangEngine {
         };
       }
 
+      // #42, #114, #360: nothing is offered, and nothing in the reply is
+      // read as a call, for a destination `#toolsCapable` refuses -- see
+      // that method.
+      const toolsCapable = this.#toolsCapable(target);
+
       // Taken as the request is built, beside the tool list `#toIR` declares.
-      offered = declaredTools(request.toolIds);
+      // #42, #114, #360: nothing is offered to a destination `#toolsCapable`
+      // refuses, which in turn keeps every `roundCalls`/`roundWords` read
+      // below empty for it too -- both gate on `offered.length > 0 || ran`,
+      // and a CLI target's `ran` never turns true once nothing is ever
+      // offered to it.
+      offered = toolsCapable ? declaredTools(request.toolIds) : [];
       for (const tool of offered) everDeclared.set(tool.id, tool);
       const irRequest = this.#toIR({ ...request, target }, outgoing, requestId, true);
 
@@ -1270,6 +1280,8 @@ export class ChatterangEngine {
            */
           // Only in a round whose request offered a tool, or that follows one a
           // tool ran in, exactly as its words are stripped: see `roundCalls`.
+          // #42, #114, #360: `offered` is already empty for a destination
+          // `#toolsCapable` refuses, so this reads nothing for a CLI target.
           const strandedCalls = roundCalls(turn.text, {
             offered,
             ran: tools.length > 0,
@@ -1418,6 +1430,11 @@ export class ChatterangEngine {
       // it ran the call the model was only weighing — under a conversation's
       // grant, the MCP server was sent its arguments — and asked for a
       // follow-up, where Stop at the same character recorded nothing.
+      //
+      // #42, #114, #360: `offered` is already empty for a destination
+      // `#toolsCapable` refuses (a CLI target), so this reads nothing for it —
+      // its reply's call-shaped text stays words, same as a turn with no
+      // tools enabled.
       const calls = roundCalls(turn.text, {
         offered,
         ran: tools.length > 0,
@@ -1639,6 +1656,47 @@ export class ChatterangEngine {
     return { text, stats, ended };
   }
 
+  /**
+   * May this destination's reply be read for tool calls at all -- textual
+   * ones (`findToolCalls`, this file's own tool-round loop) or declared ones
+   * (`#toIR`'s `tools`/`toolChoice`)?
+   *
+   * #42, #114, #360: a CLI adapter builds its own system prompt and
+   * conversation structure out of the CLI's OWN turn, never this app's
+   * IR->messages mapping or its tool-declaration convention -- so text in
+   * its reply that happens to look like fenced-call or `<tool_call>` markup
+   * is the CLI (or whatever the CLI is quoting) writing words, not this app
+   * naming a tool to run. Before the governed MCP bridge (#5, #245, #246),
+   * there was no OTHER way for a CLI turn to run a tool at all, so a chat
+   * with a tool chip on and a CLI target silently ran the model's own words
+   * as if they were a grant, and any output would have gone back to the
+   * CLI's vendor on the next round. Checked as `instanceof
+   * CliBackendAdapter` -- the same way `#resolveFallback` checks a CLI
+   * destination: the resolved adapter's real kind, never a naming convention
+   * on `backendId` that could fall out of sync with what is actually
+   * registered there.
+   *
+   * Deliberately NOT also gated on `metadata.capabilities.tools === false`
+   * generically: `FunctionBackendAdapter` (aimatey-backend-browser), which
+   * every scripted test double in this app's own suite is built on, defaults
+   * that field to `false` unless a test overrides it -- a fact about the
+   * test harness, unconnected to whether the ENGINE's own textual-tool-call
+   * loop should run. Widening the check to that field turned this fix into a
+   * regression across most of this file's existing tool tests the moment it
+   * was tried; `CliBackendAdapter` is refused by name because it is the one
+   * concrete adapter this app ships whose reply is genuinely never this
+   * app's own IR->text convention to parse, not because "declares
+   * `tools: false`" is a general rule anything else here follows.
+   *
+   * Once the governed bridge lands (#5, #245, #246), a CLI turn's tool calls
+   * will arrive ONLY through the MCP helper -- never read back out of the
+   * CLI's own reply text. This predicate is what keeps it that way: nothing
+   * here needs to change when the bridge starts dispatching for real.
+   */
+  #toolsCapable(target: EngineTarget): boolean {
+    return !(this.router.get(target.backendId) instanceof CliBackendAdapter);
+  }
+
   #resolveFallback(): { name: string; adapter: BackendAdapter; modelId?: string } | null {
     const id = this.#options.fallbackBackendId;
     if (!id) return null;
@@ -1793,7 +1851,14 @@ export class ChatterangEngine {
     requestId: string,
     stream: boolean,
   ): IRChatRequest {
-    const tools = request.toolIds?.length ? toolRegistry.toIRTools(request.toolIds) : undefined;
+    // #42, #114, #360: nothing is OFFERED to a destination `#toolsCapable`
+    // refuses -- a CLI adapter ignores this field today regardless, but
+    // "ignored by the one reader that exists" is not the same guarantee as
+    // "never sent", and this is the one place the IR request is built.
+    const tools =
+      this.#toolsCapable(request.target) && request.toolIds?.length
+        ? toolRegistry.toIRTools(request.toolIds)
+        : undefined;
 
     return {
       messages,
