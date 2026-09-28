@@ -409,11 +409,8 @@ describe('stripToolSyntax', () => {
     expect(extractTextualToolCalls(tagged).map((found) => found.name)).toEqual(['calculate']);
   });
 
-  it('keeps a malformed fenced block that names no offered tool, or carries no arguments', () => {
+  it('keeps a malformed fenced block that names no offered tool, whatever else it carries', () => {
     for (const body of [
-      // The owner's ruling: an extra key and no arguments key is words.
-      "{'id': 'call_0', 'name': 'calculate'}",
-      '{name: "calculator", version: "1.0.0",}',
       // Names no tool the turn offered.
       '{"name": "get_weather", "arguments": {"city": "Paris",}}',
       // A nested tool definition, whose `function` is an object.
@@ -422,6 +419,22 @@ describe('stripToolSyntax', () => {
       const text = `\`\`\`json\n${body}\n\`\`\``;
       expect(extractTextualToolCalls(text), body).toEqual([]);
       expect(stripToolSyntax(text), body).toBe(text);
+    }
+  });
+
+  it('runs a fenced call to an offered tool that carries no arguments key and is written with other keys (owner ruling, 2026-09-27, reversing the branch’s earlier "words")', () => {
+    // A no-argument call written with an extra key and no arguments key: the
+    // exact record the earlier ruling kept as words. It now runs, with empty
+    // input, because "calculate" is a tool the turn offered.
+    for (const [malformation, body] of [
+      ['double-quoted', '{"id": "call_0", "name": "calculate"}'],
+      ['single-quoted', "{'id': 'call_0', 'name': 'calculate'}"],
+    ] as const) {
+      const text = `\`\`\`json\n${body}\n\`\`\``;
+      expect(extractTextualToolCalls(text).map(({ name, input }) => ({ name, input })), malformation).toEqual([
+        { name: 'calculate', input: {} },
+      ]);
+      expect(stripToolSyntax(text), malformation).toBe('');
     }
   });
 
@@ -435,16 +448,28 @@ describe('stripToolSyntax', () => {
     expect(stripToolSyntax(shaped)).toBe(shaped);
   });
 
-  it('keeps a JSON record whose "name" is an offered tool’s id or name when it carries no arguments, and reads no call from it', () => {
-    for (const record of [
-      // A package.json for a project named after the calculator tool's id.
-      '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```',
-      // A column definition named after the date tool's id, and one after a tool's name.
-      '```json\n{"name": "datetime", "type": "timestamp", "nullable": false}\n```',
-      '```json\n{"name": "calculate", "type": "string"}\n```',
-    ]) {
-      expect(extractTextualToolCalls(record, [...OFFERED, 'datetime', 'get_datetime']), record).toEqual([]);
-      expect(stripToolSyntax(record, { offered: [...OFFERED, 'datetime', 'get_datetime'] }), record).toBe(record);
+  it('runs a JSON record whose "name" is an offered tool’s id or name, whatever other keys it holds and however few (owner ruling, 2026-09-27)', () => {
+    // A package.json for a project named after the calculator tool's id, a
+    // column definition named after the date tool's id, and one after a
+    // tool's name — each now runs as a call with no arguments, because its
+    // "name" is a string naming a tool the turn offered. Before the ruling
+    // these stayed words; the owner accepted that cost explicitly.
+    for (const [record, name] of [
+      [
+        '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```',
+        'calculator',
+      ],
+      [
+        '```json\n{"name": "datetime", "type": "timestamp", "nullable": false}\n```',
+        'datetime',
+      ],
+      ['```json\n{"name": "calculate", "type": "string"}\n```', 'calculate'],
+    ] as const) {
+      const offered = [...OFFERED, 'datetime', 'get_datetime'];
+      expect(extractTextualToolCalls(record, offered).map(({ name: n, input }) => ({ name: n, input })), record).toEqual([
+        { name, input: {} },
+      ]);
+      expect(stripToolSyntax(record, { offered }), record).toBe('');
     }
     // A call to a tool that takes no arguments may be written as its name alone.
     const bare = 'Now.\n```json\n{"name": "get_datetime"}\n```';
@@ -452,6 +477,53 @@ describe('stripToolSyntax', () => {
       'get_datetime',
     ]);
     expect(stripToolSyntax(bare, { offered: ['datetime', 'get_datetime'] })).toBe('Now.');
+  });
+
+  it('keeps a JSON record whose "id" happens to match an offered tool’s id, when its "name" names no offered tool', () => {
+    // The offered-tool check reads `tool`, `name` or `function` — never `id`.
+    // An offered tool's id sitting in the record's OWN "id" field must not be
+    // read as if it were the record's name: this is not the tool-id-as-name
+    // case the owner ruled on (where the id sits IN the name field), and it
+    // must still not run.
+    const record = '```json\n{"id": "calculator", "name": "get_weather", "city": "Paris"}\n```';
+    expect(extractTextualToolCalls(record)).toEqual([]);
+    expect(stripToolSyntax(record)).toBe(record);
+  });
+
+  it('runs the calculator record through the tool’s own validation honestly, rather than crashing, when it carries no arguments', async () => {
+    // "calculator" is the calculator tool's id; the fenced record carries no
+    // "arguments" key, so it runs with `{}`. The calculator tool's `execute`
+    // requires an `expression` string and does not have one, so it reports the
+    // failure the way it reports any bad expression — it does not throw.
+    const record = '```json\n{"name": "calculator", "version": "1.0.0"}\n```';
+    const calls = extractTextualToolCalls(record);
+    expect(calls.map(({ name, input }) => ({ name, input }))).toEqual([{ name: 'calculator', input: {} }]);
+    const tool = BUILT_IN_TOOLS.find((entry) => entry.id === 'calculator');
+    const result = await tool!.execute(calls[0]!.input, { now: () => new Date() });
+    expect(result.isError).toBe(true);
+    expect(typeof result.output).toBe('string');
+  });
+
+  it('reads and cuts a no-argument, other-keyed fenced call the same whether the turn finished or was stopped', () => {
+    // A COMPLETE block: stopping the turn right after it does not change
+    // whether it is read as a call — it is markup written before Stop landed,
+    // the same as any other finished call.
+    const finished = 'Here.\n```json\n{"id": "call_0", "name": "get_datetime"}\n```';
+    for (const ended of ['model', 'stopped'] as const) {
+      expect(extractFrom(finished, ['datetime', 'get_datetime'], [], { ended }).map((call) => call.name), ended).toEqual([
+        'get_datetime',
+      ]);
+    }
+    expect(stripToolSyntax(finished, { offered: ['datetime', 'get_datetime'] })).toBe('Here.');
+
+    // An UNFINISHED one — Stop landed before the closing fence — is not cut by
+    // `cutUnfinishedCall`: a bare fenced block carries no `ends` token (any
+    // other reading of an open fence is a code example the person asked for),
+    // so it is left as words for the caller, unaffected by this ruling.
+    const unfinished = 'Here.\n```json\n{"id": "call_0", "name": "get_datetime"';
+    expect(cutUnfinishedCall(unfinished, { ended: 'stopped', offered: ['datetime', 'get_datetime'] })).toBe(
+      unfinished,
+    );
   });
 
   it('reads a flat tool definition naming an offered tool as a call to it, and a nested one as words', () => {
@@ -1836,9 +1908,11 @@ describe('OpenAI’s own wire shapes: a nested function object, and arguments as
     expect(stripToolSyntax(example)).toBe(example);
   });
 
-  it('the ruling stands: an extra key and no arguments key in a fenced block is still words', () => {
+  it('the ruling reversed (2026-09-27): an extra key and no arguments key in a fenced block now runs', () => {
     const example = 'Such a block reads:\n\x60\x60\x60json\n{"id": "call_0", "name": "calculate"}\n\x60\x60\x60';
-    expect(extractTextualToolCalls(example)).toEqual([]);
-    expect(stripToolSyntax(example)).toBe(example);
+    expect(extractTextualToolCalls(example).map(({ name, input }) => ({ name, input }))).toEqual([
+      { name: 'calculate', input: {} },
+    ]);
+    expect(stripToolSyntax(example)).toBe('Such a block reads:');
   });
 });

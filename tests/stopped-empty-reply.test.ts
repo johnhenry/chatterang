@@ -3122,43 +3122,62 @@ describe('a fenced call Stop caught complete, in a turn offering its tool (refs 
   });
 });
 
-/* ── Round 6: a record named after an offered tool is not a call ────── */
+/* ── Round 6 → owner ruling of 2026-09-27: this record now runs ───────── */
 
 describe('a JSON record whose "name" is an offered tool’s id, carrying no arguments, in a chat with that tool on', () => {
-  // The calculator's id is "calculator": a package.json for a project of that
-  // name was run as a call to it and stripped from the reply. A call carries
-  // its arguments, or is nothing but its name; a record is neither.
+  // The calculator's id is "calculator". A package.json for a project of that
+  // name used to be read as words: a call carries its arguments, or is
+  // nothing but its name, and a record with other keys and no arguments key
+  // was neither. The owner's ruling of 2026-09-27 reverses that: a fenced
+  // block naming an offered tool runs whatever other keys it holds, arguments
+  // or none, so this record now runs — with no arguments — and the calculator
+  // tool reports the failure the way it reports any bad expression, honestly
+  // and without throwing.
   const PACKAGE = '```json\n{"name": "calculator", "version": "1.0.0", "private": true}\n```';
+  const NO_EXPRESSION = 'That does not look like an arithmetic expression.';
 
-  it('is not run, and stays in a finished reply and the next request', async () => {
+  it('runs with no arguments, is stripped from a finished reply, and its receipt reports the tool’s own validation failure', async () => {
     const id = 'r6_record_named_by_id';
     given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const text = `Here is a package.json:\n\n${PACKAGE}\n\nThen run npm install.`;
-    const local = recordingBackend([text, 'Anything else?', 'Fine.']);
+    const local = recordingBackend([text, 'Anything else?']);
     engineWith(local);
 
     await useChats.getState().send('a package.json for my calculator app, please');
-    await useChats.getState().send('thanks');
 
-    const last = assistantRows(id)[1]!;
-    expect(last.toolCalls, 'no tool ran').toBeUndefined();
-    expect(last.content, 'the words the person watched arrive').toBe(text);
-    expect(spoken(local.seen[1]).at(-2), 'the next request').toEqual(['assistant', text]);
+    const last = assistantRows(id).at(-1)!;
+    expect(
+      last.toolCalls?.map((call) => ({ name: call.name, input: call.input, isError: call.isError })),
+      'the call ran, with no arguments',
+    ).toEqual([{ name: 'calculator', input: {}, isError: true }]);
+    expect(last.toolCalls?.[0]?.output, 'the tool’s own message, not a crash').toBe(NO_EXPRESSION);
+    expect(last.content, 'the stripped words, both rounds').toBe(
+      'Here is a package.json:\n\n\n\nThen run npm install.\n\nAnything else?',
+    );
+    expect(JSON.stringify(local.seen[1]?.messages), 'the follow-up request').not.toContain('```');
   });
 
-  it('stays whole in a reply stopped after it', async () => {
+  it('runs, and none of it is stored when the follow-up is stopped', async () => {
     const id = 'r6_record_named_by_id_stopped';
     given(chat(id, { tools: ['calculator'] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
-    const partial = `Here is a package.json:\n\n${PACKAGE}\n\nThen run`;
     const gate = held();
-    const local = scriptedBackend([{ partial, stall: gate.promise }]);
+    const local = scriptedBackend([
+      { reply: `Here is a package.json:\n\n${PACKAGE}\n\nThen run npm install.` },
+      { partial: 'Anything el', stall: gate.promise },
+    ]);
     engineWith(local);
 
-    await stopAfterSome('a package.json for my calculator app, please', 'Then run', gate.release);
+    await stopAfterSome('a package.json for my calculator app, please', 'Anything el', gate.release);
 
     const stopped = assistantRows(id).at(-1)!;
-    expect(stopped.toolCalls, 'no tool ran').toBeUndefined();
-    expect(stopped.content, 'the words the person watched arrive').toBe(partial);
+    expect(
+      stopped.toolCalls?.map((call) => ({ name: call.name, isError: call.isError })),
+      'the call ran',
+    ).toEqual([{ name: 'calculator', isError: true }]);
+    expect(stopped.content, 'the stored reply').not.toContain('```');
+    expect(stopped.content, 'the words the person watched arrive').toMatch(
+      /^Here is a package\.json:\s+Then run npm install\.Anything el$/,
+    );
   });
 });
 
@@ -6176,28 +6195,26 @@ describe('a fenced call to an offered tool with a small model’s commonest JSON
     });
   }
 
-  it('the ruling stands: an extra key and no arguments key is words, malformed or not', async () => {
+  it('the ruling reversed (2026-09-27): an extra key and no arguments key now runs, malformed or not', async () => {
     const id = 'r12_fenced_ruling';
     const probe = mcpProbe();
-    given(chat(id, { tools: [probe.tool.id] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
+    given(chat(id, { tools: [probe.tool.id], egressGrants: [GRANT] }), [user(id, 1, 'hello'), reply(id, 2, 'Hi.')]);
     const words = 'Such a block reads:\n\x60\x60\x60json\n{\'id\': \'call_0\', \'name\': \'notes.note\'}\n\x60\x60\x60';
-    const local = scriptedBackend([{ reply: words }, { reply: 'Next.' }]);
+    const local = scriptedBackend([{ reply: words }, { reply: 'Filed.' }]);
     engineWith(local);
 
     try {
       toolRegistry.register(probe.tool);
       await useChats.getState().send('how does a no-argument call look?');
-      await useChats.getState().send('thanks');
     } finally {
       toolRegistry.unregister(probe.tool.id);
     }
 
-    const stored = assistantRows(id)[1]!;
-    expect(probe.call, 'MCP calls').not.toHaveBeenCalled();
-    expect({ content: stored.content, toolCalls: stored.toolCalls }, 'the stored reply').toEqual({
-      content: words,
-      toolCalls: undefined,
-    });
+    const stored = assistantRows(id).at(-1)!;
+    expect(probe.call, 'sent to the server once, with no arguments').toHaveBeenCalledTimes(1);
+    expect(probe.call.mock.calls[0]?.[2], 'its arguments').toEqual({});
+    expect(stored.toolCalls?.map((recorded) => recorded.receipt?.outcome), 'its record').toEqual(['sent']);
+    expect(stored.content, 'the stored reply holds none of the call').toBe('Such a block reads:\n\nFiled.');
   });
 });
 

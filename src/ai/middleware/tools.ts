@@ -540,13 +540,29 @@ function callWithArguments(name: string, raw: string): WrittenCall[] {
  * example `{"tool": "search", "arguments": …}` was run and stripped the same way.
  * Neither names an offered tool, so neither is a call.
  *
- * WHATEVER OTHER KEYS IT HOLDS BESIDE ITS ARGUMENTS (the owner's ruling). A
- * model that writes a call with an `id` or a `type` beside its name and
- * arguments is still calling the tool, and requiring nothing but a name and its
- * arguments left such a call unrun and in the reply. So a FLAT tool definition
- * naming an offered tool, `{"name": "calculate", "description": …,
- * "parameters": {…}}`, IS a call: its name is an offered tool, and its
- * `parameters` are read as the arguments.
+ * WHATEVER OTHER KEYS IT HOLDS, ARGUMENTS OR NONE (the owner's ruling of
+ * 2026-09-27, reversing the branch's earlier one). A model that writes a call
+ * with an `id` or a `type` beside its name and arguments is still calling the
+ * tool, and requiring nothing but a name and its arguments left such a call
+ * unrun and in the reply. So a FLAT tool definition naming an offered tool,
+ * `{"name": "calculate", "description": …, "parameters": {…}}`, IS a call:
+ * its name is an offered tool, and its `parameters` are read as the
+ * arguments.
+ *
+ * AND SO IS A NO-ARGUMENT CALL WRITTEN WITH OTHER KEYS BESIDE ITS NAME.
+ * `{"id": "call_0", "name": "get_datetime"}` used to be read as words, on the
+ * reasoning that a tool's id is as plain a word as its name, and that a
+ * record whose `name` is one is not a call — a package.json for a project
+ * named after the calculator tool's id, `{"name": "calculator", "version":
+ * "1.0.0", …}`, was the example that reasoning was built to keep as words.
+ * The owner's ruling accepts that cost: `calculator` names a tool the turn
+ * offered, so the record now runs, with whatever the tool does with no
+ * arguments — validated and refused the same way a call with genuinely empty
+ * arguments is, never by crashing. A record naming a tool the turn did NOT
+ * offer is unaffected by this and stays words regardless of its other keys
+ * (see the "no offered tool" tests): this ruling only widens what counts as a
+ * call for a name that IS offered, it does not relax the offered-name check
+ * itself.
  *
  * READ AS A SMALL MODEL WRITES JSON ({@link looseJson}), as every tag form's
  * body is. Read with `JSON.parse` alone, a block that unmistakably named an
@@ -557,17 +573,6 @@ function callWithArguments(name: string, raw: string): WrittenCall[] {
  * the model's own arguments were stored in the reply's words and sent back in
  * every later request, while the same body inside `<tool_call>` ran and was
  * stripped. What counts as a call cannot depend on the wrapper alone.
- *
- * BUT A CALL CARRIES ITS ARGUMENTS — an `arguments`, `parameters` or `input`
- * key — OR IS NOTHING BUT ITS NAME, a call to a tool that takes none. A tool's
- * id is as plain a word as its name, and a record whose `name` is one is not a
- * call: `{"name": "calculator", "version": "1.0.0", …}`, a package.json for a
- * project named after the calculator tool's id, was run as a call to it and
- * stripped from the reply the person had asked for, and so was a column
- * definition `{"name": "datetime", "type": "timestamp"}`. A call to a tool
- * that takes no arguments written with more keys than its name and none for
- * arguments, `{"id": "call_0", "name": "get_datetime"}`, is read as words: the
- * accepted cost of not running a record.
  */
 function fencedCall(
   body: string,
@@ -584,12 +589,10 @@ function fencedCall(
   if (!isRecord(parsed)) return undefined;
   const name = parsed.tool ?? parsed.name ?? parsed.function;
   if (typeof name !== 'string' || !offered.includes(name)) return undefined;
-  const keys = Object.keys(parsed);
-  const carriesArguments = keys.some((key) => ARGUMENT_KEYS.has(key));
-  if (!carriesArguments && !keys.every((key) => NAMING_KEYS.has(key))) return undefined;
   // Its arguments as every tag form's are read, a JSON string included: see
-  // {@link argumentsIn}. The gates above are untouched, so which blocks are
-  // calls is unchanged — only what the call carries.
+  // {@link argumentsIn}. Empty when the record carries none of `arguments`,
+  // `parameters` or `input` — a call to a tool the request offered, written
+  // with no arguments at all, whatever other keys sit beside its name.
   return { name, input: argumentsIn(parsed.arguments ?? parsed.parameters ?? parsed.input) };
 }
 
@@ -860,10 +863,8 @@ const JSON_WORD = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|True|Fal
 const BARE_WORD = /[\w.+-]+/y;
 /** A colon after a bare word, which makes it a key a small model left unquoted. */
 const AFTER_KEY = /\s*:/y;
-/** The keys a tag form's JSON names its tool by, as `extractTextualToolCalls` and `fencedCall` read them. */
+/** The keys a tag form's JSON names its tool by, as `extractTextualToolCalls` reads them. */
 const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'tool', 'function']);
-/** The keys a fenced call carries its arguments in, as `fencedCall` reads them. */
-const ARGUMENT_KEYS: ReadonlySet<string> = new Set(['arguments', 'parameters', 'input']);
 
 /**
  * How a text ended, which decides what at its end is a call still being
